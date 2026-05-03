@@ -1,0 +1,30 @@
+import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+
+export type FileContents = { path: string; content: string };
+
+const MD_FILTER = [{ name: "Markdown", extensions: ["md", "markdown", "mdown", "mkd", "mkdn"] }];
+
+export async function pickFileToOpen(): Promise<string | null> {
+  const result = await openDialog({ multiple: false, filters: MD_FILTER });
+  if (typeof result === "string") return result;
+  return null;
+}
+
+export async function pickFileToSave(suggestedName = "Untitled.md"): Promise<string | null> {
+  const result = await saveDialog({ defaultPath: suggestedName, filters: MD_FILTER });
+  return result ?? null;
+}
+
+export async function readFile(path: string): Promise<FileContents> {
+  return invoke<FileContents>("read_file", { path });
+}
+
+export async function writeFile(path: string, content: string): Promise<void> {
+  await invoke<void>("write_file", { path, content });
+}
+
+export async function getInitialFile(): Promise<string | null> {
+  const p = await invoke<string | null>("initial_file");
+  return p ?? null;
+}

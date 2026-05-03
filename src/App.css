@@ -1,0 +1,214 @@
+@import "github-markdown-css/github-markdown.css";
+@import "highlight.js/styles/github.css";
+
+:root {
+  --bg: #ffffff;
+  --bg-muted: #f6f8fa;
+  --border: #d0d7de;
+  --border-muted: #d8dee4;
+  --fg: #1f2328;
+  --fg-muted: #59636e;
+  --accent: #0969da;
+  --tab-active-bg: #ffffff;
+  --tab-active-border: #d0d7de;
+  --titlebar-h: 30px;
+}
+
+[data-theme="dark"] {
+  --bg: #0d1117;
+  --bg-muted: #161b22;
+  --border: #30363d;
+  --border-muted: #21262d;
+  --fg: #e6edf3;
+  --fg-muted: #8d96a0;
+  --accent: #2f81f7;
+  --tab-active-bg: #0d1117;
+  --tab-active-border: #30363d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Helvetica,
+    Arial, sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  font-size: 14px;
+}
+
+.app {
+  display: grid;
+  grid-template-rows: var(--titlebar-h) auto 1fr 24px;
+  height: 100vh;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.titlebar {
+  display: grid;
+  grid-template-columns: 80px 1fr 80px;
+  align-items: center;
+  height: var(--titlebar-h);
+  -webkit-app-region: drag;
+  user-select: none;
+  background: var(--bg-muted);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.title-name {
+  text-align: center;
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.tabbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px 0 16px;
+  background: var(--bg-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs {
+  display: flex;
+  gap: 0;
+}
+
+.tab {
+  appearance: none;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+
+.tab:hover {
+  color: var(--fg);
+}
+
+.tab.active {
+  background: var(--tab-active-bg);
+  border-color: var(--tab-active-border);
+  color: var(--fg);
+  font-weight: 500;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 6px;
+}
+
+.select {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.select-label {
+  user-select: none;
+}
+
+.select select {
+  appearance: none;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 22px 3px 8px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%2359636e'><path d='M4 6l4 4 4-4' stroke='%2359636e' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 12px;
+}
+
+.ghost {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.ghost:hover {
+  background: var(--bg-muted);
+}
+
+.pane {
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.preview-scroll {
+  height: 100%;
+  overflow: auto;
+  padding: 32px 48px 64px;
+}
+
+.markdown-body {
+  background: transparent !important;
+  color: var(--fg);
+  max-width: 980px;
+  margin: 0 auto;
+  font-size: 16px;
+}
+
+[data-theme="dark"] .markdown-body {
+  color-scheme: dark;
+}
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  background: var(--bg-muted);
+  border-top: 1px solid var(--border-muted);
+  font-size: 11px;
+  color: var(--fg-muted);
+  user-select: none;
+}
