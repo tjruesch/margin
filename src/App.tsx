@@ -173,7 +173,7 @@ export default function App() {
 
   return (
     <div className="app" data-theme={theme}>
-      <div className="tabbar">
+      <div className="tabbar" data-tauri-drag-region>
         <div className="tabs" role="tablist">
           <button
             role="tab"
