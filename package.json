@@ -20,6 +20,7 @@
     "@tauri-apps/plugin-dialog": "^2.7.1",
     "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-store": "^2",
     "@uiw/react-codemirror": "^4.25.9",
     "github-markdown-css": "^5.9.0",
     "highlight.js": "^11.11.1",

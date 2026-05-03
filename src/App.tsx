@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Editor } from "./Editor";
 import { Preview } from "./Preview";
+import { Settings } from "./Settings";
 import {
   getInitialFile,
   pickFileToOpen,
@@ -12,9 +13,14 @@ import {
   watchFile,
   writeFile,
 } from "./file";
+import { loadSettings, saveSetting, type Theme } from "./settingsStore";
 import "./App.css";
 
-type Mode = "edit" | "preview";
+type Mode = "edit" | "preview" | "settings";
+
+function systemTheme(): "light" | "dark" {
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
 
 const WELCOME = `# Welcome to Margin
 
@@ -51,9 +57,10 @@ export default function App() {
   const [tabSize, setTabSize] = useState<number>(2);
   const [useTabs, setUseTabs] = useState<boolean>(false);
   const [softWrap, setSoftWrap] = useState<boolean>(true);
-  const [theme, setTheme] = useState<"light" | "dark">(() =>
-    window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
-  );
+  const [themePreference, setThemePreference] = useState<Theme>("system");
+  const [systemAppearance, setSystemAppearance] = useState<"light" | "dark">(systemTheme);
+  const theme: "light" | "dark" =
+    themePreference === "system" ? systemAppearance : themePreference;
 
   const [externalChange, setExternalChange] = useState<{ path: string } | null>(null);
   const [externallyDeleted, setExternallyDeleted] = useState<boolean>(false);
@@ -160,6 +167,9 @@ export default function App() {
         case "view_preview":
           setMode("preview");
           break;
+        case "app_settings":
+          setMode("settings");
+          break;
       }
     });
     return () => {
@@ -221,12 +231,27 @@ export default function App() {
     }
   }, [externalChange]);
 
-  // Track system theme changes
+  // Track system theme changes (always — used when preference is "system")
   useEffect(() => {
     const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const handler = (e: MediaQueryListEvent) => setTheme(e.matches ? "dark" : "light");
+    const handler = (e: MediaQueryListEvent) =>
+      setSystemAppearance(e.matches ? "dark" : "light");
     mq.addEventListener("change", handler);
     return () => mq.removeEventListener("change", handler);
+  }, []);
+
+  // Hydrate persisted settings on mount
+  useEffect(() => {
+    loadSettings()
+      .then((s) => setThemePreference(s.theme))
+      .catch((err) => console.error("loadSettings failed:", err));
+  }, []);
+
+  const onThemeChange = useCallback((next: Theme) => {
+    setThemePreference(next);
+    void saveSetting("theme", next).catch((err) =>
+      console.error("saveSetting(theme) failed:", err),
+    );
   }, []);
 
   // Reflect document title
@@ -254,6 +279,14 @@ export default function App() {
             onClick={() => setMode("preview")}
           >
             Preview
+          </button>
+          <button
+            role="tab"
+            aria-selected={mode === "settings"}
+            className={"tab " + (mode === "settings" ? "active" : "")}
+            onClick={() => setMode("settings")}
+          >
+            Settings
           </button>
         </div>
 
@@ -322,7 +355,7 @@ export default function App() {
       )}
 
       <main className="pane">
-        {mode === "edit" ? (
+        {mode === "edit" && (
           <Editor
             value={content}
             onChange={setContent}
@@ -331,8 +364,10 @@ export default function App() {
             softWrap={softWrap}
             theme={theme}
           />
-        ) : (
-          <Preview source={content} theme={theme} />
+        )}
+        {mode === "preview" && <Preview source={content} theme={theme} />}
+        {mode === "settings" && (
+          <Settings theme={themePreference} onThemeChange={onThemeChange} />
         )}
       </main>
 
