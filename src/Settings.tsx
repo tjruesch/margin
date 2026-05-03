@@ -218,8 +218,8 @@ function AISection({ ai, onChange }: AISectionProps) {
             value={ai.summaryModel}
             onChange={(e) => onChange({ summaryModel: e.target.value as SummaryModel })}
           >
-            <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (default)</option>
-            <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (faster, cheaper)</option>
+            <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (default — balanced)</option>
+            <option value="claude-opus-4-7">Claude Opus 4.7 (most capable, slower)</option>
           </select>
         </div>
       </div>

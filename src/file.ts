@@ -74,3 +74,11 @@ export async function stopMeetingRecording(): Promise<string> {
 export async function transcribe(audioPath: string): Promise<Transcript> {
   return invoke<Transcript>("transcribe", { audioPath });
 }
+
+export async function summarizeMeeting(
+  transcriptPath: string,
+  title: string,
+  model?: string,
+): Promise<string> {
+  return invoke<string>("summarize_meeting", { transcriptPath, title, model });
+}

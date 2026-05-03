@@ -13,7 +13,7 @@ export type ThemeSettings = {
   darkTheme: string;
 };
 
-export type SummaryModel = "claude-sonnet-4-6" | "claude-haiku-4-5-20251001";
+export type SummaryModel = "claude-sonnet-4-6" | "claude-opus-4-7";
 export type WhisperModel = "base.en" | "small.en" | "medium.en";
 export type AudioRetention = "forever" | "30days" | "7days" | "never";
 
@@ -69,7 +69,7 @@ function isDarkThemeId(id: string): boolean {
   return getTheme(id)?.appearance === "dark";
 }
 
-const SUMMARY_MODELS: SummaryModel[] = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"];
+const SUMMARY_MODELS: SummaryModel[] = ["claude-sonnet-4-6", "claude-opus-4-7"];
 const WHISPER_MODELS: WhisperModel[] = ["base.en", "small.en", "medium.en"];
 const RETENTIONS: AudioRetention[] = ["forever", "30days", "7days", "never"];
 

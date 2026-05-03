@@ -1,6 +1,7 @@
 mod audio;
 mod keychain;
 mod paths;
+mod summarize;
 mod transcribe;
 
 use notify::{RecommendedWatcher, RecursiveMode};
@@ -316,7 +317,8 @@ pub fn run() {
             keychain::has_anthropic_api_key,
             start_meeting_recording,
             stop_meeting_recording,
-            transcribe::transcribe
+            transcribe::transcribe,
+            summarize::summarize_meeting
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
