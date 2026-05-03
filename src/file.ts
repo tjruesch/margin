@@ -52,3 +52,25 @@ export async function setAnthropicApiKey(key: string): Promise<void> {
 export async function deleteAnthropicApiKey(): Promise<void> {
   await invoke<void>("delete_anthropic_api_key");
 }
+
+// --- Meeting recording + transcription -----------------------------------
+
+export type Segment = { start_ms: number; end_ms: number; text: string };
+export type Transcript = {
+  segments: Segment[];
+  full_text: string;
+  language: string;
+  duration_ms: number;
+};
+
+export async function startMeetingRecording(title: string): Promise<string> {
+  return invoke<string>("start_meeting_recording", { title });
+}
+
+export async function stopMeetingRecording(): Promise<string> {
+  return invoke<string>("stop_meeting_recording");
+}
+
+export async function transcribe(audioPath: string): Promise<Transcript> {
+  return invoke<Transcript>("transcribe", { audioPath });
+}

@@ -1,5 +1,7 @@
+mod audio;
 mod keychain;
 mod paths;
+mod transcribe;
 
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
@@ -16,6 +18,39 @@ use tauri::{AppHandle, Emitter, Manager, State, Wry};
 #[tauri::command]
 fn meetings_dir() -> String {
     paths::meetings_dir().to_string_lossy().into_owned()
+}
+
+struct AudioState {
+    recording: Option<audio::Recording>,
+}
+
+#[tauri::command]
+fn start_meeting_recording(
+    app: AppHandle,
+    state: State<'_, Mutex<AudioState>>,
+    title: String,
+) -> Result<String, String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    if s.recording.is_some() {
+        return Err("already recording".into());
+    }
+    let r = audio::start(app, title)?;
+    let id = r.id.clone();
+    s.recording = Some(r);
+    Ok(id)
+}
+
+#[tauri::command]
+fn stop_meeting_recording(state: State<'_, Mutex<AudioState>>) -> Result<String, String> {
+    let r = {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.recording.take().ok_or("not recording")?
+    };
+    let _ = r.ctrl_tx.send(audio::Cmd::Stop);
+    r.join
+        .join()
+        .map_err(|_| "audio thread panicked".to_string())??;
+    Ok(r.wav_path.to_string_lossy().into_owned())
 }
 
 #[derive(Serialize, Clone)]
@@ -264,6 +299,7 @@ pub fn run() {
             app.manage(WriteGuard {
                 last_write: Mutex::new(None),
             });
+            app.manage(Mutex::new(AudioState { recording: None }));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -277,7 +313,10 @@ pub fn run() {
             meetings_dir,
             keychain::set_anthropic_api_key,
             keychain::delete_anthropic_api_key,
-            keychain::has_anthropic_api_key
+            keychain::has_anthropic_api_key,
+            start_meeting_recording,
+            stop_meeting_recording,
+            transcribe::transcribe
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
