@@ -187,9 +187,17 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&PredefinedMenuItem::close_window(app, None)?)
         .build()?;
 
+    // Custom Undo/Redo so they route to CodeMirror's history instead of
+    // macOS's NSResponder undo: (which doesn't reach the editor).
+    let edit_undo = MenuItemBuilder::with_id("edit_undo", "Undo")
+        .accelerator("CmdOrCtrl+Z")
+        .build(app)?;
+    let edit_redo = MenuItemBuilder::with_id("edit_redo", "Redo")
+        .accelerator("CmdOrCtrl+Shift+Z")
+        .build(app)?;
     let edit_sub = SubmenuBuilder::new(app, "Edit")
-        .item(&PredefinedMenuItem::undo(app, None)?)
-        .item(&PredefinedMenuItem::redo(app, None)?)
+        .item(&edit_undo)
+        .item(&edit_redo)
         .separator()
         .item(&PredefinedMenuItem::cut(app, None)?)
         .item(&PredefinedMenuItem::copy(app, None)?)

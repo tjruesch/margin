@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { undo, redo } from "@codemirror/commands";
+import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
 import { Preview } from "./Preview";
 import { Settings } from "./Settings";
@@ -86,6 +88,7 @@ export default function App() {
   const contentRef = useRef(content);
   const pathRef = useRef(path);
   const savedRef = useRef(savedContent);
+  const editorRef = useRef<ReactCodeMirrorRef>(null);
   useEffect(() => {
     contentRef.current = content;
   }, [content]);
@@ -185,6 +188,22 @@ export default function App() {
         case "app_settings":
           setMode("settings");
           break;
+        case "edit_undo": {
+          const v = editorRef.current?.view;
+          if (v) {
+            undo(v);
+            v.focus();
+          }
+          break;
+        }
+        case "edit_redo": {
+          const v = editorRef.current?.view;
+          if (v) {
+            redo(v);
+            v.focus();
+          }
+          break;
+        }
       }
     });
     return () => {
@@ -370,6 +389,7 @@ export default function App() {
       <main className="pane">
         {mode === "edit" && (
           <Editor
+            ref={editorRef}
             value={content}
             onChange={setContent}
             tabSize={tabSize}

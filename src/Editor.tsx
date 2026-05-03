@@ -1,5 +1,9 @@
-import { useMemo } from "react";
-import CodeMirror, { EditorView, Extension } from "@uiw/react-codemirror";
+import { forwardRef, useMemo } from "react";
+import CodeMirror, {
+  EditorView,
+  Extension,
+  ReactCodeMirrorRef,
+} from "@uiw/react-codemirror";
 import { HighlightStyle, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
@@ -44,7 +48,10 @@ type Props = {
   softWrap: boolean;
 };
 
-export function Editor({ value, onChange, tabSize, useTabs, softWrap }: Props) {
+export const Editor = forwardRef<ReactCodeMirrorRef, Props>(function Editor(
+  { value, onChange, tabSize, useTabs, softWrap },
+  ref,
+) {
   const extensions = useMemo<Extension[]>(() => {
     const exts: Extension[] = [
       markdown({ base: markdownLanguage, codeLanguages: languages }),
@@ -73,10 +80,11 @@ export function Editor({ value, onChange, tabSize, useTabs, softWrap }: Props) {
           border: "none",
         },
         ".cm-activeLine": {
-          backgroundColor: "var(--bg-muted)",
+          // Translucent overlay so the selection (drawn beneath) stays visible.
+          backgroundColor: "color-mix(in srgb, var(--fg) 8%, transparent)",
         },
         ".cm-activeLineGutter": {
-          backgroundColor: "var(--bg-muted)",
+          backgroundColor: "color-mix(in srgb, var(--fg) 10%, transparent)",
           color: "var(--fg)",
         },
         ".cm-cursor, .cm-dropCursor": {
@@ -84,8 +92,7 @@ export function Editor({ value, onChange, tabSize, useTabs, softWrap }: Props) {
         },
         "&.cm-focused .cm-selectionBackground, .cm-selectionBackground, ::selection":
           {
-            backgroundColor: "var(--accent)",
-            opacity: "0.25",
+            backgroundColor: "color-mix(in srgb, var(--accent) 35%, transparent)",
           },
         ".cm-foldPlaceholder": {
           backgroundColor: "var(--bg-muted)",
@@ -100,6 +107,7 @@ export function Editor({ value, onChange, tabSize, useTabs, softWrap }: Props) {
 
   return (
     <CodeMirror
+      ref={ref}
       value={value}
       onChange={onChange}
       theme="none"
@@ -120,4 +128,4 @@ export function Editor({ value, onChange, tabSize, useTabs, softWrap }: Props) {
       height="100%"
     />
   );
-}
+});
