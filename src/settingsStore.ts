@@ -8,13 +8,32 @@ import {
 
 export type ThemeSettings = {
   syncWithOS: boolean;
-  fixedTheme: string; // theme id used when syncWithOS = false
-  lightTheme: string; // theme id used in light system mode (when syncWithOS = true)
-  darkTheme: string; // theme id used in dark system mode (when syncWithOS = true)
+  fixedTheme: string;
+  lightTheme: string;
+  darkTheme: string;
+};
+
+export type SummaryModel = "claude-sonnet-4-6" | "claude-haiku-4-5-20251001";
+export type WhisperModel = "base.en" | "small.en" | "medium.en";
+export type AudioRetention = "forever" | "30days" | "7days" | "never";
+
+export type AISettings = {
+  summaryModel: SummaryModel;
+  whisperModel: WhisperModel;
+  recordSystemAudio: boolean;
+  audioRetention: AudioRetention;
 };
 
 export type AppSettings = {
   theme: ThemeSettings;
+  ai: AISettings;
+};
+
+export const DEFAULT_AI_SETTINGS: AISettings = {
+  summaryModel: "claude-sonnet-4-6",
+  whisperModel: "base.en",
+  recordSystemAudio: true,
+  audioRetention: "forever",
 };
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -24,6 +43,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     lightTheme: DEFAULT_LIGHT_THEME_ID,
     darkTheme: DEFAULT_DARK_THEME_ID,
   },
+  ai: DEFAULT_AI_SETTINGS,
 };
 
 const STORE_FILE = "settings.json";
@@ -49,11 +69,15 @@ function isDarkThemeId(id: string): boolean {
   return getTheme(id)?.appearance === "dark";
 }
 
-export async function loadSettings(): Promise<AppSettings> {
-  const s = getStore();
-  const raw = await s.get<unknown>("theme");
+const SUMMARY_MODELS: SummaryModel[] = ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"];
+const WHISPER_MODELS: WhisperModel[] = ["base.en", "small.en", "medium.en"];
+const RETENTIONS: AudioRetention[] = ["forever", "30days", "7days", "never"];
 
-  // New schema: an object with the four keys
+function pick<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {
+  return (allowed as readonly string[]).includes(value as string) ? (value as T) : fallback;
+}
+
+function loadTheme(raw: unknown): ThemeSettings {
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     const obj = raw as Record<string, unknown>;
     const fixed = isThemeId(obj.fixedTheme) ? obj.fixedTheme : DEFAULT_SETTINGS.theme.fixedTheme;
@@ -66,46 +90,55 @@ export async function loadSettings(): Promise<AppSettings> {
         ? obj.darkTheme
         : DEFAULT_SETTINGS.theme.darkTheme;
     return {
-      theme: {
-        syncWithOS:
-          typeof obj.syncWithOS === "boolean"
-            ? obj.syncWithOS
-            : DEFAULT_SETTINGS.theme.syncWithOS,
-        fixedTheme: fixed,
-        lightTheme: light,
-        darkTheme: dark,
-      },
+      syncWithOS:
+        typeof obj.syncWithOS === "boolean"
+          ? obj.syncWithOS
+          : DEFAULT_SETTINGS.theme.syncWithOS,
+      fixedTheme: fixed,
+      lightTheme: light,
+      darkTheme: dark,
     };
   }
-
   // Legacy schema: a single string "system" | "light" | "dark"
-  if (raw === "system") {
-    return { theme: { ...DEFAULT_SETTINGS.theme, syncWithOS: true } };
-  }
-  if (raw === "light") {
-    return {
-      theme: {
-        ...DEFAULT_SETTINGS.theme,
-        syncWithOS: false,
-        fixedTheme: DEFAULT_LIGHT_THEME_ID,
-      },
-    };
-  }
-  if (raw === "dark") {
-    return {
-      theme: {
-        ...DEFAULT_SETTINGS.theme,
-        syncWithOS: false,
-        fixedTheme: DEFAULT_DARK_THEME_ID,
-      },
-    };
-  }
+  if (raw === "system") return { ...DEFAULT_SETTINGS.theme, syncWithOS: true };
+  if (raw === "light")
+    return { ...DEFAULT_SETTINGS.theme, syncWithOS: false, fixedTheme: DEFAULT_LIGHT_THEME_ID };
+  if (raw === "dark")
+    return { ...DEFAULT_SETTINGS.theme, syncWithOS: false, fixedTheme: DEFAULT_DARK_THEME_ID };
+  return DEFAULT_SETTINGS.theme;
+}
 
-  return DEFAULT_SETTINGS;
+function loadAI(raw: unknown): AISettings {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return DEFAULT_AI_SETTINGS;
+  const obj = raw as Record<string, unknown>;
+  return {
+    summaryModel: pick(SUMMARY_MODELS, obj.summaryModel, DEFAULT_AI_SETTINGS.summaryModel),
+    whisperModel: pick(WHISPER_MODELS, obj.whisperModel, DEFAULT_AI_SETTINGS.whisperModel),
+    recordSystemAudio:
+      typeof obj.recordSystemAudio === "boolean"
+        ? obj.recordSystemAudio
+        : DEFAULT_AI_SETTINGS.recordSystemAudio,
+    audioRetention: pick(RETENTIONS, obj.audioRetention, DEFAULT_AI_SETTINGS.audioRetention),
+  };
+}
+
+export async function loadSettings(): Promise<AppSettings> {
+  const s = getStore();
+  const [rawTheme, rawAI] = await Promise.all([s.get<unknown>("theme"), s.get<unknown>("ai")]);
+  return {
+    theme: loadTheme(rawTheme),
+    ai: loadAI(rawAI),
+  };
 }
 
 export async function saveTheme(theme: ThemeSettings): Promise<void> {
   const s = getStore();
   await s.set("theme", theme);
+  await s.save();
+}
+
+export async function saveAI(ai: AISettings): Promise<void> {
+  const s = getStore();
+  await s.set("ai", ai);
   await s.save();
 }

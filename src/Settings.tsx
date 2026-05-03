@@ -1,25 +1,40 @@
-import { useState } from "react";
-import type { ThemeSettings } from "./settingsStore";
+import { useEffect, useState } from "react";
+import {
+  deleteAnthropicApiKey,
+  hasAnthropicApiKey,
+  setAnthropicApiKey,
+} from "./file";
+import type {
+  AISettings,
+  AudioRetention,
+  SummaryModel,
+  ThemeSettings,
+  WhisperModel,
+} from "./settingsStore";
 import { THEMES, darkThemes, getTheme, lightThemes, type Theme } from "./themes";
 
-type Section = "appearance" | "editor" | "shortcuts";
+type Section = "appearance" | "ai" | "editor" | "shortcuts";
 
 type SettingsProps = {
   theme: ThemeSettings;
+  ai: AISettings;
   onThemeChange: (next: ThemeSettings) => void;
+  onAIChange: (next: AISettings) => void;
 };
 
 const SECTIONS: { id: Section; label: string }[] = [
   { id: "appearance", label: "Appearance" },
+  { id: "ai", label: "AI" },
   { id: "editor", label: "Editor" },
   { id: "shortcuts", label: "Shortcuts" },
 ];
 
-export function Settings({ theme, onThemeChange }: SettingsProps) {
+export function Settings({ theme, ai, onThemeChange, onAIChange }: SettingsProps) {
   const [active, setActive] = useState<Section>("appearance");
 
-  const update = (patch: Partial<ThemeSettings>) =>
+  const updateTheme = (patch: Partial<ThemeSettings>) =>
     onThemeChange({ ...theme, ...patch });
+  const updateAI = (patch: Partial<AISettings>) => onAIChange({ ...ai, ...patch });
 
   return (
     <div className="settings">
@@ -48,7 +63,7 @@ export function Settings({ theme, onThemeChange }: SettingsProps) {
                   <input
                     type="checkbox"
                     checked={theme.syncWithOS}
-                    onChange={(e) => update({ syncWithOS: e.target.checked })}
+                    onChange={(e) => updateTheme({ syncWithOS: e.target.checked })}
                   />
                   <span className="toggle-track" aria-hidden="true">
                     <span className="toggle-thumb" />
@@ -68,13 +83,13 @@ export function Settings({ theme, onThemeChange }: SettingsProps) {
                   groupLabel="Light"
                   themes={lightThemes()}
                   selectedId={theme.lightTheme}
-                  onSelect={(id) => update({ lightTheme: id })}
+                  onSelect={(id) => updateTheme({ lightTheme: id })}
                 />
                 <ThemePicker
                   groupLabel="Dark"
                   themes={darkThemes()}
                   selectedId={theme.darkTheme}
-                  onSelect={(id) => update({ darkTheme: id })}
+                  onSelect={(id) => updateTheme({ darkTheme: id })}
                 />
               </>
             ) : (
@@ -82,11 +97,13 @@ export function Settings({ theme, onThemeChange }: SettingsProps) {
                 groupLabel="Theme"
                 themes={THEMES}
                 selectedId={theme.fixedTheme}
-                onSelect={(id) => update({ fixedTheme: id })}
+                onSelect={(id) => updateTheme({ fixedTheme: id })}
               />
             )}
           </section>
         )}
+
+        {active === "ai" && <AISection ai={ai} onChange={updateAI} />}
 
         {active === "editor" && (
           <section className="settings-section">
@@ -103,6 +120,162 @@ export function Settings({ theme, onThemeChange }: SettingsProps) {
         )}
       </div>
     </div>
+  );
+}
+
+type AISectionProps = {
+  ai: AISettings;
+  onChange: (patch: Partial<AISettings>) => void;
+};
+
+function AISection({ ai, onChange }: AISectionProps) {
+  const [hasKey, setHasKey] = useState<boolean>(false);
+  const [draft, setDraft] = useState<string>("");
+  const [saving, setSaving] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void hasAnthropicApiKey().then(setHasKey);
+  }, []);
+
+  const onSaveKey = async () => {
+    const value = draft.trim();
+    if (!value) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await setAnthropicApiKey(value);
+      setDraft("");
+      setHasKey(true);
+    } catch (e) {
+      setError(typeof e === "string" ? e : "Failed to save key");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const onRemoveKey = async () => {
+    if (!confirm("Remove the saved Anthropic API key?")) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await deleteAnthropicApiKey();
+      setHasKey(false);
+    } catch (e) {
+      setError(typeof e === "string" ? e : "Failed to remove key");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>AI</h2>
+
+      <div className="settings-row">
+        <div className="settings-row-label">Anthropic API key</div>
+        <div className="settings-row-control settings-row-control--col">
+          <div className="settings-actions">
+            <input
+              type="password"
+              className="settings-input"
+              placeholder={hasKey ? "•••••••• (saved in Keychain)" : "sk-ant-…"}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              className="ghost"
+              onClick={() => void onSaveKey()}
+              disabled={saving || !draft.trim()}
+            >
+              Save
+            </button>
+            {hasKey && (
+              <button className="ghost" onClick={() => void onRemoveKey()} disabled={saving}>
+                Remove
+              </button>
+            )}
+          </div>
+          <div className="settings-row-control">
+            <span className={"settings-status " + (hasKey ? "ok" : "muted")}>
+              {hasKey ? "Configured" : "Not configured"}
+            </span>
+            <span className="settings-hint">
+              Stored in macOS Keychain. Required for meeting summarization.
+            </span>
+          </div>
+          {error && <div className="settings-error">{error}</div>}
+        </div>
+      </div>
+
+      <div className="settings-row settings-row--inline">
+        <div className="settings-row-label">Summary model</div>
+        <div className="settings-row-control">
+          <select
+            className="settings-input"
+            value={ai.summaryModel}
+            onChange={(e) => onChange({ summaryModel: e.target.value as SummaryModel })}
+          >
+            <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (default)</option>
+            <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 (faster, cheaper)</option>
+          </select>
+        </div>
+      </div>
+
+      <div className="settings-row settings-row--inline">
+        <div className="settings-row-label">Transcription model</div>
+        <div className="settings-row-control">
+          <select
+            className="settings-input"
+            value={ai.whisperModel}
+            onChange={(e) => onChange({ whisperModel: e.target.value as WhisperModel })}
+          >
+            <option value="base.en">base.en (~140 MB)</option>
+            <option value="small.en">small.en (~470 MB)</option>
+            <option value="medium.en">medium.en (~1.5 GB)</option>
+          </select>
+          <span className="settings-hint">Downloaded on first use into ~/.margin/models/.</span>
+        </div>
+      </div>
+
+      <div className="settings-row settings-row--inline">
+        <div className="settings-row-label">Record system audio</div>
+        <div className="settings-row-control">
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={ai.recordSystemAudio}
+              onChange={(e) => onChange({ recordSystemAudio: e.target.checked })}
+            />
+            <span className="toggle-track" aria-hidden="true">
+              <span className="toggle-thumb" />
+            </span>
+          </label>
+          <span className="settings-hint">
+            Captures the other side of the call too. Requires screen-recording permission on first
+            use.
+          </span>
+        </div>
+      </div>
+
+      <div className="settings-row settings-row--inline">
+        <div className="settings-row-label">Keep meeting audio</div>
+        <div className="settings-row-control">
+          <select
+            className="settings-input"
+            value={ai.audioRetention}
+            onChange={(e) => onChange({ audioRetention: e.target.value as AudioRetention })}
+          >
+            <option value="forever">Forever</option>
+            <option value="30days">30 days</option>
+            <option value="7days">7 days</option>
+            <option value="never">Never (delete after summarize)</option>
+          </select>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -140,7 +313,6 @@ function ThemeCard({
   selected: boolean;
   onSelect: () => void;
 }) {
-  // Build inline styles from theme vars so the swatch shows the theme even before it's applied globally.
   const swatch: React.CSSProperties = {
     background: theme.vars.bg,
     color: theme.vars.fg,
@@ -165,6 +337,5 @@ function ThemeCard({
   );
 }
 
-// Re-export so consumers don't need both modules
 export type { Theme };
 export { getTheme };

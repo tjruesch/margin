@@ -36,3 +36,19 @@ export async function watchFile(path: string): Promise<void> {
 export async function unwatchFile(): Promise<void> {
   await invoke<void>("unwatch_file");
 }
+
+export async function meetingsDir(): Promise<string> {
+  return invoke<string>("meetings_dir");
+}
+
+export async function hasAnthropicApiKey(): Promise<boolean> {
+  return invoke<boolean>("has_anthropic_api_key");
+}
+
+export async function setAnthropicApiKey(key: string): Promise<void> {
+  await invoke<void>("set_anthropic_api_key", { key });
+}
+
+export async function deleteAnthropicApiKey(): Promise<void> {
+  await invoke<void>("delete_anthropic_api_key");
+}

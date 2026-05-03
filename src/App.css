@@ -436,6 +436,72 @@ body {
   font-style: italic;
 }
 
+.settings-row-control--col {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.settings-input {
+  appearance: none;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  min-width: 0;
+  flex: 1 1 220px;
+}
+.settings-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+  border-color: transparent;
+}
+select.settings-input {
+  cursor: pointer;
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M4 6l4 4 4-4' stroke='currentColor' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 14px;
+}
+
+.settings-status {
+  font-size: 12px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-muted);
+}
+.settings-status.ok {
+  color: #1a7f37;
+  background: color-mix(in srgb, #1a7f37 12%, transparent);
+  border-color: color-mix(in srgb, #1a7f37 30%, transparent);
+}
+.settings-status.muted {
+  color: var(--fg-muted);
+}
+[data-theme="dark"] .settings-status.ok {
+  color: #3fb950;
+}
+
+.settings-error {
+  color: #cf222e;
+  font-size: 12px;
+}
+[data-theme="dark"] .settings-error {
+  color: #ff7b72;
+}
+
 /* Toggle switch (used for Sync with OS) */
 .toggle {
   position: relative;

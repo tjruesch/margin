@@ -1,3 +1,6 @@
+mod keychain;
+mod paths;
+
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use serde::Serialize;
@@ -9,6 +12,11 @@ use tauri::menu::{
     MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Wry};
+
+#[tauri::command]
+fn meetings_dir() -> String {
+    paths::meetings_dir().to_string_lossy().into_owned()
+}
 
 #[derive(Serialize, Clone)]
 struct FileContents {
@@ -248,6 +256,7 @@ pub fn run() {
         .menu(build_menu)
         .on_menu_event(handle_menu_event)
         .setup(|app| {
+            paths::init().map_err(|e| e.to_string())?;
             app.manage(Mutex::new(WatcherState {
                 debouncer: None,
                 target: None,
@@ -264,7 +273,11 @@ pub fn run() {
             initial_file,
             set_mode_check,
             watch_file,
-            unwatch_file
+            unwatch_file,
+            meetings_dir,
+            keychain::set_anthropic_api_key,
+            keychain::delete_anthropic_api_key,
+            keychain::has_anthropic_api_key
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

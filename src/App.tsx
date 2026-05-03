@@ -15,7 +15,14 @@ import {
   watchFile,
   writeFile,
 } from "./file";
-import { DEFAULT_SETTINGS, loadSettings, saveTheme, type ThemeSettings } from "./settingsStore";
+import {
+  DEFAULT_SETTINGS,
+  loadSettings,
+  saveAI,
+  saveTheme,
+  type AISettings,
+  type ThemeSettings,
+} from "./settingsStore";
 import { applyTheme, getTheme, DEFAULT_LIGHT_THEME_ID, DEFAULT_DARK_THEME_ID } from "./themes";
 import "./App.css";
 
@@ -61,6 +68,7 @@ export default function App() {
   const [useTabs, setUseTabs] = useState<boolean>(false);
   const [softWrap, setSoftWrap] = useState<boolean>(true);
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(DEFAULT_SETTINGS.theme);
+  const [aiSettings, setAISettings] = useState<AISettings>(DEFAULT_SETTINGS.ai);
   const [systemAppearance, setSystemAppearance] = useState<"light" | "dark">(systemTheme);
 
   // Resolve the active theme id from settings + system appearance.
@@ -277,13 +285,21 @@ export default function App() {
   // Hydrate persisted settings on mount
   useEffect(() => {
     loadSettings()
-      .then((s) => setThemeSettings(s.theme))
+      .then((s) => {
+        setThemeSettings(s.theme);
+        setAISettings(s.ai);
+      })
       .catch((err) => console.error("loadSettings failed:", err));
   }, []);
 
   const onThemeChange = useCallback((next: ThemeSettings) => {
     setThemeSettings(next);
     void saveTheme(next).catch((err) => console.error("saveTheme failed:", err));
+  }, []);
+
+  const onAIChange = useCallback((next: AISettings) => {
+    setAISettings(next);
+    void saveAI(next).catch((err) => console.error("saveAI failed:", err));
   }, []);
 
   // Reflect document title
@@ -391,7 +407,12 @@ export default function App() {
         )}
         {mode === "preview" && <Preview source={content} theme={theme} />}
         {mode === "settings" && (
-          <Settings theme={themeSettings} onThemeChange={onThemeChange} />
+          <Settings
+            theme={themeSettings}
+            ai={aiSettings}
+            onThemeChange={onThemeChange}
+            onAIChange={onAIChange}
+          />
         )}
       </main>
 
