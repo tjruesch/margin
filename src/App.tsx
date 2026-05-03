@@ -13,7 +13,8 @@ import {
   watchFile,
   writeFile,
 } from "./file";
-import { loadSettings, saveSetting, type Theme } from "./settingsStore";
+import { DEFAULT_SETTINGS, loadSettings, saveTheme, type ThemeSettings } from "./settingsStore";
+import { applyTheme, getTheme, DEFAULT_LIGHT_THEME_ID, DEFAULT_DARK_THEME_ID } from "./themes";
 import "./App.css";
 
 type Mode = "edit" | "preview" | "settings";
@@ -57,10 +58,24 @@ export default function App() {
   const [tabSize, setTabSize] = useState<number>(2);
   const [useTabs, setUseTabs] = useState<boolean>(false);
   const [softWrap, setSoftWrap] = useState<boolean>(true);
-  const [themePreference, setThemePreference] = useState<Theme>("system");
+  const [themeSettings, setThemeSettings] = useState<ThemeSettings>(DEFAULT_SETTINGS.theme);
   const [systemAppearance, setSystemAppearance] = useState<"light" | "dark">(systemTheme);
-  const theme: "light" | "dark" =
-    themePreference === "system" ? systemAppearance : themePreference;
+
+  // Resolve the active theme id from settings + system appearance.
+  const activeThemeId = themeSettings.syncWithOS
+    ? systemAppearance === "dark"
+      ? themeSettings.darkTheme
+      : themeSettings.lightTheme
+    : themeSettings.fixedTheme;
+  const activeTheme =
+    getTheme(activeThemeId) ??
+    getTheme(systemAppearance === "dark" ? DEFAULT_DARK_THEME_ID : DEFAULT_LIGHT_THEME_ID)!;
+  const theme: "light" | "dark" = activeTheme.appearance;
+
+  // Apply CSS variables whenever the resolved theme changes.
+  useEffect(() => {
+    applyTheme(activeTheme);
+  }, [activeTheme]);
 
   const [externalChange, setExternalChange] = useState<{ path: string } | null>(null);
   const [externallyDeleted, setExternallyDeleted] = useState<boolean>(false);
@@ -243,15 +258,13 @@ export default function App() {
   // Hydrate persisted settings on mount
   useEffect(() => {
     loadSettings()
-      .then((s) => setThemePreference(s.theme))
+      .then((s) => setThemeSettings(s.theme))
       .catch((err) => console.error("loadSettings failed:", err));
   }, []);
 
-  const onThemeChange = useCallback((next: Theme) => {
-    setThemePreference(next);
-    void saveSetting("theme", next).catch((err) =>
-      console.error("saveSetting(theme) failed:", err),
-    );
+  const onThemeChange = useCallback((next: ThemeSettings) => {
+    setThemeSettings(next);
+    void saveTheme(next).catch((err) => console.error("saveTheme failed:", err));
   }, []);
 
   // Reflect document title
@@ -367,7 +380,7 @@ export default function App() {
         )}
         {mode === "preview" && <Preview source={content} theme={theme} />}
         {mode === "settings" && (
-          <Settings theme={themePreference} onThemeChange={onThemeChange} />
+          <Settings theme={themeSettings} onThemeChange={onThemeChange} />
         )}
       </main>
 

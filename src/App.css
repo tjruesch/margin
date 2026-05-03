@@ -1,6 +1,9 @@
 @import "github-markdown-css/github-markdown.css";
 @import "highlight.js/styles/github.css";
 
+/* Default vars (github-light). The applyTheme() helper in src/themes.ts
+   overwrites these on document.documentElement at runtime so any active
+   theme — bundled or future user-uploaded — drives the entire UI. */
 :root {
   --bg: #ffffff;
   --bg-muted: #f6f8fa;
@@ -11,99 +14,97 @@
   --accent: #0969da;
   --tab-active-bg: #ffffff;
   --tab-active-border: #d0d7de;
+
+  --code-bg: #f6f8fa;
+  --code-fg: #24292e;
+
+  --hl-keyword: #d73a49;
+  --hl-title: #6f42c1;
+  --hl-attr: #005cc5;
+  --hl-string: #032f62;
+  --hl-builtin: #e36209;
+  --hl-comment: #6a737d;
+  --hl-tag: #22863a;
+  --hl-section: #005cc5;
+
+  /* Banner — derived per-appearance below */
+  --banner-bg: #fff8c5;
+  --banner-fg: #59390a;
+  --banner-border: #d4a72c;
 }
 
 [data-theme="dark"] {
-  --bg: #0d1117;
-  --bg-muted: #161b22;
-  --border: #30363d;
-  --border-muted: #21262d;
-  --fg: #e6edf3;
-  --fg-muted: #8d96a0;
-  --accent: #2f81f7;
-  --tab-active-bg: #0d1117;
-  --tab-active-border: #30363d;
+  --banner-bg: #3b2e0d;
+  --banner-fg: #f0d49a;
+  --banner-border: #6a521e;
 }
 
-/* highlight.js github-dark — applied only when our root is in dark mode.
-   Overrides the github (light) theme that's imported globally. */
-[data-theme="dark"] .markdown-body pre,
-[data-theme="dark"] .hljs {
-  background: #161b22;
-  color: #c9d1d9;
+/* highlight.js — the imported github (light) theme provides defaults; we
+   override with our --hl-* vars so the active theme drives every token. */
+.markdown-body pre,
+.hljs {
+  background: var(--code-bg);
+  color: var(--code-fg);
 }
-[data-theme="dark"] .hljs-doctag,
-[data-theme="dark"] .hljs-keyword,
-[data-theme="dark"] .hljs-meta .hljs-keyword,
-[data-theme="dark"] .hljs-template-tag,
-[data-theme="dark"] .hljs-template-variable,
-[data-theme="dark"] .hljs-type,
-[data-theme="dark"] .hljs-variable.language_ {
-  color: #ff7b72;
+.hljs-doctag,
+.hljs-keyword,
+.hljs-meta .hljs-keyword,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-variable.language_ {
+  color: var(--hl-keyword);
 }
-[data-theme="dark"] .hljs-title,
-[data-theme="dark"] .hljs-title.class_,
-[data-theme="dark"] .hljs-title.class_.inherited__,
-[data-theme="dark"] .hljs-title.function_ {
-  color: #d2a8ff;
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.class_.inherited__,
+.hljs-title.function_ {
+  color: var(--hl-title);
 }
-[data-theme="dark"] .hljs-attr,
-[data-theme="dark"] .hljs-attribute,
-[data-theme="dark"] .hljs-literal,
-[data-theme="dark"] .hljs-meta,
-[data-theme="dark"] .hljs-number,
-[data-theme="dark"] .hljs-operator,
-[data-theme="dark"] .hljs-variable,
-[data-theme="dark"] .hljs-selector-attr,
-[data-theme="dark"] .hljs-selector-class,
-[data-theme="dark"] .hljs-selector-id {
-  color: #79c0ff;
+.hljs-attr,
+.hljs-attribute,
+.hljs-literal,
+.hljs-meta,
+.hljs-number,
+.hljs-operator,
+.hljs-variable,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id {
+  color: var(--hl-attr);
 }
-[data-theme="dark"] .hljs-regexp,
-[data-theme="dark"] .hljs-string,
-[data-theme="dark"] .hljs-meta .hljs-string {
-  color: #a5d6ff;
+.hljs-regexp,
+.hljs-string,
+.hljs-meta .hljs-string {
+  color: var(--hl-string);
 }
-[data-theme="dark"] .hljs-built_in,
-[data-theme="dark"] .hljs-symbol {
-  color: #ffa657;
+.hljs-built_in,
+.hljs-symbol {
+  color: var(--hl-builtin);
 }
-[data-theme="dark"] .hljs-comment,
-[data-theme="dark"] .hljs-code,
-[data-theme="dark"] .hljs-formula {
-  color: #8b949e;
+.hljs-comment,
+.hljs-code,
+.hljs-formula {
+  color: var(--hl-comment);
 }
-[data-theme="dark"] .hljs-name,
-[data-theme="dark"] .hljs-quote,
-[data-theme="dark"] .hljs-selector-tag,
-[data-theme="dark"] .hljs-selector-pseudo {
-  color: #7ee787;
+.hljs-name,
+.hljs-quote,
+.hljs-selector-tag,
+.hljs-selector-pseudo {
+  color: var(--hl-tag);
 }
-[data-theme="dark"] .hljs-subst {
-  color: #c9d1d9;
+.hljs-subst {
+  color: var(--code-fg);
 }
-[data-theme="dark"] .hljs-section {
-  color: #1f6feb;
+.hljs-section {
+  color: var(--hl-section);
   font-weight: bold;
 }
-[data-theme="dark"] .hljs-bullet {
-  color: #f2cc60;
-}
-[data-theme="dark"] .hljs-emphasis {
-  color: #c9d1d9;
+.hljs-emphasis {
   font-style: italic;
 }
-[data-theme="dark"] .hljs-strong {
-  color: #c9d1d9;
+.hljs-strong {
   font-weight: bold;
-}
-[data-theme="dark"] .hljs-addition {
-  color: #aff5b4;
-  background-color: #033a16;
-}
-[data-theme="dark"] .hljs-deletion {
-  color: #ffdcd7;
-  background-color: #67060c;
 }
 
 * {
@@ -145,14 +146,9 @@ body {
   font-size: 13px;
 }
 .banner-warn {
-  background: #fff8c5;
-  color: #59390a;
-  border-bottom-color: #d4a72c;
-}
-[data-theme="dark"] .banner-warn {
-  background: #3b2e0d;
-  color: #f0d49a;
-  border-bottom-color: #6a521e;
+  background: var(--banner-bg);
+  color: var(--banner-fg);
+  border-bottom-color: var(--banner-border);
 }
 .banner-msg {
   flex: 1;
@@ -236,7 +232,7 @@ body {
   font: inherit;
   font-size: 12px;
   cursor: pointer;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%2359636e'><path d='M4 6l4 4 4-4' stroke='%2359636e' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M4 6l4 4 4-4' stroke='currentColor' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   background-repeat: no-repeat;
   background-position: right 6px center;
   background-size: 12px;
@@ -330,7 +326,7 @@ body {
 }
 
 .settings-section {
-  max-width: 640px;
+  max-width: 720px;
 }
 
 .settings-section h2 {
@@ -349,6 +345,10 @@ body {
   border-top: 1px solid var(--border-muted);
 }
 
+.settings-row--inline {
+  align-items: center;
+}
+
 .settings-row:first-of-type {
   border-top: none;
 }
@@ -360,51 +360,122 @@ body {
   padding-top: 4px;
 }
 
-.settings-radio-group {
+.settings-row-control {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-.settings-radio {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  cursor: pointer;
-  padding: 6px 8px;
-  border-radius: 6px;
-}
-
-.settings-radio:hover {
-  background: var(--bg-muted);
-}
-
-.settings-radio input[type="radio"] {
-  margin: 3px 0 0;
-  accent-color: var(--accent);
-  cursor: pointer;
-}
-
-.settings-radio-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.settings-radio-label {
-  font-size: 13px;
-  color: var(--fg);
-}
-
-.settings-radio-hint {
+.settings-hint {
   font-size: 12px;
   color: var(--fg-muted);
+  flex: 1 1 200px;
+  min-width: 0;
 }
 
 .settings-placeholder {
   font-size: 13px;
   color: var(--fg-muted);
   font-style: italic;
+}
+
+/* Toggle switch (used for Sync with OS) */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 22px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.toggle input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.toggle-track {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 999px;
+  transition: background 120ms;
+}
+.toggle-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 120ms;
+}
+.toggle input:checked ~ .toggle-track {
+  background: var(--accent);
+}
+.toggle input:checked ~ .toggle-track .toggle-thumb {
+  transform: translateX(14px);
+}
+.toggle input:focus-visible ~ .toggle-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Theme picker grid */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.theme-card {
+  appearance: none;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+.theme-card:hover {
+  border-color: var(--accent);
+}
+.theme-card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent) inset;
+}
+
+.theme-card-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px solid;
+  height: 70px;
+  justify-content: center;
+}
+.theme-card-line {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  width: 100%;
+}
+.theme-card-line.short {
+  width: 60%;
+}
+
+.theme-card-name {
+  font-size: 13px;
+  color: var(--fg);
+  font-weight: 500;
 }
 
 .statusbar {

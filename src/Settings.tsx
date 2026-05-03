@@ -1,11 +1,12 @@
 import { useState } from "react";
-import type { Theme } from "./settingsStore";
+import type { ThemeSettings } from "./settingsStore";
+import { THEMES, darkThemes, getTheme, lightThemes, type Theme } from "./themes";
 
 type Section = "appearance" | "editor" | "shortcuts";
 
 type SettingsProps = {
-  theme: Theme;
-  onThemeChange: (theme: Theme) => void;
+  theme: ThemeSettings;
+  onThemeChange: (next: ThemeSettings) => void;
 };
 
 const SECTIONS: { id: Section; label: string }[] = [
@@ -14,14 +15,11 @@ const SECTIONS: { id: Section; label: string }[] = [
   { id: "shortcuts", label: "Shortcuts" },
 ];
 
-const THEME_OPTIONS: { value: Theme; label: string; hint: string }[] = [
-  { value: "system", label: "System", hint: "Match the macOS appearance" },
-  { value: "light", label: "Light", hint: "Always use the light theme" },
-  { value: "dark", label: "Dark", hint: "Always use the dark theme" },
-];
-
 export function Settings({ theme, onThemeChange }: SettingsProps) {
   const [active, setActive] = useState<Section>("appearance");
+
+  const update = (patch: Partial<ThemeSettings>) =>
+    onThemeChange({ ...theme, ...patch });
 
   return (
     <div className="settings">
@@ -41,28 +39,52 @@ export function Settings({ theme, onThemeChange }: SettingsProps) {
       <div className="settings-content">
         {active === "appearance" && (
           <section className="settings-section">
-            <h2>Appearance</h2>
+            <h2>Themes</h2>
 
-            <div className="settings-row">
-              <div className="settings-row-label">Theme</div>
-              <div className="settings-radio-group" role="radiogroup" aria-label="Theme">
-                {THEME_OPTIONS.map((opt) => (
-                  <label key={opt.value} className="settings-radio">
-                    <input
-                      type="radio"
-                      name="theme"
-                      value={opt.value}
-                      checked={theme === opt.value}
-                      onChange={() => onThemeChange(opt.value)}
-                    />
-                    <span className="settings-radio-text">
-                      <span className="settings-radio-label">{opt.label}</span>
-                      <span className="settings-radio-hint">{opt.hint}</span>
-                    </span>
-                  </label>
-                ))}
+            <div className="settings-row settings-row--inline">
+              <div className="settings-row-label">Sync with OS</div>
+              <div className="settings-row-control">
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={theme.syncWithOS}
+                    onChange={(e) => update({ syncWithOS: e.target.checked })}
+                  />
+                  <span className="toggle-track" aria-hidden="true">
+                    <span className="toggle-thumb" />
+                  </span>
+                </label>
+                <span className="settings-hint">
+                  {theme.syncWithOS
+                    ? "Automatically switch between light and dark themes when your system does."
+                    : "Use one fixed theme regardless of system appearance."}
+                </span>
               </div>
             </div>
+
+            {theme.syncWithOS ? (
+              <>
+                <ThemePicker
+                  groupLabel="Light"
+                  themes={lightThemes()}
+                  selectedId={theme.lightTheme}
+                  onSelect={(id) => update({ lightTheme: id })}
+                />
+                <ThemePicker
+                  groupLabel="Dark"
+                  themes={darkThemes()}
+                  selectedId={theme.darkTheme}
+                  onSelect={(id) => update({ darkTheme: id })}
+                />
+              </>
+            ) : (
+              <ThemePicker
+                groupLabel="Theme"
+                themes={THEMES}
+                selectedId={theme.fixedTheme}
+                onSelect={(id) => update({ fixedTheme: id })}
+              />
+            )}
           </section>
         )}
 
@@ -83,3 +105,66 @@ export function Settings({ theme, onThemeChange }: SettingsProps) {
     </div>
   );
 }
+
+type PickerProps = {
+  groupLabel: string;
+  themes: Theme[];
+  selectedId: string;
+  onSelect: (id: string) => void;
+};
+
+function ThemePicker({ groupLabel, themes, selectedId, onSelect }: PickerProps) {
+  return (
+    <div className="settings-row settings-row--inline">
+      <div className="settings-row-label">{groupLabel}</div>
+      <div className="theme-grid" role="radiogroup" aria-label={`${groupLabel} theme`}>
+        {themes.map((t) => (
+          <ThemeCard
+            key={t.id}
+            theme={t}
+            selected={t.id === selectedId}
+            onSelect={() => onSelect(t.id)}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ThemeCard({
+  theme,
+  selected,
+  onSelect,
+}: {
+  theme: Theme;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  // Build inline styles from theme vars so the swatch shows the theme even before it's applied globally.
+  const swatch: React.CSSProperties = {
+    background: theme.vars.bg,
+    color: theme.vars.fg,
+    borderColor: theme.vars.border,
+  };
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={selected}
+      className={"theme-card " + (selected ? "selected" : "")}
+      onClick={onSelect}
+    >
+      <span className="theme-card-preview" style={swatch}>
+        <span className="theme-card-line" style={{ background: theme.vars.fg, opacity: 0.85 }} />
+        <span className="theme-card-line short" style={{ background: theme.vars.hlKeyword }} />
+        <span className="theme-card-line" style={{ background: theme.vars.hlString }} />
+        <span className="theme-card-line short" style={{ background: theme.vars.hlComment }} />
+      </span>
+      <span className="theme-card-name">{theme.name}</span>
+    </button>
+  );
+}
+
+// Re-export so consumers don't need both modules
+export type { Theme };
+export { getTheme };
