@@ -312,14 +312,6 @@ export default function App() {
           >
             Preview
           </button>
-          <button
-            role="tab"
-            aria-selected={mode === "settings"}
-            className={"tab " + (mode === "settings" ? "active" : "")}
-            onClick={() => setMode("settings")}
-          >
-            Settings
-          </button>
         </div>
 
         <div className="toolbar">
