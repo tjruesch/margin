@@ -32,6 +32,94 @@ export type Theme = {
   vars: ThemeVars;
 };
 
+const marginDark: Theme = {
+  id: "margin-dark",
+  name: "Margin Dark",
+  appearance: "dark",
+  // Inspired by the Anthropic console: pure-black canvas with warm accents.
+  // Source palette: #000, #FDBA74, #2B1FEB, #9EB5FE, #C3420D, #00786F, #6A5E83, #50307B
+  vars: {
+    bg: "#000000",
+    bgMuted: "#0a0a0a",
+    border: "#2a2a2a",
+    borderMuted: "#1a1a1a",
+    fg: "#ececec",
+    fgMuted: "#9a9a9a",
+    accent: "#FDBA74",
+    tabActiveBg: "#000000",
+    tabActiveBorder: "#2a2a2a",
+    codeBg: "#0e0e0e",
+    codeFg: "#ececec",
+    hlKeyword: "#C3420D",
+    hlTitle: "#FDBA74",
+    hlAttr: "#9EB5FE",
+    hlString: "#00786F",
+    hlBuiltin: "#FDBA74",
+    hlComment: "#6A5E83",
+    hlTag: "#FDBA74",
+    hlSection: "#9EB5FE",
+  },
+};
+
+const marginLight: Theme = {
+  id: "margin-light",
+  name: "Margin Light",
+  appearance: "light",
+  // Paper-toned sibling of Margin Dark, same accent vocabulary tuned for contrast on cream.
+  vars: {
+    bg: "#fbfaf6",
+    bgMuted: "#f1ede2",
+    border: "#d4cfc1",
+    borderMuted: "#e3ded1",
+    fg: "#1a1a1a",
+    fgMuted: "#5a5a5a",
+    accent: "#C3420D",
+    tabActiveBg: "#fbfaf6",
+    tabActiveBorder: "#d4cfc1",
+    codeBg: "#f1ede2",
+    codeFg: "#1a1a1a",
+    hlKeyword: "#C3420D",
+    hlTitle: "#50307B",
+    hlAttr: "#2B1FEB",
+    hlString: "#00786F",
+    hlBuiltin: "#b85a1a",
+    hlComment: "#6A5E83",
+    hlTag: "#00786F",
+    hlSection: "#2B1FEB",
+  },
+};
+
+const marginRouge: Theme = {
+  id: "margin-rouge",
+  name: "Margin Rouge",
+  appearance: "dark",
+  // Wine canvas with pink/rose accents.
+  // Source palette: #F5B0D1, #651D31, #752E44, #CE93B0, #fff
+  vars: {
+    bg: "#651D31",
+    bgMuted: "#752E44",
+    border: "#CE93B0",
+    borderMuted: "#752E44",
+    fg: "#F5B0D1",
+    fgMuted: "#CE93B0",
+    accent: "#F5B0D1",
+    tabActiveBg: "#651D31",
+    tabActiveBorder: "#752E44",
+    codeBg: "#752E44",
+    codeFg: "#ffffff",
+    // Warm-spectrum palette derived from the rose theme: rose, peach, gold,
+    // lavender, cream — keeps the brand vibe while giving syntax real variety.
+    hlKeyword: "#FF7B9D",
+    hlTitle: "#FFB995",
+    hlAttr: "#E0B0E0",
+    hlString: "#F5B0D1",
+    hlBuiltin: "#FFD580",
+    hlComment: "#CE93B0",
+    hlTag: "#FFE5A8",
+    hlSection: "#ffffff",
+  },
+};
+
 const githubLight: Theme = {
   id: "github-light",
   name: "GitHub Light",
@@ -195,6 +283,9 @@ const nord: Theme = {
 };
 
 export const THEMES: Theme[] = [
+  marginLight,
+  marginDark,
+  marginRouge,
   githubLight,
   githubDark,
   solarizedLight,

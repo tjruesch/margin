@@ -23,7 +23,7 @@ export const md: MarkdownIt = new MarkdownIt({
     return `<pre><code class="hljs">${md.utils.escapeHtml(str)}</code></pre>`;
   },
 })
-  .use(anchor, { permalink: anchor.permalink.headerLink() })
+  .use(anchor)
   .use(taskLists, { enabled: false, label: true })
   .use(footnote)
   .use(emoji);

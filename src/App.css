@@ -268,10 +268,66 @@ body {
 
 .markdown-body {
   background: transparent !important;
-  color: var(--fg);
+  color: var(--fg) !important;
   max-width: 980px;
   margin: 0 auto;
   font-size: 16px;
+}
+
+/* github-markdown-css ships hardcoded grays that only land well on its own
+   canvas colors. Force the things we care about to track our theme vars. */
+.markdown-body p,
+.markdown-body li,
+.markdown-body td,
+.markdown-body th,
+.markdown-body dt,
+.markdown-body dd,
+.markdown-body summary {
+  color: var(--fg);
+}
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  color: var(--fg);
+  border-bottom-color: var(--border-muted);
+}
+.markdown-body blockquote {
+  color: var(--fg-muted);
+  border-left-color: var(--border);
+}
+.markdown-body hr {
+  background-color: var(--border);
+  border-color: var(--border);
+}
+.markdown-body a {
+  color: var(--accent);
+}
+.markdown-body table tr {
+  background-color: transparent;
+  border-top-color: var(--border-muted);
+}
+.markdown-body table tr:nth-child(2n) {
+  background-color: var(--bg-muted);
+}
+.markdown-body table th,
+.markdown-body table td {
+  border-color: var(--border-muted);
+}
+.markdown-body code:not(.hljs) {
+  background-color: var(--bg-muted);
+  color: var(--fg);
+}
+.markdown-body kbd {
+  background-color: var(--bg-muted);
+  border-color: var(--border);
+  color: var(--fg);
+}
+.markdown-body .footnotes {
+  color: var(--fg);
+  border-top-color: var(--border-muted);
 }
 
 [data-theme="dark"] .markdown-body {

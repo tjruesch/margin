@@ -375,7 +375,6 @@ export default function App() {
             tabSize={tabSize}
             useTabs={useTabs}
             softWrap={softWrap}
-            theme={theme}
           />
         )}
         {mode === "preview" && <Preview source={content} theme={theme} />}
