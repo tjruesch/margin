@@ -150,9 +150,15 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         ..Default::default()
     };
 
+    let app_settings = MenuItemBuilder::with_id("app_settings", "Settings\u{2026}")
+        .accelerator("CmdOrCtrl+,")
+        .build(app)?;
+
     // Slot 0 — macOS treats this as the application menu and substitutes the app name.
     let app_sub = SubmenuBuilder::new(app, "Margin")
         .item(&PredefinedMenuItem::about(app, None, Some(about_md))?)
+        .separator()
+        .item(&app_settings)
         .separator()
         .item(&PredefinedMenuItem::services(app, None)?)
         .separator()
@@ -230,6 +236,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
         .menu(build_menu)
         .on_menu_event(handle_menu_event)
         .setup(|app| {
