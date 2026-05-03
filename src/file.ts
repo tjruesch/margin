@@ -74,6 +74,10 @@ export async function stopMeetingRecording(): Promise<string> {
   return invoke<string>("stop_meeting_recording");
 }
 
+export async function deleteMeetingFiles(id: string): Promise<void> {
+  await invoke<void>("delete_meeting_files", { id });
+}
+
 export async function transcribe(audioPath: string): Promise<Transcript> {
   return invoke<Transcript>("transcribe", { audioPath });
 }

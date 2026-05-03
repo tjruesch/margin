@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
+import { Meeting } from "./Meeting";
 import { Preview } from "./Preview";
 import { Settings } from "./Settings";
 import {
@@ -26,7 +27,7 @@ import {
 import { applyTheme, getTheme, DEFAULT_LIGHT_THEME_ID, DEFAULT_DARK_THEME_ID } from "./themes";
 import "./App.css";
 
-type Mode = "edit" | "preview" | "settings";
+type Mode = "edit" | "preview" | "settings" | "meeting";
 
 function systemTheme(): "light" | "dark" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
@@ -89,6 +90,18 @@ export default function App() {
 
   const [externalChange, setExternalChange] = useState<{ path: string } | null>(null);
   const [externallyDeleted, setExternallyDeleted] = useState<boolean>(false);
+  const [meetingExclusive, setMeetingExclusive] = useState<boolean>(false);
+
+  const tryNavigate = useCallback(
+    (next: Mode) => {
+      // Lock mode switching while a meeting is in an in-progress state
+      // (recording / transcribing / summarizing). Idle and error states
+      // don't lock.
+      if (meetingExclusive && mode === "meeting") return;
+      setMode(next);
+    },
+    [meetingExclusive, mode],
+  );
 
   const dirty = content !== savedContent;
   const fileName = path ? path.split("/").pop() ?? "Untitled.md" : "Untitled.md";
@@ -188,13 +201,16 @@ export default function App() {
           void onSaveAs();
           break;
         case "view_edit":
-          setMode("edit");
+          tryNavigate("edit");
           break;
         case "view_preview":
-          setMode("preview");
+          tryNavigate("preview");
           break;
         case "app_settings":
-          setMode("settings");
+          tryNavigate("settings");
+          break;
+        case "file_new_meeting":
+          tryNavigate("meeting");
           break;
         case "edit_undo": {
           const v = editorRef.current?.view;
@@ -217,7 +233,7 @@ export default function App() {
     return () => {
       unlisten.then((u) => u());
     };
-  }, [onOpen, onSave, onSaveAs]);
+  }, [onOpen, onSave, onSaveAs, tryNavigate]);
 
   // Keep View → Edit/Preview check marks in sync with React state.
   useEffect(() => {
@@ -316,7 +332,7 @@ export default function App() {
             role="tab"
             aria-selected={mode === "edit"}
             className={"tab " + (mode === "edit" ? "active" : "")}
-            onClick={() => setMode("edit")}
+            onClick={() => tryNavigate("edit")}
           >
             Edit
           </button>
@@ -324,7 +340,7 @@ export default function App() {
             role="tab"
             aria-selected={mode === "preview"}
             className={"tab " + (mode === "preview" ? "active" : "")}
-            onClick={() => setMode("preview")}
+            onClick={() => tryNavigate("preview")}
           >
             Preview
           </button>
@@ -359,7 +375,7 @@ export default function App() {
               />
             </>
           ) : (
-            <button className="ghost" onClick={() => setMode("edit")}>
+            <button className="ghost" onClick={() => tryNavigate("edit")}>
               Back to edit
             </button>
           )}
@@ -412,6 +428,13 @@ export default function App() {
             ai={aiSettings}
             onThemeChange={onThemeChange}
             onAIChange={onAIChange}
+          />
+        )}
+        {mode === "meeting" && (
+          <Meeting
+            ai={aiSettings}
+            onMdReady={(p) => void loadFile(p)}
+            onExclusiveChange={setMeetingExclusive}
           />
         )}
       </main>

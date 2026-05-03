@@ -53,6 +53,20 @@ fn stop_meeting_recording(state: State<'_, Mutex<AudioState>>) -> Result<String,
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Removes meeting artifacts for a given id (wav + transcript + md). Used by
+/// the Meeting UI's Discard button after a recording is aborted.
+#[tauri::command]
+fn delete_meeting_files(id: String) -> Result<(), String> {
+    let dir = paths::meetings_dir();
+    for ext in ["wav", "transcript.json", "md"] {
+        let p = dir.join(format!("{id}.{ext}"));
+        if p.exists() {
+            std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Clone)]
 struct FileContents {
     path: String,
@@ -212,6 +226,9 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&PredefinedMenuItem::quit(app, None)?)
         .build()?;
 
+    let new_meeting = MenuItemBuilder::with_id("file_new_meeting", "New Meeting\u{2026}")
+        .accelerator("CmdOrCtrl+Shift+M")
+        .build(app)?;
     let open = MenuItemBuilder::with_id("file_open", "Open\u{2026}")
         .accelerator("CmdOrCtrl+O")
         .build(app)?;
@@ -222,6 +239,8 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .accelerator("CmdOrCtrl+Shift+S")
         .build(app)?;
     let file_sub = SubmenuBuilder::new(app, "File")
+        .item(&new_meeting)
+        .separator()
         .item(&open)
         .separator()
         .item(&save)
@@ -316,6 +335,7 @@ pub fn run() {
             keychain::has_anthropic_api_key,
             start_meeting_recording,
             stop_meeting_recording,
+            delete_meeting_files,
             transcribe::transcribe,
             summarize::summarize_meeting
         ])
