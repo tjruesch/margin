@@ -47,11 +47,42 @@ body {
 }
 
 .app {
-  display: grid;
-  grid-template-rows: auto 1fr 24px;
+  display: flex;
+  flex-direction: column;
   height: 100vh;
   background: var(--bg);
   color: var(--fg);
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.banner-warn {
+  background: #fff8c5;
+  color: #59390a;
+  border-bottom-color: #d4a72c;
+}
+[data-theme="dark"] .banner-warn {
+  background: #3b2e0d;
+  color: #f0d49a;
+  border-bottom-color: #6a521e;
+}
+.banner-msg {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.banner-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .tabbar {
@@ -146,6 +177,8 @@ body {
 }
 
 .pane {
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
   background: var(--bg);
 }

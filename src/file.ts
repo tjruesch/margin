@@ -28,3 +28,11 @@ export async function getInitialFile(): Promise<string | null> {
   const p = await invoke<string | null>("initial_file");
   return p ?? null;
 }
+
+export async function watchFile(path: string): Promise<void> {
+  await invoke<void>("watch_file", { path });
+}
+
+export async function unwatchFile(): Promise<void> {
+  await invoke<void>("unwatch_file");
+}

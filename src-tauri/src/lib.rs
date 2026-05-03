@@ -1,6 +1,9 @@
+use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tauri::menu::{
     AboutMetadata, CheckMenuItem, CheckMenuItemBuilder, Menu, MenuBuilder, MenuEvent,
     MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
@@ -18,6 +21,15 @@ struct ViewModeItems {
     preview: CheckMenuItem<Wry>,
 }
 
+struct WatcherState {
+    debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
+    target: Option<PathBuf>,
+}
+
+struct WriteGuard {
+    last_write: Mutex<Option<Instant>>,
+}
+
 #[tauri::command]
 fn read_file(path: String) -> Result<FileContents, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
@@ -25,8 +37,82 @@ fn read_file(path: String) -> Result<FileContents, String> {
 }
 
 #[tauri::command]
-fn write_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, content).map_err(|e| e.to_string())
+fn write_file(
+    path: String,
+    content: String,
+    guard: State<'_, WriteGuard>,
+) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    *guard
+        .last_write
+        .lock()
+        .map_err(|e| e.to_string())? = Some(Instant::now());
+    Ok(())
+}
+
+#[tauri::command]
+fn watch_file(
+    app: AppHandle,
+    state: State<'_, Mutex<WatcherState>>,
+    path: String,
+) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    let parent = target
+        .parent()
+        .ok_or("file has no parent directory")?
+        .to_path_buf();
+    let target_cb = target.clone();
+    let path_cb = path.clone();
+    let app_cb = app.clone();
+
+    let mut deb = new_debouncer(
+        Duration::from_millis(200),
+        None,
+        move |res: DebounceEventResult| {
+            let Ok(events) = res else { return };
+            for ev in events {
+                if !ev.paths.iter().any(|p| p == &target_cb) {
+                    continue;
+                }
+                // Suppress events caused by our own write_file calls.
+                let guard = app_cb.state::<WriteGuard>();
+                if let Ok(g) = guard.last_write.lock() {
+                    if let Some(t) = *g {
+                        if t.elapsed() < Duration::from_millis(500) {
+                            continue;
+                        }
+                    }
+                }
+                use notify::EventKind::*;
+                match ev.kind {
+                    Remove(_) => {
+                        let _ = app_cb.emit("external-delete", &path_cb);
+                    }
+                    Modify(_) | Create(_) | Any => {
+                        let _ = app_cb.emit("external-change", &path_cb);
+                    }
+                    _ => {}
+                }
+            }
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    deb.watch(&parent, RecursiveMode::NonRecursive)
+        .map_err(|e| e.to_string())?;
+
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    s.debouncer = Some(deb); // dropping the previous Debouncer stops its watch
+    s.target = Some(target);
+    Ok(())
+}
+
+#[tauri::command]
+fn unwatch_file(state: State<'_, Mutex<WatcherState>>) -> Result<(), String> {
+    let mut s = state.lock().map_err(|e| e.to_string())?;
+    s.debouncer = None;
+    s.target = None;
+    Ok(())
 }
 
 #[tauri::command]
@@ -146,12 +232,24 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .menu(build_menu)
         .on_menu_event(handle_menu_event)
+        .setup(|app| {
+            app.manage(Mutex::new(WatcherState {
+                debouncer: None,
+                target: None,
+            }));
+            app.manage(WriteGuard {
+                last_write: Mutex::new(None),
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             read_file,
             write_file,
             file_exists,
             initial_file,
-            set_mode_check
+            set_mode_check,
+            watch_file,
+            unwatch_file
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

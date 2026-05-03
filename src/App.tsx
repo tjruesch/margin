@@ -8,6 +8,8 @@ import {
   pickFileToOpen,
   pickFileToSave,
   readFile,
+  unwatchFile,
+  watchFile,
   writeFile,
 } from "./file";
 import "./App.css";
@@ -53,17 +55,24 @@ export default function App() {
     window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
   );
 
+  const [externalChange, setExternalChange] = useState<{ path: string } | null>(null);
+  const [externallyDeleted, setExternallyDeleted] = useState<boolean>(false);
+
   const dirty = content !== savedContent;
   const fileName = path ? path.split("/").pop() ?? "Untitled.md" : "Untitled.md";
 
   const contentRef = useRef(content);
   const pathRef = useRef(path);
+  const savedRef = useRef(savedContent);
   useEffect(() => {
     contentRef.current = content;
   }, [content]);
   useEffect(() => {
     pathRef.current = path;
   }, [path]);
+  useEffect(() => {
+    savedRef.current = savedContent;
+  }, [savedContent]);
 
   const loadFile = useCallback(async (p: string) => {
     try {
@@ -72,6 +81,8 @@ export default function App() {
       setContent(file.content);
       setSavedContent(file.content);
       setMode("edit");
+      setExternalChange(null);
+      setExternallyDeleted(false);
     } catch (err) {
       console.error("read_file failed:", err);
     }
@@ -92,6 +103,8 @@ export default function App() {
       await writeFile(target, contentRef.current);
       setPath(target);
       setSavedContent(contentRef.current);
+      setExternalChange(null);
+      setExternallyDeleted(false);
     } catch (err) {
       console.error("write_file failed:", err);
     }
@@ -104,6 +117,8 @@ export default function App() {
       await writeFile(target, contentRef.current);
       setPath(target);
       setSavedContent(contentRef.current);
+      setExternalChange(null);
+      setExternallyDeleted(false);
     } catch (err) {
       console.error("write_file failed:", err);
     }
@@ -156,6 +171,55 @@ export default function App() {
   useEffect(() => {
     void invoke("set_mode_check", { mode });
   }, [mode]);
+
+  // (Re-)arm the disk watcher whenever the active path changes.
+  useEffect(() => {
+    if (path) void watchFile(path);
+    else void unwatchFile();
+  }, [path]);
+
+  // External-change handler: reload silently if buffer is clean, else show banner.
+  useEffect(() => {
+    const unlisten = listen<string>("external-change", async (e) => {
+      if (!e.payload) return;
+      try {
+        const f = await readFile(e.payload);
+        if (f.content === savedRef.current) return; // spurious (mtime-only)
+        if (contentRef.current === savedRef.current) {
+          setContent(f.content);
+          setSavedContent(f.content);
+          setExternalChange(null);
+        } else {
+          setExternalChange({ path: e.payload });
+        }
+      } catch {
+        /* file may have just been removed; let external-delete drive UI */
+      }
+    });
+    return () => {
+      unlisten.then((u) => u());
+    };
+  }, []);
+
+  // External-delete handler.
+  useEffect(() => {
+    const unlisten = listen<string>("external-delete", () => setExternallyDeleted(true));
+    return () => {
+      unlisten.then((u) => u());
+    };
+  }, []);
+
+  const onReloadFromDisk = useCallback(async () => {
+    if (!externalChange) return;
+    try {
+      const f = await readFile(externalChange.path);
+      setContent(f.content);
+      setSavedContent(f.content);
+      setExternalChange(null);
+    } catch (err) {
+      console.error("reload failed:", err);
+    }
+  }, [externalChange]);
 
   // Track system theme changes
   useEffect(() => {
@@ -228,6 +292,34 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {externalChange && (
+        <div className="banner banner-warn" role="alert">
+          <span className="banner-msg">This file was modified on disk.</span>
+          <div className="banner-actions">
+            <button className="ghost" onClick={() => void onReloadFromDisk()}>
+              Reload
+            </button>
+            <button className="ghost" onClick={() => setExternalChange(null)}>
+              Keep mine
+            </button>
+          </div>
+        </div>
+      )}
+
+      {externallyDeleted && (
+        <div className="banner banner-warn" role="alert">
+          <span className="banner-msg">This file was deleted on disk.</span>
+          <div className="banner-actions">
+            <button className="ghost" onClick={() => void onSave()}>
+              Save to recreate
+            </button>
+            <button className="ghost" onClick={() => setExternallyDeleted(false)}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       <main className="pane">
         {mode === "edit" ? (
