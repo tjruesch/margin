@@ -384,7 +384,7 @@ export default function App() {
       </main>
 
       <footer className="statusbar">
-        <span>{path ?? "Unsaved buffer"}</span>
+        <span>{path ?? "Not yet saved"}</span>
         <span>
           {content.length.toLocaleString()} chars · {content.split(/\n/).length.toLocaleString()} lines
           {dirty ? " · Modified" : ""}
