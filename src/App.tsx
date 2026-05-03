@@ -13,7 +13,7 @@ import "./App.css";
 
 type Mode = "edit" | "preview";
 
-const WELCOME = `# Welcome to Markpad
+const WELCOME = `# Welcome to Margin
 
 A lightweight, GitHub-flavored Markdown editor for macOS.
 
@@ -160,7 +160,7 @@ export default function App() {
 
   // Reflect document title
   useEffect(() => {
-    const title = `${dirty ? "● " : ""}${fileName} — Markpad`;
+    const title = `${dirty ? "● " : ""}${fileName} — Margin`;
     document.title = title;
   }, [dirty, fileName]);
 

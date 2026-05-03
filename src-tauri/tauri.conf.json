@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Markpad",
+  "productName": "Margin",
   "version": "0.1.0",
-  "identifier": "com.markpad.app",
+  "identifier": "com.margin.app",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Markpad",
+        "title": "Margin",
         "width": 1100,
         "height": 760,
         "minWidth": 600,
