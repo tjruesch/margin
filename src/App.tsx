@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Editor } from "./Editor";
 import { Preview } from "./Preview";
@@ -125,30 +126,36 @@ export default function App() {
     };
   }, [loadFile]);
 
-  // Keyboard shortcuts
+  // Native menu events from Rust
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const meta = e.metaKey || e.ctrlKey;
-      if (!meta) return;
-      const k = e.key.toLowerCase();
-      if (k === "o") {
-        e.preventDefault();
-        void onOpen();
-      } else if (k === "s") {
-        e.preventDefault();
-        if (e.shiftKey) void onSaveAs();
-        else void onSave();
-      } else if (k === "e") {
-        e.preventDefault();
-        setMode("edit");
-      } else if (k === "p") {
-        e.preventDefault();
-        setMode("preview");
+    const unlisten = listen<string>("menu", (e) => {
+      switch (e.payload) {
+        case "file_open":
+          void onOpen();
+          break;
+        case "file_save":
+          void onSave();
+          break;
+        case "file_save_as":
+          void onSaveAs();
+          break;
+        case "view_edit":
+          setMode("edit");
+          break;
+        case "view_preview":
+          setMode("preview");
+          break;
       }
+    });
+    return () => {
+      unlisten.then((u) => u());
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
   }, [onOpen, onSave, onSaveAs]);
+
+  // Keep View → Edit/Preview check marks in sync with React state.
+  useEffect(() => {
+    void invoke("set_mode_check", { mode });
+  }, [mode]);
 
   // Track system theme changes
   useEffect(() => {
@@ -166,15 +173,6 @@ export default function App() {
 
   return (
     <div className="app" data-theme={theme}>
-      <header className="titlebar">
-        <div className="title-spacer" />
-        <div className="title-name">
-          {dirty && <span className="dot" aria-label="unsaved" />}
-          {fileName}
-        </div>
-        <div className="title-actions" />
-      </header>
-
       <div className="tabbar">
         <div className="tabs" role="tablist">
           <button
