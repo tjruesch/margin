@@ -2,6 +2,7 @@ mod audio;
 mod keychain;
 mod paths;
 mod summarize;
+mod sysaudio;
 mod transcribe;
 
 use notify::{RecommendedWatcher, RecursiveMode};
@@ -30,12 +31,13 @@ fn start_meeting_recording(
     app: AppHandle,
     state: State<'_, Mutex<AudioState>>,
     title: String,
+    with_system_audio: Option<bool>,
 ) -> Result<String, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     if s.recording.is_some() {
         return Err("already recording".into());
     }
-    let r = audio::start(app, title)?;
+    let r = audio::start(app, title, with_system_audio.unwrap_or(false))?;
     let id = r.id.clone();
     s.recording = Some(r);
     Ok(id)
@@ -47,11 +49,8 @@ fn stop_meeting_recording(state: State<'_, Mutex<AudioState>>) -> Result<String,
         let mut s = state.lock().map_err(|e| e.to_string())?;
         s.recording.take().ok_or("not recording")?
     };
-    let _ = r.ctrl_tx.send(audio::Cmd::Stop);
-    r.join
-        .join()
-        .map_err(|_| "audio thread panicked".to_string())??;
-    Ok(r.wav_path.to_string_lossy().into_owned())
+    let path = r.stop()?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[derive(Serialize, Clone)]

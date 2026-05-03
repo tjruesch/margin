@@ -63,8 +63,11 @@ export type Transcript = {
   duration_ms: number;
 };
 
-export async function startMeetingRecording(title: string): Promise<string> {
-  return invoke<string>("start_meeting_recording", { title });
+export async function startMeetingRecording(
+  title: string,
+  withSystemAudio = false,
+): Promise<string> {
+  return invoke<string>("start_meeting_recording", { title, withSystemAudio });
 }
 
 export async function stopMeetingRecording(): Promise<string> {

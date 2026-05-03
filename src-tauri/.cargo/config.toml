@@ -8,5 +8,15 @@ runner = ["sh", "-c", "codesign --force --sign - --identifier com.margin.app \"$
 # whisper-rs links against whisper.cpp's C++ object files; macOS needs libc++
 # and the Accelerate framework explicitly so the linker resolves
 # ___cxx_global_var_init and the BLAS symbols whisper.cpp uses.
+#
+# screencapturekit (SCK) bridges to Swift internally and needs the Swift
+# runtime dylibs at load time. Release-bundled apps get this via the
+# Swift runtime auto-embedded by Xcode/codesign; unsigned dev binaries
+# need an explicit rpath. /usr/lib/swift is where the system Swift
+# stdlib lives on macOS 11+.
 [target.aarch64-apple-darwin]
-rustflags = ["-C", "link-arg=-lc++", "-C", "link-arg=-framework", "-C", "link-arg=Accelerate"]
+rustflags = [
+    "-C", "link-arg=-lc++",
+    "-C", "link-arg=-framework", "-C", "link-arg=Accelerate",
+    "-C", "link-arg=-Wl,-rpath,/usr/lib/swift",
+]
