@@ -27,7 +27,10 @@ export type AISettings = {
 export type AppSettings = {
   theme: ThemeSettings;
   ai: AISettings;
+  recentFiles: string[];
 };
+
+const RECENT_FILES_LIMIT = 20;
 
 export const DEFAULT_AI_SETTINGS: AISettings = {
   summaryModel: "claude-sonnet-4-6",
@@ -44,6 +47,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     darkTheme: DEFAULT_DARK_THEME_ID,
   },
   ai: DEFAULT_AI_SETTINGS,
+  recentFiles: [],
 };
 
 const STORE_FILE = "settings.json";
@@ -122,12 +126,24 @@ function loadAI(raw: unknown): AISettings {
   };
 }
 
+function loadRecentFiles(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((p): p is string => typeof p === "string" && p.length > 0)
+    .slice(0, RECENT_FILES_LIMIT);
+}
+
 export async function loadSettings(): Promise<AppSettings> {
   const s = getStore();
-  const [rawTheme, rawAI] = await Promise.all([s.get<unknown>("theme"), s.get<unknown>("ai")]);
+  const [rawTheme, rawAI, rawRecent] = await Promise.all([
+    s.get<unknown>("theme"),
+    s.get<unknown>("ai"),
+    s.get<unknown>("recentFiles"),
+  ]);
   return {
     theme: loadTheme(rawTheme),
     ai: loadAI(rawAI),
+    recentFiles: loadRecentFiles(rawRecent),
   };
 }
 
@@ -141,4 +157,14 @@ export async function saveAI(ai: AISettings): Promise<void> {
   const s = getStore();
   await s.set("ai", ai);
   await s.save();
+}
+
+/// Push `path` to the front of recents (dedup, cap at RECENT_FILES_LIMIT).
+/// Returns the new list so the caller can update React state in lockstep.
+export async function addRecentFile(path: string, current: string[]): Promise<string[]> {
+  const next = [path, ...current.filter((p) => p !== path)].slice(0, RECENT_FILES_LIMIT);
+  const s = getStore();
+  await s.set("recentFiles", next);
+  await s.save();
+  return next;
 }

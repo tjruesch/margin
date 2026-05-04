@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
+import { Home } from "./Home";
 import { Meeting } from "./Meeting";
 import { Preview } from "./Preview";
 import { Settings } from "./Settings";
@@ -18,6 +19,7 @@ import {
 } from "./file";
 import {
   DEFAULT_SETTINGS,
+  addRecentFile,
   loadSettings,
   saveAI,
   saveTheme,
@@ -27,7 +29,7 @@ import {
 import { applyTheme, getTheme, DEFAULT_LIGHT_THEME_ID, DEFAULT_DARK_THEME_ID } from "./themes";
 import "./App.css";
 
-type Mode = "edit" | "preview" | "settings" | "meeting";
+type Mode = "home" | "edit" | "preview" | "settings" | "meeting";
 
 function systemTheme(): "light" | "dark" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
@@ -61,7 +63,8 @@ function greet(name: string) {
 `;
 
 export default function App() {
-  const [mode, setMode] = useState<Mode>("edit");
+  const [mode, setMode] = useState<Mode>("home");
+  const [recentFiles, setRecentFiles] = useState<string[]>([]);
   const [content, setContent] = useState<string>(WELCOME);
   const [path, setPath] = useState<string | null>(null);
   const [savedContent, setSavedContent] = useState<string>(WELCOME);
@@ -109,7 +112,11 @@ export default function App() {
   const contentRef = useRef(content);
   const pathRef = useRef(path);
   const savedRef = useRef(savedContent);
+  const recentFilesRef = useRef<string[]>(recentFiles);
   const editorRef = useRef<ReactCodeMirrorRef>(null);
+  useEffect(() => {
+    recentFilesRef.current = recentFiles;
+  }, [recentFiles]);
   useEffect(() => {
     contentRef.current = content;
   }, [content]);
@@ -129,9 +136,25 @@ export default function App() {
       setMode("edit");
       setExternalChange(null);
       setExternallyDeleted(false);
+      addRecentFile(file.path, recentFilesRef.current)
+        .then(setRecentFiles)
+        .catch((err) => console.error("addRecentFile failed:", err));
     } catch (err) {
       console.error("read_file failed:", err);
     }
+  }, []);
+
+  const onNewNote = useCallback(() => {
+    setPath(null);
+    setContent("");
+    setSavedContent("");
+    setMode("edit");
+    setExternalChange(null);
+    setExternallyDeleted(false);
+  }, []);
+
+  const onNewMeeting = useCallback(() => {
+    setMode("meeting");
   }, []);
 
   const onOpen = useCallback(async () => {
@@ -211,6 +234,9 @@ export default function App() {
           break;
         case "file_new_meeting":
           tryNavigate("meeting");
+          break;
+        case "file_home":
+          tryNavigate("home");
           break;
         case "edit_undo": {
           const v = editorRef.current?.view;
@@ -304,6 +330,7 @@ export default function App() {
       .then((s) => {
         setThemeSettings(s.theme);
         setAISettings(s.ai);
+        setRecentFiles(s.recentFiles);
       })
       .catch((err) => console.error("loadSettings failed:", err));
   }, []);
@@ -324,9 +351,12 @@ export default function App() {
     document.title = title;
   }, [dirty, fileName]);
 
+  const showTabbar = mode === "edit" || mode === "preview";
+
   return (
     <div className="app" data-theme={theme}>
-      <div className="tabbar" data-tauri-drag-region>
+      {!showTabbar && <div className="drag-bar" data-tauri-drag-region />}
+      {showTabbar && <div className="tabbar" data-tauri-drag-region>
         <div className="tabs" role="tablist">
           <button
             role="tab"
@@ -380,7 +410,7 @@ export default function App() {
             </button>
           )}
         </div>
-      </div>
+      </div>}
 
       {externalChange && (
         <div className="banner banner-warn" role="alert">
@@ -435,6 +465,14 @@ export default function App() {
             ai={aiSettings}
             onMdReady={(p) => void loadFile(p)}
             onExclusiveChange={setMeetingExclusive}
+          />
+        )}
+        {mode === "home" && (
+          <Home
+            recentFiles={recentFiles}
+            onOpen={(p) => void loadFile(p)}
+            onNewNote={onNewNote}
+            onNewMeeting={onNewMeeting}
           />
         )}
       </main>

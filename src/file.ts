@@ -78,6 +78,17 @@ export async function deleteMeetingFiles(id: string): Promise<void> {
   await invoke<void>("delete_meeting_files", { id });
 }
 
+export type MeetingItem = {
+  path: string;
+  title: string;
+  modified_ms: number;
+  duration_ms: number | null;
+};
+
+export async function listMeetings(): Promise<MeetingItem[]> {
+  return invoke<MeetingItem[]>("list_meetings");
+}
+
 export async function transcribe(audioPath: string): Promise<Transcript> {
   return invoke<Transcript>("transcribe", { audioPath });
 }

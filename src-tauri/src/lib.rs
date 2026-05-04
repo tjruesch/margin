@@ -1,4 +1,5 @@
 mod audio;
+mod home;
 mod keychain;
 mod paths;
 mod summarize;
@@ -226,6 +227,9 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&PredefinedMenuItem::quit(app, None)?)
         .build()?;
 
+    let home = MenuItemBuilder::with_id("file_home", "Home")
+        .accelerator("CmdOrCtrl+0")
+        .build(app)?;
     let new_meeting = MenuItemBuilder::with_id("file_new_meeting", "New Meeting\u{2026}")
         .accelerator("CmdOrCtrl+Shift+M")
         .build(app)?;
@@ -239,6 +243,8 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .accelerator("CmdOrCtrl+Shift+S")
         .build(app)?;
     let file_sub = SubmenuBuilder::new(app, "File")
+        .item(&home)
+        .separator()
         .item(&new_meeting)
         .separator()
         .item(&open)
@@ -337,7 +343,8 @@ pub fn run() {
             stop_meeting_recording,
             delete_meeting_files,
             transcribe::transcribe,
-            summarize::summarize_meeting
+            summarize::summarize_meeting,
+            home::list_meetings
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
