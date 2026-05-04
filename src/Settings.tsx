@@ -11,6 +11,7 @@ import type {
   ThemeSettings,
   WhisperModel,
 } from "./settingsStore";
+import { loadGlossary } from "./settingsStore";
 import { THEMES, darkThemes, getTheme, lightThemes, type Theme } from "./themes";
 
 type Section = "appearance" | "ai" | "editor" | "shortcuts";
@@ -260,6 +261,8 @@ function AISection({ ai, onChange }: AISectionProps) {
         </div>
       </div>
 
+      <GlossaryRow glossary={ai.glossary} onChange={(next) => onChange({ glossary: next })} />
+
       <div className="settings-row settings-row--inline">
         <div className="settings-row-label">Keep meeting audio</div>
         <div className="settings-row-control">
@@ -276,6 +279,50 @@ function AISection({ ai, onChange }: AISectionProps) {
         </div>
       </div>
     </section>
+  );
+}
+
+type GlossaryRowProps = {
+  glossary: string[];
+  onChange: (next: string[]) => void;
+};
+
+function GlossaryRow({ glossary, onChange }: GlossaryRowProps) {
+  // Local draft state so users can type partial lines without each keystroke
+  // round-tripping through settings + the LazyStore. Commit on blur.
+  const [draft, setDraft] = useState<string>(glossary.join("\n"));
+  useEffect(() => {
+    setDraft(glossary.join("\n"));
+  }, [glossary]);
+
+  const commit = () => {
+    const next = loadGlossary(draft.split("\n"));
+    setDraft(next.join("\n"));
+    if (next.length === glossary.length && next.every((t, i) => t === glossary[i])) {
+      return;
+    }
+    onChange(next);
+  };
+
+  return (
+    <div className="settings-row">
+      <div className="settings-row-label">Glossary</div>
+      <div className="settings-row-control settings-row-control--col">
+        <textarea
+          className="settings-input settings-textarea"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          rows={5}
+          spellCheck={false}
+          placeholder={"emasphere\nELAN\nMargin"}
+        />
+        <span className="settings-hint">
+          One term per line. Used to bias transcription and summarization toward your domain
+          vocabulary (product names, jargon, etc.).
+        </span>
+      </div>
+    </div>
   );
 }
 

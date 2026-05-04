@@ -105,8 +105,11 @@ export async function stopMeetingRecording(): Promise<string> {
   return invoke<string>("stop_meeting_recording");
 }
 
-export async function transcribe(audioPath: string): Promise<Transcript> {
-  return invoke<Transcript>("transcribe", { audioPath });
+export async function transcribe(
+  audioPath: string,
+  glossary: string[] = [],
+): Promise<Transcript> {
+  return invoke<Transcript>("transcribe", { audioPath, glossary });
 }
 
 export async function reconcileNotes(
@@ -114,6 +117,13 @@ export async function reconcileNotes(
   transcriptPath: string,
   title: string,
   model?: string,
+  glossary: string[] = [],
 ): Promise<string> {
-  return invoke<string>("reconcile_notes", { handNotes, transcriptPath, title, model });
+  return invoke<string>("reconcile_notes", {
+    handNotes,
+    transcriptPath,
+    title,
+    model,
+    glossary,
+  });
 }

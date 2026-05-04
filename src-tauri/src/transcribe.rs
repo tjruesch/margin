@@ -25,11 +25,20 @@ pub struct Transcript {
     pub duration_ms: u64,
 }
 
+/// Whisper's hard cap is `n_text_ctx / 2 = 224` tokens for `initial_prompt`.
+/// 800 chars is a defensive char-based estimate (~200 tokens) leaving headroom.
+const INITIAL_PROMPT_MAX_CHARS: usize = 800;
+
 #[tauri::command]
-pub async fn transcribe(app: AppHandle, audio_path: String) -> Result<Transcript, String> {
+pub async fn transcribe(
+    app: AppHandle,
+    audio_path: String,
+    glossary: Vec<String>,
+) -> Result<Transcript, String> {
     let path = PathBuf::from(audio_path);
     let model_path = ensure_model(&app).await?;
     let app2 = app.clone();
+    let initial_prompt = build_initial_prompt(&glossary);
 
     tauri::async_runtime::spawn_blocking(move || -> Result<Transcript, String> {
         // Load Whisper model + state (Metal acceleration on Apple Silicon).
@@ -60,6 +69,9 @@ pub async fn transcribe(app: AppHandle, audio_path: String) -> Result<Transcript
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_print_realtime(false);
+        if let Some(p) = initial_prompt.as_deref() {
+            params.set_initial_prompt(p);
+        }
 
         let app3 = app2.clone();
         params.set_progress_callback_safe(move |pct: i32| {
@@ -106,6 +118,39 @@ pub async fn transcribe(app: AppHandle, audio_path: String) -> Result<Transcript
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Format a glossary into a sentence-form prompt that whisper.cpp's decoder
+/// can use as prior context. Returns None for an empty glossary so the caller
+/// can skip `set_initial_prompt` entirely (passing an empty string to the
+/// binding is safe but pointless).
+///
+/// Truncation: drop terms from the end until under the char cap, preserving
+/// the user's ordering from the textarea.
+fn build_initial_prompt(glossary: &[String]) -> Option<String> {
+    let terms: Vec<&str> = glossary
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    let prefix = "Domain terms used in this recording: ";
+    let mut included: Vec<&str> = Vec::with_capacity(terms.len());
+    let mut len = prefix.len() + 1; // +1 for trailing "."
+    for t in terms {
+        let extra = t.len() + if included.is_empty() { 0 } else { 2 }; // ", "
+        if len + extra > INITIAL_PROMPT_MAX_CHARS {
+            break;
+        }
+        included.push(t);
+        len += extra;
+    }
+    if included.is_empty() {
+        return None;
+    }
+    Some(format!("{}{}.", prefix, included.join(", ")))
 }
 
 /// Returns the local path to the Whisper model, downloading it from

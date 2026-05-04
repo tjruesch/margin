@@ -236,7 +236,7 @@ export default function App() {
 
   const runTranscribe = useCallback(async (wavPath: string) => {
     try {
-      await transcribe(wavPath);
+      await transcribe(wavPath, aiRef.current.glossary);
       const notePath = pathRef.current;
       const tp = notePath ? transcriptPathFor(notePath) : wavPath.replace(/\/audio\.wav$/, "/transcript.json");
       setRecording({ kind: "ready", transcriptPath: tp });
@@ -298,6 +298,7 @@ export default function App() {
           transcriptPath,
           title,
           aiRef.current.summaryModel,
+          aiRef.current.glossary,
         );
         setContent(md);
         setRecording({ kind: "none", hasTranscript: true, transcriptPath });

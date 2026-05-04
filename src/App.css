@@ -466,6 +466,13 @@ body {
   outline-offset: -1px;
   border-color: transparent;
 }
+.settings-textarea {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  min-height: 80px;
+}
 select.settings-input {
   cursor: pointer;
   padding-right: 28px;

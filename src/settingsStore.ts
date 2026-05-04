@@ -22,6 +22,7 @@ export type AISettings = {
   whisperModel: WhisperModel;
   recordSystemAudio: boolean;
   audioRetention: AudioRetention;
+  glossary: string[];
 };
 
 export type AppSettings = {
@@ -37,7 +38,11 @@ export const DEFAULT_AI_SETTINGS: AISettings = {
   whisperModel: "base.en",
   recordSystemAudio: true,
   audioRetention: "forever",
+  glossary: [],
 };
+
+const GLOSSARY_MAX_ENTRIES = 64;
+const GLOSSARY_MAX_TERM_LEN = 64;
 
 export const DEFAULT_SETTINGS: AppSettings = {
   theme: {
@@ -123,7 +128,25 @@ function loadAI(raw: unknown): AISettings {
         ? obj.recordSystemAudio
         : DEFAULT_AI_SETTINGS.recordSystemAudio,
     audioRetention: pick(RETENTIONS, obj.audioRetention, DEFAULT_AI_SETTINGS.audioRetention),
+    glossary: loadGlossary(obj.glossary),
   };
+}
+
+export function loadGlossary(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== "string") continue;
+    const trimmed = entry.trim();
+    if (!trimmed || trimmed.length > GLOSSARY_MAX_TERM_LEN) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(trimmed);
+    if (out.length >= GLOSSARY_MAX_ENTRIES) break;
+  }
+  return out;
 }
 
 function loadRecentFiles(raw: unknown): string[] {

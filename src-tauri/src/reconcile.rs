@@ -217,6 +217,25 @@ sections, then `---`, then `## Notes` with the user's notes verbatim (or the \
 empty-notes placeholder), then `---`, then `## Transcript` with the transcript \
 verbatim. No preamble, no code fences around the whole document, no commentary.";
 
+/// Format the user's glossary as a small system-block addendum that nudges
+/// Claude to preserve domain spellings. Returns None for an empty glossary
+/// so the caller can skip pushing the block.
+fn format_glossary_block(glossary: &[String]) -> Option<String> {
+    let terms: Vec<&str> = glossary
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Domain terms in this meeting (preserve exact spelling — do not auto-correct \
+         or substitute similar-sounding words): {}.",
+        terms.join(", ")
+    ))
+}
+
 #[derive(Serialize)]
 struct CacheControl {
     #[serde(rename = "type")]
@@ -307,6 +326,7 @@ pub async fn reconcile_notes(
     transcript_path: String,
     title: String,
     model: Option<String>,
+    glossary: Vec<String>,
 ) -> Result<String, String> {
     let key = keychain::read_anthropic_api_key().map_err(|_| {
         "Anthropic API key not configured — open Settings → AI to add one".to_string()
@@ -338,16 +358,32 @@ pub async fn reconcile_notes(
     );
 
     let model = model.as_deref().unwrap_or(DEFAULT_MODEL);
+
+    // Glossary is appended as a second system block AFTER the cached
+    // SYSTEM_PROMPT prefix. That keeps the (much larger) SYSTEM_PROMPT
+    // breakpoint stable across glossary edits — and the glossary itself
+    // gets its own breakpoint, so when the user doesn't change it, the
+    // suffix hits cache too.
+    let glossary_text = format_glossary_block(&glossary);
+    let mut system = vec![SystemBlock {
+        kind: "text",
+        text: SYSTEM_PROMPT,
+        cache_control: CacheControl { kind: "ephemeral" },
+    }];
+    if let Some(text) = glossary_text.as_deref() {
+        system.push(SystemBlock {
+            kind: "text",
+            text,
+            cache_control: CacheControl { kind: "ephemeral" },
+        });
+    }
+
     let body = ReqBody {
         model,
         max_tokens: MAX_TOKENS,
         thinking: ThinkingConfig { kind: "adaptive" },
         output_config: OutputConfig { effort: EFFORT },
-        system: vec![SystemBlock {
-            kind: "text",
-            text: SYSTEM_PROMPT,
-            cache_control: CacheControl { kind: "ephemeral" },
-        }],
+        system,
         messages: vec![ReqMessage {
             role: "user",
             content: user_message,
