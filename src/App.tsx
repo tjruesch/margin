@@ -301,6 +301,15 @@ export default function App() {
           aiRef.current.glossary,
         );
         setContent(md);
+        // Persist immediately — reconcile is expensive (a Claude call) and
+        // the autosave debounce isn't a strong enough guarantee for output
+        // the user just paid for. Don't lose it to a window close.
+        try {
+          await writeFile(notePath, md);
+          setSavedContent(md);
+        } catch (err) {
+          console.error("post-reconcile save failed:", err);
+        }
         setRecording({ kind: "none", hasTranscript: true, transcriptPath });
       } catch (err) {
         setRecording({
@@ -528,6 +537,25 @@ export default function App() {
     if (path) void watchFile(path);
     else void unwatchFile();
   }, [path]);
+
+  // Debounced autosave. Fires 800ms after the last edit, skipped when there's
+  // no path (untitled buffer), nothing changed, or a disk-state conflict
+  // needs the user's attention. Self-induced writes are suppressed by
+  // WriteGuard in lib.rs so this doesn't echo back as an external-change.
+  useEffect(() => {
+    if (!path) return;
+    if (content === savedContent) return;
+    if (externalChange || externallyDeleted) return;
+    const t = setTimeout(async () => {
+      try {
+        await writeFile(path, content);
+        setSavedContent(content);
+      } catch (err) {
+        console.error("autosave failed:", err);
+      }
+    }, 800);
+    return () => clearTimeout(t);
+  }, [content, path, savedContent, externalChange, externallyDeleted]);
 
   // External-change handler: reload silently if buffer is clean, else show banner.
   useEffect(() => {
