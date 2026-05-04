@@ -238,7 +238,7 @@ export default function App() {
     try {
       await transcribe(wavPath);
       const notePath = pathRef.current;
-      const tp = notePath ? transcriptPathFor(notePath) : wavPath.replace(/\.wav$/, ".transcript.json");
+      const tp = notePath ? transcriptPathFor(notePath) : wavPath.replace(/\/audio\.wav$/, "/transcript.json");
       setRecording({ kind: "ready", transcriptPath: tp });
     } catch (err) {
       setRecording({

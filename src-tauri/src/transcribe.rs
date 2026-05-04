@@ -98,7 +98,7 @@ pub async fn transcribe(app: AppHandle, audio_path: String) -> Result<Transcript
         };
 
         // Sidecar JSON for re-summarization without re-transcribing.
-        let json_path = path.with_extension("transcript.json");
+        let json_path = path.with_file_name(crate::notes::TRANSCRIPT_FILENAME);
         std::fs::write(&json_path, serde_json::to_vec_pretty(&transcript).unwrap())
             .map_err(|e| e.to_string())?;
 
