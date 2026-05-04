@@ -58,7 +58,7 @@ pub fn has_anthropic_api_key() -> bool {
     }
 }
 
-/// Internal accessor for future summarize_meeting (#10). Never via IPC.
+/// Internal accessor for reconcile_notes. Never via IPC.
 #[allow(dead_code)]
 pub fn read_anthropic_api_key() -> Result<String, String> {
     entry()?.get_password().map_err(|e| e.to_string())

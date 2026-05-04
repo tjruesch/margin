@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { listMeetings, type MeetingItem } from "./file";
+import { listNotes, type NoteListItem } from "./file";
 
 type Props = {
   recentFiles: string[];
@@ -10,16 +10,16 @@ type Props = {
 };
 
 export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
-  const [meetings, setMeetings] = useState<MeetingItem[]>([]);
+  const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
 
   useEffect(() => {
     let alive = true;
-    listMeetings()
+    listNotes()
       .then((items) => {
-        if (alive) setMeetings(items);
+        if (alive) setNotes(items);
       })
-      .catch((err) => console.error("listMeetings failed:", err))
+      .catch((err) => console.error("listNotes failed:", err))
       .finally(() => {
         if (alive) setLoading(false);
       });
@@ -28,7 +28,7 @@ export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
     };
   }, []);
 
-  const grouped = useMemo(() => groupByDay(meetings), [meetings]);
+  const grouped = useMemo(() => groupByDay(notes), [notes]);
 
   return (
     <div className="home-scroll">
@@ -36,7 +36,7 @@ export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
         <header className="home-header">
           <div className="home-title">
             <h1>Margin</h1>
-            <p className="home-subtitle">Your notes and meetings.</p>
+            <p className="home-subtitle">Your notes.</p>
           </div>
           <div className="home-cta">
             <button className="home-btn home-btn-secondary" onClick={onNewNote}>
@@ -49,12 +49,13 @@ export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
         </header>
 
         <section className="home-section">
-          <h2 className="home-section-title">Meetings</h2>
+          <h2 className="home-section-title">Notes</h2>
           {loading ? (
             <p className="home-empty">Loading…</p>
-          ) : meetings.length === 0 ? (
+          ) : notes.length === 0 ? (
             <p className="home-empty">
-              No meetings yet — press <kbd>⌘⇧M</kbd> to start one.
+              No notes yet — press <kbd>⌘N</kbd> for a new note, <kbd>⌘⇧M</kbd> to start one with a
+              recording.
             </p>
           ) : (
             <div className="home-meetings">
@@ -64,17 +65,25 @@ export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
                   <div className="home-day-cards">
                     {items.map((m) => (
                       <button
-                        key={m.path}
+                        key={m.note_path}
                         className="home-card"
-                        onClick={() => onOpen(m.path)}
+                        onClick={() => onOpen(m.note_path)}
                       >
                         <div className="home-card-row">
-                          <span className="home-card-title">{m.title || "Untitled meeting"}</span>
+                          <span className="home-card-title">
+                            {m.duration_ms !== null && (
+                              <span className="home-card-glyph" aria-label="has recording">
+                                🎙
+                              </span>
+                            )}
+                            {m.title || "Untitled note"}
+                          </span>
                           <span className="home-card-time">{formatTime(m.modified_ms)}</span>
                         </div>
                         <div className="home-card-meta">
-                          {formatDuration(m.duration_ms)}
-                          {m.duration_ms !== null && " · transcribed"}
+                          {m.duration_ms !== null
+                            ? `${formatDuration(m.duration_ms)} · transcribed`
+                            : "Note"}
                         </div>
                       </button>
                     ))}
@@ -109,15 +118,14 @@ export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
 
 function dayKey(ms: number): string {
   const d = new Date(ms);
-  // YYYY-MM-DD in local time
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
 
-function groupByDay(items: MeetingItem[]): Map<string, MeetingItem[]> {
-  const out = new Map<string, MeetingItem[]>();
+function groupByDay(items: NoteListItem[]): Map<string, NoteListItem[]> {
+  const out = new Map<string, NoteListItem[]>();
   for (const item of items) {
     const k = dayKey(item.modified_ms);
     const list = out.get(k);
@@ -146,7 +154,6 @@ function formatDuration(ms: number | null): string {
 }
 
 function formatDayHeading(key: string): string {
-  // key is YYYY-MM-DD local
   const [y, m, d] = key.split("-").map(Number);
   const date = new Date(y, m - 1, d);
   const today = new Date();

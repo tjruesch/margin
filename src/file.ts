@@ -37,10 +37,6 @@ export async function unwatchFile(): Promise<void> {
   await invoke<void>("unwatch_file");
 }
 
-export async function meetingsDir(): Promise<string> {
-  return invoke<string>("meetings_dir");
-}
-
 export async function hasAnthropicApiKey(): Promise<boolean> {
   return invoke<boolean>("has_anthropic_api_key");
 }
@@ -53,7 +49,42 @@ export async function deleteAnthropicApiKey(): Promise<void> {
   await invoke<void>("delete_anthropic_api_key");
 }
 
-// --- Meeting recording + transcription -----------------------------------
+// --- Notes (bundle abstraction) ------------------------------------------
+
+export type NoteRef = { id: string; note_path: string };
+
+export type NoteListItem = {
+  note_path: string;
+  title: string;
+  modified_ms: number;
+  duration_ms: number | null;
+};
+
+export async function notesDir(): Promise<string> {
+  return invoke<string>("notes_dir");
+}
+
+export async function createNote(): Promise<NoteRef> {
+  return invoke<NoteRef>("create_note");
+}
+
+export async function convertExternal(sourcePath: string): Promise<NoteRef> {
+  return invoke<NoteRef>("convert_external", { sourcePath });
+}
+
+export async function isOwnedNote(path: string): Promise<boolean> {
+  return invoke<boolean>("is_owned_note", { path });
+}
+
+export async function listNotes(): Promise<NoteListItem[]> {
+  return invoke<NoteListItem[]>("list_notes");
+}
+
+export async function discardRecording(notePath: string): Promise<void> {
+  await invoke<void>("discard_recording", { notePath });
+}
+
+// --- Recording + transcription -------------------------------------------
 
 export type Segment = { start_ms: number; end_ms: number; text: string };
 export type Transcript = {
@@ -64,39 +95,25 @@ export type Transcript = {
 };
 
 export async function startMeetingRecording(
-  title: string,
+  notePath: string,
   withSystemAudio = false,
 ): Promise<string> {
-  return invoke<string>("start_meeting_recording", { title, withSystemAudio });
+  return invoke<string>("start_meeting_recording", { notePath, withSystemAudio });
 }
 
 export async function stopMeetingRecording(): Promise<string> {
   return invoke<string>("stop_meeting_recording");
 }
 
-export async function deleteMeetingFiles(id: string): Promise<void> {
-  await invoke<void>("delete_meeting_files", { id });
-}
-
-export type MeetingItem = {
-  path: string;
-  title: string;
-  modified_ms: number;
-  duration_ms: number | null;
-};
-
-export async function listMeetings(): Promise<MeetingItem[]> {
-  return invoke<MeetingItem[]>("list_meetings");
-}
-
 export async function transcribe(audioPath: string): Promise<Transcript> {
   return invoke<Transcript>("transcribe", { audioPath });
 }
 
-export async function summarizeMeeting(
+export async function reconcileNotes(
+  handNotes: string,
   transcriptPath: string,
   title: string,
   model?: string,
 ): Promise<string> {
-  return invoke<string>("summarize_meeting", { transcriptPath, title, model });
+  return invoke<string>("reconcile_notes", { handNotes, transcriptPath, title, model });
 }

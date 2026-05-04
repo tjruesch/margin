@@ -36,7 +36,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 use tauri::{AppHandle, Emitter};
 
-use crate::{paths, sysaudio};
+use crate::{notes, sysaudio};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const RESAMPLE_CHUNK: usize = 1024; // mic-side input frames per resampler step
@@ -48,7 +48,7 @@ pub enum Cmd {
 }
 
 pub struct Recording {
-    pub id: String,
+    pub note_path: PathBuf,
     pub wav_path: PathBuf,
     mic_ctrl_tx: Sender<Cmd>,
     sys_ctrl_tx: Option<Sender<sysaudio::Cmd>>,
@@ -83,11 +83,12 @@ impl Recording {
 
 pub fn start(
     app: AppHandle,
-    _title: String,
+    note_path: PathBuf,
     with_system_audio: bool,
 ) -> Result<Recording, String> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let wav_path = paths::meetings_dir().join(format!("{id}.wav"));
+    let bundle_dir = notes::bundle_dir_for(&note_path)
+        .ok_or_else(|| "Recording requires an owned note (path under ~/.margin/notes/)".to_string())?;
+    let wav_path = bundle_dir.join(notes::AUDIO_FILENAME);
 
     // Channels carry 16 kHz mono f32 chunks from each source to the mixer.
     let (mic_tx, mic_rx) = bounded::<Vec<f32>>(64);
@@ -132,7 +133,7 @@ pub fn start(
         .map_err(|e| e.to_string())?;
 
     Ok(Recording {
-        id,
+        note_path,
         wav_path,
         mic_ctrl_tx,
         sys_ctrl_tx,

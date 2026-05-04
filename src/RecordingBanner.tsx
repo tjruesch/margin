@@ -1,0 +1,190 @@
+import { useEffect, useState } from "react";
+
+import { LevelMeter } from "./LevelMeter";
+import type { SummaryModel } from "./settingsStore";
+
+export type NoteRecording =
+  | { kind: "none"; hasTranscript: boolean; transcriptPath?: string }
+  | { kind: "recording"; startedAt: number }
+  | {
+      kind: "transcribing";
+      pct: number;
+      modelDl?: { downloaded: number; total: number };
+    }
+  | { kind: "ready"; transcriptPath: string }
+  | { kind: "reconciling" }
+  | { kind: "error"; message: string; transcriptPath?: string };
+
+const SUMMARY_LABEL: Record<SummaryModel, string> = {
+  "claude-sonnet-4-6": "Claude Sonnet 4.6",
+  "claude-opus-4-7": "Claude Opus 4.7",
+};
+
+type Props = {
+  state: NoteRecording;
+  recordingSysAudio: boolean;
+  sysAvailable: boolean;
+  summaryModel: SummaryModel;
+  hasKey: boolean;
+  onStart: () => void;
+  onStop: () => void;
+  onDiscard: () => void;
+  onGenerate: () => void;
+  onDismissError: () => void;
+};
+
+export function RecordingBanner({
+  state,
+  recordingSysAudio,
+  sysAvailable,
+  summaryModel,
+  hasKey,
+  onStart,
+  onStop,
+  onDiscard,
+  onGenerate,
+  onDismissError,
+}: Props) {
+  if (state.kind === "none") {
+    return (
+      <div className="recording-banner recording-banner-idle">
+        <button className="recording-rec-btn" onClick={onStart} aria-label="Start recording">
+          <span className="recording-dot" />
+          <span>Record</span>
+        </button>
+        {state.hasTranscript && (
+          <>
+            <span className="recording-banner-sep" />
+            <span className="recording-banner-msg">Recording on file</span>
+            <div className="recording-banner-actions">
+              <button className="ghost" onClick={onGenerate} disabled={!hasKey}>
+                ✨ Generate notes
+              </button>
+              <button className="ghost" onClick={onDiscard}>
+                Discard recording
+              </button>
+            </div>
+          </>
+        )}
+        {!hasKey && state.hasTranscript && (
+          <span className="recording-banner-warn">
+            Add an Anthropic API key in Settings → AI to generate.
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  if (state.kind === "recording") {
+    return (
+      <div className="recording-banner recording-banner-rec">
+        <div className="recording-rec-pill">
+          <span className="recording-dot recording-dot-pulse" />
+          <span>REC</span>
+          <Timer startedAt={state.startedAt} />
+        </div>
+        <LevelMeter />
+        {recordingSysAudio && !sysAvailable && (
+          <span className="recording-banner-warn">
+            System audio unavailable — mic only.
+          </span>
+        )}
+        <div className="recording-banner-actions">
+          <button className="recording-stop-btn" onClick={onStop}>
+            Stop
+          </button>
+          <button className="ghost" onClick={onDiscard}>
+            Discard
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (state.kind === "transcribing") {
+    const pct = Math.min(100, Math.max(0, state.pct));
+    return (
+      <div className="recording-banner recording-banner-busy">
+        <div className="recording-spinner" aria-hidden="true" />
+        <span className="recording-banner-msg">
+          {state.modelDl
+            ? `Downloading Whisper model · ${(state.modelDl.downloaded / 1e6).toFixed(1)} / ${(state.modelDl.total / 1e6).toFixed(1)} MB`
+            : `Transcribing… ${pct.toFixed(0)}%`}
+        </span>
+        <div className="recording-progress">
+          <div
+            className="recording-progress-fill"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (state.kind === "ready") {
+    return (
+      <div className="recording-banner recording-banner-ready">
+        <span className="recording-banner-msg">
+          Recording captured. Generate to merge with your notes.
+        </span>
+        <div className="recording-banner-actions">
+          <button className="recording-primary" onClick={onGenerate} disabled={!hasKey}>
+            ✨ Generate notes
+          </button>
+          <button className="ghost" onClick={onDiscard}>
+            Discard recording
+          </button>
+        </div>
+        {!hasKey && (
+          <span className="recording-banner-warn">
+            Add an Anthropic API key in Settings → AI first.
+          </span>
+        )}
+      </div>
+    );
+  }
+
+  if (state.kind === "reconciling") {
+    return (
+      <div className="recording-banner recording-banner-busy">
+        <div className="recording-spinner" aria-hidden="true" />
+        <span className="recording-banner-msg">
+          Reconciling notes with {SUMMARY_LABEL[summaryModel]}…
+        </span>
+      </div>
+    );
+  }
+
+  // error
+  return (
+    <div className="recording-banner recording-banner-error" role="alert">
+      <span className="recording-banner-msg">{state.message}</span>
+      <div className="recording-banner-actions">
+        {state.transcriptPath && (
+          <button className="ghost" onClick={onGenerate}>
+            Retry
+          </button>
+        )}
+        <button className="ghost" onClick={onDismissError}>
+          Dismiss
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function Timer({ startedAt }: { startedAt: number }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const elapsedMs = Math.max(0, now - startedAt);
+  const mm = String(Math.floor(elapsedMs / 60_000)).padStart(2, "0");
+  const ss = String(Math.floor((elapsedMs % 60_000) / 1000)).padStart(2, "0");
+  return (
+    <span className="recording-timer">
+      {mm}:{ss}
+    </span>
+  );
+}

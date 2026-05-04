@@ -1,8 +1,8 @@
 mod audio;
-mod home;
 mod keychain;
+mod notes;
 mod paths;
-mod summarize;
+mod reconcile;
 mod sysaudio;
 mod transcribe;
 
@@ -18,30 +18,32 @@ use tauri::menu::{
 };
 use tauri::{AppHandle, Emitter, Manager, State, Wry};
 
-#[tauri::command]
-fn meetings_dir() -> String {
-    paths::meetings_dir().to_string_lossy().into_owned()
-}
-
 struct AudioState {
     recording: Option<audio::Recording>,
 }
 
+/// Start recording into a Margin note bundle. The note_path must be an owned
+/// `~/.margin/notes/<uuid>/note.md`; the audio backend resolves the bundle
+/// dir and writes audio.wav alongside the note.
 #[tauri::command]
 fn start_meeting_recording(
     app: AppHandle,
     state: State<'_, Mutex<AudioState>>,
-    title: String,
+    note_path: String,
     with_system_audio: Option<bool>,
 ) -> Result<String, String> {
     let mut s = state.lock().map_err(|e| e.to_string())?;
     if s.recording.is_some() {
         return Err("already recording".into());
     }
-    let r = audio::start(app, title, with_system_audio.unwrap_or(false))?;
-    let id = r.id.clone();
+    let r = audio::start(
+        app,
+        PathBuf::from(&note_path),
+        with_system_audio.unwrap_or(false),
+    )?;
+    let path = r.note_path.to_string_lossy().into_owned();
     s.recording = Some(r);
-    Ok(id)
+    Ok(path)
 }
 
 #[tauri::command]
@@ -52,20 +54,6 @@ fn stop_meeting_recording(state: State<'_, Mutex<AudioState>>) -> Result<String,
     };
     let path = r.stop()?;
     Ok(path.to_string_lossy().into_owned())
-}
-
-/// Removes meeting artifacts for a given id (wav + transcript + md). Used by
-/// the Meeting UI's Discard button after a recording is aborted.
-#[tauri::command]
-fn delete_meeting_files(id: String) -> Result<(), String> {
-    let dir = paths::meetings_dir();
-    for ext in ["wav", "transcript.json", "md"] {
-        let p = dir.join(format!("{id}.{ext}"));
-        if p.exists() {
-            std::fs::remove_file(&p).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Serialize, Clone)]
@@ -230,7 +218,10 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let home = MenuItemBuilder::with_id("file_home", "Home")
         .accelerator("CmdOrCtrl+0")
         .build(app)?;
-    let new_meeting = MenuItemBuilder::with_id("file_new_meeting", "New Meeting\u{2026}")
+    let new_note = MenuItemBuilder::with_id("file_new_note", "New Note")
+        .accelerator("CmdOrCtrl+N")
+        .build(app)?;
+    let new_meeting = MenuItemBuilder::with_id("file_record", "Start Recording")
         .accelerator("CmdOrCtrl+Shift+M")
         .build(app)?;
     let open = MenuItemBuilder::with_id("file_open", "Open\u{2026}")
@@ -245,6 +236,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let file_sub = SubmenuBuilder::new(app, "File")
         .item(&home)
         .separator()
+        .item(&new_note)
         .item(&new_meeting)
         .separator()
         .item(&open)
@@ -335,16 +327,19 @@ pub fn run() {
             set_mode_check,
             watch_file,
             unwatch_file,
-            meetings_dir,
             keychain::set_anthropic_api_key,
             keychain::delete_anthropic_api_key,
             keychain::has_anthropic_api_key,
             start_meeting_recording,
             stop_meeting_recording,
-            delete_meeting_files,
             transcribe::transcribe,
-            summarize::summarize_meeting,
-            home::list_meetings
+            reconcile::reconcile_notes,
+            notes::notes_dir,
+            notes::create_note,
+            notes::convert_external,
+            notes::is_owned_note,
+            notes::list_notes,
+            notes::discard_recording
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

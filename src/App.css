@@ -849,126 +849,115 @@ select.settings-input {
   max-width: 50%;
 }
 
-/* ---------- Meeting mode ------------------------------------------------- */
+/* ---------- Recording banner (above editor for owned notes) ------------- */
 
-.meeting {
-  height: 100%;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: var(--bg);
-}
-
-.meeting-card {
-  width: min(560px, 100%);
+.recording-banner {
   display: flex;
-  flex-direction: column;
-  gap: 18px;
-  align-items: stretch;
-  padding: 32px;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
   background: var(--bg-muted);
-  border: 1px solid var(--border-muted);
-  border-radius: 14px;
-}
-
-.meeting-h1 {
-  margin: 0;
-  font-size: 22px;
-  font-weight: 600;
-  color: var(--fg);
-  text-align: center;
-}
-
-.meeting-sub {
-  margin: 0;
+  border-bottom: 1px solid var(--border-muted);
   font-size: 13px;
-  color: var(--fg-muted);
-  text-align: center;
-}
-
-.meeting-banner {
-  border-radius: 8px;
-  border: 1px solid var(--banner-border);
-}
-
-.meeting-title-input {
-  font-size: 16px;
-  padding: 10px 12px;
-}
-
-.meeting-primary {
-  appearance: none;
-  background: var(--accent);
-  color: var(--bg);
-  border: 1px solid var(--accent);
-  border-radius: 8px;
-  padding: 10px 16px;
-  font: inherit;
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: filter 100ms;
-}
-.meeting-primary:hover {
-  filter: brightness(1.05);
-}
-.meeting-primary:active {
-  filter: brightness(0.92);
-}
-
-.meeting-secondary {
-  appearance: none;
-  background: transparent;
   color: var(--fg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 16px;
-  font: inherit;
-  font-size: 14px;
-  cursor: pointer;
-}
-.meeting-secondary:hover {
-  background: var(--bg);
-}
-
-.meeting-actions {
-  display: flex;
-  gap: 10px;
-  justify-content: center;
   flex-wrap: wrap;
 }
-.meeting-actions .meeting-primary,
-.meeting-actions .meeting-secondary {
-  flex: 1 1 160px;
+
+.recording-banner-idle {
+  padding: 6px 12px;
+}
+
+.recording-banner-rec {
+  background: color-mix(in srgb, #e74c3c 8%, var(--bg-muted));
+  border-bottom-color: color-mix(in srgb, #e74c3c 30%, var(--border-muted));
+}
+
+.recording-banner-busy {
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-muted));
+}
+
+.recording-banner-ready {
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-muted));
+}
+
+.recording-banner-error {
+  background: color-mix(in srgb, #d4a72c 18%, var(--bg-muted));
+  color: var(--banner-fg);
+}
+
+.recording-banner-msg {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
-.meeting-recording-pill {
+.recording-banner-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.recording-banner-warn {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.recording-banner-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border-muted);
+}
+
+.recording-rec-btn {
+  appearance: none;
   display: inline-flex;
-  align-self: center;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 100ms, border-color 100ms;
+}
+.recording-rec-btn:hover {
+  background: color-mix(in srgb, #e74c3c 12%, transparent);
+  border-color: color-mix(in srgb, #e74c3c 60%, var(--border));
+}
+
+.recording-rec-pill {
+  display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 12px;
+  padding: 4px 10px;
   border-radius: 999px;
-  background: color-mix(in srgb, #e74c3c 18%, transparent);
+  background: color-mix(in srgb, #e74c3c 22%, transparent);
   color: #c0392b;
   font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.4px;
   text-transform: uppercase;
 }
-[data-theme="dark"] .meeting-recording-pill {
+[data-theme="dark"] .recording-rec-pill {
   color: #ff8a73;
 }
-.meeting-recording-dot {
+
+.recording-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  background: #e74c3c;
+}
+.recording-rec-pill .recording-dot {
   background: currentColor;
-  animation: meeting-pulse 1.2s ease-in-out infinite;
+}
+.recording-dot-pulse {
+  animation: recording-pulse 1.2s ease-in-out infinite;
 }
 
-@keyframes meeting-pulse {
+@keyframes recording-pulse {
   0%,
   100% {
     opacity: 1;
@@ -978,68 +967,125 @@ select.settings-input {
   }
 }
 
-.meeting-timer {
+.recording-timer {
   font-family:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 56px;
-  font-weight: 600;
-  color: var(--fg);
-  text-align: center;
-  letter-spacing: 1px;
-}
-
-.meeting-warn {
-  margin: 0;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: color-mix(in srgb, #d4a72c 14%, transparent);
-  color: var(--fg);
-  font-size: 12px;
-  text-align: center;
-}
-
-.meeting-error {
-  margin: 0;
-  color: var(--fg-muted);
   font-size: 13px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  text-align: center;
+  letter-spacing: 0.5px;
+  color: var(--fg);
 }
 
-.meeting-spinner {
-  width: 28px;
-  height: 28px;
-  margin: 0 auto;
+.recording-stop-btn {
+  appearance: none;
+  background: #e74c3c;
+  color: #ffffff;
+  border: 1px solid #c0392b;
+  border-radius: 6px;
+  padding: 5px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.recording-stop-btn:hover {
+  filter: brightness(1.05);
+}
+
+.recording-primary {
+  appearance: none;
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 5px 14px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.recording-primary:hover {
+  filter: brightness(1.05);
+}
+.recording-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.recording-spinner {
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
   border: 2px solid var(--border);
   border-top-color: var(--accent);
-  animation: meeting-spin 0.85s linear infinite;
+  animation: recording-spin 0.85s linear infinite;
+  flex: 0 0 auto;
 }
 
-@keyframes meeting-spin {
+@keyframes recording-spin {
   to {
     transform: rotate(360deg);
   }
 }
 
-.meeting-progress {
-  width: 100%;
-  height: 6px;
+.recording-progress {
+  flex: 0 0 120px;
+  height: 4px;
   background: var(--border-muted);
   border-radius: 999px;
   overflow: hidden;
 }
-.meeting-progress-fill {
+.recording-progress-fill {
   height: 100%;
   background: var(--accent);
   transition: width 200ms ease-out;
 }
 
-/* Level meter */
+/* ---------- Restricted banner (external markdown) ----------------------- */
+
+.restricted-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, #d4a72c 12%, var(--bg-muted));
+  border-bottom: 1px solid var(--banner-border);
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.restricted-banner-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--fg);
+}
+
+.restricted-banner-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.restricted-primary {
+  appearance: none;
+  background: var(--accent);
+  color: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.restricted-primary:hover {
+  filter: brightness(1.05);
+}
+
+/* ---------- Level meter (used inside RecordingBanner) ------------------- */
 .level-meter {
-  width: 100%;
-  height: 8px;
+  flex: 1 1 120px;
+  max-width: 240px;
+  min-width: 60px;
+  height: 6px;
   background: var(--border-muted);
   border-radius: 999px;
   overflow: hidden;
