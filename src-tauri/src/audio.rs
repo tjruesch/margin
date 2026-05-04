@@ -107,7 +107,7 @@ pub fn start(
     // System audio thread + control (optional, may fail to start on permission deny).
     let (sys_ctrl_tx, sys_join) = if with_system_audio {
         let (tx, rx) = unbounded::<sysaudio::Cmd>();
-        match sysaudio::spawn(sys_tx.clone(), rx) {
+        match sysaudio::spawn(app.clone(), sys_tx.clone(), rx) {
             Ok(handle) => (Some(tx), Some(handle)),
             Err(e) => {
                 eprintln!("[audio] system audio unavailable, falling back to mic-only: {e}");

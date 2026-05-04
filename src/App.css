@@ -1100,6 +1100,30 @@ select.settings-input {
   border-radius: 999px;
   transition: width 60ms linear;
 }
+.level-meters-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 200px;
+  max-width: 240px;
+}
+.level-meter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.level-meter-row .level-meter {
+  flex: 1 1 auto;
+  max-width: none;
+  min-width: 0;
+}
+.level-meter-label {
+  font-size: 11px;
+  width: 26px;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
 .statusbar > span {
   white-space: nowrap;
   overflow: hidden;

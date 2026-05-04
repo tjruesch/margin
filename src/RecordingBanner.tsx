@@ -83,7 +83,14 @@ export function RecordingBanner({
           <span>REC</span>
           <Timer startedAt={state.startedAt} />
         </div>
-        <LevelMeter />
+        {recordingSysAudio && sysAvailable ? (
+          <div className="level-meters-stack">
+            <LevelMeter eventName="audio-level" ariaLabel="Microphone level" label="Mic" />
+            <LevelMeter eventName="sysaudio-level" ariaLabel="System audio level" label="Sys" />
+          </div>
+        ) : (
+          <LevelMeter />
+        )}
         {recordingSysAudio && !sysAvailable && (
           <span className="recording-banner-warn">
             System audio unavailable — mic only.

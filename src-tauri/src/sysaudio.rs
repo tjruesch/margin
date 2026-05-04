@@ -8,6 +8,9 @@
 //! `with_excludes_current_process_audio(true)` keeps Margin's own UI sounds
 //! (and any audio it ever plays back) out of the mix.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use crossbeam_channel::{Receiver, Sender};
 use screencapturekit::cm::CMSampleBuffer;
 use screencapturekit::shareable_content::SCShareableContent;
@@ -15,6 +18,7 @@ use screencapturekit::stream::{
     configuration::SCStreamConfiguration, content_filter::SCContentFilter,
     output_trait::SCStreamOutputTrait, output_type::SCStreamOutputType, sc_stream::SCStream,
 };
+use tauri::{AppHandle, Emitter};
 
 pub enum Cmd {
     Stop,
@@ -31,6 +35,8 @@ fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 
 struct AudioHandler {
     tx: Sender<Vec<f32>>,
+    app: AppHandle,
+    last_emit: Mutex<Instant>,
 }
 
 impl SCStreamOutputTrait for AudioHandler {
@@ -45,6 +51,7 @@ impl SCStreamOutputTrait for AudioHandler {
         let Some(list) = sample.audio_buffer_list() else {
             return;
         };
+
         // Configured for mono → expect a single buffer of interleaved (or
         // really just sequential, since 1 ch) f32 samples. Defensive: handle
         // multi-buffer planar too in case macOS ever gives us stereo despite
@@ -77,6 +84,18 @@ impl SCStreamOutputTrait for AudioHandler {
             }
             out
         };
+
+        // ~30 Hz level emission, mirroring the mic side. RMS lets the JS
+        // meter use the same `* 2.2` scaling for both bars.
+        if let Ok(mut last) = self.last_emit.lock() {
+            if last.elapsed() >= Duration::from_millis(33) && !samples.is_empty() {
+                let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32)
+                    .sqrt();
+                let _ = self.app.emit("sysaudio-level", rms);
+                *last = Instant::now();
+            }
+        }
+
         let _ = self.tx.try_send(samples);
     }
 }
@@ -88,6 +107,7 @@ impl SCStreamOutputTrait for AudioHandler {
 /// `start_capture()` fails (typically because the user denied screen-recording
 /// permission). The caller should fall back to mic-only on error.
 pub fn spawn(
+    app: AppHandle,
     tx: Sender<Vec<f32>>,
     ctrl_rx: Receiver<Cmd>,
 ) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
@@ -130,7 +150,14 @@ pub fn spawn(
                 .with_excludes_current_process_audio(true);
 
             let mut stream = SCStream::new(&filter, &cfg);
-            stream.add_output_handler(AudioHandler { tx }, SCStreamOutputType::Audio);
+            stream.add_output_handler(
+                AudioHandler {
+                    tx,
+                    app,
+                    last_emit: Mutex::new(Instant::now()),
+                },
+                SCStreamOutputType::Audio,
+            );
 
             if let Err(e) = stream.start_capture() {
                 let msg = format!("SCK start_capture: {e:?}");
