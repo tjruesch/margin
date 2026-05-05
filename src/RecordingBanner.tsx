@@ -28,6 +28,11 @@ type Props = {
   sysAvailable: boolean;
   summaryModel: SummaryModel;
   hasKey: boolean;
+  /** True once the active note's body looks like a reconciled output
+   *  (presence of the `## Summary` heading). Suppresses the post-
+   *  recording "Recording on file" idle banner so the user doesn't keep
+   *  seeing a Generate-notes CTA after they've already generated. */
+  notesGenerated: boolean;
   onStop: () => void;
   onDiscard: () => void;
   onGenerate: () => void;
@@ -40,6 +45,7 @@ export function RecordingBanner({
   sysAvailable,
   summaryModel,
   hasKey,
+  notesGenerated,
   onStop,
   onDiscard,
   onGenerate,
@@ -48,9 +54,12 @@ export function RecordingBanner({
   if (state.kind === "none") {
     // The Record entry point now lives in the note header. The banner only
     // surfaces when there's a transcript already on file — that's the
-    // post-recording "Generate / Discard" affordance, which isn't covered
-    // by the header.
+    // post-recording Generate-notes affordance, which isn't covered by
+    // the header.
     if (!state.hasTranscript) return null;
+    // Once the user has run Generate at least once, the reconciled body
+    // is in the editor and a fresh CTA is just noise.
+    if (notesGenerated) return null;
     return (
       <div className="recording-banner recording-banner-idle">
         <span className="recording-banner-msg">Recording on file</span>

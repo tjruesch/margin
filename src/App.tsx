@@ -718,6 +718,11 @@ export default function App() {
 
   const noteTitle = useMemo(() => deriveTitle(content, fileName), [content, fileName]);
 
+  // Heuristic: a reconciled note always starts with `## Summary` as the
+  // first synthesized section (see SYSTEM_PROMPT in reconcile.rs). When
+  // present, the post-recording banner suppresses its Generate-notes CTA.
+  const notesGenerated = useMemo(() => /(?:^|\n)## Summary\b/.test(content), [content]);
+
   const onTitleChange = useCallback((next: string) => {
     setContent((cur) => rewriteH1(cur, next));
   }, []);
@@ -789,6 +794,7 @@ export default function App() {
           sysAvailable={sysAvailable}
           summaryModel={aiSettings.summaryModel}
           hasKey={hasKey}
+          notesGenerated={notesGenerated}
           onStop={() => void onStopRecording()}
           onDiscard={() => void onDiscardRecording()}
           onGenerate={onGenerate}
@@ -833,7 +839,6 @@ export default function App() {
       </main>
 
       <footer className="statusbar">
-        <span>{path ?? "Not yet saved"}</span>
         <span>
           {content.length.toLocaleString()} chars · {content.split(/\n/).length.toLocaleString()} lines
           {dirty ? " · Modified" : ""}
