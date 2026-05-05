@@ -6,9 +6,22 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::paths;
 
-const MODEL_FILENAME: &str = "ggml-base.en.bin";
-const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+/// Whisper models we expose in the picker. All multilingual — language is
+/// auto-detected at transcription time. Keep in sync with
+/// `WhisperModel` in `src/settingsStore.ts`.
+const ALLOWED_MODELS: &[&str] = &["medium", "large-v3-turbo", "large-v3"];
+const DEFAULT_MODEL: &str = "large-v3-turbo";
+
+fn model_filename(model: &str) -> String {
+    format!("ggml-{model}.bin")
+}
+
+fn model_url(model: &str) -> String {
+    format!(
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+        model_filename(model)
+    )
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Segment {
@@ -43,9 +56,17 @@ pub async fn transcribe(
     app: AppHandle,
     audio_path: String,
     glossary: Vec<String>,
+    model: Option<String>,
 ) -> Result<Transcript, String> {
     let path = PathBuf::from(audio_path);
-    let model_path = ensure_model(&app).await?;
+    // Validate against the picker's allowlist; unknown values fall back to
+    // the default rather than asking the OS to download an arbitrary URL.
+    let model = model
+        .as_deref()
+        .filter(|m| ALLOWED_MODELS.contains(m))
+        .unwrap_or(DEFAULT_MODEL)
+        .to_string();
+    let model_path = ensure_model(&app, &model).await?;
     let diar_paths = crate::diarize::ensure_diarization_models(&app).await?;
     let app2 = app.clone();
     let initial_prompt = build_initial_prompt(&glossary);
@@ -72,9 +93,18 @@ pub async fn transcribe(
 
         let duration_ms = (pcm_f32.len() as u64 * 1000) / 16_000;
 
-        // Run Whisper.
+        // Run Whisper. Language is auto-detected per recording — passing
+        // None tells whisper.cpp to run its built-in language ID on the
+        // first 30s window. `no_context` prevents prior-window text from
+        // bleeding into subsequent windows; without this, a degraded
+        // window's output can self-reinforce into a phrase loop that
+        // continues for the rest of the meeting (observed catastrophic
+        // failure on a 38-minute German recording with the old base.en
+        // pipeline forcing English).
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(Some("en"));
+        params.set_language(None);
+        params.set_detect_language(true);
+        params.set_no_context(true);
         params.set_translate(false);
         params.set_print_progress(false);
         params.set_print_special(false);
@@ -89,6 +119,18 @@ pub async fn transcribe(
         });
 
         state.full(params, &pcm_f32).map_err(|e| e.to_string())?;
+
+        // Whisper sets full_lang_id_from_state once detection completes.
+        // -1 means "couldn't detect" — fall back to "und" (undetermined,
+        // ISO 639-2) so the field is never an empty string.
+        let lang_id = state.full_lang_id_from_state();
+        let language = if lang_id >= 0 {
+            whisper_rs::get_lang_str(lang_id)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "und".to_string())
+        } else {
+            "und".to_string()
+        };
 
         // Collect segments — whisper.cpp t0/t1 are 10-ms ticks → multiply by 10 for ms.
         let n = state.full_n_segments();
@@ -133,7 +175,7 @@ pub async fn transcribe(
         let transcript = Transcript {
             segments,
             full_text,
-            language: "en".into(),
+            language,
             duration_ms,
             num_speakers,
         };
@@ -182,16 +224,16 @@ fn build_initial_prompt(glossary: &[String]) -> Option<String> {
     Some(format!("{}{}.", prefix, included.join(", ")))
 }
 
-/// Returns the local path to the Whisper model, downloading it from
-/// Hugging Face on first use. Atomic via `.part` rename so a torn
+/// Returns the local path to the requested Whisper model, downloading it
+/// from Hugging Face on first use. Atomic via `.part` rename so a torn
 /// download isn't silently loaded as a corrupt model on next run.
-async fn ensure_model(app: &AppHandle) -> Result<PathBuf, String> {
-    let path = paths::models_dir().join(MODEL_FILENAME);
+async fn ensure_model(app: &AppHandle, model: &str) -> Result<PathBuf, String> {
+    let path = paths::models_dir().join(model_filename(model));
     if path.exists() {
         return Ok(path);
     }
 
-    let resp = reqwest::get(MODEL_URL)
+    let resp = reqwest::get(model_url(model))
         .await
         .map_err(|e| e.to_string())?
         .error_for_status()

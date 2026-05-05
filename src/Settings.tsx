@@ -299,11 +299,14 @@ function AISection({ ai, onChange }: AISectionProps) {
             value={ai.whisperModel}
             onChange={(e) => onChange({ whisperModel: e.target.value as WhisperModel })}
           >
-            <option value="base.en">base.en (~140 MB)</option>
-            <option value="small.en">small.en (~470 MB)</option>
-            <option value="medium.en">medium.en (~1.5 GB)</option>
+            <option value="large-v3-turbo">large-v3-turbo (~1.6 GB) — recommended</option>
+            <option value="large-v3">large-v3 (~3 GB) — slowest, highest accuracy</option>
+            <option value="medium">medium (~1.5 GB)</option>
           </select>
-          <span className="settings-hint">Downloaded on first use into ~/.margin/models/.</span>
+          <span className="settings-hint">
+            Multilingual; language is auto-detected per recording. Downloaded on first use into
+            ~/.margin/models/.
+          </span>
         </div>
       </div>
 

@@ -14,7 +14,7 @@ export type ThemeSettings = {
 };
 
 export type SummaryModel = "claude-sonnet-4-6" | "claude-opus-4-7";
-export type WhisperModel = "base.en" | "small.en" | "medium.en";
+export type WhisperModel = "medium" | "large-v3-turbo" | "large-v3";
 export type AudioRetention = "forever" | "30days" | "7days" | "never";
 
 export type AISettings = {
@@ -35,7 +35,7 @@ const RECENT_FILES_LIMIT = 20;
 
 export const DEFAULT_AI_SETTINGS: AISettings = {
   summaryModel: "claude-sonnet-4-6",
-  whisperModel: "base.en",
+  whisperModel: "large-v3-turbo",
   recordSystemAudio: true,
   audioRetention: "forever",
   glossary: [],
@@ -79,7 +79,7 @@ function isDarkThemeId(id: string): boolean {
 }
 
 const SUMMARY_MODELS: SummaryModel[] = ["claude-sonnet-4-6", "claude-opus-4-7"];
-const WHISPER_MODELS: WhisperModel[] = ["base.en", "small.en", "medium.en"];
+const WHISPER_MODELS: WhisperModel[] = ["medium", "large-v3-turbo", "large-v3"];
 const RETENTIONS: AudioRetention[] = ["forever", "30days", "7days", "never"];
 
 function pick<T extends string>(allowed: readonly T[], value: unknown, fallback: T): T {

@@ -120,8 +120,9 @@ export async function stopMeetingRecording(): Promise<string> {
 export async function transcribe(
   audioPath: string,
   glossary: string[] = [],
+  model?: string,
 ): Promise<Transcript> {
-  return invoke<Transcript>("transcribe", { audioPath, glossary });
+  return invoke<Transcript>("transcribe", { audioPath, glossary, model });
 }
 
 export async function reconcileNotes(

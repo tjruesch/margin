@@ -255,7 +255,7 @@ export default function App() {
 
   const runTranscribe = useCallback(async (wavPath: string) => {
     try {
-      await transcribe(wavPath, aiRef.current.glossary);
+      await transcribe(wavPath, aiRef.current.glossary, aiRef.current.whisperModel);
       const notePath = pathRef.current;
       const tp = notePath ? transcriptPathFor(notePath) : wavPath.replace(/\/audio\.wav$/, "/transcript.json");
       setRecording({ kind: "ready", transcriptPath: tp });
