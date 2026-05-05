@@ -75,19 +75,31 @@ export function TranscriptView({ path }: Props) {
   );
 }
 
+/** ≥ this gap (ms) between segments forces a paragraph break when no
+ *  speaker labels are present, so unlabeled transcripts don't render as
+ *  one giant wall of text. */
+const PAUSE_PARAGRAPH_MS = 2000;
+
 function groupBySpeaker(segments: Segment[]): { speaker: number | null; text: string }[] {
   const out: { speaker: number | null; text: string }[] = [];
   let cur: number | null | undefined = undefined;
+  let prevEnd = 0;
   for (const seg of segments) {
     const text = seg.text.trim();
     if (!text) continue;
     const sp = seg.speaker == null ? null : seg.speaker;
-    if (sp === cur && out.length > 0) {
-      out[out.length - 1].text += " " + text;
-    } else {
+    const gap = seg.start_ms - prevEnd;
+    const startNew =
+      out.length === 0 ||
+      sp !== cur ||
+      (sp === null && gap >= PAUSE_PARAGRAPH_MS);
+    if (startNew) {
       out.push({ speaker: sp, text });
       cur = sp;
+    } else {
+      out[out.length - 1].text += " " + text;
     }
+    prevEnd = seg.end_ms;
   }
   return out;
 }

@@ -73,7 +73,6 @@ pub async fn transcribe(
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
     let model_path = ensure_model(&app, &model).await?;
-    let diar_paths = crate::diarize::ensure_diarization_models(&app).await?;
     let app2 = app.clone();
     let initial_prompt = build_initial_prompt(&glossary);
 
@@ -164,29 +163,22 @@ pub async fn transcribe(
             });
         }
 
-        // Diarization phase: run sherpa-onnx on the same PCM buffer Whisper
-        // just consumed. The UI swaps the "Transcribing…" label to
-        // "Identifying speakers…" when this fires.
-        let _ = app2.emit("transcribe-phase", "diarizing");
-        let num_speakers = match crate::diarize::diarize(&diar_paths, &pcm_f32) {
-            Ok(spans) => {
-                crate::diarize::assign_speakers(&mut segments, &spans);
-                Some(crate::diarize::count_unique_speakers(&segments))
-            }
-            Err(e) => {
-                // Diarization failure shouldn't kill the transcript — the
-                // Whisper output is still useful without speaker labels.
-                eprintln!("[diarize] failed, continuing without speaker labels: {e}");
-                None
-            }
-        };
+        // Diarization is disabled until the chunked clustering pipeline
+        // (issue #23) ships with a tuned threshold. The current pyannote
+        // + nemo-titanet + 0.5-threshold combo over-segments dramatically
+        // on real meeting audio (40+ phantom speakers on tested files),
+        // which makes the transcript view harder to read and adds zero
+        // signal to the reconcile pass — Claude doesn't get useful
+        // attribution from anonymous "Speaker N" tags. The diarize module
+        // stays compiled and reachable so #23 can re-enable it.
+        let _ = (&mut segments, &app2);
 
         let transcript = Transcript {
             segments,
             full_text,
             language,
             duration_ms,
-            num_speakers,
+            num_speakers: None,
             reconciled_at: None,
         };
 

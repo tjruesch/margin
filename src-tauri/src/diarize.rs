@@ -1,5 +1,12 @@
 //! Speaker diarization via sherpa-onnx.
 //!
+//! **Currently disabled** in `transcribe.rs` until issue #23 ships the
+//! chunked clustering pipeline. The functions below stay compiled so the
+//! re-enable is mechanical rather than a rewrite.
+
+#![allow(dead_code)]
+
+//!
 //! v1 batch pipeline: load full 16 kHz mono PCM, run pyannote segmentation +
 //! NeMo titanet embedding + fast clustering in one call. Returns a list of
 //! `DiarSpan` (timestamp + speaker index).
