@@ -104,6 +104,10 @@ export type Transcript = {
   language: string;
   duration_ms: number;
   num_speakers?: number | null;
+  /** Unix-ms timestamp of the last successful Claude reconcile against
+   *  this transcript. `null`/missing means the user hasn't generated
+   *  notes from it yet. */
+  reconciled_at?: number | null;
 };
 
 export async function startMeetingRecording(

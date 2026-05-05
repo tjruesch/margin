@@ -366,7 +366,7 @@ pub async fn reconcile_notes(
     let bytes = tokio::fs::read(&transcript_path)
         .await
         .map_err(|e| format!("read transcript: {e}"))?;
-    let transcript: Transcript =
+    let mut transcript: Transcript =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse transcript: {e}"))?;
 
     let _ = app.emit("reconcile-progress", "started");
@@ -474,6 +474,21 @@ pub async fn reconcile_notes(
             "Anthropic returned no text content (stop_reason={:?})",
             parsed.stop_reason
         ));
+    }
+
+    // Stamp the transcript so the post-record banner can suppress its
+    // Generate-notes CTA next time the note is opened. Failure to write
+    // is non-fatal — the user got their reconciled output, the flag is
+    // just a UI affordance.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    transcript.reconciled_at = Some(now_ms);
+    if let Ok(json) = serde_json::to_vec_pretty(&transcript) {
+        if let Err(e) = tokio::fs::write(&transcript_path, json).await {
+            eprintln!("[reconcile] could not stamp transcript.json: {e}");
+        }
     }
 
     let _ = app.emit("reconcile-progress", "done");

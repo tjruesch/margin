@@ -45,6 +45,12 @@ pub struct Transcript {
     /// diarization didn't run.
     #[serde(default)]
     pub num_speakers: Option<u32>,
+    /// Unix-ms timestamp set by reconcile_notes when Claude has produced
+    /// reconciled output for this transcript. Drives the post-recording
+    /// banner: if Some, the user has already generated notes once and
+    /// the Generate CTA is suppressed.
+    #[serde(default)]
+    pub reconciled_at: Option<u64>,
 }
 
 /// Whisper's hard cap is `n_text_ctx / 2 = 224` tokens for `initial_prompt`.
@@ -181,6 +187,7 @@ pub async fn transcribe(
             language,
             duration_ms,
             num_speakers,
+            reconciled_at: None,
         };
 
         // Sidecar JSON for re-summarization without re-transcribing.

@@ -19,6 +19,7 @@ import {
   isOwnedNote,
   noteMeta,
   notesDir as fetchNotesDir,
+  type Transcript,
   pickFileToOpen,
   pickFileToSave,
   readFile,
@@ -193,7 +194,9 @@ export default function App() {
     aiRef.current = aiSettings;
   }, [aiSettings]);
 
-  // Detect whether the bundle has a transcript on disk and reset banner state.
+  // Detect whether the bundle has a transcript on disk, and whether that
+  // transcript has already been reconciled (`reconciled_at` set by
+  // reconcile_notes), and reset banner state accordingly.
   const refreshRecordingState = useCallback(async (notePath: string | null) => {
     if (!notePath || !notePath.endsWith("/note.md")) {
       setRecording({ kind: "none", hasTranscript: false });
@@ -206,10 +209,21 @@ export default function App() {
     } catch {
       exists = false;
     }
+    let reconciled = false;
+    if (exists) {
+      try {
+        const f = await readFile(tp);
+        const parsed: Partial<Transcript> = JSON.parse(f.content);
+        reconciled = !!parsed.reconciled_at;
+      } catch {
+        reconciled = false;
+      }
+    }
     setRecording({
       kind: "none",
       hasTranscript: exists,
       transcriptPath: exists ? tp : undefined,
+      reconciled,
     });
   }, []);
 
@@ -330,7 +344,12 @@ export default function App() {
         } catch (err) {
           console.error("post-reconcile save failed:", err);
         }
-        setRecording({ kind: "none", hasTranscript: true, transcriptPath });
+        setRecording({
+          kind: "none",
+          hasTranscript: true,
+          transcriptPath,
+          reconciled: true,
+        });
       } catch (err) {
         setRecording({
           kind: "error",
@@ -718,10 +737,11 @@ export default function App() {
 
   const noteTitle = useMemo(() => deriveTitle(content, fileName), [content, fileName]);
 
-  // Heuristic: a reconciled note always starts with `## Summary` as the
-  // first synthesized section (see SYSTEM_PROMPT in reconcile.rs). When
-  // present, the post-recording banner suppresses its Generate-notes CTA.
-  const notesGenerated = useMemo(() => /(?:^|\n)## Summary\b/.test(content), [content]);
+  // Has the active note's transcript already been reconciled at least
+  // once? Read from transcript.json's `reconciled_at` field via the
+  // recording state machine. Used to suppress the post-recording
+  // Generate-notes CTA after the user has run it.
+  const notesGenerated = recording.kind === "none" && !!recording.reconciled;
 
   const onTitleChange = useCallback((next: string) => {
     setContent((cur) => rewriteH1(cur, next));

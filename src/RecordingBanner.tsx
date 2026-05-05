@@ -4,7 +4,13 @@ import { LevelMeter } from "./LevelMeter";
 import type { SummaryModel } from "./settingsStore";
 
 export type NoteRecording =
-  | { kind: "none"; hasTranscript: boolean; transcriptPath?: string }
+  | {
+      kind: "none";
+      hasTranscript: boolean;
+      transcriptPath?: string;
+      /** True iff transcript.json has a `reconciled_at` timestamp. */
+      reconciled?: boolean;
+    }
   | { kind: "recording"; startedAt: number }
   | {
       kind: "transcribing";
