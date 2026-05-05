@@ -774,7 +774,6 @@ export default function App() {
           sysAvailable={sysAvailable}
           summaryModel={aiSettings.summaryModel}
           hasKey={hasKey}
-          onStart={() => void startRecordingForCurrent()}
           onStop={() => void onStopRecording()}
           onDiscard={() => void onDiscardRecording()}
           onGenerate={onGenerate}

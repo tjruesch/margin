@@ -28,7 +28,6 @@ type Props = {
   sysAvailable: boolean;
   summaryModel: SummaryModel;
   hasKey: boolean;
-  onStart: () => void;
   onStop: () => void;
   onDiscard: () => void;
   onGenerate: () => void;
@@ -41,34 +40,29 @@ export function RecordingBanner({
   sysAvailable,
   summaryModel,
   hasKey,
-  onStart,
   onStop,
   onDiscard,
   onGenerate,
   onDismissError,
 }: Props) {
   if (state.kind === "none") {
+    // The Record entry point now lives in the note header. The banner only
+    // surfaces when there's a transcript already on file — that's the
+    // post-recording "Generate / Discard" affordance, which isn't covered
+    // by the header.
+    if (!state.hasTranscript) return null;
     return (
       <div className="recording-banner recording-banner-idle">
-        <button className="recording-rec-btn" onClick={onStart} aria-label="Start recording">
-          <span className="recording-dot" />
-          <span>Record</span>
-        </button>
-        {state.hasTranscript && (
-          <>
-            <span className="recording-banner-sep" />
-            <span className="recording-banner-msg">Recording on file</span>
-            <div className="recording-banner-actions">
-              <button className="ghost" onClick={onGenerate} disabled={!hasKey}>
-                ✨ Generate notes
-              </button>
-              <button className="ghost" onClick={onDiscard}>
-                Discard recording
-              </button>
-            </div>
-          </>
-        )}
-        {!hasKey && state.hasTranscript && (
+        <span className="recording-banner-msg">Recording on file</span>
+        <div className="recording-banner-actions">
+          <button className="ghost" onClick={onGenerate} disabled={!hasKey}>
+            ✨ Generate notes
+          </button>
+          <button className="ghost" onClick={onDiscard}>
+            Discard recording
+          </button>
+        </div>
+        {!hasKey && (
           <span className="recording-banner-warn">
             Add an Anthropic API key in Settings → AI to generate.
           </span>

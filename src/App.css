@@ -834,32 +834,6 @@ select.settings-input {
   color: var(--fg-muted);
 }
 
-.recording-banner-sep {
-  width: 1px;
-  height: 18px;
-  background: var(--border-muted);
-}
-
-.recording-rec-btn {
-  appearance: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 12px;
-  border-radius: 999px;
-  background: transparent;
-  color: var(--fg);
-  border: 1px solid var(--border);
-  font: inherit;
-  font-size: 13px;
-  cursor: pointer;
-  transition: background 100ms, border-color 100ms;
-}
-.recording-rec-btn:hover {
-  background: color-mix(in srgb, #e74c3c 12%, transparent);
-  border-color: color-mix(in srgb, #e74c3c 60%, var(--border));
-}
-
 .recording-rec-pill {
   display: inline-flex;
   align-items: center;
