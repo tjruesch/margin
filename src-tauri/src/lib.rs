@@ -340,6 +340,7 @@ pub fn run() {
             notes::convert_external,
             notes::is_owned_note,
             notes::list_notes,
+            notes::note_meta,
             notes::discard_recording
         ])
         .build(tauri::generate_context!())

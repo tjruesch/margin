@@ -80,6 +80,12 @@ export async function listNotes(): Promise<NoteListItem[]> {
   return invoke<NoteListItem[]>("list_notes");
 }
 
+export type NoteMeta = { modified_ms: number };
+
+export async function noteMeta(notePath: string): Promise<NoteMeta> {
+  return invoke<NoteMeta>("note_meta", { notePath });
+}
+
 export async function discardRecording(notePath: string): Promise<void> {
   await invoke<void>("discard_recording", { notePath });
 }

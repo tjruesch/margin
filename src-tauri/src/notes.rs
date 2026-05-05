@@ -193,6 +193,26 @@ pub fn list_notes() -> Result<Vec<NoteListItem>, String> {
     Ok(out)
 }
 
+#[derive(Serialize)]
+pub struct NoteMeta {
+    pub modified_ms: i64,
+}
+
+/// Read mtime for a single note path. Used by the note header's date chip.
+/// Cheaper than calling `list_notes` and filtering on the JS side.
+#[tauri::command]
+pub fn note_meta(note_path: String) -> Result<NoteMeta, String> {
+    let p = PathBuf::from(&note_path);
+    let meta = fs::metadata(&p).map_err(|e| e.to_string())?;
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(NoteMeta { modified_ms })
+}
+
 /// Remove `audio.wav` and `transcript.json` from the bundle. Leaves
 /// `note.md` intact (the user might still want their hand-notes minus
 /// the recording).

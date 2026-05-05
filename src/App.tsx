@@ -16,6 +16,7 @@ import {
   getInitialFile,
   hasAnthropicApiKey,
   isOwnedNote,
+  noteMeta,
   notesDir as fetchNotesDir,
   pickFileToOpen,
   pickFileToSave,
@@ -38,6 +39,7 @@ import {
   type ThemeSettings,
 } from "./settingsStore";
 import { applyTheme, getTheme, DEFAULT_LIGHT_THEME_ID, DEFAULT_DARK_THEME_ID } from "./themes";
+import { NoteHeader, type EditorSettings } from "./NoteHeader";
 import "./App.css";
 
 type Mode = "home" | "edit" | "preview" | "settings";
@@ -88,6 +90,22 @@ function deriveTitle(content: string, fallback: string): string {
   return fallback;
 }
 
+/// Replace the first `# H1` line with `newTitle`, preserving any leading
+/// indentation. If no H1 exists, prepend one.
+function rewriteH1(content: string, newTitle: string): string {
+  const lines = content.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith("# ")) {
+      const indent = line.slice(0, line.length - trimmed.length);
+      lines[i] = `${indent}# ${newTitle}`;
+      return lines.join("\n");
+    }
+  }
+  return `# ${newTitle}\n\n${content}`;
+}
+
 export default function App() {
   const [mode, setMode] = useState<Mode>("home");
   const [recentFiles, setRecentFiles] = useState<string[]>([]);
@@ -107,6 +125,7 @@ export default function App() {
     kind: "none",
     hasTranscript: false,
   });
+  const [modifiedMs, setModifiedMs] = useState<number | null>(null);
 
   // Resolve the active theme id from settings + system appearance.
   const activeThemeId = themeSettings.syncWithOS
@@ -546,6 +565,20 @@ export default function App() {
     else void unwatchFile();
   }, [path]);
 
+  // Refresh mtime for the active note whenever a save lands or path changes.
+  // savedContent flips in lockstep with disk state (loadFile, autosave,
+  // onSave, post-reconcile, external-change merge), so this effect catches
+  // every "the file on disk just changed" moment without per-call plumbing.
+  useEffect(() => {
+    if (!path) {
+      setModifiedMs(null);
+      return;
+    }
+    noteMeta(path)
+      .then((m) => setModifiedMs(m.modified_ms))
+      .catch(() => setModifiedMs(null));
+  }, [path, savedContent]);
+
   // Debounced autosave. Fires 800ms after the last edit, skipped when there's
   // no path (untitled buffer), nothing changed, or a disk-state conflict
   // needs the user's attention. Self-induced writes are suppressed by
@@ -663,65 +696,47 @@ export default function App() {
   const showRecordingBanner = mode === "edit" && isOwned;
   const showRestrictedBanner = mode === "edit" && !isOwned && path !== null;
 
+  const noteTitle = useMemo(() => deriveTitle(content, fileName), [content, fileName]);
+
+  const onTitleChange = useCallback((next: string) => {
+    setContent((cur) => rewriteH1(cur, next));
+  }, []);
+
+  const editorSettings = useMemo<EditorSettings>(
+    () => ({
+      indent: useTabs ? "Tabs" : "Spaces",
+      width: (String(tabSize) as "2" | "4" | "8"),
+      wrap: softWrap ? "Soft wrap" : "No wrap",
+    }),
+    [useTabs, tabSize, softWrap],
+  );
+
+  const onEditorSettingsChange = useCallback((next: EditorSettings) => {
+    setUseTabs(next.indent === "Tabs");
+    setTabSize(Number(next.width));
+    setSoftWrap(next.wrap === "Soft wrap");
+  }, []);
+
+  const canRecord = isOwned && recording.kind === "none";
+
   return (
     <div className="app" data-theme={theme}>
       {!showTabbar && <div className="drag-bar" data-tauri-drag-region />}
       {showTabbar && (
-        <div className="tabbar" data-tauri-drag-region>
-          <div className="tabs" role="tablist">
-            <button
-              role="tab"
-              aria-selected={mode === "edit"}
-              className={"tab " + (mode === "edit" ? "active" : "")}
-              onClick={() => tryNavigate("edit")}
-            >
-              Edit
-            </button>
-            <button
-              role="tab"
-              aria-selected={mode === "preview"}
-              className={"tab " + (mode === "preview" ? "active" : "")}
-              onClick={() => tryNavigate("preview")}
-            >
-              Preview
-            </button>
-          </div>
-
-          <div className="toolbar">
-            {mode === "edit" ? (
-              <>
-                <Select
-                  label="Indent"
-                  value={useTabs ? "tabs" : "spaces"}
-                  options={[
-                    { value: "spaces", label: "Spaces" },
-                    { value: "tabs", label: "Tabs" },
-                  ]}
-                  onChange={(v) => setUseTabs(v === "tabs")}
-                />
-                <Select
-                  label="Width"
-                  value={String(tabSize)}
-                  options={[2, 4, 8].map((n) => ({ value: String(n), label: String(n) }))}
-                  onChange={(v) => setTabSize(Number(v))}
-                />
-                <Select
-                  label="Wrap"
-                  value={softWrap ? "soft" : "no"}
-                  options={[
-                    { value: "soft", label: "Soft wrap" },
-                    { value: "no", label: "No wrap" },
-                  ]}
-                  onChange={(v) => setSoftWrap(v === "soft")}
-                />
-              </>
-            ) : (
-              <button className="ghost" onClick={() => tryNavigate("edit")}>
-                Back to edit
-              </button>
-            )}
-          </div>
-        </div>
+        <NoteHeader
+          title={noteTitle}
+          onTitleChange={onTitleChange}
+          mode={mode === "preview" ? "preview" : "edit"}
+          onModeChange={(m) => tryNavigate(m)}
+          recording={recording.kind === "recording"}
+          canRecord={canRecord}
+          onStartRecord={() => void startRecordingForCurrent()}
+          onStopRecord={() => void onStopRecording()}
+          settings={editorSettings}
+          onSettingsChange={onEditorSettingsChange}
+          modifiedMs={modifiedMs}
+          onBack={() => tryNavigate("home")}
+        />
       )}
 
       {externalChange && (
@@ -809,24 +824,3 @@ export default function App() {
   );
 }
 
-type SelectProps = {
-  label: string;
-  value: string;
-  options: { value: string; label: string }[];
-  onChange: (v: string) => void;
-};
-
-function Select({ label, value, options, onChange }: SelectProps) {
-  return (
-    <label className="select">
-      <span className="select-label">{label}</span>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
-        {options.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
-}
