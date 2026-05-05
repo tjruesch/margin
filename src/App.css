@@ -1093,23 +1093,23 @@ select.settings-input {
 }
 
 /* ---------- Note page header (replaces .tabbar) ------------------------- */
-/* Scoped palette so the redesigned header keeps its warm cream look       */
-/* regardless of the active editor theme. Dark-theme parity is a follow-up. */
+/* Header palette is derived from the active theme tokens so the chrome   */
+/* tracks light, dark, and brand themes automatically.                    */
 .note-header {
-  --nh-bg: #f7f3ec;
-  --nh-bg-elev: #fbf8f2;
-  --nh-bg-chip: rgba(0, 0, 0, 0.04);
-  --nh-bg-chip-hover: rgba(0, 0, 0, 0.07);
-  --nh-line: rgba(0, 0, 0, 0.08);
-  --nh-line-strong: rgba(0, 0, 0, 0.14);
-  --nh-ink: #1a1a1a;
-  --nh-ink-2: #3d3a36;
-  --nh-ink-3: #6b655c;
-  --nh-ink-4: #9a9388;
-  --nh-accent: #c44a1f;
-  --nh-accent-soft: rgba(196, 74, 31, 0.1);
-  --nh-accent-border: rgba(196, 74, 31, 0.35);
-  --nh-accent-ink: #8a2f11;
+  --nh-bg: var(--bg-muted);
+  --nh-bg-elev: var(--bg);
+  --nh-bg-chip: color-mix(in srgb, var(--fg) 5%, transparent);
+  --nh-bg-chip-hover: color-mix(in srgb, var(--fg) 9%, transparent);
+  --nh-line: var(--border-muted);
+  --nh-line-strong: var(--border);
+  --nh-ink: var(--fg);
+  --nh-ink-2: var(--fg);
+  --nh-ink-3: var(--fg-muted);
+  --nh-ink-4: color-mix(in srgb, var(--fg-muted) 70%, var(--bg));
+  --nh-accent: var(--accent);
+  --nh-accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --nh-accent-border: color-mix(in srgb, var(--accent) 40%, transparent);
+  --nh-accent-ink: var(--accent);
 
   position: sticky;
   top: 0;
@@ -1143,14 +1143,14 @@ select.settings-input {
   transition: background 120ms ease;
 }
 .nh-back:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: var(--nh-bg-chip);
 }
 
 /* Segmented Edit/Preview toggle */
 .nh-segmented {
   display: inline-flex;
   padding: 3px;
-  background: rgba(0, 0, 0, 0.05);
+  background: var(--nh-bg-chip);
   border-radius: 9px;
   gap: 2px;
 }
@@ -1174,7 +1174,8 @@ select.settings-input {
   background: var(--nh-bg-elev);
   color: var(--nh-ink);
   font-weight: 600;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 8%, transparent),
+              0 0 0 0.5px var(--nh-line-strong);
 }
 
 /* Record button */
@@ -1186,7 +1187,7 @@ select.settings-input {
   padding: 0 12px 0 10px;
   border-radius: 15px;
   background: transparent;
-  border: 0.5px solid rgba(0, 0, 0, 0.12);
+  border: 0.5px solid var(--nh-line-strong);
   color: var(--nh-ink-2);
   font: inherit;
   font-size: 12.5px;
@@ -1195,7 +1196,7 @@ select.settings-input {
   transition: all 150ms ease;
 }
 .nh-record:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: var(--nh-bg-chip);
 }
 .nh-record.recording {
   background: var(--nh-accent-soft);
@@ -1216,9 +1217,9 @@ select.settings-input {
   animation: nh-rec-pulse 1.4s ease-out infinite;
 }
 @keyframes nh-rec-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(196, 74, 31, 0.55); }
-  70% { box-shadow: 0 0 0 8px rgba(196, 74, 31, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(196, 74, 31, 0); }
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+  70% { box-shadow: 0 0 0 8px color-mix(in srgb, var(--accent) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent); }
 }
 
 /* Icon button (square, 32px, used for settings + more) */
@@ -1237,10 +1238,10 @@ select.settings-input {
   padding: 0;
 }
 .nh-icon-btn:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: var(--nh-bg-chip);
 }
 .nh-icon-btn.active {
-  background: rgba(0, 0, 0, 0.08);
+  background: var(--nh-bg-chip-hover);
 }
 
 /* Share split-button */
@@ -1258,7 +1259,7 @@ select.settings-input {
   justify-content: center;
   background: transparent;
   border: none;
-  color: #f7f3ec;
+  color: var(--bg);
   cursor: pointer;
   font: inherit;
   font-size: 12.5px;
@@ -1270,7 +1271,7 @@ select.settings-input {
 }
 .nh-share-divider {
   width: 0.5px;
-  background: rgba(255, 255, 255, 0.18);
+  background: color-mix(in srgb, var(--bg) 30%, transparent);
   margin: 6px 0;
 }
 .nh-share-link {
@@ -1287,7 +1288,8 @@ select.settings-input {
   right: 0;
   background: var(--nh-bg-elev);
   border-radius: 12px;
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.12), 0 0 0 0.5px var(--nh-line-strong);
+  box-shadow: 0 10px 30px color-mix(in srgb, #000 35%, transparent),
+              0 0 0 0.5px var(--nh-line-strong);
   z-index: 20;
   animation: nh-pop-in 140ms ease-out;
 }
@@ -1318,10 +1320,10 @@ select.settings-input {
   text-align: left;
 }
 .nh-more-item:hover {
-  background: rgba(0, 0, 0, 0.05);
+  background: var(--nh-bg-chip);
 }
 .nh-more-item.danger {
-  color: #b23a1a;
+  color: #e5484d;
 }
 .nh-more-sep {
   height: 1px;
@@ -1354,10 +1356,10 @@ select.settings-input {
   transition: background 120ms ease;
 }
 .nh-title:hover {
-  background: rgba(0, 0, 0, 0.025);
+  background: var(--nh-bg-chip);
 }
 input.nh-title {
-  background: rgba(0, 0, 0, 0.03);
+  background: var(--nh-bg-chip);
   box-shadow: inset 0 0 0 1px var(--nh-accent-border);
   /* the input element ignores text-overflow — leave whitespace default so
      editing long titles can scroll horizontally inside the field */
@@ -1414,5 +1416,5 @@ input.nh-title {
   justify-content: center;
 }
 .nh-chip-add:hover {
-  background: rgba(0, 0, 0, 0.025);
+  background: var(--nh-bg-chip);
 }
