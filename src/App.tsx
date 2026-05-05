@@ -79,6 +79,10 @@ function transcriptPathFor(notePath: string): string {
   return notePath.replace(/note\.md$/, "transcript.json");
 }
 
+function audioPathFor(notePath: string): string {
+  return notePath.replace(/note\.md$/, "audio.wav");
+}
+
 function deriveTitle(content: string, fallback: string): string {
   for (const line of content.split("\n")) {
     const trimmed = line.trimStart();
@@ -279,6 +283,22 @@ export default function App() {
         message: typeof err === "string" ? err : "Failed to stop recording.",
       });
     }
+  }, [runTranscribe]);
+
+  const onReTranscribe = useCallback(async () => {
+    const notePath = pathRef.current;
+    if (!notePath) return;
+    const wavPath = audioPathFor(notePath);
+    const exists = await invoke<boolean>("file_exists", { path: wavPath }).catch(() => false);
+    if (!exists) {
+      setRecording({
+        kind: "error",
+        message: "No audio.wav on disk for this note — nothing to re-transcribe.",
+      });
+      return;
+    }
+    setRecording({ kind: "transcribing", phase: "asr", pct: 0 });
+    void runTranscribe(wavPath);
   }, [runTranscribe]);
 
   const onDiscardRecording = useCallback(async () => {
@@ -768,6 +788,7 @@ export default function App() {
           hasKey={hasKey}
           onStop={() => void onStopRecording()}
           onDiscard={() => void onDiscardRecording()}
+          onReTranscribe={() => void onReTranscribe()}
           onGenerate={onGenerate}
           onDismissError={onDismissError}
         />
