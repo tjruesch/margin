@@ -9,6 +9,7 @@ import { Preview } from "./Preview";
 import { RecordingBanner, type NoteRecording } from "./RecordingBanner";
 import { RestrictedBanner } from "./RestrictedBanner";
 import { Settings } from "./Settings";
+import { TranscriptView } from "./Transcript";
 import {
   convertExternal,
   createNote,
@@ -42,7 +43,7 @@ import { applyTheme, getTheme, DEFAULT_LIGHT_THEME_ID, DEFAULT_DARK_THEME_ID } f
 import { NoteHeader } from "./NoteHeader";
 import "./App.css";
 
-type Mode = "home" | "edit" | "preview" | "settings";
+type Mode = "home" | "edit" | "preview" | "transcript" | "settings";
 
 function systemTheme(): "light" | "dark" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
@@ -77,10 +78,6 @@ function greet(name: string) {
 
 function transcriptPathFor(notePath: string): string {
   return notePath.replace(/note\.md$/, "transcript.json");
-}
-
-function audioPathFor(notePath: string): string {
-  return notePath.replace(/note\.md$/, "audio.wav");
 }
 
 function deriveTitle(content: string, fallback: string): string {
@@ -283,22 +280,6 @@ export default function App() {
         message: typeof err === "string" ? err : "Failed to stop recording.",
       });
     }
-  }, [runTranscribe]);
-
-  const onReTranscribe = useCallback(async () => {
-    const notePath = pathRef.current;
-    if (!notePath) return;
-    const wavPath = audioPathFor(notePath);
-    const exists = await invoke<boolean>("file_exists", { path: wavPath }).catch(() => false);
-    if (!exists) {
-      setRecording({
-        kind: "error",
-        message: "No audio.wav on disk for this note — nothing to re-transcribe.",
-      });
-      return;
-    }
-    setRecording({ kind: "transcribing", phase: "asr", pct: 0 });
-    void runTranscribe(wavPath);
   }, [runTranscribe]);
 
   const onDiscardRecording = useCallback(async () => {
@@ -712,7 +693,26 @@ export default function App() {
     document.title = title;
   }, [dirty, fileName]);
 
-  const showTabbar = mode === "edit" || mode === "preview";
+  const showTabbar = mode === "edit" || mode === "preview" || mode === "transcript";
+
+  // Path to the active note's transcript.json, if one exists. Pulled from
+  // the recording state machine — kind: "none" with hasTranscript, or any
+  // post-stop kind that already carries a transcriptPath.
+  const transcriptPath: string | undefined =
+    recording.kind === "none" && recording.hasTranscript
+      ? recording.transcriptPath
+      : recording.kind === "ready"
+        ? recording.transcriptPath
+        : recording.kind === "error" && recording.transcriptPath
+          ? recording.transcriptPath
+          : undefined;
+  const hasTranscript = !!transcriptPath;
+
+  // If the user was looking at the transcript and it disappeared (recording
+  // discarded, or note swapped to one without one), bounce back to edit.
+  useEffect(() => {
+    if (mode === "transcript" && !hasTranscript) setMode("edit");
+  }, [mode, hasTranscript]);
   const showRecordingBanner = mode === "edit" && isOwned;
   const showRestrictedBanner = mode === "edit" && !isOwned && path !== null;
 
@@ -740,8 +740,11 @@ export default function App() {
         <NoteHeader
           title={noteTitle}
           onTitleChange={onTitleChange}
-          mode={mode === "preview" ? "preview" : "edit"}
+          mode={
+            mode === "preview" ? "preview" : mode === "transcript" ? "transcript" : "edit"
+          }
           onModeChange={(m) => tryNavigate(m)}
+          hasTranscript={hasTranscript}
           recording={recording.kind === "recording"}
           canRecord={canRecord}
           onStartRecord={() => void startRecordingForCurrent()}
@@ -788,7 +791,6 @@ export default function App() {
           hasKey={hasKey}
           onStop={() => void onStopRecording()}
           onDiscard={() => void onDiscardRecording()}
-          onReTranscribe={() => void onReTranscribe()}
           onGenerate={onGenerate}
           onDismissError={onDismissError}
         />
@@ -807,6 +809,9 @@ export default function App() {
           />
         )}
         {mode === "preview" && <Preview source={content} theme={theme} />}
+        {mode === "transcript" && transcriptPath && (
+          <TranscriptView path={transcriptPath} />
+        )}
         {mode === "settings" && (
           <Settings
             theme={themeSettings}

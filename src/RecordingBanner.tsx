@@ -30,7 +30,6 @@ type Props = {
   hasKey: boolean;
   onStop: () => void;
   onDiscard: () => void;
-  onReTranscribe: () => void;
   onGenerate: () => void;
   onDismissError: () => void;
 };
@@ -43,7 +42,6 @@ export function RecordingBanner({
   hasKey,
   onStop,
   onDiscard,
-  onReTranscribe,
   onGenerate,
   onDismissError,
 }: Props) {
@@ -59,16 +57,6 @@ export function RecordingBanner({
         <div className="recording-banner-actions">
           <button className="ghost" onClick={onGenerate} disabled={!hasKey}>
             ✨ Generate notes
-          </button>
-          <button
-            className="ghost"
-            onClick={onReTranscribe}
-            title="Re-run Whisper on the existing audio.wav, overwriting transcript.json"
-          >
-            Re-transcribe
-          </button>
-          <button className="ghost" onClick={onDiscard}>
-            Discard recording
           </button>
         </div>
         {!hasKey && (

@@ -1037,6 +1037,49 @@ select.settings-input {
   text-overflow: ellipsis;
 }
 
+/* ---------- Transcript view ------------------------------------------- */
+.transcript-view {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 28px 32px 80px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--fg);
+}
+.transcript-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  margin-bottom: 22px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-muted);
+}
+.transcript-paragraph {
+  margin-bottom: 16px;
+}
+.transcript-speaker {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--fg-muted);
+  margin-bottom: 4px;
+}
+.transcript-paragraph p {
+  margin: 0;
+}
+.transcript-status {
+  padding: 28px 32px;
+  font-size: 13px;
+  color: var(--fg-muted);
+  text-align: center;
+}
+.transcript-status.transcript-error {
+  color: #b23a1a;
+}
+
 /* ---------- Note page header (replaces .tabbar) ------------------------- */
 /* Scoped palette so the redesigned header keeps its warm cream look       */
 /* regardless of the active editor theme. Dark-theme parity is a follow-up. */

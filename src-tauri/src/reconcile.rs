@@ -48,15 +48,12 @@ the raw inputs:
 
 ## Notes
 {verbatim user hand-notes — preserve formatting, headings, lists}
-
----
-
-## Transcript
-{full transcript text}
 ```
 
-The four reconciled sections at the top are *your* synthesis. Everything below \
-the first `---` is reference material — preserve it verbatim.
+The four reconciled sections at the top are *your* synthesis. The `## Notes` \
+block below the divider is reference material — preserve it verbatim. The raw \
+transcript is stored separately by the app; **do not** include a `## Transcript` \
+section, the transcript text, or any verbatim quotes longer than a phrase.
 
 ## Reconciliation rules
 
@@ -67,7 +64,9 @@ is broader but noisier.
 exact decisions, action item owners, deadlines, technical specifics.
 - **Preserve the user's notes verbatim** under `## Notes` — do not edit, \
 reformat, or 'improve' them. They go in as-is.
-- **Preserve the transcript verbatim** under `## Transcript`.
+- **Do NOT echo the transcript** into the document. The user has it stored \
+separately and can view it on demand. Distill it into the four reconciled \
+sections; never paste it.
 - **If the user's notes are empty**, produce the four sections from the \
 transcript alone. Skip the `## Notes` section content but keep the heading and \
 write `_(no hand-notes were taken)_`.
@@ -157,12 +156,6 @@ Sprint review
 - Charlie burned the build twice
 - Need to lock the API contract this week
 - Sarah taking SDK pass
-
----
-
-## Transcript
-
-{transcript verbatim}
 ```
 
 ### Example 2 — empty hand-notes, transcript-only
@@ -202,20 +195,15 @@ enough to outweigh the activation lift?
 ## Notes
 
 _(no hand-notes were taken)_
-
----
-
-## Transcript
-
-{transcript verbatim}
 ```
 
 ## Final reminder
 
 Produce the entire output: `# {title}` line, then four `##` reconciled \
 sections, then `---`, then `## Notes` with the user's notes verbatim (or the \
-empty-notes placeholder), then `---`, then `## Transcript` with the transcript \
-verbatim. No preamble, no code fences around the whole document, no commentary.";
+empty-notes placeholder). Stop there. Never emit a `## Transcript` section \
+and never paste the transcript text into the document. No preamble, no code \
+fences around the whole document, no commentary.";
 
 /// Format the transcript for the reconcile user message. When any segment
 /// carries a speaker label, render one line per segment as `Speaker N: text`

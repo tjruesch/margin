@@ -6,6 +6,7 @@ import {
   IconCopy,
   IconEdit,
   IconEye,
+  IconFileText,
   IconFolder,
   IconHome,
   IconLink,
@@ -17,14 +18,18 @@ import {
   IconTrash,
 } from "./icons";
 
+export type ViewMode = "edit" | "preview" | "transcript";
+
 type Props = {
   /** Derived from the markdown body's first H1; falls back to filename. */
   title: string;
   /** Called when the user edits the title. Caller rewrites the H1 line. */
   onTitleChange: (next: string) => void;
-  /** "edit" | "preview" */
-  mode: "edit" | "preview";
-  onModeChange: (next: "edit" | "preview") => void;
+  mode: ViewMode;
+  onModeChange: (next: ViewMode) => void;
+  /** Whether a transcript exists for the active note — gates the third
+   *  segment in the view-mode toggle. */
+  hasTranscript: boolean;
   /** Whether a recording is currently active (mic capture running). */
   recording: boolean;
   /** True iff Record can be started right now (owned note + idle state). */
@@ -45,6 +50,7 @@ export function NoteHeader({
   canRecord,
   onStartRecord,
   onStopRecord,
+  hasTranscript,
   modifiedMs,
   onBack,
 }: Props) {
@@ -126,7 +132,11 @@ export function NoteHeader({
             <IconPlus size={12} sw={1.8} />
           </button>
         </div>
-        <ViewModeToggle mode={mode} onChange={onModeChange} />
+        <ViewModeToggle
+          mode={mode}
+          onChange={onModeChange}
+          hasTranscript={hasTranscript}
+        />
       </div>
     </header>
   );
@@ -135,14 +145,23 @@ export function NoteHeader({
 function ViewModeToggle({
   mode,
   onChange,
+  hasTranscript,
 }: {
-  mode: "edit" | "preview";
-  onChange: (m: "edit" | "preview") => void;
+  mode: ViewMode;
+  onChange: (m: ViewMode) => void;
+  hasTranscript: boolean;
 }) {
-  const opts: { id: "edit" | "preview"; label: string; icon: React.ReactNode }[] = [
+  const opts: { id: ViewMode; label: string; icon: React.ReactNode }[] = [
     { id: "edit", label: "Edit", icon: <IconEdit size={13} sw={1.7} /> },
     { id: "preview", label: "Preview", icon: <IconEye size={13} sw={1.7} /> },
   ];
+  if (hasTranscript) {
+    opts.push({
+      id: "transcript",
+      label: "Transcript",
+      icon: <IconFileText size={13} sw={1.7} />,
+    });
+  }
   return (
     <div className="nh-segmented" role="tablist" aria-label="View mode">
       {opts.map((o) => (
