@@ -39,7 +39,7 @@ import {
   type ThemeSettings,
 } from "./settingsStore";
 import { applyTheme, getTheme, DEFAULT_LIGHT_THEME_ID, DEFAULT_DARK_THEME_ID } from "./themes";
-import { NoteHeader, type EditorSettings } from "./NoteHeader";
+import { NoteHeader } from "./NoteHeader";
 import "./App.css";
 
 type Mode = "home" | "edit" | "preview" | "settings";
@@ -702,20 +702,14 @@ export default function App() {
     setContent((cur) => rewriteH1(cur, next));
   }, []);
 
-  const editorSettings = useMemo<EditorSettings>(
-    () => ({
-      indent: useTabs ? "Tabs" : "Spaces",
-      width: (String(tabSize) as "2" | "4" | "8"),
-      wrap: softWrap ? "Soft wrap" : "No wrap",
-    }),
-    [useTabs, tabSize, softWrap],
+  const onEditorPrefsChange = useCallback(
+    (next: { tabSize: number; useTabs: boolean; softWrap: boolean }) => {
+      setTabSize(next.tabSize);
+      setUseTabs(next.useTabs);
+      setSoftWrap(next.softWrap);
+    },
+    [],
   );
-
-  const onEditorSettingsChange = useCallback((next: EditorSettings) => {
-    setUseTabs(next.indent === "Tabs");
-    setTabSize(Number(next.width));
-    setSoftWrap(next.wrap === "Soft wrap");
-  }, []);
 
   const canRecord = isOwned && recording.kind === "none";
 
@@ -732,8 +726,6 @@ export default function App() {
           canRecord={canRecord}
           onStartRecord={() => void startRecordingForCurrent()}
           onStopRecord={() => void onStopRecording()}
-          settings={editorSettings}
-          onSettingsChange={onEditorSettingsChange}
           modifiedMs={modifiedMs}
           onBack={() => tryNavigate("home")}
         />
@@ -798,8 +790,10 @@ export default function App() {
           <Settings
             theme={themeSettings}
             ai={aiSettings}
+            editor={{ tabSize, useTabs, softWrap }}
             onThemeChange={onThemeChange}
             onAIChange={onAIChange}
+            onEditorChange={onEditorPrefsChange}
           />
         )}
         {mode === "home" && (

@@ -1077,21 +1077,8 @@ select.settings-input {
   flex: 1;
 }
 
-.note-header-divider {
-  width: 1px;
-  height: 18px;
-  background: var(--nh-line);
-  margin: 0 4px;
-}
-
-/* Breadcrumb */
-.nh-breadcrumb {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  min-width: 0;
-}
-.nh-breadcrumb-back {
+/* Back to all notes (small, icon-only) */
+.nh-back {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1102,28 +1089,10 @@ select.settings-input {
   border: none;
   cursor: pointer;
   color: var(--nh-ink-3);
-  font: inherit;
-  font-size: 13px;
-  font-weight: 500;
   transition: background 120ms ease;
 }
-.nh-breadcrumb-back:hover {
+.nh-back:hover {
   background: rgba(0, 0, 0, 0.05);
-}
-.nh-breadcrumb-sep {
-  color: var(--nh-ink-4);
-  font-size: 13px;
-  padding: 0 2px;
-}
-.nh-breadcrumb-title {
-  color: var(--nh-ink-3);
-  font-size: 13px;
-  font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 240px;
-  padding: 0 4px;
 }
 
 /* Segmented Edit/Preview toggle */
@@ -1275,50 +1244,9 @@ select.settings-input {
   from { opacity: 0; transform: translateY(-4px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
-.nh-settings-popover {
-  width: 240px;
-  padding: 12px;
-}
 .nh-more-popover {
   width: 220px;
   padding: 5px;
-}
-
-/* Settings popover rows */
-.nh-settings-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 6px 4px;
-}
-.nh-settings-row-label {
-  font-size: 12.5px;
-  color: var(--nh-ink-3);
-  font-weight: 500;
-}
-.nh-settings-seg {
-  display: inline-flex;
-  gap: 2px;
-  background: rgba(0, 0, 0, 0.05);
-  padding: 2px;
-  border-radius: 7px;
-}
-.nh-settings-seg-btn {
-  font: inherit;
-  font-size: 11.5px;
-  font-weight: 500;
-  padding: 4px 9px;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--nh-ink-3);
-  border: none;
-  cursor: pointer;
-}
-.nh-settings-seg-btn.active {
-  background: var(--nh-bg-elev);
-  color: var(--nh-ink);
-  font-weight: 600;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 0 0 0.5px rgba(0, 0, 0, 0.08);
 }
 
 /* More menu items */
@@ -1356,11 +1284,11 @@ select.settings-input {
 }
 .nh-title {
   font-family: "Fraunces", Georgia, serif;
-  font-size: 38px;
-  font-weight: 500;
-  font-variation-settings: "opsz" 144;
-  letter-spacing: -0.015em;
-  line-height: 1.1;
+  font-size: 22px;
+  font-weight: 600;
+  font-variation-settings: "opsz" 36;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
   color: var(--nh-ink);
   margin: 0 0 0 -6px;
   padding: 2px 6px;
@@ -1381,13 +1309,20 @@ input.nh-title {
   box-shadow: inset 0 0 0 1px var(--nh-accent-border);
 }
 
-/* Chip row */
+/* Row 2 bottom — chips on the left, view-mode toggle on the right */
+.nh-row2-bottom {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 8px;
+}
 .nh-chips {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  margin-top: 10px;
+  min-width: 0;
 }
 .nh-chip {
   display: inline-flex;

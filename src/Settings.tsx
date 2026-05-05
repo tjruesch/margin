@@ -16,11 +16,19 @@ import { THEMES, darkThemes, getTheme, lightThemes, type Theme } from "./themes"
 
 type Section = "appearance" | "ai" | "editor" | "shortcuts";
 
+export type EditorPrefs = {
+  tabSize: number;
+  useTabs: boolean;
+  softWrap: boolean;
+};
+
 type SettingsProps = {
   theme: ThemeSettings;
   ai: AISettings;
+  editor: EditorPrefs;
   onThemeChange: (next: ThemeSettings) => void;
   onAIChange: (next: AISettings) => void;
+  onEditorChange: (next: EditorPrefs) => void;
 };
 
 const SECTIONS: { id: Section; label: string }[] = [
@@ -30,12 +38,21 @@ const SECTIONS: { id: Section; label: string }[] = [
   { id: "shortcuts", label: "Shortcuts" },
 ];
 
-export function Settings({ theme, ai, onThemeChange, onAIChange }: SettingsProps) {
+export function Settings({
+  theme,
+  ai,
+  editor,
+  onThemeChange,
+  onAIChange,
+  onEditorChange,
+}: SettingsProps) {
   const [active, setActive] = useState<Section>("appearance");
 
   const updateTheme = (patch: Partial<ThemeSettings>) =>
     onThemeChange({ ...theme, ...patch });
   const updateAI = (patch: Partial<AISettings>) => onAIChange({ ...ai, ...patch });
+  const updateEditor = (patch: Partial<EditorPrefs>) =>
+    onEditorChange({ ...editor, ...patch });
 
   return (
     <div className="settings">
@@ -109,7 +126,56 @@ export function Settings({ theme, ai, onThemeChange, onAIChange }: SettingsProps
         {active === "editor" && (
           <section className="settings-section">
             <h2>Editor</h2>
-            <p className="settings-placeholder">Editor preferences coming soon.</p>
+
+            <div className="settings-row settings-row--inline">
+              <div className="settings-row-label">Indent</div>
+              <div className="settings-row-control">
+                <select
+                  className="settings-input"
+                  value={editor.useTabs ? "tabs" : "spaces"}
+                  onChange={(e) => updateEditor({ useTabs: e.target.value === "tabs" })}
+                >
+                  <option value="spaces">Spaces</option>
+                  <option value="tabs">Tabs</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="settings-row settings-row--inline">
+              <div className="settings-row-label">Width</div>
+              <div className="settings-row-control">
+                <select
+                  className="settings-input"
+                  value={String(editor.tabSize)}
+                  onChange={(e) => updateEditor({ tabSize: Number(e.target.value) })}
+                >
+                  <option value="2">2</option>
+                  <option value="4">4</option>
+                  <option value="8">8</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="settings-row settings-row--inline">
+              <div className="settings-row-label">Wrap lines</div>
+              <div className="settings-row-control">
+                <label className="toggle">
+                  <input
+                    type="checkbox"
+                    checked={editor.softWrap}
+                    onChange={(e) => updateEditor({ softWrap: e.target.checked })}
+                  />
+                  <span className="toggle-track" aria-hidden="true">
+                    <span className="toggle-thumb" />
+                  </span>
+                </label>
+                <span className="settings-hint">
+                  {editor.softWrap
+                    ? "Long lines wrap to fit the editor width."
+                    : "Long lines extend horizontally and the editor scrolls."}
+                </span>
+              </div>
+            </div>
           </section>
         )}
 

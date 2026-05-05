@@ -11,21 +11,11 @@ import {
   IconLink,
   IconMore,
   IconPlus,
-  IconSettings,
   IconShare,
   IconSparkle,
   IconStar,
   IconTrash,
 } from "./icons";
-
-export type EditorSettings = {
-  /** "tabs" | "spaces" — derived from useTabs in App.tsx */
-  indent: "Spaces" | "Tabs";
-  /** Tab width — "2" | "4" | "8" */
-  width: "2" | "4" | "8";
-  /** "Soft wrap" | "No wrap" */
-  wrap: "Soft wrap" | "No wrap";
-};
 
 type Props = {
   /** Derived from the markdown body's first H1; falls back to filename. */
@@ -41,9 +31,6 @@ type Props = {
   canRecord: boolean;
   onStartRecord: () => void;
   onStopRecord: () => void;
-  /** Editor settings (indent/width/wrap). */
-  settings: EditorSettings;
-  onSettingsChange: (next: EditorSettings) => void;
   /** Created/modified timestamp for the date chip. */
   modifiedMs: number | null;
   onBack: () => void;
@@ -58,56 +45,37 @@ export function NoteHeader({
   canRecord,
   onStartRecord,
   onStopRecord,
-  settings,
-  onSettingsChange,
   modifiedMs,
   onBack,
 }: Props) {
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
 
-  // Close popovers on any outside click.
   useEffect(() => {
-    if (!settingsOpen && !moreOpen) return;
-    const close = () => {
-      setSettingsOpen(false);
-      setMoreOpen(false);
-    };
+    if (!moreOpen) return;
+    const close = () => setMoreOpen(false);
     window.addEventListener("mousedown", close);
     return () => window.removeEventListener("mousedown", close);
-  }, [settingsOpen, moreOpen]);
+  }, [moreOpen]);
 
   return (
     <header className="note-header">
       <div className="note-header-row1" data-tauri-drag-region>
-        <Breadcrumb noteTitle={title} onBack={onBack} />
+        <button
+          type="button"
+          className="nh-back"
+          title="Back to all notes"
+          aria-label="Back to all notes"
+          onClick={onBack}
+        >
+          <IconChevLeft size={14} sw={1.8} />
+          <IconHome size={14} sw={1.6} />
+        </button>
         <div className="note-header-spacer" />
-        <ViewModeToggle mode={mode} onChange={onModeChange} />
-        <div className="note-header-divider" />
         <RecordButton
           recording={recording}
           disabled={!canRecord && !recording}
           onClick={recording ? onStopRecord : onStartRecord}
         />
-
-        <div className="nh-popover-anchor">
-          <button
-            type="button"
-            className={"nh-icon-btn" + (settingsOpen ? " active" : "")}
-            aria-label="Editor settings"
-            title="Editor settings"
-            onClick={(e) => {
-              e.stopPropagation();
-              setSettingsOpen((v) => !v);
-              setMoreOpen(false);
-            }}
-          >
-            <IconSettings size={15} sw={1.7} />
-          </button>
-          {settingsOpen && (
-            <SettingsPopover settings={settings} onChange={onSettingsChange} />
-          )}
-        </div>
 
         <ShareCluster
           onShare={() => stub("Share", 15)}
@@ -123,7 +91,6 @@ export function NoteHeader({
             onClick={(e) => {
               e.stopPropagation();
               setMoreOpen((v) => !v);
-              setSettingsOpen(false);
             }}
           >
             <IconMore size={16} sw={1.8} />
@@ -134,52 +101,37 @@ export function NoteHeader({
 
       <div className="note-header-row2">
         <EditableTitle value={title} onChange={onTitleChange} />
-        <div className="nh-chips">
-          <button
-            type="button"
-            className="nh-chip"
-            title="Folders coming soon — see issue #13"
-            onClick={() => stub("Folder", 13)}
-          >
-            <IconFolder size={12} sw={1.7} />
-            <span>Add to folder</span>
-          </button>
-          {modifiedMs !== null && (
-            <span className="nh-chip" title="Modified">
-              <IconCalendar size={12} sw={1.7} />
-              <span>{formatModifiedAt(modifiedMs)}</span>
-            </span>
-          )}
-          <button
-            type="button"
-            className="nh-chip-add"
-            title="Tags coming soon — see issue #14"
-            aria-label="Add tag"
-            onClick={() => stub("Tag", 14)}
-          >
-            <IconPlus size={12} sw={1.8} />
-          </button>
+        <div className="nh-row2-bottom">
+          <div className="nh-chips">
+            <button
+              type="button"
+              className="nh-chip"
+              title="Folders coming soon — see issue #13"
+              onClick={() => stub("Folder", 13)}
+            >
+              <IconFolder size={12} sw={1.7} />
+              <span>Add to folder</span>
+            </button>
+            {modifiedMs !== null && (
+              <span className="nh-chip" title="Modified">
+                <IconCalendar size={12} sw={1.7} />
+                <span>{formatModifiedAt(modifiedMs)}</span>
+              </span>
+            )}
+            <button
+              type="button"
+              className="nh-chip-add"
+              title="Tags coming soon — see issue #14"
+              aria-label="Add tag"
+              onClick={() => stub("Tag", 14)}
+            >
+              <IconPlus size={12} sw={1.8} />
+            </button>
+          </div>
+          <ViewModeToggle mode={mode} onChange={onModeChange} />
         </div>
       </div>
     </header>
-  );
-}
-
-function Breadcrumb({ noteTitle, onBack }: { noteTitle: string; onBack: () => void }) {
-  return (
-    <div className="nh-breadcrumb">
-      <button
-        type="button"
-        className="nh-breadcrumb-back"
-        title="Back to all notes"
-        onClick={onBack}
-      >
-        <IconChevLeft size={14} sw={1.8} />
-        <IconHome size={14} sw={1.6} />
-      </button>
-      <span className="nh-breadcrumb-sep">/</span>
-      <span className="nh-breadcrumb-title">{noteTitle}</span>
-    </div>
   );
 }
 
@@ -232,53 +184,6 @@ function RecordButton({
       <span className="nh-record-dot" />
       {recording ? "Recording…" : "Record"}
     </button>
-  );
-}
-
-function SettingsPopover({
-  settings,
-  onChange,
-}: {
-  settings: EditorSettings;
-  onChange: (next: EditorSettings) => void;
-}) {
-  const rows: {
-    key: keyof EditorSettings;
-    label: string;
-    opts: readonly string[];
-  }[] = [
-    { key: "indent", label: "Indent", opts: ["Spaces", "Tabs"] },
-    { key: "width", label: "Width", opts: ["2", "4", "8"] },
-    { key: "wrap", label: "Wrap", opts: ["Soft wrap", "No wrap"] },
-  ];
-  return (
-    <div
-      className="nh-popover nh-settings-popover"
-      onMouseDown={(e) => e.stopPropagation()}
-    >
-      {rows.map((row) => (
-        <div key={row.key} className="nh-settings-row">
-          <span className="nh-settings-row-label">{row.label}</span>
-          <div className="nh-settings-seg">
-            {row.opts.map((o) => {
-              const on = settings[row.key] === o;
-              return (
-                <button
-                  key={o}
-                  type="button"
-                  className={"nh-settings-seg-btn" + (on ? " active" : "")}
-                  onClick={() =>
-                    onChange({ ...settings, [row.key]: o } as EditorSettings)
-                  }
-                >
-                  {o}
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      ))}
-    </div>
   );
 }
 
