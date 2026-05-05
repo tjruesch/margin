@@ -8,6 +8,8 @@ export type NoteRecording =
   | { kind: "recording"; startedAt: number }
   | {
       kind: "transcribing";
+      /** "asr" while Whisper runs, "diar" after Whisper finishes and sherpa is identifying speakers. */
+      phase: "asr" | "diar";
       pct: number;
       modelDl?: { downloaded: number; total: number };
     }
@@ -110,20 +112,27 @@ export function RecordingBanner({
 
   if (state.kind === "transcribing") {
     const pct = Math.min(100, Math.max(0, state.pct));
+    const showProgressBar = !!state.modelDl || state.phase === "asr";
+    let msg: string;
+    if (state.modelDl) {
+      msg = `Downloading model · ${(state.modelDl.downloaded / 1e6).toFixed(1)} / ${(state.modelDl.total / 1e6).toFixed(1)} MB`;
+    } else if (state.phase === "diar") {
+      msg = "Identifying speakers…";
+    } else {
+      msg = `Transcribing… ${pct.toFixed(0)}%`;
+    }
     return (
       <div className="recording-banner recording-banner-busy">
         <div className="recording-spinner" aria-hidden="true" />
-        <span className="recording-banner-msg">
-          {state.modelDl
-            ? `Downloading Whisper model · ${(state.modelDl.downloaded / 1e6).toFixed(1)} / ${(state.modelDl.total / 1e6).toFixed(1)} MB`
-            : `Transcribing… ${pct.toFixed(0)}%`}
-        </span>
-        <div className="recording-progress">
-          <div
-            className="recording-progress-fill"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
+        <span className="recording-banner-msg">{msg}</span>
+        {showProgressBar && (
+          <div className="recording-progress">
+            <div
+              className="recording-progress-fill"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        )}
       </div>
     );
   }

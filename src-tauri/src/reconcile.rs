@@ -217,6 +217,47 @@ sections, then `---`, then `## Notes` with the user's notes verbatim (or the \
 empty-notes placeholder), then `---`, then `## Transcript` with the transcript \
 verbatim. No preamble, no code fences around the whole document, no commentary.";
 
+/// Format the transcript for the reconcile user message. When any segment
+/// carries a speaker label, render one line per segment as `Speaker N: text`
+/// so Claude can attribute statements. Otherwise fall back to the plain
+/// concatenated `full_text` (preserves backwards compat with non-diarized
+/// transcripts already on disk).
+fn format_transcript(t: &Transcript) -> String {
+    let any_labeled = t.segments.iter().any(|s| s.speaker.is_some());
+    if !any_labeled {
+        return t.full_text.trim().to_string();
+    }
+
+    let mut out = String::with_capacity(t.full_text.len() + t.segments.len() * 12);
+    let mut prev_speaker: Option<u32> = None;
+    for seg in &t.segments {
+        let text = seg.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let speaker_label = match seg.speaker {
+            Some(n) => format!("Speaker {n}"),
+            None => "Unknown".to_string(),
+        };
+        // Group consecutive segments by the same speaker into one paragraph
+        // so the transcript reads naturally and Claude doesn't see needless
+        // line-by-line repetition of the speaker tag.
+        if prev_speaker == seg.speaker {
+            out.push(' ');
+            out.push_str(text);
+        } else {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&speaker_label);
+            out.push_str(": ");
+            out.push_str(text);
+            prev_speaker = seg.speaker;
+        }
+    }
+    out
+}
+
 /// Format the user's glossary as a small system-block addendum that nudges
 /// Claude to preserve domain spellings. Returns None for an empty glossary
 /// so the caller can skip pushing the block.
@@ -350,11 +391,12 @@ pub async fn reconcile_notes(
 
     // Hand-notes formatting: pass through as-is. The model is told to keep
     // them verbatim under ## Notes.
+    let transcript_body = format_transcript(&transcript);
     let user_message = format!(
         "Title: {}\n\n## My notes\n\n{}\n\n## Transcript\n\n{}",
         resolved_title,
         hand_notes.trim(),
-        transcript.full_text.trim(),
+        transcript_body.trim(),
     );
 
     let model = model.as_deref().unwrap_or(DEFAULT_MODEL);

@@ -15,6 +15,11 @@ pub struct Segment {
     pub start_ms: u64,
     pub end_ms: u64,
     pub text: String,
+    /// Speaker index from diarization, when available. `None` for transcripts
+    /// produced before diarization shipped, or when diarization fails / yields
+    /// no overlapping span for this segment.
+    #[serde(default)]
+    pub speaker: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -23,6 +28,10 @@ pub struct Transcript {
     pub full_text: String,
     pub language: String,
     pub duration_ms: u64,
+    /// Number of distinct speakers detected by diarization. `None` if
+    /// diarization didn't run.
+    #[serde(default)]
+    pub num_speakers: Option<u32>,
 }
 
 /// Whisper's hard cap is `n_text_ctx / 2 = 224` tokens for `initial_prompt`.
@@ -37,6 +46,7 @@ pub async fn transcribe(
 ) -> Result<Transcript, String> {
     let path = PathBuf::from(audio_path);
     let model_path = ensure_model(&app).await?;
+    let diar_paths = crate::diarize::ensure_diarization_models(&app).await?;
     let app2 = app.clone();
     let initial_prompt = build_initial_prompt(&glossary);
 
@@ -99,14 +109,33 @@ pub async fn transcribe(
                 start_ms,
                 end_ms,
                 text,
+                speaker: None,
             });
         }
+
+        // Diarization phase: run sherpa-onnx on the same PCM buffer Whisper
+        // just consumed. The UI swaps the "Transcribing…" label to
+        // "Identifying speakers…" when this fires.
+        let _ = app2.emit("transcribe-phase", "diarizing");
+        let num_speakers = match crate::diarize::diarize(&diar_paths, &pcm_f32) {
+            Ok(spans) => {
+                crate::diarize::assign_speakers(&mut segments, &spans);
+                Some(crate::diarize::count_unique_speakers(&segments))
+            }
+            Err(e) => {
+                // Diarization failure shouldn't kill the transcript — the
+                // Whisper output is still useful without speaker labels.
+                eprintln!("[diarize] failed, continuing without speaker labels: {e}");
+                None
+            }
+        };
 
         let transcript = Transcript {
             segments,
             full_text,
             language: "en".into(),
             duration_ms,
+            num_speakers,
         };
 
         // Sidecar JSON for re-summarization without re-transcribing.

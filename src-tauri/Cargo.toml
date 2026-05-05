@@ -39,4 +39,5 @@ tokio = { version = "1", features = ["fs", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 screencapturekit = { version = "1.5", features = ["macos_14_0"] }
+sherpa-onnx = "1.13"
 

@@ -1,4 +1,5 @@
 mod audio;
+mod diarize;
 mod keychain;
 mod notes;
 mod paths;

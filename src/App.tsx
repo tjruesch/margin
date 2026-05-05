@@ -252,7 +252,7 @@ export default function App() {
     if (recordingRef.current.kind !== "recording") return;
     try {
       const wavPath = await stopMeetingRecording();
-      setRecording({ kind: "transcribing", pct: 0 });
+      setRecording({ kind: "transcribing", phase: "asr", pct: 0 });
       void runTranscribe(wavPath);
     } catch (err) {
       setRecording({
@@ -353,12 +353,20 @@ export default function App() {
         );
       },
     );
+    const unPhase = listen<string>("transcribe-phase", (e) => {
+      if (e.payload === "diarizing") {
+        setRecording((s) =>
+          s.kind === "transcribing" ? { ...s, phase: "diar", modelDl: undefined } : s,
+        );
+      }
+    });
     const unSys = listen<string>("sysaudio-unavailable", () => {
       setSysAvailable(false);
     });
     return () => {
       unTr.then((u) => u());
       unDl.then((u) => u());
+      unPhase.then((u) => u());
       unSys.then((u) => u());
     };
   }, []);

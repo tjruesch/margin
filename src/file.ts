@@ -86,12 +86,18 @@ export async function discardRecording(notePath: string): Promise<void> {
 
 // --- Recording + transcription -------------------------------------------
 
-export type Segment = { start_ms: number; end_ms: number; text: string };
+export type Segment = {
+  start_ms: number;
+  end_ms: number;
+  text: string;
+  speaker?: number | null;
+};
 export type Transcript = {
   segments: Segment[];
   full_text: string;
   language: string;
   duration_ms: number;
+  num_speakers?: number | null;
 };
 
 export async function startMeetingRecording(
