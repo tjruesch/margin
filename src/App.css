@@ -1061,7 +1061,7 @@ select.settings-input {
   z-index: 10;
   background: var(--nh-bg);
   border-bottom: 0.5px solid var(--nh-line);
-  padding: 14px 22px 18px;
+  padding: 12px 22px 14px;
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   color: var(--nh-ink);
 }
@@ -1071,10 +1071,6 @@ select.settings-input {
   align-items: center;
   gap: 10px;
   min-height: 32px;
-}
-
-.note-header-spacer {
-  flex: 1;
 }
 
 /* Back to all notes (small, icon-only) */
@@ -1278,27 +1274,28 @@ select.settings-input {
   margin: 4px 6px;
 }
 
-/* Title row */
-.note-header-row2 {
-  margin-top: 14px;
-}
+/* Inline title in row 1 — fills the space between the back button and the
+   action cluster. Editable in place. */
 .nh-title {
   font-family: "Fraunces", Georgia, serif;
-  font-size: 22px;
+  font-size: 18px;
   font-weight: 600;
   font-variation-settings: "opsz" 36;
   letter-spacing: -0.01em;
-  line-height: 1.2;
+  line-height: 1.3;
   color: var(--nh-ink);
-  margin: 0 0 0 -6px;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
   padding: 2px 6px;
   border: none;
   outline: none;
   background: transparent;
   border-radius: 6px;
   cursor: text;
-  width: 100%;
-  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   transition: background 120ms ease;
 }
 .nh-title:hover {
@@ -1307,10 +1304,15 @@ select.settings-input {
 input.nh-title {
   background: rgba(0, 0, 0, 0.03);
   box-shadow: inset 0 0 0 1px var(--nh-accent-border);
+  /* the input element ignores text-overflow — leave whitespace default so
+     editing long titles can scroll horizontally inside the field */
+  white-space: normal;
+  text-overflow: clip;
+  overflow: visible;
 }
 
-/* Row 2 bottom — chips on the left, view-mode toggle on the right */
-.nh-row2-bottom {
+/* Row 2 — chips on the left, view-mode toggle on the right */
+.note-header-row2 {
   display: flex;
   align-items: center;
   justify-content: space-between;

@@ -70,7 +70,7 @@ export function NoteHeader({
           <IconChevLeft size={14} sw={1.8} />
           <IconHome size={14} sw={1.6} />
         </button>
-        <div className="note-header-spacer" />
+        <EditableTitle value={title} onChange={onTitleChange} />
         <RecordButton
           recording={recording}
           disabled={!canRecord && !recording}
@@ -100,36 +100,33 @@ export function NoteHeader({
       </div>
 
       <div className="note-header-row2">
-        <EditableTitle value={title} onChange={onTitleChange} />
-        <div className="nh-row2-bottom">
-          <div className="nh-chips">
-            <button
-              type="button"
-              className="nh-chip"
-              title="Folders coming soon — see issue #13"
-              onClick={() => stub("Folder", 13)}
-            >
-              <IconFolder size={12} sw={1.7} />
-              <span>Add to folder</span>
-            </button>
-            {modifiedMs !== null && (
-              <span className="nh-chip" title="Modified">
-                <IconCalendar size={12} sw={1.7} />
-                <span>{formatModifiedAt(modifiedMs)}</span>
-              </span>
-            )}
-            <button
-              type="button"
-              className="nh-chip-add"
-              title="Tags coming soon — see issue #14"
-              aria-label="Add tag"
-              onClick={() => stub("Tag", 14)}
-            >
-              <IconPlus size={12} sw={1.8} />
-            </button>
-          </div>
-          <ViewModeToggle mode={mode} onChange={onModeChange} />
+        <div className="nh-chips">
+          <button
+            type="button"
+            className="nh-chip"
+            title="Folders coming soon — see issue #13"
+            onClick={() => stub("Folder", 13)}
+          >
+            <IconFolder size={12} sw={1.7} />
+            <span>Add to folder</span>
+          </button>
+          {modifiedMs !== null && (
+            <span className="nh-chip" title="Modified">
+              <IconCalendar size={12} sw={1.7} />
+              <span>{formatModifiedAt(modifiedMs)}</span>
+            </span>
+          )}
+          <button
+            type="button"
+            className="nh-chip-add"
+            title="Tags coming soon — see issue #14"
+            aria-label="Add tag"
+            onClick={() => stub("Tag", 14)}
+          >
+            <IconPlus size={12} sw={1.8} />
+          </button>
         </div>
+        <ViewModeToggle mode={mode} onChange={onModeChange} />
       </div>
     </header>
   );
