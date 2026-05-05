@@ -95,15 +95,18 @@ pub async fn transcribe(
 
         // Run Whisper. Language is auto-detected per recording — passing
         // None tells whisper.cpp to run its built-in language ID on the
-        // first 30s window. `no_context` prevents prior-window text from
-        // bleeding into subsequent windows; without this, a degraded
-        // window's output can self-reinforce into a phrase loop that
-        // continues for the rest of the meeting (observed catastrophic
-        // failure on a 38-minute German recording with the old base.en
-        // pipeline forcing English).
+        // first 30s window and then transcribe with the detected
+        // language's decoder head. Do NOT also set `detect_language: true`
+        // — that's a detection-only mode in whisper.cpp that returns
+        // before producing any segments. (Hit on a German meeting that
+        // came back with language="de" but n_segments=0.)
+        // `no_context` prevents prior-window text from bleeding into
+        // subsequent windows; without this, a degraded window's output
+        // can self-reinforce into a phrase loop that continues for the
+        // rest of the meeting (observed catastrophic failure on the same
+        // recording with the old base.en pipeline forcing English).
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_language(None);
-        params.set_detect_language(true);
         params.set_no_context(true);
         params.set_translate(false);
         params.set_print_progress(false);
