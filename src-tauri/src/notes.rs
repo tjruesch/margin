@@ -35,6 +35,7 @@ pub struct NoteListItem {
     pub title: String,
     pub modified_ms: i64,
     pub duration_ms: Option<u64>,
+    pub preview: String,
 }
 
 fn new_note_ref(id: String, note_path: PathBuf) -> NoteRef {
@@ -181,11 +182,14 @@ pub fn list_notes() -> Result<Vec<NoteListItem>, String> {
             None
         };
 
+        let preview = extract_preview(&body);
+
         out.push(NoteListItem {
             note_path: note_path.to_string_lossy().into_owned(),
             title,
             modified_ms,
             duration_ms,
+            preview,
         });
     }
 
@@ -211,6 +215,196 @@ pub fn note_meta(note_path: String) -> Result<NoteMeta, String> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     Ok(NoteMeta { modified_ms })
+}
+
+const PREVIEW_MAX_CHARS: usize = 160;
+
+/// Best-effort plaintext snippet of the first non-empty paragraph of a
+/// markdown body. Skips headings and code-fence delimiters; strips
+/// list/quote markers and inline emphasis/links so the result reads as
+/// prose. Truncates to ~160 chars at a word boundary with `…`.
+fn extract_preview(body: &str) -> String {
+    let mut paragraph: Vec<String> = Vec::new();
+    let mut in_code_fence = false;
+    let mut started = false;
+
+    for raw in body.lines() {
+        let line = raw.trim();
+
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+        if line.is_empty() {
+            if started {
+                break;
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            // Skip ATX headings of any level (#, ##, …).
+            continue;
+        }
+
+        let cleaned = strip_inline_markdown(strip_block_markers(line));
+        if cleaned.is_empty() {
+            continue;
+        }
+        paragraph.push(cleaned);
+        started = true;
+    }
+
+    let joined = collapse_whitespace(&paragraph.join(" "));
+    truncate_with_ellipsis(&joined, PREVIEW_MAX_CHARS)
+}
+
+/// Trim leading list / blockquote / numbered-list markers from a line.
+fn strip_block_markers(line: &str) -> &str {
+    let l = line.trim_start();
+    // Blockquote: `> `, possibly nested `> > `.
+    let mut rest = l;
+    while let Some(next) = rest.strip_prefix("> ").or_else(|| rest.strip_prefix(">")) {
+        rest = next.trim_start();
+    }
+    // Bullet list: `- `, `* `, `+ `.
+    if let Some(next) = rest
+        .strip_prefix("- ")
+        .or_else(|| rest.strip_prefix("* "))
+        .or_else(|| rest.strip_prefix("+ "))
+    {
+        return next;
+    }
+    // Numbered list: `1. `, `12. `, etc.
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i > 0 && i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1] == b' ' {
+        return &rest[i + 2..];
+    }
+    rest
+}
+
+/// Remove inline markdown decorations: emphasis markers (`*`, `_`),
+/// inline code backticks, and link/image syntax (keeping the visible
+/// text only). Intentionally simple — this isn't a full parser.
+fn strip_inline_markdown(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'*' | b'_' | b'`' => {
+                // Skip the marker; surrounding spaces handle word boundaries.
+                i += 1;
+            }
+            b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'[' => {
+                // Image: `![alt](url)` → drop entirely.
+                i += 2;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // consume ']'
+                }
+                if i < bytes.len() && bytes[i] == b'(' {
+                    while i < bytes.len() && bytes[i] != b')' {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+            }
+            b'[' => {
+                // Link: `[text](url)` → keep text only.
+                i += 1;
+                let text_start = i;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                let text_end = i;
+                if i < bytes.len() {
+                    i += 1; // consume ']'
+                }
+                if i < bytes.len() && bytes[i] == b'(' {
+                    while i < bytes.len() && bytes[i] != b')' {
+                        i += 1;
+                    }
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                out.push_str(&input[text_start..text_end]);
+            }
+            _ => {
+                // UTF-8 safe: copy through using char iteration when
+                // we hit a non-ASCII byte. The simple cases above are
+                // all ASCII so this branch is the fallback.
+                let ch_start = i;
+                let ch_len = utf8_char_len(b);
+                let ch_end = (i + ch_len).min(bytes.len());
+                out.push_str(&input[ch_start..ch_end]);
+                i = ch_end;
+            }
+        }
+    }
+    out
+}
+
+fn utf8_char_len(first: u8) -> usize {
+    match first {
+        0..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        _ => 4,
+    }
+}
+
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    // Find the byte index of the (max_chars+1)th char; back up to the
+    // last word boundary at or before that point.
+    let cut_byte = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    let prefix = &s[..cut_byte];
+    let trimmed = match prefix.rfind(|c: char| c.is_whitespace()) {
+        Some(idx) if idx > 0 => &prefix[..idx],
+        _ => prefix,
+    };
+    let mut out = trimmed.trim_end().to_string();
+    out.push('…');
+    out
 }
 
 /// Remove `audio.wav` and `transcript.json` from the bundle. Leaves

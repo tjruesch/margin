@@ -58,6 +58,7 @@ export type NoteListItem = {
   title: string;
   modified_ms: number;
   duration_ms: number | null;
+  preview: string;
 };
 
 export async function notesDir(): Promise<string> {

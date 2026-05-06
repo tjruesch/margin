@@ -567,7 +567,7 @@ function NoteRow({
           )}
         </div>
         <div className="home-note-preview">
-          {isMeeting ? "Recorded meeting" : "Note"}
+          {item.preview || (isMeeting ? "Recorded meeting" : "Note")}
         </div>
       </div>
       <div className="home-note-meta">
