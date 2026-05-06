@@ -34,6 +34,7 @@ import {
   setArchived as setArchivedFile,
   setFavorite as setFavoriteFile,
   setNoteTags,
+  shareNote,
   startMeetingRecording,
   stopMeetingRecording,
   transcribe,
@@ -1070,6 +1071,20 @@ export default function App() {
     [isOwnedPath, refreshNotes, loadFile],
   );
 
+  /** Open the macOS share sheet for the active note. The Rust side
+   *  writes a renamed temp `<title>.md` (frontmatter stripped) and
+   *  hands the file URL to NSSharingServicePicker. */
+  const onShareNote = useCallback(async () => {
+    const target = pathRef.current;
+    if (!target || !isOwnedPath(target)) return;
+    try {
+      await shareNote(target);
+    } catch (err) {
+      console.error("shareNote failed:", err);
+      alert("Could not open the share sheet. See console for details.");
+    }
+  }, [isOwnedPath]);
+
   // Refresh API-key status whenever settings change (or banner re-enters idle).
   useEffect(() => {
     if (mode === "settings" || recording.kind === "none" || recording.kind === "ready") {
@@ -1182,6 +1197,11 @@ export default function App() {
           onDuplicate={
             isOwned && recording.kind === "none"
               ? () => void onDuplicateNote()
+              : undefined
+          }
+          onShare={
+            isOwned && recording.kind === "none"
+              ? () => void onShareNote()
               : undefined
           }
         />

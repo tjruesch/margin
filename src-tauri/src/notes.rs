@@ -147,7 +147,7 @@ pub fn is_owned_note(path: String) -> bool {
     is_owned_note_in(Path::new(&path), &paths::notes_dir())
 }
 
-fn is_owned_note_in(path: &Path, notes_dir: &Path) -> bool {
+pub(crate) fn is_owned_note_in(path: &Path, notes_dir: &Path) -> bool {
     if path.file_name().and_then(|s| s.to_str()) != Some(NOTE_FILENAME) {
         return false;
     }

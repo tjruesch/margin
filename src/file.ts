@@ -108,6 +108,10 @@ export async function setFavorite(notePath: string, favorite: boolean): Promise<
   await invoke<void>("set_favorite", { notePath, favorite });
 }
 
+export async function shareNote(notePath: string): Promise<void> {
+  await invoke<void>("share_note", { notePath });
+}
+
 export async function notesDir(): Promise<string> {
   return invoke<string>("notes_dir");
 }

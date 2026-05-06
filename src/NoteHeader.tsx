@@ -6,7 +6,6 @@ import {
   IconEye,
   IconFileText,
   IconHome,
-  IconLink,
   IconMore,
   IconPlus,
   IconShare,
@@ -55,6 +54,8 @@ type Props = {
   favorited?: boolean;
   /** When omitted, the Duplicate item stays a no-op stub. */
   onDuplicate?: () => void;
+  /** When omitted, the Share button is hidden. */
+  onShare?: () => void;
 };
 
 export function NoteHeader({
@@ -79,6 +80,7 @@ export function NoteHeader({
   onFavorite,
   favorited,
   onDuplicate,
+  onShare,
 }: Props) {
   const [moreOpen, setMoreOpen] = useState(false);
 
@@ -109,10 +111,7 @@ export function NoteHeader({
           onClick={recording ? onStopRecord : onStartRecord}
         />
 
-        <ShareCluster
-          onShare={() => stub("Share", 15)}
-          onCopyLink={() => stub("Copy link", 15)}
-        />
+        {onShare && <ShareButton onShare={onShare} />}
 
         <div className="nh-popover-anchor">
           <button
@@ -233,35 +232,17 @@ function RecordButton({
   );
 }
 
-function ShareCluster({
-  onShare,
-  onCopyLink,
-}: {
-  onShare: () => void;
-  onCopyLink: () => void;
-}) {
+function ShareButton({ onShare }: { onShare: () => void }) {
   return (
-    <div className="nh-share">
-      <button
-        type="button"
-        className="nh-share-main"
-        onClick={onShare}
-        title="Share — coming soon (issue #15)"
-      >
-        <IconShare size={13} sw={1.8} />
-        Share
-      </button>
-      <div className="nh-share-divider" />
-      <button
-        type="button"
-        className="nh-share-link"
-        onClick={onCopyLink}
-        aria-label="Copy link"
-        title="Copy link — coming soon (issue #15)"
-      >
-        <IconLink size={13} sw={1.7} />
-      </button>
-    </div>
+    <button
+      type="button"
+      className="nh-share-main nh-share-solo"
+      onClick={onShare}
+      title="Share via AirDrop, Mail, Messages, …"
+    >
+      <IconShare size={13} sw={1.8} />
+      Share
+    </button>
   );
 }
 
@@ -444,10 +425,6 @@ function normalizeTag(raw: string): string {
 }
 
 // --- helpers ---
-
-function stub(label: string, issue: number) {
-  console.log(`[stub] ${label} clicked — see issue #${issue}`);
-}
 
 function formatModifiedAt(ms: number): string {
   const d = new Date(ms);

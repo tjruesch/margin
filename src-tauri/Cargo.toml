@@ -43,6 +43,19 @@ screencapturekit = { version = "1.5", features = ["macos_14_0"] }
 sherpa-onnx = "1.13"
 window-vibrancy = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSSharingService",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSURL",
+    "NSString",
+    "NSArray",
+    "NSGeometry",
+] }
 
 [dev-dependencies]
 tempfile = "3"

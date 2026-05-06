@@ -5,6 +5,7 @@ mod keychain;
 mod notes;
 mod paths;
 mod reconcile;
+mod sharing;
 mod sysaudio;
 mod transcribe;
 
@@ -451,7 +452,8 @@ pub fn run() {
             notes::write_note,
             notes::set_note_tags,
             notes::set_archived,
-            notes::set_favorite
+            notes::set_favorite,
+            sharing::share_note
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
