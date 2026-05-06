@@ -12,7 +12,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_yml::Mapping;
 
 use crate::paths;
 
@@ -36,6 +37,7 @@ pub struct NoteListItem {
     pub modified_ms: i64,
     pub duration_ms: Option<u64>,
     pub preview: String,
+    pub tags: Vec<String>,
 }
 
 fn new_note_ref(id: String, note_path: PathBuf) -> NoteRef {
@@ -160,7 +162,13 @@ pub fn list_notes() -> Result<Vec<NoteListItem>, String> {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        let body = fs::read_to_string(&note_path).unwrap_or_default();
+        let raw = fs::read_to_string(&note_path).unwrap_or_default();
+        let (frontmatter_yaml, body) = split_frontmatter(&raw);
+        let frontmatter = frontmatter_yaml
+            .map(parse_frontmatter)
+            .unwrap_or_default();
+        let tags = read_tags(&frontmatter);
+
         let title = body
             .lines()
             .find_map(|l| {
@@ -182,7 +190,7 @@ pub fn list_notes() -> Result<Vec<NoteListItem>, String> {
             None
         };
 
-        let preview = extract_preview(&body);
+        let preview = extract_preview(body);
 
         out.push(NoteListItem {
             note_path: note_path.to_string_lossy().into_owned(),
@@ -190,6 +198,7 @@ pub fn list_notes() -> Result<Vec<NoteListItem>, String> {
             modified_ms,
             duration_ms,
             preview,
+            tags,
         });
     }
 
@@ -215,6 +224,178 @@ pub fn note_meta(note_path: String) -> Result<NoteMeta, String> {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     Ok(NoteMeta { modified_ms })
+}
+
+// ---------- Frontmatter ---------------------------------------------------
+
+const TAG_MAX_LEN: usize = 32;
+const TAGS_MAX_PER_NOTE: usize = 16;
+
+#[derive(Serialize, Deserialize)]
+pub struct NoteContent {
+    pub body: String,
+    pub tags: Vec<String>,
+    /// Frontmatter keys other than `tags`, preserved verbatim. Round-trips
+    /// through the frontend so user-added YAML survives a save.
+    pub frontmatter_extras: Mapping,
+}
+
+/// Split a leading YAML frontmatter block off the raw note text. Returns
+/// `(yaml_chunk_without_delimiters, body)`. If no frontmatter is present
+/// (or the closing `---` is missing), returns `(None, raw)`.
+fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
+    // Be lenient about a leading BOM, but don't otherwise allow whitespace
+    // before the opening delimiter.
+    let stripped = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
+    let after_open = match stripped.strip_prefix("---\n") {
+        Some(rest) => rest,
+        None => return (None, raw),
+    };
+    // Find the next `---` on its own line.
+    let mut search_from = 0usize;
+    while search_from < after_open.len() {
+        let idx = match after_open[search_from..].find("\n---") {
+            Some(i) => search_from + i,
+            None => return (None, raw), // no closing delimiter; not frontmatter
+        };
+        let after_delim = idx + "\n---".len();
+        // Accept either `\n---\n…` or `\n---` at EOF.
+        let body_start = if after_open[after_delim..].starts_with('\n') {
+            after_delim + 1
+        } else if after_open.len() == after_delim {
+            after_delim
+        } else {
+            // `---` followed by other characters (e.g. `---foo`) — not a
+            // closer; keep searching.
+            search_from = after_delim;
+            continue;
+        };
+        return (Some(&after_open[..idx]), &after_open[body_start..]);
+    }
+    (None, raw)
+}
+
+fn parse_frontmatter(yaml: &str) -> Mapping {
+    serde_yml::from_str::<Mapping>(yaml).unwrap_or_default()
+}
+
+fn read_tags(map: &Mapping) -> Vec<String> {
+    let raw = match map.get(serde_yml::Value::String("tags".into())) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let items: Vec<&str> = match raw {
+        serde_yml::Value::Sequence(seq) => seq.iter().filter_map(|v| v.as_str()).collect(),
+        // Tolerate a single string for `tags: foo` style.
+        serde_yml::Value::String(s) => vec![s.as_str()],
+        _ => return Vec::new(),
+    };
+    normalize_tags(items.iter().map(|s| s.to_string()))
+}
+
+fn normalize_tags<I: IntoIterator<Item = String>>(input: I) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for raw in input {
+        let trimmed = raw.trim().to_lowercase();
+        if trimmed.is_empty() || trimmed.len() > TAG_MAX_LEN {
+            continue;
+        }
+        if seen.insert(trimmed.clone()) {
+            out.push(trimmed);
+            if out.len() >= TAGS_MAX_PER_NOTE {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Re-emit a note with the given frontmatter mapping prepended to `body`.
+/// Empty mapping → no frontmatter block at all.
+fn write_with_frontmatter(map: &Mapping, body: &str) -> String {
+    if map.is_empty() {
+        return body.to_string();
+    }
+    let yaml = serde_yml::to_string(map).unwrap_or_default();
+    format!("---\n{yaml}---\n{body}")
+}
+
+/// Parse a note from disk into body + tags + extras. Used by the editor
+/// flow so the textarea never sees the YAML.
+#[tauri::command]
+pub fn read_note(note_path: String) -> Result<NoteContent, String> {
+    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
+    let tags = read_tags(&map);
+    map.remove(serde_yml::Value::String("tags".into()));
+    Ok(NoteContent {
+        body: body.to_string(),
+        tags,
+        frontmatter_extras: map,
+    })
+}
+
+/// Write a note by merging tags + extras into a frontmatter block above
+/// the body. The caller must pass back any `frontmatter_extras` it got
+/// from `read_note` so unknown keys round-trip unchanged.
+#[tauri::command]
+pub fn write_note(
+    note_path: String,
+    body: String,
+    tags: Vec<String>,
+    frontmatter_extras: Mapping,
+    guard: tauri::State<'_, crate::WriteGuard>,
+) -> Result<(), String> {
+    let normalized = normalize_tags(tags);
+    let mut map = frontmatter_extras;
+    if !normalized.is_empty() {
+        let seq: Vec<serde_yml::Value> = normalized
+            .into_iter()
+            .map(serde_yml::Value::String)
+            .collect();
+        map.insert(
+            serde_yml::Value::String("tags".into()),
+            serde_yml::Value::Sequence(seq),
+        );
+    } else {
+        map.remove(serde_yml::Value::String("tags".into()));
+    }
+    let merged = write_with_frontmatter(&map, &body);
+    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
+    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    Ok(())
+}
+
+/// Convenience for header chip mutations: read → replace tags → write.
+/// Doesn't touch the body, so an in-flight editor buffer isn't disturbed.
+#[tauri::command]
+pub fn set_note_tags(
+    note_path: String,
+    tags: Vec<String>,
+    guard: tauri::State<'_, crate::WriteGuard>,
+) -> Result<(), String> {
+    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
+    let normalized = normalize_tags(tags);
+    if normalized.is_empty() {
+        map.remove(serde_yml::Value::String("tags".into()));
+    } else {
+        let seq: Vec<serde_yml::Value> = normalized
+            .into_iter()
+            .map(serde_yml::Value::String)
+            .collect();
+        map.insert(
+            serde_yml::Value::String("tags".into()),
+            serde_yml::Value::Sequence(seq),
+        );
+    }
+    let merged = write_with_frontmatter(&map, body);
+    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
+    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    Ok(())
 }
 
 const PREVIEW_MAX_CHARS: usize = 160;

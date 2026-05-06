@@ -14,6 +14,7 @@ import {
   IconMore,
   IconPlus,
   IconSearch,
+  IconSettings,
   IconSidebar,
   IconSparkle,
   IconStar,
@@ -25,6 +26,7 @@ type Props = {
   onOpen: (path: string) => void;
   onNewNote: () => void;
   onNewMeeting: () => void;
+  onOpenSettings: () => void;
 };
 
 type NavId = "home" | "actions" | "meetings" | "shared" | "favorites";
@@ -36,11 +38,12 @@ type FilterId = "all" | "notes" | "meetings" | "shared";
 const UPCOMING_EVENTS: UpcomingEvent[] = [];
 const ACTION_ITEMS: ActionItem[] = [];
 
-export function Home({ onOpen, onNewNote, onNewMeeting }: Props) {
+export function Home({ onOpen, onNewNote, onNewMeeting, onOpenSettings }: Props) {
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [nav, setNav] = useState<NavId>("home");
   const [filter, setFilter] = useState<FilterId>("all");
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
     return typeof localStorage === "undefined"
       ? true
@@ -68,18 +71,28 @@ export function Home({ onOpen, onNewNote, onNewMeeting }: Props) {
     };
   }, []);
 
+  // Sidebar tags = union of every tag across the loaded notes. Avoids a
+  // second disk walk that `list_all_tags` used to do.
+  const allTags = useMemo(() => {
+    const set = new Set<string>();
+    for (const n of notes) for (const t of n.tags) set.add(t);
+    return Array.from(set).sort();
+  }, [notes]);
+
   const filteredNotes = useMemo(() => {
+    let list = notes;
+    if (tagFilter) list = list.filter((n) => n.tags.includes(tagFilter));
     switch (filter) {
       case "notes":
-        return notes.filter((n) => n.duration_ms === null);
+        return list.filter((n) => n.duration_ms === null);
       case "meetings":
-        return notes.filter((n) => n.duration_ms !== null);
+        return list.filter((n) => n.duration_ms !== null);
       case "shared":
         return [];
       default:
-        return notes;
+        return list;
     }
-  }, [notes, filter]);
+  }, [notes, filter, tagFilter]);
 
   const grouped = useMemo(() => groupByDay(filteredNotes), [filteredNotes]);
 
@@ -93,6 +106,10 @@ export function Home({ onOpen, onNewNote, onNewMeeting }: Props) {
           onSelect={setNav}
           actionCount={openActionCount}
           meetingCount={UPCOMING_EVENTS.length}
+          tags={allTags}
+          activeTag={tagFilter}
+          onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
+          onOpenSettings={onOpenSettings}
         />
       )}
       <div className="home-main">
@@ -136,6 +153,8 @@ export function Home({ onOpen, onNewNote, onNewMeeting }: Props) {
           totalNotes={notes.length}
           filter={filter}
           onFilterChange={setFilter}
+          tagFilter={tagFilter}
+          onClearTagFilter={() => setTagFilter(null)}
           onOpen={onOpen}
         />
 
@@ -148,23 +167,24 @@ export function Home({ onOpen, onNewNote, onNewMeeting }: Props) {
 
 // ---------- Sidebar -------------------------------------------------------
 
-const SIDEBAR_TAGS = [
-  { label: "investigation", color: "rgba(196,74,31,0.14)" },
-  { label: "cbr", color: "rgba(58,93,168,0.14)" },
-  { label: "todo", color: "rgba(79,138,63,0.16)" },
-  { label: "idea", color: "rgba(110,79,168,0.14)" },
-];
-
 function Sidebar({
   active,
   onSelect,
   actionCount,
   meetingCount,
+  tags,
+  activeTag,
+  onTagSelect,
+  onOpenSettings,
 }: {
   active: NavId;
   onSelect: (id: NavId) => void;
   actionCount: number;
   meetingCount: number;
+  tags: string[];
+  activeTag: string | null;
+  onTagSelect: (tag: string) => void;
+  onOpenSettings: () => void;
 }) {
   return (
     <aside className="home-sidebar">
@@ -218,27 +238,36 @@ function Sidebar({
       <div className="home-side-section">
         <div className="home-side-header">
           <span>Tags</span>
-          <button
-            type="button"
-            className="home-side-add"
-            title="New tag — coming soon (issue #14)"
-            aria-label="New tag"
-            onClick={() => stub("Tag", 14)}
-          >
-            <IconPlus size={11} sw={2} />
-          </button>
         </div>
         <div className="home-side-tags">
-          {SIDEBAR_TAGS.map((t) => (
-            <span
-              key={t.label}
-              className="home-side-tag"
-              style={{ background: t.color }}
-            >
-              {t.label}
+          {tags.length === 0 ? (
+            <span className="home-side-tags-empty">
+              No tags yet. Add tags to your notes to show them here.
             </span>
-          ))}
+          ) : (
+            tags.map((t) => (
+              <button
+                key={t}
+                type="button"
+                className={"home-side-tag" + (activeTag === t ? " active" : "")}
+                style={{ "--tag-dot": tagDotColor(t) } as React.CSSProperties}
+                onClick={() => onTagSelect(t)}
+                title={activeTag === t ? `Clear filter` : `Filter by ${t}`}
+              >
+                {t}
+              </button>
+            ))
+          )}
         </div>
+      </div>
+
+      <div className="home-side-foot">
+        <NavItem
+          icon={<IconSettings size={14} sw={1.7} />}
+          label="Settings"
+          active={false}
+          onClick={onOpenSettings}
+        />
       </div>
     </aside>
   );
@@ -464,6 +493,8 @@ function NotesFeed({
   totalNotes,
   filter,
   onFilterChange,
+  tagFilter,
+  onClearTagFilter,
   onOpen,
 }: {
   loading: boolean;
@@ -471,6 +502,8 @@ function NotesFeed({
   totalNotes: number;
   filter: FilterId;
   onFilterChange: (id: FilterId) => void;
+  tagFilter: string | null;
+  onClearTagFilter: () => void;
   onOpen: (path: string) => void;
 }) {
   const filters: { id: FilterId; label: string }[] = [
@@ -500,6 +533,22 @@ function NotesFeed({
           ))}
         </div>
       </div>
+
+      {tagFilter && (
+        <div className="home-active-filter">
+          <span className="home-active-filter-label">Filtering by</span>
+          <button
+            type="button"
+            className="home-active-filter-chip"
+            style={{ background: tagColor(tagFilter) }}
+            onClick={onClearTagFilter}
+            title="Clear filter"
+          >
+            <span>{tagFilter}</span>
+            <span className="home-active-filter-x" aria-hidden="true">×</span>
+          </button>
+        </div>
+      )}
 
       {loading ? (
         <p className="home-empty">Loading…</p>
@@ -571,6 +620,7 @@ function NoteRow({
         </div>
       </div>
       <div className="home-note-meta">
+        {item.tags.length > 0 && <TagChips tags={item.tags} max={2} />}
         <span className="home-note-time">{formatTime(item.modified_ms)}</span>
         <button
           type="button"
@@ -689,13 +739,42 @@ function SectionTitle({
 
 // ---------- Tag chips -----------------------------------------------------
 
-const TAG_COLORS: Record<string, string> = {
-  investigation: "rgba(196,74,31,0.14)",
-  cbr: "rgba(58,93,168,0.14)",
-  todo: "rgba(79,138,63,0.16)",
-  idea: "rgba(110,79,168,0.14)",
-  transcribed: "rgba(0,0,0,0.06)",
-};
+/// Deterministic chip background tint per tag name. Hash the string and
+/// pick from a small palette of muted alpha colors; same tag always ends
+/// up the same color across the app.
+const TAG_PALETTE = [
+  "rgba(196,74,31,0.14)",
+  "rgba(58,93,168,0.14)",
+  "rgba(79,138,63,0.16)",
+  "rgba(110,79,168,0.14)",
+  "rgba(168,139,58,0.14)",
+  "rgba(58,140,140,0.14)",
+];
+
+/// Companion solid-color palette for the Finder-style colored dot used
+/// in the sidebar tag list. Same hash → same dot color as chip color.
+const TAG_DOT_PALETTE = [
+  "#C44A1F",
+  "#3A5DA8",
+  "#4F8A3F",
+  "#6E4FA8",
+  "#A88B3A",
+  "#3A8C8C",
+];
+
+function tagHash(tag: string): number {
+  let h = 0;
+  for (let i = 0; i < tag.length; i++) h = (h * 31 + tag.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+
+function tagColor(tag: string): string {
+  return TAG_PALETTE[tagHash(tag) % TAG_PALETTE.length];
+}
+
+function tagDotColor(tag: string): string {
+  return TAG_DOT_PALETTE[tagHash(tag) % TAG_DOT_PALETTE.length];
+}
 
 function TagChips({ tags, max }: { tags: string[]; max?: number }) {
   if (!tags || tags.length === 0) return null;
@@ -704,7 +783,7 @@ function TagChips({ tags, max }: { tags: string[]; max?: number }) {
   return (
     <span className="home-tagchips">
       {list.map((t) => (
-        <span key={t} className="home-tagchip" style={{ background: TAG_COLORS[t] ?? "rgba(0,0,0,0.06)" }}>
+        <span key={t} className="home-tagchip" style={{ background: tagColor(t) }}>
           {t}
         </span>
       ))}

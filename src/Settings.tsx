@@ -4,6 +4,13 @@ import {
   hasAnthropicApiKey,
   setAnthropicApiKey,
 } from "./file";
+import {
+  IconChevLeft,
+  IconEdit,
+  IconHome,
+  IconSettings,
+  IconSparkle,
+} from "./icons";
 import type {
   AISettings,
   AudioRetention,
@@ -29,14 +36,26 @@ type SettingsProps = {
   onThemeChange: (next: ThemeSettings) => void;
   onAIChange: (next: AISettings) => void;
   onEditorChange: (next: EditorPrefs) => void;
+  onBack: () => void;
 };
 
-const SECTIONS: { id: Section; label: string }[] = [
-  { id: "appearance", label: "Appearance" },
-  { id: "ai", label: "AI" },
-  { id: "editor", label: "Editor" },
-  { id: "shortcuts", label: "Shortcuts" },
+const SECTIONS: {
+  id: Section;
+  label: string;
+  icon: React.ReactNode;
+}[] = [
+  { id: "appearance", label: "Appearance", icon: <IconSettings size={14} sw={1.7} /> },
+  { id: "ai", label: "AI", icon: <IconSparkle size={14} sw={1.7} /> },
+  { id: "editor", label: "Editor", icon: <IconEdit size={14} sw={1.7} /> },
+  { id: "shortcuts", label: "Shortcuts", icon: <IconHome size={14} sw={1.7} /> },
 ];
+
+const SECTION_TITLE: Record<Section, string> = {
+  appearance: "Appearance",
+  ai: "AI",
+  editor: "Editor",
+  shortcuts: "Shortcuts",
+};
 
 export function Settings({
   theme,
@@ -45,6 +64,7 @@ export function Settings({
   onThemeChange,
   onAIChange,
   onEditorChange,
+  onBack,
 }: SettingsProps) {
   const [active, setActive] = useState<Section>("appearance");
 
@@ -55,21 +75,39 @@ export function Settings({
     onEditorChange({ ...editor, ...patch });
 
   return (
-    <div className="settings">
-      <nav className="settings-nav" aria-label="Settings sections">
-        {SECTIONS.map((s) => (
-          <button
-            key={s.id}
-            className={"settings-nav-item " + (active === s.id ? "active" : "")}
-            onClick={() => setActive(s.id)}
-            aria-current={active === s.id ? "page" : undefined}
-          >
-            {s.label}
+    <div className="home">
+      <aside className="home-sidebar" aria-label="Settings sections">
+        <div className="home-search-wrap">
+          <button type="button" className="home-back-link" onClick={onBack}>
+            <IconChevLeft size={14} sw={1.7} />
+            <span>Back</span>
           </button>
-        ))}
-      </nav>
+        </div>
+        <nav className="home-nav">
+          {SECTIONS.map((s) => (
+            <button
+              key={s.id}
+              type="button"
+              className={"home-nav-item" + (active === s.id ? " active" : "")}
+              onClick={() => setActive(s.id)}
+              aria-current={active === s.id ? "page" : undefined}
+            >
+              <span className="home-nav-icon">{s.icon}</span>
+              <span className="home-nav-label">{s.label}</span>
+            </button>
+          ))}
+        </nav>
+      </aside>
 
-      <div className="settings-content">
+      <main className="home-main">
+        <header className="home-greeting">
+          <div className="home-greeting-text">
+            <div className="home-greeting-eyebrow">Settings</div>
+            <h1 className="home-greeting-title">{SECTION_TITLE[active]}</h1>
+          </div>
+        </header>
+
+        <div className="settings-content">
         {active === "appearance" && (
           <section className="settings-section">
             <h2>Themes</h2>
@@ -185,7 +223,8 @@ export function Settings({
             <p className="settings-placeholder">Keyboard shortcut customization coming soon.</p>
           </section>
         )}
-      </div>
+        </div>
+      </main>
     </div>
   );
 }

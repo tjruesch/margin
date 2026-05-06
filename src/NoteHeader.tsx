@@ -7,7 +7,6 @@ import {
   IconEdit,
   IconEye,
   IconFileText,
-  IconFolder,
   IconHome,
   IconLink,
   IconMore,
@@ -38,6 +37,13 @@ type Props = {
   onStopRecord: () => void;
   /** Created/modified timestamp for the date chip. */
   modifiedMs: number | null;
+  /** Tags for the active note. Empty for external (non-owned) notes. */
+  tags: string[];
+  /** Autocomplete pool — every tag known across all owned notes. */
+  allTags: string[];
+  /** External notes don't carry tags; the chip cluster degrades to none. */
+  tagsEditable: boolean;
+  onTagsChange: (next: string[]) => void;
   onBack: () => void;
 };
 
@@ -52,6 +58,10 @@ export function NoteHeader({
   onStopRecord,
   hasTranscript,
   modifiedMs,
+  tags,
+  allTags,
+  tagsEditable,
+  onTagsChange,
   onBack,
 }: Props) {
   const [moreOpen, setMoreOpen] = useState(false);
@@ -107,30 +117,19 @@ export function NoteHeader({
 
       <div className="note-header-row2">
         <div className="nh-chips">
-          <button
-            type="button"
-            className="nh-chip"
-            title="Folders coming soon — see issue #13"
-            onClick={() => stub("Folder", 13)}
-          >
-            <IconFolder size={12} sw={1.7} />
-            <span>Add to folder</span>
-          </button>
           {modifiedMs !== null && (
             <span className="nh-chip" title="Modified">
               <IconCalendar size={12} sw={1.7} />
               <span>{formatModifiedAt(modifiedMs)}</span>
             </span>
           )}
-          <button
-            type="button"
-            className="nh-chip-add"
-            title="Tags coming soon — see issue #14"
-            aria-label="Add tag"
-            onClick={() => stub("Tag", 14)}
-          >
-            <IconPlus size={12} sw={1.8} />
-          </button>
+          {tagsEditable && (
+            <TagCluster
+              tags={tags}
+              allTags={allTags}
+              onChange={onTagsChange}
+            />
+          )}
         </div>
         <ViewModeToggle
           mode={mode}
@@ -335,6 +334,128 @@ function EditableTitle({
       {value}
     </h1>
   );
+}
+
+function TagCluster({
+  tags,
+  allTags,
+  onChange,
+}: {
+  tags: string[];
+  allTags: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  // Close on outside click. Don't trip when the click lands inside the
+  // popover (lets the user pick suggestions without dismissing).
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (popoverRef.current && target && popoverRef.current.contains(target)) return;
+      setOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open]);
+
+  const removeTag = (t: string) => {
+    onChange(tags.filter((x) => x !== t));
+  };
+  const addTag = (t: string) => {
+    const norm = normalizeTag(t);
+    if (!norm) return;
+    if (tags.includes(norm)) return;
+    onChange([...tags, norm]);
+    setDraft("");
+  };
+
+  const draftNorm = normalizeTag(draft);
+  const suggestions = draftNorm
+    ? allTags.filter((t) => t.startsWith(draftNorm) && !tags.includes(t)).slice(0, 6)
+    : allTags.filter((t) => !tags.includes(t)).slice(0, 6);
+
+  return (
+    <>
+      {tags.map((t) => (
+        <button
+          key={t}
+          type="button"
+          className="nh-chip nh-chip-tag"
+          title={`Remove tag ${t}`}
+          onClick={() => removeTag(t)}
+        >
+          <span>{t}</span>
+          <span className="nh-chip-tag-x" aria-hidden="true">×</span>
+        </button>
+      ))}
+      <div className="nh-popover-anchor">
+        <button
+          type="button"
+          className={"nh-chip-add" + (open ? " active" : "")}
+          aria-label="Add tag"
+          title="Add tag"
+          onClick={(e) => {
+            e.stopPropagation();
+            setOpen((v) => !v);
+          }}
+        >
+          <IconPlus size={12} sw={1.8} />
+        </button>
+        {open && (
+          <div
+            ref={popoverRef}
+            className="nh-popover nh-tag-popover"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <input
+              ref={inputRef}
+              className="nh-tag-input"
+              placeholder="Add a tag…"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addTag(suggestions[0] ?? draft);
+                } else if (e.key === "Escape") {
+                  setOpen(false);
+                }
+              }}
+            />
+            {suggestions.length > 0 && (
+              <div className="nh-tag-suggestions">
+                {suggestions.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    className="nh-tag-suggestion"
+                    onClick={() => addTag(s)}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+const TAG_MAX_LEN = 32;
+
+function normalizeTag(raw: string): string {
+  return raw.trim().toLowerCase().slice(0, TAG_MAX_LEN);
 }
 
 // --- helpers ---

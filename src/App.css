@@ -260,51 +260,34 @@ body {
   color-scheme: dark;
 }
 
-.settings {
-  height: 100%;
-  display: grid;
-  grid-template-columns: 200px 1fr;
-  overflow: hidden;
-}
-
-.settings-nav {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 16px 8px;
-  border-right: 1px solid var(--border-muted);
-  background: var(--bg-muted);
-  overflow-y: auto;
-}
-
-.settings-nav-item {
-  appearance: none;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 6px 12px;
-  font: inherit;
-  font-size: 13px;
-  color: var(--fg-muted);
-  text-align: left;
-  cursor: pointer;
-}
-
-.settings-nav-item:hover {
-  background: var(--bg);
-  color: var(--fg);
-}
-
-.settings-nav-item.active {
-  background: var(--bg);
-  border-color: var(--border);
-  color: var(--fg);
-  font-weight: 500;
-}
+/* Settings reuses the home shell (.home, .home-sidebar, .home-main, etc.) */
+/* so its chrome stays in lockstep with the home page. Only the inner       */
+/* form layout below is settings-specific.                                   */
 
 .settings-content {
-  overflow-y: auto;
-  padding: 32px 40px;
+  padding: 0 32px 32px;
+  max-width: 760px;
+}
+
+.home-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 7px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  transition: background 120ms ease, color 120ms ease;
+}
+.home-back-link:hover {
+  background: var(--home-chip);
+  color: var(--fg);
 }
 
 .settings-section {
@@ -573,7 +556,9 @@ select.settings-input {
   height: 100%;
   width: 100%;
   display: flex;
-  background: var(--bg-muted);
+  /* Page background — sidebar floats on this; matches main column so the */
+  /* gap on the sidebar's right reads as a clean inset, not a seam. */
+  background: var(--bg);
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   color: var(--fg);
   min-height: 0;
@@ -581,16 +566,34 @@ select.settings-input {
 
 /* ----- Sidebar ----- */
 
+/* Tahoe-style "floating" sidebar — inset margins + rounded corners +      */
+/* a soft drop shadow + inner top highlight. Tinted via --bg-muted so it   */
+/* visibly contrasts against the page (which is --bg).                      */
 .home-sidebar {
-  width: 244px;
+  width: 224px;
   flex-shrink: 0;
-  background: color-mix(in srgb, var(--fg) 3%, var(--bg-muted));
-  border-right: 0.5px solid var(--home-line);
+  margin: 8px 0 8px 8px;
+  border-radius: 12px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--fg) 5%, var(--bg-muted)) 0%,
+      color-mix(in srgb, var(--fg) 9%, var(--bg-muted)) 100%
+    );
+  /* Floating elevation: soft drop shadow + inner highlight at the top    */
+  /* edge + faint inner outline to crisp the corners against the page.    */
+  box-shadow:
+    0 1px 3px color-mix(in srgb, #000 8%, transparent),
+    0 6px 18px color-mix(in srgb, #000 5%, transparent),
+    inset 0 1px 0 color-mix(in srgb, var(--bg) 65%, transparent),
+    inset 0 0 0 0.5px color-mix(in srgb, var(--fg) 8%, transparent);
   display: flex;
   flex-direction: column;
-  padding: 12px 8px;
-  gap: 4px;
+  padding: 10px 10px;
+  gap: 2px;
   overflow: hidden;
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  backdrop-filter: blur(20px) saturate(160%);
 }
 
 .home-search-wrap {
@@ -636,11 +639,11 @@ select.settings-input {
 .home-nav-item {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   width: 100%;
   height: 30px;
-  padding: 0 9px;
-  border-radius: 7px;
+  padding: 0 11px;
+  border-radius: 8px;
   background: transparent;
   border: none;
   cursor: pointer;
@@ -649,17 +652,19 @@ select.settings-input {
   font-size: 13px;
   font-weight: 500;
   text-align: left;
-  transition: background 120ms ease;
+  transition: background 120ms ease, box-shadow 120ms ease;
 }
 .home-nav-item:hover {
-  background: var(--home-chip);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
 .home-nav-item.active {
-  background: var(--home-chip-hover);
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 8%, transparent),
+              inset 0 0 0 0.5px color-mix(in srgb, var(--fg) 8%, transparent);
   font-weight: 600;
 }
 .home-nav-icon {
-  width: 16px;
+  width: 18px;
   display: inline-flex;
   justify-content: center;
   color: var(--fg-muted);
@@ -688,48 +693,74 @@ select.settings-input {
   margin-top: 14px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 .home-side-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 11px;
-  height: 18px;
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
+  padding: 4px 11px 4px;
+  height: 22px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
   color: var(--fg-muted);
-  text-transform: uppercase;
+  text-transform: none;
 }
-.home-side-add {
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  background: transparent;
-  border: none;
-  color: var(--fg-muted);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.home-side-add:hover {
-  background: var(--home-chip);
-}
+/* Tag rows mirror Finder's "Tags" panel: colored dot + plain label,    */
+/* on a full-width row that highlights on hover like the nav items.      */
 .home-side-tags {
-  padding: 2px 7px;
   display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
+  flex-direction: column;
+  gap: 1px;
 }
 .home-side-tag {
-  font-size: 11px;
-  font-weight: 500;
-  color: var(--fg);
-  padding: 2px 8px;
-  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 8px;
+  background: transparent;
+  border: none;
   cursor: pointer;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  transition: background 120ms ease;
+}
+.home-side-tag::before {
+  content: "";
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--tag-dot, color-mix(in srgb, var(--fg) 30%, transparent));
+  flex-shrink: 0;
+  box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--fg) 12%, transparent);
+}
+.home-side-tag:hover {
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+}
+.home-side-tag.active {
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--fg) 8%, transparent),
+              inset 0 0 0 0.5px color-mix(in srgb, var(--fg) 8%, transparent);
+  font-weight: 600;
+}
+.home-side-tags-empty {
+  font-size: 12px;
+  color: var(--fg-muted);
+  padding: 4px 11px;
+  line-height: 1.4;
+}
+
+.home-side-foot {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 0.5px solid var(--home-line);
 }
 
 /* ----- Main column ----- */
@@ -1130,6 +1161,39 @@ select.settings-input {
   background: var(--home-chip-hover);
   color: var(--fg);
   font-weight: 600;
+}
+
+.home-active-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 0 4px;
+}
+.home-active-filter-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+}
+.home-active-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--fg);
+  padding: 2px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  border: none;
+  font-family: inherit;
+}
+.home-active-filter-x {
+  font-size: 13px;
+  line-height: 1;
+  color: var(--fg-muted);
 }
 
 .home-day-group {
@@ -2026,6 +2090,69 @@ input.nh-title {
   align-items: center;
   justify-content: center;
 }
-.nh-chip-add:hover {
+.nh-chip-add:hover,
+.nh-chip-add.active {
+  background: var(--nh-bg-chip);
+}
+
+/* Tag chips reuse .nh-chip but show an inline × on hover */
+.nh-chip-tag {
+  background: var(--nh-bg-chip);
+  color: var(--nh-ink-2);
+}
+.nh-chip-tag-x {
+  font-size: 14px;
+  line-height: 1;
+  color: var(--nh-ink-4);
+  margin-left: 1px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.nh-chip-tag:hover .nh-chip-tag-x {
+  opacity: 1;
+}
+
+/* Add-tag popover */
+.nh-tag-popover {
+  width: 220px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.nh-tag-input {
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 7px;
+  border: 0.5px solid var(--nh-line-strong);
+  background: var(--nh-bg);
+  color: var(--nh-ink);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+}
+.nh-tag-input:focus {
+  border-color: var(--nh-accent-border);
+  box-shadow: 0 0 0 2px var(--nh-accent-soft);
+}
+.nh-tag-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 2px;
+}
+.nh-tag-suggestion {
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--nh-ink-2);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+}
+.nh-tag-suggestion:hover {
   background: var(--nh-bg-chip);
 }

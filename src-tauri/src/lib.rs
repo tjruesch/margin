@@ -73,8 +73,8 @@ struct WatcherState {
     target: Option<PathBuf>,
 }
 
-struct WriteGuard {
-    last_write: Mutex<Option<Instant>>,
+pub struct WriteGuard {
+    pub last_write: Mutex<Option<Instant>>,
 }
 
 #[tauri::command]
@@ -341,7 +341,10 @@ pub fn run() {
             notes::is_owned_note,
             notes::list_notes,
             notes::note_meta,
-            notes::discard_recording
+            notes::discard_recording,
+            notes::read_note,
+            notes::write_note,
+            notes::set_note_tags
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

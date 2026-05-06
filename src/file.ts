@@ -59,7 +59,38 @@ export type NoteListItem = {
   modified_ms: number;
   duration_ms: number | null;
   preview: string;
+  tags: string[];
 };
+
+export type NoteContent = {
+  body: string;
+  tags: string[];
+  /** Frontmatter keys other than `tags`, opaque to the frontend. Round-trip
+   *  unchanged on writes so user-added YAML survives. */
+  frontmatter_extras: Record<string, unknown>;
+};
+
+export async function readNote(notePath: string): Promise<NoteContent> {
+  return invoke<NoteContent>("read_note", { notePath });
+}
+
+export async function writeNote(
+  notePath: string,
+  body: string,
+  tags: string[],
+  frontmatterExtras: Record<string, unknown>,
+): Promise<void> {
+  await invoke<void>("write_note", {
+    notePath,
+    body,
+    tags,
+    frontmatterExtras,
+  });
+}
+
+export async function setNoteTags(notePath: string, tags: string[]): Promise<void> {
+  await invoke<void>("set_note_tags", { notePath, tags });
+}
 
 export async function notesDir(): Promise<string> {
   return invoke<string>("notes_dir");

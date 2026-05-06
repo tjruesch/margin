@@ -17,19 +17,23 @@ import {
   getInitialFile,
   hasAnthropicApiKey,
   isOwnedNote,
+  listNotes,
   noteMeta,
   notesDir as fetchNotesDir,
   type Transcript,
   pickFileToOpen,
   pickFileToSave,
   readFile,
+  readNote,
   reconcileNotes,
+  setNoteTags,
   startMeetingRecording,
   stopMeetingRecording,
   transcribe,
   unwatchFile,
   watchFile,
   writeFile,
+  writeNote,
 } from "./file";
 import {
   DEFAULT_SETTINGS,
@@ -168,6 +172,13 @@ export default function App() {
   const dirty = content !== savedContent;
   const fileName = path ? path.split("/").pop() ?? "Untitled.md" : "Untitled.md";
 
+  // Tags + extras live in lockstep with the active note. The editor body
+  // never sees the YAML frontmatter; tag mutations write the disk via
+  // set_note_tags so the in-flight buffer isn't disturbed.
+  const [tags, setTags] = useState<string[]>([]);
+  const [frontmatterExtras, setFrontmatterExtras] = useState<Record<string, unknown>>({});
+  const [allTags, setAllTags] = useState<string[]>([]);
+
   const contentRef = useRef(content);
   const pathRef = useRef(path);
   const savedRef = useRef(savedContent);
@@ -175,6 +186,9 @@ export default function App() {
   const recordingRef = useRef<NoteRecording>(recording);
   const aiRef = useRef<AISettings>(aiSettings);
   const editorRef = useRef<ReactCodeMirrorRef>(null);
+  const notesDirRef = useRef<string | null>(null);
+  const tagsRef = useRef<string[]>(tags);
+  const frontmatterExtrasRef = useRef<Record<string, unknown>>(frontmatterExtras);
   useEffect(() => {
     recentFilesRef.current = recentFiles;
   }, [recentFiles]);
@@ -193,6 +207,25 @@ export default function App() {
   useEffect(() => {
     aiRef.current = aiSettings;
   }, [aiSettings]);
+  useEffect(() => {
+    notesDirRef.current = notesDir;
+  }, [notesDir]);
+  useEffect(() => {
+    tagsRef.current = tags;
+  }, [tags]);
+  useEffect(() => {
+    frontmatterExtrasRef.current = frontmatterExtras;
+  }, [frontmatterExtras]);
+
+  /** True iff `p` lives under the owned-notes directory. Cheaper than the
+   *  Tauri `isOwnedNote` round-trip; safe to call before notesDir loads
+   *  (returns false in that brief window). */
+  const isOwnedPath = useCallback((p: string): boolean => {
+    const dir = notesDirRef.current;
+    if (!dir) return false;
+    const prefix = dir.endsWith("/") ? dir : dir + "/";
+    return p.startsWith(prefix);
+  }, []);
 
   // Detect whether the bundle has a transcript on disk, and whether that
   // transcript has already been reconciled (`reconciled_at` set by
@@ -230,22 +263,33 @@ export default function App() {
   const loadFile = useCallback(
     async (p: string) => {
       try {
-        const file = await readFile(p);
-        setPath(file.path);
-        setContent(file.content);
-        setSavedContent(file.content);
+        if (isOwnedPath(p)) {
+          const note = await readNote(p);
+          setPath(p);
+          setContent(note.body);
+          setSavedContent(note.body);
+          setTags(note.tags);
+          setFrontmatterExtras(note.frontmatter_extras ?? {});
+        } else {
+          const file = await readFile(p);
+          setPath(file.path);
+          setContent(file.content);
+          setSavedContent(file.content);
+          setTags([]);
+          setFrontmatterExtras({});
+        }
         setMode("edit");
         setExternalChange(null);
         setExternallyDeleted(false);
-        addRecentFile(file.path, recentFilesRef.current)
+        addRecentFile(p, recentFilesRef.current)
           .then(setRecentFiles)
           .catch((err) => console.error("addRecentFile failed:", err));
-        await refreshRecordingState(file.path);
+        await refreshRecordingState(p);
       } catch (err) {
-        console.error("read_file failed:", err);
+        console.error("loadFile failed:", err);
       }
     },
-    [refreshRecordingState],
+    [isOwnedPath, refreshRecordingState],
   );
 
   // ----- recording state machine ----------------------------------------
@@ -339,7 +383,11 @@ export default function App() {
         // the autosave debounce isn't a strong enough guarantee for output
         // the user just paid for. Don't lose it to a window close.
         try {
-          await writeFile(notePath, md);
+          if (isOwnedPath(notePath)) {
+            await writeNote(notePath, md, tagsRef.current, frontmatterExtrasRef.current);
+          } else {
+            await writeFile(notePath, md);
+          }
           setSavedContent(md);
         } catch (err) {
           console.error("post-reconcile save failed:", err);
@@ -462,20 +510,32 @@ export default function App() {
       if (!target) return;
     }
     try {
-      await writeFile(target, contentRef.current);
+      if (isOwnedPath(target)) {
+        await writeNote(
+          target,
+          contentRef.current,
+          tagsRef.current,
+          frontmatterExtrasRef.current,
+        );
+      } else {
+        await writeFile(target, contentRef.current);
+      }
       setPath(target);
       setSavedContent(contentRef.current);
       setExternalChange(null);
       setExternallyDeleted(false);
     } catch (err) {
-      console.error("write_file failed:", err);
+      console.error("save failed:", err);
     }
-  }, []);
+  }, [isOwnedPath]);
 
   const onSaveAs = useCallback(async () => {
     const target = await pickFileToSave(fileName);
     if (!target) return;
     try {
+      // Save-As lands at a user-chosen path which is virtually always
+      // outside the owned-notes directory; treat it as external and write
+      // the body verbatim (frontmatter and all if the user had any).
       await writeFile(target, contentRef.current);
       setPath(target);
       setSavedContent(contentRef.current);
@@ -609,25 +669,48 @@ export default function App() {
     if (externalChange || externallyDeleted) return;
     const t = setTimeout(async () => {
       try {
-        await writeFile(path, content);
+        if (isOwnedPath(path)) {
+          await writeNote(path, content, tagsRef.current, frontmatterExtrasRef.current);
+        } else {
+          await writeFile(path, content);
+        }
         setSavedContent(content);
       } catch (err) {
         console.error("autosave failed:", err);
       }
     }, 800);
     return () => clearTimeout(t);
-  }, [content, path, savedContent, externalChange, externallyDeleted]);
+  }, [content, path, savedContent, externalChange, externallyDeleted, isOwnedPath]);
 
   // External-change handler: reload silently if buffer is clean, else show banner.
   useEffect(() => {
     const unlisten = listen<string>("external-change", async (e) => {
       if (!e.payload) return;
       try {
-        const f = await readFile(e.payload);
-        if (f.content === savedRef.current) return; // spurious (mtime-only)
+        let nextBody: string;
+        let nextTags: string[] | null = null;
+        let nextExtras: Record<string, unknown> | null = null;
+        if (isOwnedPath(e.payload)) {
+          const note = await readNote(e.payload);
+          nextBody = note.body;
+          nextTags = note.tags;
+          nextExtras = note.frontmatter_extras ?? {};
+        } else {
+          const f = await readFile(e.payload);
+          nextBody = f.content;
+        }
+        if (nextBody === savedRef.current) {
+          // The body didn't change. Pick up any tag-only edits made via
+          // an external editor and move on without disturbing the buffer.
+          if (nextTags) setTags(nextTags);
+          if (nextExtras) setFrontmatterExtras(nextExtras);
+          return;
+        }
         if (contentRef.current === savedRef.current) {
-          setContent(f.content);
-          setSavedContent(f.content);
+          setContent(nextBody);
+          setSavedContent(nextBody);
+          if (nextTags) setTags(nextTags);
+          if (nextExtras) setFrontmatterExtras(nextExtras);
           setExternalChange(null);
         } else {
           setExternalChange({ path: e.payload });
@@ -639,7 +722,7 @@ export default function App() {
     return () => {
       unlisten.then((u) => u());
     };
-  }, []);
+  }, [isOwnedPath]);
 
   // External-delete handler.
   useEffect(() => {
@@ -652,14 +735,22 @@ export default function App() {
   const onReloadFromDisk = useCallback(async () => {
     if (!externalChange) return;
     try {
-      const f = await readFile(externalChange.path);
-      setContent(f.content);
-      setSavedContent(f.content);
+      if (isOwnedPath(externalChange.path)) {
+        const note = await readNote(externalChange.path);
+        setContent(note.body);
+        setSavedContent(note.body);
+        setTags(note.tags);
+        setFrontmatterExtras(note.frontmatter_extras ?? {});
+      } else {
+        const f = await readFile(externalChange.path);
+        setContent(f.content);
+        setSavedContent(f.content);
+      }
       setExternalChange(null);
     } catch (err) {
       console.error("reload failed:", err);
     }
-  }, [externalChange]);
+  }, [externalChange, isOwnedPath]);
 
   // Track system theme changes
   useEffect(() => {
@@ -685,7 +776,40 @@ export default function App() {
     hasAnthropicApiKey()
       .then(setHasKey)
       .catch(() => setHasKey(false));
+    // Seed the autocomplete pool from the existing notes' frontmatter.
+    // We piggy-back on list_notes (one disk walk) instead of a dedicated
+    // list_all_tags command, which would re-scan every bundle a second
+    // time. Subsequent mutations union into the pool below.
+    listNotes()
+      .then((items) => {
+        const set = new Set<string>();
+        for (const n of items) for (const t of n.tags) set.add(t);
+        setAllTags(Array.from(set).sort());
+      })
+      .catch((err) => console.error("listNotes (seed tags) failed:", err));
   }, []);
+
+  const onTagsChange = useCallback(
+    async (next: string[]) => {
+      const target = pathRef.current;
+      if (!target || !isOwnedPath(target)) return;
+      setTags(next);
+      // Optimistically union new tags into the autocomplete pool. Tags
+      // that *no* note has anymore linger as suggestions until the next
+      // app start; that's a deliberate tradeoff for not re-scanning all
+      // notes on every header edit.
+      setAllTags((prev) => {
+        if (next.every((t) => prev.includes(t))) return prev;
+        return Array.from(new Set([...prev, ...next])).sort();
+      });
+      try {
+        await setNoteTags(target, next);
+      } catch (err) {
+        console.error("setNoteTags failed:", err);
+      }
+    },
+    [isOwnedPath],
+  );
 
   // Refresh API-key status whenever settings change (or banner re-enters idle).
   useEffect(() => {
@@ -760,7 +884,9 @@ export default function App() {
 
   return (
     <div className="app" data-theme={theme}>
-      {!showTabbar && mode !== "home" && <div className="drag-bar" data-tauri-drag-region />}
+      {!showTabbar && mode !== "home" && mode !== "settings" && (
+        <div className="drag-bar" data-tauri-drag-region />
+      )}
       {showTabbar && (
         <NoteHeader
           title={noteTitle}
@@ -775,6 +901,10 @@ export default function App() {
           onStartRecord={() => void startRecordingForCurrent()}
           onStopRecord={() => void onStopRecording()}
           modifiedMs={modifiedMs}
+          tags={tags}
+          allTags={allTags}
+          tagsEditable={isOwned}
+          onTagsChange={(next) => void onTagsChange(next)}
           onBack={() => tryNavigate("home")}
         />
       )}
@@ -846,6 +976,7 @@ export default function App() {
             onThemeChange={onThemeChange}
             onAIChange={onAIChange}
             onEditorChange={onEditorPrefsChange}
+            onBack={() => tryNavigate("home")}
           />
         )}
         {mode === "home" && (
@@ -854,11 +985,12 @@ export default function App() {
             onOpen={(p) => void loadFile(p)}
             onNewNote={() => void onNewNote()}
             onNewMeeting={() => void onNewMeeting()}
+            onOpenSettings={() => tryNavigate("settings")}
           />
         )}
       </main>
 
-      {mode !== "home" && (
+      {mode !== "home" && mode !== "settings" && (
         <footer className="statusbar">
           <span>
             {content.length.toLocaleString()} chars · {content.split(/\n/).length.toLocaleString()} lines
