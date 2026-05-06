@@ -17,6 +17,7 @@ import {
   createNote,
   deleteNote,
   discardRecording,
+  duplicateNote,
   getInitialFile,
   hasAnthropicApiKey,
   isOwnedNote,
@@ -1048,6 +1049,27 @@ export default function App() {
     [isOwnedPath, refreshNotes],
   );
 
+  /** Clone a note to a new bundle and open it. `target` defaults to the
+   *  open note. Doesn't copy audio.wav / transcript.json — see the
+   *  `duplicate_note` rationale in notes.rs. */
+  const onDuplicateNote = useCallback(
+    async (target?: string) => {
+      const source = target ?? pathRef.current;
+      if (!source || !isOwnedPath(source)) return;
+      let ref;
+      try {
+        ref = await duplicateNote(source);
+      } catch (err) {
+        console.error("duplicateNote failed:", err);
+        alert("Could not duplicate the note. See console for details.");
+        return;
+      }
+      await refreshNotes();
+      await loadFile(ref.note_path);
+    },
+    [isOwnedPath, refreshNotes, loadFile],
+  );
+
   // Refresh API-key status whenever settings change (or banner re-enters idle).
   useEffect(() => {
     if (mode === "settings" || recording.kind === "none" || recording.kind === "ready") {
@@ -1157,6 +1179,11 @@ export default function App() {
               : undefined
           }
           favorited={favorite}
+          onDuplicate={
+            isOwned && recording.kind === "none"
+              ? () => void onDuplicateNote()
+              : undefined
+          }
         />
       )}
 
@@ -1245,6 +1272,7 @@ export default function App() {
             onDeleteRow={(p) => void onDeleteNote(p)}
             onArchiveRow={(p, next) => void onArchiveNote(p, next)}
             onFavoriteRow={(p, next) => void onFavoriteNote(p, next)}
+            onDuplicateRow={(p) => void onDuplicateNote(p)}
           />
         )}
       </main>

@@ -31,6 +31,7 @@ export function MoreMenu({
   archived,
   onFavorite,
   favorited,
+  onDuplicate,
 }: {
   onClose: () => void;
   /** When omitted, the Delete item is hidden. */
@@ -43,6 +44,8 @@ export function MoreMenu({
   onFavorite?: () => void;
   /** When true, the Favorites item's label flips to "Remove from favorites". */
   favorited?: boolean;
+  /** When omitted, the Duplicate item stays a no-op stub. */
+  onDuplicate?: () => void;
 }) {
   // Hide Delete when the parent hasn't authorized it, then drop any
   // separator that would dangle as a result.
@@ -64,8 +67,10 @@ export function MoreMenu({
         }
         const isArchive = it.id === "arc";
         const isFavorite = it.id === "fav";
+        const isDuplicate = it.id === "dup";
         const archiveWired = isArchive && onArchive !== undefined;
         const favoriteWired = isFavorite && onFavorite !== undefined;
+        const duplicateWired = isDuplicate && onDuplicate !== undefined;
         const label = isArchive && archived
           ? "Move to notes"
           : isFavorite && favorited
@@ -74,7 +79,8 @@ export function MoreMenu({
         const wired =
           (it.id === "del" && onDelete !== undefined) ||
           archiveWired ||
-          favoriteWired;
+          favoriteWired ||
+          duplicateWired;
         return (
           <button
             key={it.id}
@@ -94,6 +100,11 @@ export function MoreMenu({
               }
               if (favoriteWired) {
                 onFavorite!();
+                onClose();
+                return;
+              }
+              if (duplicateWired) {
+                onDuplicate!();
                 onClose();
                 return;
               }

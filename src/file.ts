@@ -120,6 +120,10 @@ export async function convertExternal(sourcePath: string): Promise<NoteRef> {
   return invoke<NoteRef>("convert_external", { sourcePath });
 }
 
+export async function duplicateNote(notePath: string): Promise<NoteRef> {
+  return invoke<NoteRef>("duplicate_note", { notePath });
+}
+
 export async function isOwnedNote(path: string): Promise<boolean> {
   return invoke<boolean>("is_owned_note", { path });
 }

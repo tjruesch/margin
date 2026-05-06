@@ -106,6 +106,41 @@ pub fn convert_external(
     Ok(new_note_ref(id, note_path))
 }
 
+/// Clone an owned note into a fresh bundle. Title and tags carry over;
+/// `archived` and `favorite` flags are stripped (they're state, not
+/// content — duplicating shouldn't bury the clone in Archive). The
+/// audio.wav / transcript.json sidecars are intentionally not copied
+/// since a duplicate is for editorial work, not a bit-for-bit clone of
+/// a recording. Title-suffix convention: verbatim, matching macOS
+/// Notes / Bear (no "(copy)").
+#[tauri::command]
+pub fn duplicate_note(
+    note_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<NoteRef, String> {
+    let src = PathBuf::from(&note_path);
+    if !is_owned_note_in(&src, &paths::notes_dir()) {
+        return Err("Refusing to duplicate: not an owned note path".into());
+    }
+    if !src.is_file() {
+        return Err("Source note not found".into());
+    }
+    let raw = fs::read_to_string(&src).map_err(|e| e.to_string())?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
+    set_bool_key(&mut map, "archived", false);
+    set_bool_key(&mut map, "favorite", false);
+    let merged = write_with_frontmatter(&map, body);
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let dir = paths::notes_dir().join(&id);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(NOTE_FILENAME);
+    fs::write(&dest, merged).map_err(|e| e.to_string())?;
+    touch_index(&conn, &dest, false);
+    Ok(new_note_ref(id, dest))
+}
+
 /// True iff `path` is `~/.margin/notes/<uuid>/note.md`.
 #[tauri::command]
 pub fn is_owned_note(path: String) -> bool {

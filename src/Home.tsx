@@ -44,6 +44,8 @@ type Props = {
   /** Toggle favorite for a row. Caller passes `nextFavorited` based on
    *  the row's per-row `favorite` field. */
   onFavoriteRow?: (path: string, nextFavorited: boolean) => void;
+  /** Clone a row to a new bundle. */
+  onDuplicateRow?: (path: string) => void;
 };
 
 type NavId = "home" | "actions" | "meetings" | "shared" | "favorites" | "archive";
@@ -68,6 +70,7 @@ export function Home({
   onDeleteRow,
   onArchiveRow,
   onFavoriteRow,
+  onDuplicateRow,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -174,6 +177,7 @@ export function Home({
           onDeleteRow={onDeleteRow}
           onArchiveRow={onArchiveRow}
           onFavoriteRow={onFavoriteRow}
+          onDuplicateRow={onDuplicateRow}
           archivedScope={scope === "archived"}
           favoritesScope={scope === "favorites"}
         />
@@ -527,6 +531,7 @@ function NotesFeed({
   onDeleteRow,
   onArchiveRow,
   onFavoriteRow,
+  onDuplicateRow,
   archivedScope,
   favoritesScope,
 }: {
@@ -541,6 +546,7 @@ function NotesFeed({
   onDeleteRow?: (path: string) => void;
   onArchiveRow?: (path: string, nextArchived: boolean) => void;
   onFavoriteRow?: (path: string, nextFavorited: boolean) => void;
+  onDuplicateRow?: (path: string) => void;
   archivedScope: boolean;
   favoritesScope: boolean;
 }) {
@@ -627,6 +633,7 @@ function NotesFeed({
                   onArchive={onArchiveRow}
                   archived={archivedScope}
                   onFavorite={onFavoriteRow}
+                  onDuplicate={onDuplicateRow}
                 />
               ))}
             </div>
@@ -644,6 +651,7 @@ function NoteRow({
   onArchive,
   archived,
   onFavorite,
+  onDuplicate,
 }: {
   item: NoteListItem;
   onOpen: (path: string) => void;
@@ -653,6 +661,7 @@ function NoteRow({
    *  in active view it's always false, in archive view always true. */
   archived?: boolean;
   onFavorite?: (path: string, nextFavorited: boolean) => void;
+  onDuplicate?: (path: string) => void;
 }) {
   const isMeeting = item.duration_ms !== null;
   const [moreOpen, setMoreOpen] = useState(false);
@@ -729,6 +738,9 @@ function NoteRow({
                   : undefined
               }
               favorited={item.favorite}
+              onDuplicate={
+                onDuplicate ? () => onDuplicate(item.note_path) : undefined
+              }
             />
           )}
         </div>

@@ -53,6 +53,8 @@ type Props = {
   onFavorite?: () => void;
   /** Whether the open note is favorited — flips the Favorites item's label. */
   favorited?: boolean;
+  /** When omitted, the Duplicate item stays a no-op stub. */
+  onDuplicate?: () => void;
 };
 
 export function NoteHeader({
@@ -76,6 +78,7 @@ export function NoteHeader({
   archived,
   onFavorite,
   favorited,
+  onDuplicate,
 }: Props) {
   const [moreOpen, setMoreOpen] = useState(false);
 
@@ -132,6 +135,7 @@ export function NoteHeader({
               archived={archived}
               onFavorite={onFavorite}
               favorited={favorited}
+              onDuplicate={onDuplicate}
             />
           )}
         </div>

@@ -441,6 +441,7 @@ pub fn run() {
             notes::notes_dir,
             notes::create_note,
             notes::convert_external,
+            notes::duplicate_note,
             notes::is_owned_note,
             notes::list_notes,
             notes::note_meta,
