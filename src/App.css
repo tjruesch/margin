@@ -888,6 +888,9 @@ select.settings-input {
 .home-section {
   padding: 10px 32px 4px;
 }
+.home-section + .home-section {
+  margin-top: 22px;
+}
 .home-section-head {
   display: flex;
   align-items: flex-end;
@@ -1052,6 +1055,42 @@ select.settings-input {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+.home-action-group {
+  margin-top: 18px;
+}
+.home-action-group:first-of-type {
+  margin-top: 14px;
+}
+.home-action-group-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.home-action-group-head:hover {
+  background: var(--home-chip);
+}
+.home-action-group-title {
+  flex: 1 1 auto;
+  text-align: left;
+}
+.home-action-group-count {
+  color: var(--fg-muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+.home-action-group .home-actions {
+  margin-top: 6px;
 }
 .home-action-row {
   display: flex;

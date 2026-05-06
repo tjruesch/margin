@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { type NoteListItem } from "./file";
+import { type ActionListItem, type NoteListItem } from "./file";
 import { MoreMenu } from "./MoreMenu";
 import {
   IconArchive,
@@ -46,16 +46,20 @@ type Props = {
   onFavoriteRow?: (path: string, nextFavorited: boolean) => void;
   /** Clone a row to a new bundle. */
   onDuplicateRow?: (path: string) => void;
+  /** Open action items across all non-archived owned notes. Drives the
+   *  Action items sidebar nav, the count badge, and the home teaser. */
+  actions: ActionListItem[];
+  /** Flip an action item's done state. Optimistic upstream. */
+  onToggleAction: (id: string, nextDone: boolean) => void;
 };
 
 type NavId = "home" | "actions" | "meetings" | "shared" | "favorites" | "archive";
 type FilterId = "all" | "notes" | "meetings" | "shared";
 
-// Stub data for sections whose backends don't exist yet (#27, #28).
-// These return empty arrays so the sections hide gracefully; swapping in
-// live data later is a one-line change.
+// Stub data for sections whose backends don't exist yet (#27 calendar).
+// Returns empty so the section hides gracefully; swap in live data when
+// the backend lands.
 const UPCOMING_EVENTS: UpcomingEvent[] = [];
-const ACTION_ITEMS: ActionItem[] = [];
 
 export function Home({
   notes,
@@ -71,6 +75,8 @@ export function Home({
   onArchiveRow,
   onFavoriteRow,
   onDuplicateRow,
+  actions,
+  onToggleAction,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -114,7 +120,7 @@ export function Home({
 
   const grouped = useMemo(() => groupByDay(filteredNotes), [filteredNotes]);
 
-  const openActionCount = ACTION_ITEMS.filter((a) => !a.done).length;
+  const openActionCount = actions.filter((a) => !a.done).length;
 
   return (
     <div className={"home" + (sidebarOpen ? "" : " home-collapsed")}>
@@ -161,26 +167,40 @@ export function Home({
 
         {UPCOMING_EVENTS.length > 0 && <UpcomingStrip events={UPCOMING_EVENTS} />}
 
-        {openActionCount > 0 && (
-          <ActionItemsTeaser items={ACTION_ITEMS} />
+        {nav === "actions" ? (
+          <ActionsFeed
+            actions={actions}
+            onToggle={onToggleAction}
+            onOpenNote={onOpen}
+          />
+        ) : (
+          <>
+            {openActionCount > 0 && (
+              <ActionItemsTeaser
+                items={actions}
+                onToggle={onToggleAction}
+                onOpenNote={onOpen}
+                onViewAll={() => setNav("actions")}
+              />
+            )}
+            <NotesFeed
+              loading={notesLoading}
+              grouped={grouped}
+              totalNotes={notes.length}
+              filter={filter}
+              onFilterChange={setFilter}
+              tagFilter={tagFilter}
+              onClearTagFilter={() => setTagFilter(null)}
+              onOpen={onOpen}
+              onDeleteRow={onDeleteRow}
+              onArchiveRow={onArchiveRow}
+              onFavoriteRow={onFavoriteRow}
+              onDuplicateRow={onDuplicateRow}
+              archivedScope={scope === "archived"}
+              favoritesScope={scope === "favorites"}
+            />
+          </>
         )}
-
-        <NotesFeed
-          loading={notesLoading}
-          grouped={grouped}
-          totalNotes={notes.length}
-          filter={filter}
-          onFilterChange={setFilter}
-          tagFilter={tagFilter}
-          onClearTagFilter={() => setTagFilter(null)}
-          onOpen={onOpen}
-          onDeleteRow={onDeleteRow}
-          onArchiveRow={onArchiveRow}
-          onFavoriteRow={onFavoriteRow}
-          onDuplicateRow={onDuplicateRow}
-          archivedScope={scope === "archived"}
-          favoritesScope={scope === "favorites"}
-        />
 
         <div className="home-spacer" />
         <AskBar />
@@ -456,63 +476,151 @@ function AttendeeStack({ attendees }: { attendees: string[] }) {
 
 // ---------- Action items teaser ------------------------------------------
 
-type ActionItem = {
-  id: string;
-  text: string;
-  done: boolean;
-  due?: string;
-  dueState?: "today" | "soon" | "later";
-  source: { kind: "note" | "meeting"; title: string };
-  tags?: string[];
-};
-
-function ActionItemsTeaser({ items }: { items: ActionItem[] }) {
-  const order = { today: 0, soon: 1, later: 2 } as const;
-  const top = items
-    .filter((it) => !it.done)
-    .sort((a, b) => (order[a.dueState ?? "later"] ?? 3) - (order[b.dueState ?? "later"] ?? 3))
-    .slice(0, 3);
+function ActionItemsTeaser({
+  items,
+  onToggle,
+  onOpenNote,
+  onViewAll,
+}: {
+  items: ActionListItem[];
+  onToggle: (id: string, nextDone: boolean) => void;
+  onOpenNote: (path: string) => void;
+  onViewAll: () => void;
+}) {
+  // Open items only — teaser is the "things to do" preview; done/all
+  // belong on the dedicated actions feed.
+  const open = items.filter((it) => !it.done);
+  const top = open.slice(0, 3);
   if (top.length === 0) return null;
 
   return (
     <section className="home-section">
-      <SectionTitle
-        eyebrow="Action items"
-        title="Things to do"
-        actionLabel={`View all (${items.filter((i) => !i.done).length})`}
-        actionIssue={28}
-      />
+      <div className="home-section-head">
+        <div>
+          <div className="home-section-eyebrow">Action items</div>
+          <h2 className="home-section-title">Things to do</h2>
+        </div>
+        <button
+          type="button"
+          className="home-section-action"
+          onClick={onViewAll}
+          title="See all action items"
+        >
+          View all ({open.length})
+          <IconChevRight size={12} sw={1.7} />
+        </button>
+      </div>
       <div className="home-actions">
         {top.map((it) => (
           <div key={it.id} className="home-action-row">
             <button
               type="button"
               className={"home-checkbox" + (it.done ? " done" : "")}
-              aria-label={it.done ? "Mark as open" : "Mark as done"}
-              onClick={() => stub("Toggle action", 28)}
+              aria-label="Mark as done"
+              onClick={() => onToggle(it.id, true)}
             >
               {it.done && <IconCheck size={12} sw={2.6} />}
             </button>
             <div className="home-action-body">
-              <div className={"home-action-text" + (it.done ? " done" : "")}>{it.text}</div>
+              <div className="home-action-text">{it.text}</div>
               <div className="home-action-meta">
-                <span className="home-action-source">
-                  {it.source.kind === "meeting" ? (
-                    <IconMic size={11} sw={1.7} />
-                  ) : (
-                    <IconFileText size={11} sw={1.7} />
-                  )}
-                  {it.source.title}
-                </span>
-                {it.due && (
-                  <span className={"home-due " + (it.dueState ?? "later")}>{it.due}</span>
-                )}
-                <TagChips tags={it.tags ?? []} max={3} />
+                <button
+                  type="button"
+                  className="home-action-source"
+                  onClick={() => onOpenNote(it.note_path)}
+                  title={`Open ${it.note_title}`}
+                >
+                  <IconFileText size={11} sw={1.7} />
+                  {it.note_title}
+                </button>
               </div>
             </div>
           </div>
         ))}
       </div>
+    </section>
+  );
+}
+
+function ActionsFeed({
+  actions,
+  onToggle,
+  onOpenNote,
+}: {
+  actions: ActionListItem[];
+  onToggle: (id: string, nextDone: boolean) => void;
+  onOpenNote: (path: string) => void;
+}) {
+  // Group by source note. Map iteration preserves insertion order, and
+  // `actions` is already sorted (note mtime desc, then line asc) by the
+  // backend — so groups appear newest-note-first.
+  const grouped = useMemo(() => {
+    const map = new Map<string, ActionListItem[]>();
+    for (const a of actions) {
+      const arr = map.get(a.note_path);
+      if (arr) arr.push(a);
+      else map.set(a.note_path, [a]);
+    }
+    return map;
+  }, [actions]);
+
+  if (actions.length === 0) {
+    return (
+      <section className="home-section">
+        <div className="home-section-head">
+          <div>
+            <div className="home-section-eyebrow">Action items</div>
+            <h2 className="home-section-title">Things to do</h2>
+          </div>
+        </div>
+        <p className="home-empty">
+          No open action items. Add <code>- [ ] task</code> lines to any note.
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="home-section">
+      <div className="home-section-head">
+        <div>
+          <div className="home-section-eyebrow">Action items</div>
+          <h2 className="home-section-title">Things to do</h2>
+        </div>
+      </div>
+      {[...grouped.entries()].map(([notePath, items]) => (
+        <div key={notePath} className="home-action-group">
+          <button
+            type="button"
+            className="home-action-group-head"
+            onClick={() => onOpenNote(notePath)}
+            title={`Open ${items[0].note_title}`}
+          >
+            <IconFileText size={13} sw={1.7} />
+            <span className="home-action-group-title">{items[0].note_title}</span>
+            <span className="home-action-group-count">
+              {items.filter((i) => !i.done).length} open
+            </span>
+          </button>
+          <div className="home-actions">
+            {items.map((it) => (
+              <div key={it.id} className="home-action-row">
+                <button
+                  type="button"
+                  className={"home-checkbox" + (it.done ? " done" : "")}
+                  aria-label={it.done ? "Mark as open" : "Mark as done"}
+                  onClick={() => onToggle(it.id, !it.done)}
+                >
+                  {it.done && <IconCheck size={12} sw={2.6} />}
+                </button>
+                <div className="home-action-body">
+                  <div className={"home-action-text" + (it.done ? " done" : "")}>{it.text}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
     </section>
   );
 }

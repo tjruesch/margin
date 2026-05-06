@@ -453,6 +453,8 @@ pub fn run() {
             notes::set_note_tags,
             notes::set_archived,
             notes::set_favorite,
+            notes::list_actions,
+            notes::set_action_done,
             sharing::share_note
         ])
         .build(tauri::generate_context!())

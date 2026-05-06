@@ -33,8 +33,11 @@ import {
   reconcileNotes,
   setArchived as setArchivedFile,
   setFavorite as setFavoriteFile,
+  setActionDone,
   setNoteTags,
   shareNote,
+  listActions,
+  type ActionListItem,
   startMeetingRecording,
   stopMeetingRecording,
   transcribe,
@@ -198,6 +201,7 @@ export default function App() {
   // sidebar / autocomplete stay in sync without an extra disk walk.
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [notesLoading, setNotesLoading] = useState<boolean>(true);
+  const [actions, setActions] = useState<ActionListItem[]>([]);
   const allTags = useMemo(() => {
     const set = new Set<string>();
     for (const n of notes) for (const t of n.tags) set.add(t);
@@ -275,6 +279,19 @@ export default function App() {
       console.error("listNotes failed:", err);
     } finally {
       setNotesLoading(false);
+    }
+  }, []);
+
+  /** Re-scan open action items. Used by the Home teaser, the sidebar
+   *  count badge, and the dedicated actions feed. Always fetches the
+   *  open scope; done/all are query-time choices the actions feed can
+   *  surface later if we add a "Show completed" toggle. */
+  const refreshActions = useCallback(async () => {
+    try {
+      const items = await listActions("open");
+      setActions(items);
+    } catch (err) {
+      console.error("listActions failed:", err);
     }
   }, []);
 
@@ -888,12 +905,17 @@ export default function App() {
       .then(setHasKey)
       .catch(() => setHasKey(false));
     void refreshNotes();
+    void refreshActions();
   }, []);
 
   // Re-scan notes whenever the user enters home or flips between active
   // and archive scopes so the feed reflects any edits since last visit.
+  // Also refresh actions so the teaser + sidebar count stay current.
   useEffect(() => {
-    if (mode === "home") void refreshNotes();
+    if (mode === "home") {
+      void refreshNotes();
+      void refreshActions();
+    }
     // refreshNotes is stable (defined below with empty deps)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, notesScope]);
@@ -1070,6 +1092,39 @@ export default function App() {
     },
     [isOwnedPath, refreshNotes, loadFile],
   );
+
+  /** Toggle the done state of an action item. Optimistic — flips the
+   *  local state instantly, then writes through. On error, revert and
+   *  surface the message. */
+  const onToggleAction = useCallback(async (id: string, nextDone: boolean) => {
+    let prev: ActionListItem | undefined;
+    setActions((curr) => {
+      const i = curr.findIndex((a) => a.id === id);
+      if (i < 0) return curr;
+      prev = curr[i];
+      // In the open scope we currently store, flipping to done removes
+      // the row from view; flipping back to open re-adds it (the next
+      // refresh will sort it correctly).
+      if (nextDone) {
+        return [...curr.slice(0, i), ...curr.slice(i + 1)];
+      }
+      return curr.map((a) => (a.id === id ? { ...a, done: false } : a));
+    });
+    try {
+      await setActionDone(id, nextDone);
+    } catch (err) {
+      console.error("setActionDone failed:", err);
+      alert("Could not update the task. See console for details.");
+      // Revert: put `prev` back if we removed it.
+      if (prev) {
+        setActions((curr) => (curr.some((a) => a.id === id) ? curr : [...curr, prev!]));
+      }
+      return;
+    }
+    // Watcher should drive the index → next refresh; but force one for
+    // immediate consistency in the actions feed.
+    await refreshActions();
+  }, [refreshActions]);
 
   /** Open the macOS share sheet for the active note. The Rust side
    *  writes a renamed temp `<title>.md` (frontmatter stripped) and
@@ -1293,6 +1348,8 @@ export default function App() {
             onArchiveRow={(p, next) => void onArchiveNote(p, next)}
             onFavoriteRow={(p, next) => void onFavoriteNote(p, next)}
             onDuplicateRow={(p) => void onDuplicateNote(p)}
+            actions={actions}
+            onToggleAction={(id, next) => void onToggleAction(id, next)}
           />
         )}
       </main>

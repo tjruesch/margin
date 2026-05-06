@@ -112,6 +112,28 @@ export async function shareNote(notePath: string): Promise<void> {
   await invoke<void>("share_note", { notePath });
 }
 
+// --- Action items --------------------------------------------------------
+
+export type ActionScope = "open" | "done" | "all";
+
+export type ActionListItem = {
+  id: string;
+  note_path: string;
+  note_title: string;
+  text: string;
+  done: boolean;
+  line: number;
+  created_ms: number;
+};
+
+export async function listActions(scope: ActionScope = "open"): Promise<ActionListItem[]> {
+  return invoke<ActionListItem[]>("list_actions", { scope });
+}
+
+export async function setActionDone(id: string, done: boolean): Promise<void> {
+  await invoke<void>("set_action_done", { id, done });
+}
+
 export async function notesDir(): Promise<string> {
   return invoke<string>("notes_dir");
 }

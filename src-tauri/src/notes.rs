@@ -51,6 +51,26 @@ pub enum NoteScope {
     All,
 }
 
+#[derive(Serialize)]
+pub struct ActionListItem {
+    pub id: String,
+    pub note_path: String,
+    pub note_title: String,
+    pub text: String,
+    pub done: bool,
+    pub line: i64,
+    pub created_ms: i64,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum ActionScope {
+    #[default]
+    Open,
+    Done,
+    All,
+}
+
 fn new_note_ref(id: String, note_path: PathBuf) -> NoteRef {
     NoteRef {
         id,
@@ -193,6 +213,18 @@ pub fn list_notes(
 ) -> Result<Vec<NoteListItem>, String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
     crate::index::list_all(&c, scope.unwrap_or_default()).map_err(|e| e.to_string())
+}
+
+/// Return action items across all non-archived owned notes, scoped to
+/// open / done / all. Default `Open`. Joins on the notes table for the
+/// source note's title.
+#[tauri::command]
+pub fn list_actions(
+    scope: Option<ActionScope>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<ActionListItem>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    crate::index::list_actions(&c, scope.unwrap_or_default()).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -448,6 +480,88 @@ pub fn set_archived(
     set_bool_in_frontmatter(&note_path, "archived", archived, &guard, &conn)
 }
 
+/// Toggle the done state of an action item by its derived id. Looks up
+/// the action's source note, finds the line (via cached line number
+/// first, then by re-scanning the body for the text-hash), flips the
+/// `[ ]`/`[x]` marker, and writes the file back through the existing
+/// frontmatter round-trip. Index refresh happens via `touch_index`.
+#[tauri::command]
+pub fn set_action_done(
+    id: String,
+    done: bool,
+    guard: tauri::State<'_, crate::WriteGuard>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let (note_path, cached_line, want_text) = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT note_path, line, text FROM actions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
+    let want_hash = action_text_hash(&want_text);
+
+    let mut target_idx: Option<usize> = None;
+    if cached_line >= 1 && cached_line <= lines.len() {
+        if let Some((line_text, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
+            if action_text_hash(&line_text) == want_hash {
+                target_idx = Some(cached_line - 1);
+            }
+        }
+    }
+    if target_idx.is_none() {
+        for (i, line) in lines.iter().enumerate() {
+            if let Some((line_text, _)) = parse_action_line(line.trim_start()) {
+                if action_text_hash(&line_text) == want_hash {
+                    target_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let idx = target_idx.ok_or_else(|| {
+        "Action not found in note (index may be stale; reload to refresh)".to_string()
+    })?;
+    lines[idx] = toggle_checkbox_marker(&lines[idx], done);
+    let new_body = lines.join("\n");
+
+    let map = yaml.map(parse_frontmatter).unwrap_or_default();
+    let merged = write_with_frontmatter(&map, &new_body);
+    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
+    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    touch_index(&conn, Path::new(&note_path), false);
+    Ok(())
+}
+
+/// Replace the character between `[` and `]` on the first checkbox the
+/// line contains. Preserves indentation, bullet character, and
+/// trailing text/whitespace. Always normalizes done to lowercase `x`.
+fn toggle_checkbox_marker(line: &str, done: bool) -> String {
+    if let Some(open) = line.find('[') {
+        let close = open + 2;
+        if line.as_bytes().get(close) == Some(&b']') {
+            let mut out = String::with_capacity(line.len());
+            out.push_str(&line[..open + 1]);
+            out.push(if done { 'x' } else { ' ' });
+            out.push_str(&line[open + 2..]);
+            return out;
+        }
+    }
+    line.to_string()
+}
+
 /// Flip the favorite flag on a note's frontmatter. Surgical, same shape
 /// as `set_archived`.
 #[tauri::command]
@@ -476,6 +590,79 @@ fn set_bool_in_frontmatter(
     *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
     touch_index(conn, Path::new(note_path), false);
     Ok(())
+}
+
+// ---------- Action items (markdown checkboxes) ---------------------------
+
+#[derive(Clone)]
+pub(crate) struct ParsedAction {
+    pub line: usize,
+    pub text: String,
+    pub done: bool,
+}
+
+/// Walk a note body and return every markdown task line as a
+/// ParsedAction. Lines inside fenced code blocks are skipped (mirrors
+/// the heuristic used by `extract_preview` for prose extraction).
+pub(crate) fn parse_actions(body: &str) -> Vec<ParsedAction> {
+    let mut out = Vec::new();
+    let mut in_code_fence = false;
+    for (i, raw) in body.lines().enumerate() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence {
+            continue;
+        }
+        if let Some((text, done)) = parse_action_line(trimmed) {
+            out.push(ParsedAction {
+                line: i + 1,
+                text,
+                done,
+            });
+        }
+    }
+    out
+}
+
+fn parse_action_line(line: &str) -> Option<(String, bool)> {
+    let after_bullet = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))?;
+    let bytes = after_bullet.as_bytes();
+    // Need `[X] x` (4 ASCII bytes plus the body) — the body itself must
+    // be non-empty after trimming.
+    if bytes.len() < 4 || bytes[0] != b'[' || bytes[2] != b']' || bytes[3] != b' ' {
+        return None;
+    }
+    let done = match bytes[1] {
+        b' ' => false,
+        b'x' | b'X' => true,
+        _ => return None,
+    };
+    let text = after_bullet[4..].trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some((text, done))
+}
+
+/// Stable per-text hash for action IDs. FNV-1a 64-bit, keep low 32 bits
+/// as 8 hex chars. No new dep; deterministic across builds.
+pub(crate) fn action_text_hash(text: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", h as u32)
+}
+
+pub(crate) fn action_id(bundle_id: &str, text: &str) -> String {
+    format!("{bundle_id}:{}", action_text_hash(text))
 }
 
 const PREVIEW_MAX_CHARS: usize = 160;
@@ -791,6 +978,54 @@ mod tests {
     fn read_favorite_true() {
         let map: Mapping = serde_yml::from_str("favorite: true").unwrap();
         assert!(read_favorite(&map));
+    }
+
+    #[test]
+    fn parse_actions_open_and_done() {
+        let body = "intro\n- [ ] alpha\n- [x] beta\n- [X] gamma\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].line, 2);
+        assert_eq!(got[0].text, "alpha");
+        assert!(!got[0].done);
+        assert_eq!(got[1].text, "beta");
+        assert!(got[1].done);
+        assert_eq!(got[2].text, "gamma");
+        assert!(got[2].done);
+    }
+
+    #[test]
+    fn parse_actions_alt_bullets() {
+        let body = "* [ ] starred\n+ [x] plussed\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text, "starred");
+        assert!(got[1].done);
+    }
+
+    #[test]
+    fn parse_actions_skips_code_fences() {
+        let body = "intro\n```\n- [ ] inside fence\n```\n- [ ] after fence\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "after fence");
+    }
+
+    #[test]
+    fn parse_actions_skips_non_checkbox_lines() {
+        let body = "- regular bullet\n- [text]\n- [ ]nospace\n- [ ]\n";
+        let got = parse_actions(body);
+        assert!(got.is_empty(), "got: {:?}", got.iter().map(|a| &a.text).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn action_text_hash_stable_for_same_text() {
+        assert_eq!(action_text_hash("hello"), action_text_hash("hello"));
+    }
+
+    #[test]
+    fn action_text_hash_distinct_for_different_text() {
+        assert_ne!(action_text_hash("foo"), action_text_hash("bar"));
     }
 
     #[test]

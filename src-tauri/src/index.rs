@@ -23,15 +23,17 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 
 use crate::notes::{
-    bundle_dir_for_in, extract_preview, parse_frontmatter, read_archived, read_favorite,
-    read_tags, split_frontmatter, NoteListItem, NoteScope, NOTE_FILENAME, TRANSCRIPT_FILENAME,
+    action_id, bundle_dir_for_in, extract_preview, parse_actions, parse_frontmatter,
+    read_archived, read_favorite, read_tags, split_frontmatter, ActionListItem, ActionScope,
+    NoteListItem, NoteScope, ParsedAction, NOTE_FILENAME, TRANSCRIPT_FILENAME,
 };
 use crate::paths;
 
 const SCHEMA_V1: &str = include_str!("migrations/001_init.sql");
 const SCHEMA_V2: &str = include_str!("migrations/002_archived.sql");
 const SCHEMA_V3: &str = include_str!("migrations/003_favorite.sql");
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_V4: &str = include_str!("migrations/004_actions.sql");
+const SCHEMA_VERSION: i64 = 4;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -74,6 +76,17 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 2 {
         conn.execute_batch(SCHEMA_V3)?;
         version = 3;
+    }
+    if version == 3 {
+        conn.execute_batch(SCHEMA_V4)?;
+        // The new `actions` table is empty but the existing `notes`
+        // rows still match disk on mtime+size, so a vanilla reconcile
+        // would skip them and the actions feed would stay empty until
+        // each note is re-saved. Sentinel `-1` busts the cheap-check
+        // so the very next reconcile re-reads every note and populates
+        // actions for free.
+        conn.execute("UPDATE notes SET body_size = -1", [])?;
+        version = 4;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
@@ -154,6 +167,42 @@ pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>
             favorite: r.favorite,
         })
         .collect())
+}
+
+/// Action items across all non-archived owned notes, scoped to open /
+/// done / all. JOINs with `notes` so the result rows carry the source
+/// note's title for direct display in the actions feed. Archived notes
+/// are excluded from `Open` view since their actions are out of sight
+/// (mirrors the `Active` notes scope).
+pub fn list_actions(conn: &Connection, scope: ActionScope) -> Result<Vec<ActionListItem>> {
+    let where_done = match scope {
+        ActionScope::Open => "AND a.done = 0",
+        ActionScope::Done => "AND a.done = 1",
+        ActionScope::All => "",
+    };
+    let sql = format!(
+        "SELECT a.id, a.note_path, n.title, a.text, a.done, a.line, a.created_ms \
+         FROM actions a JOIN notes n ON n.note_path = a.note_path \
+         WHERE n.archived = 0 {where_done} \
+         ORDER BY n.modified_ms DESC, a.line ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok(ActionListItem {
+            id: r.get(0)?,
+            note_path: r.get(1)?,
+            note_title: r.get(2)?,
+            text: r.get(3)?,
+            done: r.get::<_, i64>(4)? != 0,
+            line: r.get(5)?,
+            created_ms: r.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -262,6 +311,7 @@ struct Indexable {
     archived: bool,
     favorite: bool,
     tags: Vec<String>,
+    actions: Vec<ParsedAction>,
     body: String,
 }
 
@@ -315,6 +365,7 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
     let tags = read_tags(&frontmatter);
     let archived = read_archived(&frontmatter);
     let favorite = read_favorite(&frontmatter);
+    let actions = parse_actions(body);
     let title = body
         .lines()
         .find_map(|l| {
@@ -347,6 +398,7 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
         archived,
         favorite,
         tags,
+        actions,
         body: body.to_string(),
     })
 }
@@ -394,7 +446,38 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
         "INSERT INTO notes_fts(note_path, title, body) VALUES (?1, ?2, ?3)",
         params![note_path, p.title, p.body],
     )?;
+
+    // Actions: replace wholesale. Two open checkboxes with identical
+    // text in one note collapse to one row via the PRIMARY KEY (id is
+    // <bundle>:<hash(text)>). Documented as the v1 trade-off.
+    tx.execute("DELETE FROM actions WHERE note_path = ?1", params![note_path])?;
+    {
+        let now_ms = current_unix_ms();
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO actions(id, note_path, line, text, done, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
+        )?;
+        for a in &p.actions {
+            let id = action_id(&p.bundle_id, &a.text);
+            stmt.execute(params![
+                id,
+                note_path,
+                a.line as i64,
+                a.text,
+                a.done as i64,
+                now_ms,
+            ])?;
+        }
+    }
     Ok(())
+}
+
+fn current_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn remove_in_tx(tx: &Transaction<'_>, note_path: &str) -> Result<()> {
@@ -452,7 +535,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         // FTS table reachable.
         conn.query_row("SELECT count(*) FROM notes_fts", [], |r| r.get::<_, i64>(0))
             .unwrap();
@@ -514,7 +597,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         conn.execute(
             "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
              VALUES ('/x/zzz/note.md', 'zzz', 't', 1, 0)",
@@ -545,7 +628,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
     }
 
     #[test]
@@ -631,6 +714,7 @@ mod tests {
             body_size: 1,
             archived: false,
             favorite: false,
+            actions: vec![],
             tags: vec!["a".into()],
             body: "v1".into(),
         };
@@ -663,6 +747,7 @@ mod tests {
             body_size: 1,
             archived: false,
             favorite: false,
+            actions: vec![],
             tags: vec!["a".into(), "b".into()],
             body: "body".into(),
         };
@@ -763,6 +848,61 @@ mod tests {
     }
 
     #[test]
+    fn upsert_indexes_actions() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let note = write_bundle(
+            &notes,
+            "actbundle",
+            "# Plan\n\n- [ ] open one\n- [x] done one\n",
+        );
+        let mut conn = fresh_conn();
+        upsert_in(&mut conn, &note, &notes).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let opens: Vec<ActionListItem> = list_actions(&conn, ActionScope::Open).unwrap();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].text, "open one");
+        let done: Vec<ActionListItem> = list_actions(&conn, ActionScope::Done).unwrap();
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].text, "done one");
+    }
+
+    #[test]
+    fn upsert_replaces_actions_on_rewrite() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let note = write_bundle(&notes, "rewrite", "# T\n\n- [ ] alpha\n");
+        let mut conn = fresh_conn();
+        upsert_in(&mut conn, &note, &notes).unwrap();
+        // Rewrite with a different action text.
+        std::fs::write(&note, "# T\n\n- [ ] beta\n").unwrap();
+        upsert_in(&mut conn, &note, &notes).unwrap();
+        let opens = list_actions(&conn, ActionScope::Open).unwrap();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].text, "beta");
+    }
+
+    #[test]
+    fn list_actions_excludes_archived_note() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        write_bundle(&notes, "active", "# A\n\n- [ ] visible\n");
+        write_bundle(
+            &notes,
+            "arc",
+            "---\narchived: true\n---\n# Z\n\n- [ ] hidden\n",
+        );
+        let mut conn = fresh_conn();
+        reconcile(&mut conn, &notes).unwrap();
+        let opens = list_actions(&conn, ActionScope::Open).unwrap();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].text, "visible");
+    }
+
+    #[test]
     fn upsert_indexes_archived_flag() {
         let tmp = TempDir::new().unwrap();
         let notes = tmp.path().to_path_buf();
@@ -795,6 +935,7 @@ mod tests {
             body_size: 0,
             archived: false,
             favorite: false,
+            actions: vec![],
             tags: vec![],
             body: String::new(),
         };
