@@ -36,28 +36,29 @@ const marginDark: Theme = {
   id: "margin-dark",
   name: "Margin Dark",
   appearance: "dark",
-  // Inspired by the Anthropic console: pure-black canvas with warm accents.
-  // Source palette: #000, #FDBA74, #2B1FEB, #9EB5FE, #C3420D, #00786F, #6A5E83, #50307B
+  // Warm dark sibling of Margin Light: deep brown canvas with the same
+  // rust accent and a softened blue for heading marks (mirrors the
+  // design's `mark` blue tuned for low-light).
   vars: {
-    bg: "#000000",
-    bgMuted: "#0a0a0a",
-    border: "#2a2a2a",
-    borderMuted: "#1a1a1a",
-    fg: "#ececec",
-    fgMuted: "#9a9a9a",
-    accent: "#FDBA74",
-    tabActiveBg: "#000000",
-    tabActiveBorder: "#2a2a2a",
-    codeBg: "#0e0e0e",
-    codeFg: "#ececec",
-    hlKeyword: "#C3420D",
-    hlTitle: "#FDBA74",
-    hlAttr: "#9EB5FE",
-    hlString: "#00786F",
-    hlBuiltin: "#FDBA74",
-    hlComment: "#6A5E83",
-    hlTag: "#FDBA74",
-    hlSection: "#9EB5FE",
+    bg: "#181410",
+    bgMuted: "#221d18",
+    border: "#3a322b",
+    borderMuted: "#2a2520",
+    fg: "#ECE5D8",
+    fgMuted: "#B3A998",
+    accent: "#E8703F",
+    tabActiveBg: "#181410",
+    tabActiveBorder: "#3a322b",
+    codeBg: "#1f1a14",
+    codeFg: "#ECE5D8",
+    hlKeyword: "#E8703F",       // rust list markers
+    hlTitle: "#E8C58A",
+    hlAttr: "#7A98D8",
+    hlString: "#7DC9B8",
+    hlBuiltin: "#E8703F",
+    hlComment: "#8B7E6D",
+    hlTag: "#E8C58A",
+    hlSection: "#7A98D8",       // muted blue heading marks
   },
 };
 
@@ -65,27 +66,29 @@ const marginLight: Theme = {
   id: "margin-light",
   name: "Margin Light",
   appearance: "light",
-  // Paper-toned sibling of Margin Dark, same accent vocabulary tuned for contrast on cream.
+  // Cream-and-rust palette mirroring the polished note design.
+  // --bg-window / --bg-elev / --accent / --accent-ink / --code-blue
+  // tokens map directly from margin_design/Note Page Polished.html.
   vars: {
-    bg: "#fbfaf6",
-    bgMuted: "#f1ede2",
-    border: "#d4cfc1",
-    borderMuted: "#e3ded1",
-    fg: "#1a1a1a",
-    fgMuted: "#5a5a5a",
-    accent: "#C3420D",
-    tabActiveBg: "#fbfaf6",
-    tabActiveBorder: "#d4cfc1",
-    codeBg: "#f1ede2",
-    codeFg: "#1a1a1a",
-    hlKeyword: "#C3420D",
-    hlTitle: "#50307B",
-    hlAttr: "#2B1FEB",
-    hlString: "#00786F",
-    hlBuiltin: "#b85a1a",
-    hlComment: "#6A5E83",
-    hlTag: "#00786F",
-    hlSection: "#2B1FEB",
+    bg: "#F7F3EC",              // --bg-window
+    bgMuted: "#F2EDE3",         // --bg-window-alt
+    border: "#C8C0B0",
+    borderMuted: "#E0D8C9",
+    fg: "#1A1A1A",              // --ink
+    fgMuted: "#3D3A36",          // --ink-2
+    accent: "#C44A1F",           // --accent (rust)
+    tabActiveBg: "#F7F3EC",
+    tabActiveBorder: "#C8C0B0",
+    codeBg: "#FBF8F2",           // --bg-elev
+    codeFg: "#1A1A1A",
+    hlKeyword: "#8A2F11",        // rust list markers (--accent-ink)
+    hlTitle: "#0E7A6E",          // --code-teal
+    hlAttr: "#2447B3",           // --code-blue
+    hlString: "#0E7A6E",
+    hlBuiltin: "#C44A1F",
+    hlComment: "#6B655C",        // --ink-3
+    hlTag: "#0E7A6E",
+    hlSection: "#3A5DA8",        // muted blue heading marks (--markH1)
   },
 };
 
@@ -93,30 +96,32 @@ const marginRouge: Theme = {
   id: "margin-rouge",
   name: "Margin Rouge",
   appearance: "dark",
-  // Wine canvas with pink/rose accents.
-  // Source palette: #F5B0D1, #651D31, #752E44, #CE93B0, #fff
+  // Wine canvas with pink/rose accents. The body text reads as
+  // near-cream pink (~10:1 against the wine) so prose pops without
+  // sacrificing the warm vibe; list markers shift to a warm peach so
+  // they sit in a different hue family from the body.
   vars: {
     bg: "#651D31",
     bgMuted: "#752E44",
     border: "#CE93B0",
     borderMuted: "#752E44",
-    fg: "#F5B0D1",
-    fgMuted: "#CE93B0",
+    fg: "#FFE8F0",                  // bright cream-pink body text
+    fgMuted: "#E8C5D2",
     accent: "#F5B0D1",
     tabActiveBg: "#651D31",
     tabActiveBorder: "#752E44",
     codeBg: "#752E44",
-    codeFg: "#ffffff",
-    // Warm-spectrum palette derived from the rose theme: rose, peach, gold,
-    // lavender, cream — keeps the brand vibe while giving syntax real variety.
-    hlKeyword: "#FF7B9D",
+    codeFg: "#FFFFFF",
+    // Warm-spectrum palette: peach list markers stand out against the
+    // pink body; cream headings; soft lavender attributes; etc.
+    hlKeyword: "#FF8A47",           // peach `- ` list dash
     hlTitle: "#FFB995",
     hlAttr: "#E0B0E0",
     hlString: "#F5B0D1",
     hlBuiltin: "#FFD580",
     hlComment: "#CE93B0",
     hlTag: "#FFE5A8",
-    hlSection: "#ffffff",
+    hlSection: "#B8B0E8",           // soft lavender heading marks (cool third hue)
   },
 };
 

@@ -112,6 +112,21 @@
   box-sizing: border-box;
 }
 
+::selection {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+  color: inherit;
+}
+
+/* Editor selection layer. CodeMirror 6 draws its own selection rects via
+   .cm-selectionBackground inside .cm-selectionLayer; the inline
+   EditorView.theme rule loses to internal styles in some browsers, so
+   force the theme accent here with high specificity. */
+.cm-editor .cm-selectionBackground,
+.cm-editor.cm-focused .cm-selectionBackground,
+.cm-editor .cm-selectionLayer .cm-selectionBackground {
+  background: color-mix(in srgb, var(--accent) 35%, transparent) !important;
+}
+
 html,
 body,
 #root {
@@ -191,15 +206,134 @@ body {
 .preview-scroll {
   height: 100%;
   overflow: auto;
-  padding: 32px 48px 64px;
+  padding: 40px 0 80px;
 }
 
 .markdown-body {
   background: transparent !important;
   color: var(--fg) !important;
-  max-width: 980px;
+  max-width: 720px;
   margin: 0 auto;
-  font-size: 16px;
+  padding: 0 32px;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  font-size: calc(var(--editor-font-size, 14px) + 1.5px);
+  line-height: 1.65;
+}
+
+/* Tiny uppercase label above the article — signals "rendered view" with
+   the same vocabulary as the design's eyebrow. */
+.preview-eyebrow {
+  max-width: 720px;
+  margin: 0 auto 8px;
+  padding: 0 32px;
+  font-family: "Inter", sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--fg-muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* ----- Polished preview typography overrides on .markdown-body ----- */
+
+.note-preview h1 {
+  font-family: "Fraunces Variable", "Fraunces", Georgia, serif;
+  font-size: 38px;
+  font-weight: 500;
+  font-variation-settings: "opsz" 144;
+  letter-spacing: -0.015em;
+  line-height: 1.1;
+  margin: 0 0 20px;
+  color: var(--fg);
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.note-preview h2 {
+  font-family: "Fraunces Variable", "Fraunces", Georgia, serif;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1.25;
+  margin: 32px 0 12px;
+  color: var(--fg);
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.note-preview h3 {
+  font-family: "Fraunces Variable", "Fraunces", Georgia, serif;
+  font-size: 18px;
+  font-weight: 600;
+  margin: 26px 0 10px;
+  color: var(--fg);
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.note-preview p {
+  font-size: calc(var(--editor-font-size, 14px) + 1.5px);
+  line-height: 1.65;
+  color: var(--fg-muted);
+  margin: 0 0 14px;
+}
+.note-preview ul,
+.note-preview ol {
+  padding-left: 22px;
+  margin: 0 0 14px;
+}
+.note-preview li {
+  font-size: calc(var(--editor-font-size, 14px) + 1.5px);
+  line-height: 1.6;
+  color: var(--fg-muted);
+  margin-bottom: 8px;
+}
+
+/* Custom-rendered checkboxes for `- [ ] task` lines. markdown-it-task-lists
+   produces <input type="checkbox" class="task-list-item-checkbox">.
+   Strip native chrome and replace with a 18px rounded square that fills
+   with the accent when checked. */
+.note-preview ul.contains-task-list {
+  padding-left: 0;
+  list-style: none;
+}
+.note-preview li.task-list-item {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 4px 0;
+  margin-bottom: 0;
+}
+.note-preview .task-list-item-checkbox {
+  appearance: none;
+  -webkit-appearance: none;
+  margin: -2px 0 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  border: 1.5px solid var(--border);
+  background: transparent;
+  flex-shrink: 0;
+  position: relative;
+  cursor: pointer;
+}
+.note-preview .task-list-item-label {
+  cursor: pointer;
+}
+.note-preview .task-list-item-checkbox:checked {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'><path d='M5 12.5l4.5 4.5L19 7'/></svg>");
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 11px 11px;
+  box-shadow: inset 0 0.5px 0 color-mix(in srgb, #fff 25%, transparent);
+}
+.note-preview li.task-list-item:has(.task-list-item-checkbox:checked) {
+  color: color-mix(in srgb, var(--fg-muted) 70%, var(--bg));
+}
+.note-preview li.task-list-item:has(.task-list-item-checkbox:checked)
+  > :not(input) {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--fg) 18%, transparent);
+  text-decoration-thickness: 1px;
 }
 
 /* github-markdown-css ships hardcoded grays that only land well on its own
@@ -1441,72 +1575,6 @@ select.settings-input {
   margin: 0 2px;
 }
 
-/* ----- Ask bar ----- */
-
-.home-spacer {
-  flex: 1;
-  min-height: 24px;
-}
-.home-askbar {
-  position: sticky;
-  bottom: 0;
-  padding: 14px 32px 18px;
-  background: linear-gradient(
-    to top,
-    var(--bg) 60%,
-    color-mix(in srgb, var(--bg) 0%, transparent)
-  );
-}
-.home-ask {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  height: 48px;
-  padding: 0 8px 0 18px;
-  background: var(--home-card);
-  border-radius: 14px;
-  box-shadow: 0 2px 12px color-mix(in srgb, var(--fg) 5%, transparent),
-              0 0 0 0.5px var(--home-line);
-  transition: box-shadow 160ms ease;
-}
-.home-ask:hover,
-.home-ask:focus-within {
-  box-shadow: 0 6px 24px color-mix(in srgb, var(--fg) 8%, transparent),
-              0 0 0 0.5px var(--home-line-strong);
-}
-.home-ask-icon {
-  color: var(--accent);
-  display: inline-flex;
-}
-.home-ask-input {
-  flex: 1;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--fg);
-  font: inherit;
-  font-size: 13.5px;
-}
-.home-ask-input::placeholder {
-  color: var(--fg-muted);
-}
-.home-ask-send {
-  width: 32px;
-  height: 32px;
-  border-radius: 9px;
-  background: var(--accent);
-  color: var(--bg);
-  border: none;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: inset 0 0.5px 0 color-mix(in srgb, var(--bg) 25%, transparent);
-}
-.home-ask-send:hover {
-  filter: brightness(1.05);
-}
-
 /* ---------- Recording banner (above editor for owned notes) ------------- */
 
 .recording-banner {
@@ -1763,52 +1831,59 @@ select.settings-input {
 }
 
 /* ---------- Transcript view ------------------------------------------- */
+/* Mirrors the preview's polished column: 720px, Inter body in --fg-muted,
+   tiny uppercase eyebrow at the top, hairline meta strip. */
 .transcript-view {
   height: 100%;
   overflow-y: auto;
-  font-size: 14px;
-  line-height: 1.6;
-  color: var(--fg);
+  padding: 40px 0 80px;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  font-size: calc(var(--editor-font-size, 14px) + 1.5px);
+  line-height: 1.65;
+  color: var(--fg-muted);
 }
 .transcript-view > * {
-  max-width: 760px;
+  max-width: 720px;
   margin-left: auto;
   margin-right: auto;
   padding-left: 32px;
   padding-right: 32px;
 }
-.transcript-view > .transcript-meta {
-  padding-top: 28px;
-}
-.transcript-view > .transcript-body {
-  padding-bottom: 80px;
+.transcript-eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--fg-muted);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
 }
 .transcript-meta {
   display: flex;
   flex-wrap: wrap;
   gap: 14px;
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--fg-muted);
-  margin-bottom: 22px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--border-muted);
+  margin-bottom: 24px;
+  padding-bottom: 14px;
+  border-bottom: 0.5px solid var(--border-muted);
 }
 .transcript-paragraph {
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 .transcript-speaker {
   font-size: 11px;
-  font-weight: 600;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.06em;
   color: var(--fg-muted);
-  margin-bottom: 4px;
+  margin-bottom: 6px;
 }
 .transcript-paragraph p {
   margin: 0;
+  color: var(--fg-muted);
 }
 .transcript-status {
-  padding: 28px 32px;
+  padding: 40px 32px;
   font-size: 13px;
   color: var(--fg-muted);
   text-align: center;
@@ -1821,7 +1896,7 @@ select.settings-input {
 /* Header palette is derived from the active theme tokens so the chrome   */
 /* tracks light, dark, and brand themes automatically.                    */
 .note-header {
-  --nh-bg: var(--bg-muted);
+  --nh-bg: var(--bg);
   --nh-bg-elev: var(--bg);
   --nh-bg-chip: color-mix(in srgb, var(--fg) 5%, transparent);
   --nh-bg-chip-hover: color-mix(in srgb, var(--fg) 9%, transparent);
@@ -1841,10 +1916,10 @@ select.settings-input {
   z-index: 10;
   background: var(--nh-bg);
   border-bottom: 0.5px solid var(--nh-line);
-  /* Left padding clears the macOS traffic lights with the integrated     */
-  /* `titleBarStyle: Overlay` window. The OS reserves ~80px at top-left   */
-  /* for the lights — anything inside that zone is unreachable.            */
-  padding: 12px 22px 14px 80px;
+  /* Top padding reserves a strip for the macOS traffic lights so the
+     chrome row starts cleanly below them (matches the polished design's
+     dedicated title-bar treatment). Left padding goes back to normal. */
+  padding: 38px 22px 18px;
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   color: var(--nh-ink);
 }
@@ -1855,9 +1930,26 @@ select.settings-input {
   gap: 10px;
   min-height: 32px;
 }
+.nh-row1-spacer {
+  flex: 1 1 auto;
+}
+.nh-row1-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--nh-line);
+  margin: 0 4px;
+}
 
-/* Back to all notes (small, icon-only) */
-.nh-back {
+/* Breadcrumb: back-chevron + home glyph as a single hit target, then a
+   path separator and the truncated note title. Reads as a path rather
+   than a bare back button. */
+.nh-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+.nh-breadcrumb-back {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1870,8 +1962,24 @@ select.settings-input {
   color: var(--nh-ink-3);
   transition: background 120ms ease;
 }
-.nh-back:hover {
+.nh-breadcrumb-back:hover {
   background: var(--nh-bg-chip);
+}
+.nh-breadcrumb-sep {
+  color: var(--nh-ink-4);
+  font-size: 13px;
+  padding: 0 2px;
+  user-select: none;
+}
+.nh-breadcrumb-title {
+  color: var(--nh-ink-3);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+  padding: 0 4px;
 }
 
 /* Segmented Edit/Preview toggle */
@@ -2070,18 +2178,19 @@ select.settings-input {
   margin: 4px 6px;
 }
 
-/* Inline title in row 1 — fills the space between the back button and the
-   action cluster. Editable in place. */
+/* Note title — large display element below the chrome row. Editable
+   in place; falls through Fraunces → Georgia → serif until the
+   palette work loads the variable font. */
 .nh-title {
-  font-family: "Fraunces", Georgia, serif;
-  font-size: 18px;
+  display: block;
+  font-family: "Fraunces Variable", "Fraunces", Georgia, serif;
+  font-size: 32px;
   font-weight: 600;
-  font-variation-settings: "opsz" 36;
-  letter-spacing: -0.01em;
-  line-height: 1.3;
+  font-variation-settings: "opsz" 144;
+  letter-spacing: -0.015em;
+  line-height: 1.15;
   color: var(--nh-ink);
-  flex: 1 1 auto;
-  min-width: 0;
+  width: 100%;
   margin: 0;
   padding: 2px 6px;
   border: none;
@@ -2107,13 +2216,15 @@ input.nh-title {
   overflow: visible;
 }
 
-/* Row 2 — chips on the left, view-mode toggle on the right */
+/* Row 2 — title (above) + chip cluster (below). Replaces the old
+   chips-vs-toggle horizontal split; the toggle now lives in row 1. */
 .note-header-row2 {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-top: 8px;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+  margin-left: -6px; /* unindent the title's hover-padding so its
+                         baseline aligns with the breadcrumb */
 }
 .nh-chips {
   display: flex;

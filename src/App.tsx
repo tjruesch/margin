@@ -133,6 +133,13 @@ export default function App() {
   const [tabSize, setTabSize] = useState<number>(2);
   const [useTabs, setUseTabs] = useState<boolean>(false);
   const [softWrap, setSoftWrap] = useState<boolean>(true);
+  const [fontSize, setFontSize] = useState<number>(14);
+
+  // Expose the editor font size as a CSS custom property so preview /
+  // transcript bodies can derive their typography from it via calc().
+  useEffect(() => {
+    document.documentElement.style.setProperty("--editor-font-size", `${fontSize}px`);
+  }, [fontSize]);
   const [themeSettings, setThemeSettings] = useState<ThemeSettings>(DEFAULT_SETTINGS.theme);
   const [aiSettings, setAISettings] = useState<AISettings>(DEFAULT_SETTINGS.ai);
   const [systemAppearance, setSystemAppearance] = useState<"light" | "dark">(systemTheme);
@@ -1201,10 +1208,16 @@ export default function App() {
   }, []);
 
   const onEditorPrefsChange = useCallback(
-    (next: { tabSize: number; useTabs: boolean; softWrap: boolean }) => {
+    (next: {
+      tabSize: number;
+      useTabs: boolean;
+      softWrap: boolean;
+      fontSize: number;
+    }) => {
       setTabSize(next.tabSize);
       setUseTabs(next.useTabs);
       setSoftWrap(next.softWrap);
+      setFontSize(next.fontSize);
     },
     [],
   );
@@ -1315,9 +1328,12 @@ export default function App() {
             tabSize={tabSize}
             useTabs={useTabs}
             softWrap={softWrap}
+            fontSize={fontSize}
           />
         )}
-        {mode === "preview" && <Preview source={content} theme={theme} />}
+        {mode === "preview" && (
+          <Preview source={content} theme={theme} onSourceChange={setContent} />
+        )}
         {mode === "transcript" && transcriptPath && (
           <TranscriptView path={transcriptPath} />
         )}
@@ -1325,7 +1341,7 @@ export default function App() {
           <Settings
             theme={themeSettings}
             ai={aiSettings}
-            editor={{ tabSize, useTabs, softWrap }}
+            editor={{ tabSize, useTabs, softWrap, fontSize }}
             onThemeChange={onThemeChange}
             onAIChange={onAIChange}
             onEditorChange={onEditorPrefsChange}

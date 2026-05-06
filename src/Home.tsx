@@ -4,7 +4,6 @@ import { type ActionListItem, type NoteListItem } from "./file";
 import { MoreMenu } from "./MoreMenu";
 import {
   IconArchive,
-  IconArrowRight,
   IconBell,
   IconCalendar,
   IconCheck,
@@ -18,7 +17,6 @@ import {
   IconSearch,
   IconSettings,
   IconSidebar,
-  IconSparkle,
   IconStar,
   IconUsers,
 } from "./icons";
@@ -202,8 +200,6 @@ export function Home({
           </>
         )}
 
-        <div className="home-spacer" />
-        <AskBar />
       </div>
     </div>
   );
@@ -888,39 +884,6 @@ function Waveform() {
   );
 }
 
-// ---------- Ask bar -------------------------------------------------------
-
-function AskBar() {
-  return (
-    <div className="home-askbar">
-      <div className="home-ask">
-        <span className="home-ask-icon">
-          <IconSparkle size={16} sw={1.6} />
-        </span>
-        <input
-          className="home-ask-input"
-          placeholder="Ask Margin anything — summarize a meeting, find a decision, draft an email…"
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              stub("Ask Margin", 29);
-            }
-          }}
-          aria-label="Ask Margin"
-        />
-        <button
-          type="button"
-          className="home-ask-send"
-          title="Ask — coming soon (issue #29)"
-          aria-label="Send"
-          onClick={() => stub("Ask Margin", 29)}
-        >
-          <IconArrowRight size={13} sw={2} />
-        </button>
-      </div>
-    </div>
-  );
-}
 
 // ---------- Section title -------------------------------------------------
 

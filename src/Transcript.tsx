@@ -52,6 +52,7 @@ export function TranscriptView({ path }: Props) {
 
   return (
     <div className="transcript-view">
+      <div className="transcript-eyebrow">Transcript</div>
       <div className="transcript-meta">
         {langLabel && <span>Detected language: {langLabel}</span>}
         <span>{durationLabel}</span>

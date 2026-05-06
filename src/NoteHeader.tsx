@@ -92,19 +92,20 @@ export function NoteHeader({
   }, [moreOpen]);
 
   return (
-    <header className="note-header">
-      <div className="note-header-row1" data-tauri-drag-region>
-        <button
-          type="button"
-          className="nh-back"
-          title="Back to all notes"
-          aria-label="Back to all notes"
-          onClick={onBack}
-        >
-          <IconChevLeft size={14} sw={1.8} />
-          <IconHome size={14} sw={1.6} />
-        </button>
-        <EditableTitle value={title} onChange={onTitleChange} />
+    <header className="note-header" data-tauri-drag-region>
+      <div className="note-header-row1">
+        <Breadcrumb noteTitle={title} onBack={onBack} />
+
+        <div className="nh-row1-spacer" />
+
+        <ViewModeToggle
+          mode={mode}
+          onChange={onModeChange}
+          hasTranscript={hasTranscript}
+        />
+
+        <div className="nh-row1-divider" aria-hidden="true" />
+
         <RecordButton
           recording={recording}
           disabled={!canRecord && !recording}
@@ -141,6 +142,7 @@ export function NoteHeader({
       </div>
 
       <div className="note-header-row2">
+        <EditableTitle value={title} onChange={onTitleChange} />
         <div className="nh-chips">
           {favorited && (
             <span className="nh-chip nh-chip-fav" title="Favorite" aria-label="Favorite">
@@ -161,13 +163,29 @@ export function NoteHeader({
             />
           )}
         </div>
-        <ViewModeToggle
-          mode={mode}
-          onChange={onModeChange}
-          hasTranscript={hasTranscript}
-        />
       </div>
     </header>
+  );
+}
+
+function Breadcrumb({ noteTitle, onBack }: { noteTitle: string; onBack: () => void }) {
+  return (
+    <div className="nh-breadcrumb">
+      <button
+        type="button"
+        className="nh-breadcrumb-back"
+        title="Back to all notes"
+        aria-label="Back to all notes"
+        onClick={onBack}
+      >
+        <IconChevLeft size={14} sw={1.8} />
+        <IconHome size={14} sw={1.6} />
+      </button>
+      <span className="nh-breadcrumb-sep" aria-hidden="true">/</span>
+      <span className="nh-breadcrumb-title" title={noteTitle}>
+        {noteTitle}
+      </span>
+    </div>
   );
 }
 

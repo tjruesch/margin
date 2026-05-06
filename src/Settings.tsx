@@ -28,7 +28,10 @@ export type EditorPrefs = {
   tabSize: number;
   useTabs: boolean;
   softWrap: boolean;
+  fontSize: number;
 };
+
+const FONT_SIZES = [12, 13, 14, 15, 16, 18, 20];
 
 type SettingsProps = {
   theme: ThemeSettings;
@@ -193,6 +196,23 @@ export function Settings({
                   <option value="2">2</option>
                   <option value="4">4</option>
                   <option value="8">8</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="settings-row settings-row--inline">
+              <div className="settings-row-label">Font size</div>
+              <div className="settings-row-control">
+                <select
+                  className="settings-input"
+                  value={String(editor.fontSize)}
+                  onChange={(e) => updateEditor({ fontSize: Number(e.target.value) })}
+                >
+                  {FONT_SIZES.map((s) => (
+                    <option key={s} value={String(s)}>
+                      {s}px
+                    </option>
+                  ))}
                 </select>
               </div>
             </div>

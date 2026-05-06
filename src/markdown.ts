@@ -24,7 +24,7 @@ export const md: MarkdownIt = new MarkdownIt({
   },
 })
   .use(anchor)
-  .use(taskLists, { enabled: false, label: true })
+  .use(taskLists, { enabled: true, label: true })
   .use(footnote)
   .use(emoji);
 
