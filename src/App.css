@@ -124,7 +124,9 @@ body {
     -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Helvetica,
     Arial, sans-serif;
   color: var(--fg);
-  background: var(--bg);
+  /* Transparent so the OS NSVisualEffectView (applied at the window      */
+  /* level via window-vibrancy) shows through where children let it.     */
+  background: transparent;
   -webkit-font-smoothing: antialiased;
   font-size: 14px;
 }
@@ -133,7 +135,7 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: var(--bg);
+  background: transparent;
   color: var(--fg);
 }
 
@@ -530,15 +532,6 @@ select.settings-input {
   user-select: none;
 }
 
-/* ---------- drag-bar (covers traffic light area when no tabbar) -------- */
-
-.drag-bar {
-  height: 28px;
-  flex-shrink: 0;
-  background: var(--bg);
-  -webkit-app-region: drag;
-}
-
 /* ---------- Home --------------------------------------------------------- */
 /* Theme-aware home page chrome. All surfaces derive from --bg / --fg /     */
 /* --accent so the redesigned home tracks light, dark, and brand themes.    */
@@ -556,9 +549,10 @@ select.settings-input {
   height: 100%;
   width: 100%;
   display: flex;
-  /* Page background — sidebar floats on this; matches main column so the */
-  /* gap on the sidebar's right reads as a clean inset, not a seam. */
-  background: var(--bg);
+  /* Transparent so the window-level NSVisualEffectView reaches the      */
+  /* sidebar's region. Main column paints solid on top, hiding blur     */
+  /* everywhere it isn't wanted.                                         */
+  background: transparent;
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   color: var(--fg);
   min-height: 0;
@@ -566,9 +560,22 @@ select.settings-input {
 
 /* ----- Sidebar ----- */
 
-/* Tahoe-style "floating" sidebar — inset margins + rounded corners +      */
-/* a soft drop shadow + inner top highlight. Tinted via --bg-muted so it   */
-/* visibly contrasts against the page (which is --bg).                      */
+/* Top drag-handle strips. Empty zones reserved at the top of the      */
+/* sidebar and main column so the macOS traffic lights have visual    */
+/* breathing room and dragging the window from these areas works.     */
+.home-titlebar {
+  height: 24px;
+  flex-shrink: 0;
+}
+.home-main-titlebar {
+  height: 28px;
+  flex-shrink: 0;
+}
+
+/* Tahoe "floating" sidebar — sits over the OS NSVisualEffectView. The     */
+/* low-alpha gradient lets vibrancy through; the inner top highlight +     */
+/* outline crisp the rounded corners against the desktop blur. The OS     */
+/* material handles elevation, so we don't add a CSS drop shadow.         */
 .home-sidebar {
   width: 224px;
   flex-shrink: 0;
@@ -577,23 +584,17 @@ select.settings-input {
   background:
     linear-gradient(
       180deg,
-      color-mix(in srgb, var(--fg) 5%, var(--bg-muted)) 0%,
-      color-mix(in srgb, var(--fg) 9%, var(--bg-muted)) 100%
+      color-mix(in srgb, var(--fg) 5%, transparent) 0%,
+      color-mix(in srgb, var(--fg) 9%, transparent) 100%
     );
-  /* Floating elevation: soft drop shadow + inner highlight at the top    */
-  /* edge + faint inner outline to crisp the corners against the page.    */
   box-shadow:
-    0 1px 3px color-mix(in srgb, #000 8%, transparent),
-    0 6px 18px color-mix(in srgb, #000 5%, transparent),
     inset 0 1px 0 color-mix(in srgb, var(--bg) 65%, transparent),
-    inset 0 0 0 0.5px color-mix(in srgb, var(--fg) 8%, transparent);
+    inset 0 0 0 0.5px color-mix(in srgb, var(--fg) 10%, transparent);
   display: flex;
   flex-direction: column;
   padding: 10px 10px;
   gap: 2px;
   overflow: hidden;
-  -webkit-backdrop-filter: blur(20px) saturate(160%);
-  backdrop-filter: blur(20px) saturate(160%);
 }
 
 .home-search-wrap {
@@ -1791,7 +1792,10 @@ select.settings-input {
   z-index: 10;
   background: var(--nh-bg);
   border-bottom: 0.5px solid var(--nh-line);
-  padding: 12px 22px 14px;
+  /* Left padding clears the macOS traffic lights with the integrated     */
+  /* `titleBarStyle: Overlay` window. The OS reserves ~80px at top-left   */
+  /* for the lights — anything inside that zone is unreachable.            */
+  padding: 12px 22px 14px 80px;
   font-family: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
   color: var(--nh-ink);
 }

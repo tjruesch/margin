@@ -18,6 +18,7 @@ use tauri::menu::{
     MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
 };
 use tauri::{AppHandle, Emitter, Manager, State, Wry};
+use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
 struct AudioState {
     recording: Option<audio::Recording>,
@@ -318,6 +319,13 @@ pub fn run() {
                 last_write: Mutex::new(None),
             });
             app.manage(Mutex::new(AudioState { recording: None }));
+            // macOS Liquid Glass / NSVisualEffectView under the window so
+            // the sidebar can show real desktop blur. Failure is purely
+            // cosmetic (older macOS, future API drift) — fall through to
+            // the CSS fallback gradient.
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = apply_vibrancy(&win, NSVisualEffectMaterial::Sidebar, None, None);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

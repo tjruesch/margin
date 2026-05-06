@@ -113,7 +113,7 @@ export function Home({ onOpen, onNewNote, onNewMeeting, onOpenSettings }: Props)
         />
       )}
       <div className="home-main">
-        <div className="home-toolbar">
+        <div className="home-toolbar" data-tauri-drag-region>
           <button
             type="button"
             className="home-icon-btn"
@@ -188,9 +188,11 @@ function Sidebar({
 }) {
   return (
     <aside className="home-sidebar">
+      <div className="home-titlebar" data-tauri-drag-region />
       <div className="home-search-wrap">
         <div
           className="home-search"
+          data-tauri-drag-region="false"
           title="Search — coming soon (issue #31)"
           onClick={() => stub("Search", 31)}
         >

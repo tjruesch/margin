@@ -77,6 +77,7 @@ export function Settings({
   return (
     <div className="home">
       <aside className="home-sidebar" aria-label="Settings sections">
+        <div className="home-titlebar" data-tauri-drag-region />
         <div className="home-search-wrap">
           <button type="button" className="home-back-link" onClick={onBack}>
             <IconChevLeft size={14} sw={1.7} />
@@ -100,6 +101,7 @@ export function Settings({
       </aside>
 
       <main className="home-main">
+        <div className="home-main-titlebar" data-tauri-drag-region />
         <header className="home-greeting">
           <div className="home-greeting-text">
             <div className="home-greeting-eyebrow">Settings</div>

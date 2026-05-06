@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
@@ -761,6 +762,36 @@ export default function App() {
     return () => mq.removeEventListener("change", handler);
   }, []);
 
+  // Manual window-drag handler. Tauri 2's auto-injected `data-tauri-drag-
+  // region` listener doesn't fire reliably on macOS windows that combine
+  // `transparent: true` + `titleBarStyle: Overlay` + `hiddenTitle: true`
+  // (issue tauri-apps/tauri#10662 & friends). We walk ancestors on
+  // mousedown, look for the attribute, and call startDragging() ourselves.
+  // Double-click in the same region toggles maximize, matching the macOS
+  // title-bar convention.
+  useEffect(() => {
+    const win = getCurrentWindow();
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      let el = e.target as HTMLElement | null;
+      while (el) {
+        const flag = el.dataset.tauriDragRegion;
+        if (flag === "false") return;
+        if (flag !== undefined) break;
+        el = el.parentElement;
+      }
+      if (!el) return;
+      e.preventDefault();
+      if (e.detail >= 2) {
+        void win.toggleMaximize();
+      } else {
+        void win.startDragging();
+      }
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, []);
+
   // Hydrate persisted settings on mount
   useEffect(() => {
     loadSettings()
@@ -884,9 +915,6 @@ export default function App() {
 
   return (
     <div className="app" data-theme={theme}>
-      {!showTabbar && mode !== "home" && mode !== "settings" && (
-        <div className="drag-bar" data-tauri-drag-region />
-      )}
       {showTabbar && (
         <NoteHeader
           title={noteTitle}
