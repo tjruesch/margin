@@ -240,8 +240,10 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let save = MenuItemBuilder::with_id("file_save", "Save")
         .accelerator("CmdOrCtrl+S")
         .build(app)?;
+    // Note: no accelerator — Cmd+Shift+S is taken by the editor's
+    // strikethrough wrapper. With autosave enabled for owned notes,
+    // Save As is rarely needed and stays accessible via the File menu.
     let save_as = MenuItemBuilder::with_id("file_save_as", "Save As\u{2026}")
-        .accelerator("CmdOrCtrl+Shift+S")
         .build(app)?;
     let file_sub = SubmenuBuilder::new(app, "File")
         .item(&home)

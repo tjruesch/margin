@@ -4,11 +4,66 @@ import CodeMirror, {
   Extension,
   ReactCodeMirrorRef,
 } from "@uiw/react-codemirror";
-import { ViewPlugin } from "@codemirror/view";
+import { keymap, ViewPlugin } from "@codemirror/view";
+import { EditorSelection, Prec } from "@codemirror/state";
 import { HighlightStyle, indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { Tag, styleTags, tags as t } from "@lezer/highlight";
+
+// Toggle a markdown wrapper (e.g., `**`, `*`, `~~`) around the current
+// selection. Per-range behaviour:
+//   - Selection wrapped by markers on both sides (whether they're inside
+//     or outside the selection) → unwrap.
+//   - Empty selection → insert paired markers, place cursor between.
+//   - Otherwise → wrap selection.
+function toggleWrap(view: EditorView, marker: string): boolean {
+  const len = marker.length;
+  const tr = view.state.changeByRange((range) => {
+    const text = view.state.sliceDoc(range.from, range.to);
+    const before = view.state.sliceDoc(Math.max(0, range.from - len), range.from);
+    const after = view.state.sliceDoc(range.to, range.to + len);
+    if (before === marker && after === marker) {
+      return {
+        changes: [
+          { from: range.from - len, to: range.from, insert: "" },
+          { from: range.to, to: range.to + len, insert: "" },
+        ],
+        range: EditorSelection.range(range.from - len, range.to - len),
+      };
+    }
+    if (text.startsWith(marker) && text.endsWith(marker) && text.length >= 2 * len) {
+      const inner = text.slice(len, text.length - len);
+      return {
+        changes: { from: range.from, to: range.to, insert: inner },
+        range: EditorSelection.range(range.from, range.to - 2 * len),
+      };
+    }
+    if (range.empty) {
+      return {
+        changes: { from: range.from, insert: marker + marker },
+        range: EditorSelection.cursor(range.from + len),
+      };
+    }
+    return {
+      changes: { from: range.from, to: range.to, insert: marker + text + marker },
+      range: EditorSelection.range(range.from + len, range.to + len),
+    };
+  });
+  view.dispatch(tr);
+  return true;
+}
+
+// Prec.highest so our Cmd+B / Cmd+I / Cmd+Shift+S beat anything that
+// basicSetup's keymaps (search, history, defaults) might claim — Cmd+I
+// in particular has a tendency to get captured upstream.
+const markdownFormatKeymap = Prec.highest(
+  keymap.of([
+    { key: "Mod-b", run: (v) => toggleWrap(v, "**"), preventDefault: true },
+    { key: "Mod-i", run: (v) => toggleWrap(v, "*"), preventDefault: true },
+    { key: "Mod-Shift-s", run: (v) => toggleWrap(v, "~~"), preventDefault: true },
+  ]),
+);
 
 // Click-to-toggle on `- [ ] task` checkboxes: clicking inside the bracket
 // region (`[`, the inner char, or `]`) flips the marker between space
@@ -118,6 +173,7 @@ export const Editor = forwardRef<ReactCodeMirrorRef, Props>(function Editor(
       indentUnit.of(useTabs ? "\t" : " ".repeat(tabSize)),
       syntaxHighlighting(themedHighlight),
       taskCheckboxClickPlugin,
+      markdownFormatKeymap,
       EditorView.theme({
         "&": {
           fontSize: `${fontSize}px`,
@@ -130,7 +186,7 @@ export const Editor = forwardRef<ReactCodeMirrorRef, Props>(function Editor(
         // padding collapses to 0 on narrow panes via max(0, ...).
         ".cm-scroller": {
           fontFamily: '"JetBrains Mono Variable", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
-          lineHeight: "1.55",
+          lineHeight: "1.7",
           letterSpacing: "-0.005em",
           backgroundColor: "var(--bg)",
           paddingLeft: "max(0px, calc((100% - 880px) / 2))",
