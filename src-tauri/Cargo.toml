@@ -42,6 +42,7 @@ chrono = "0.4"
 screencapturekit = { version = "1.5", features = ["macos_14_0"] }
 sherpa-onnx = "1.13"
 window-vibrancy = "0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

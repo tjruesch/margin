@@ -19,6 +19,10 @@ pub fn notes_dir() -> PathBuf {
     data_dir().join("notes")
 }
 
+pub fn index_db_path() -> PathBuf {
+    data_dir().join("index.db")
+}
+
 pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }

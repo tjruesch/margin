@@ -1,5 +1,6 @@
 mod audio;
 mod diarize;
+mod index;
 mod keychain;
 mod notes;
 mod paths;
@@ -77,6 +78,12 @@ struct WatcherState {
 pub struct WriteGuard {
     pub last_write: Mutex<Option<Instant>>,
 }
+
+/// Recursive watcher over `~/.margin/notes/` that keeps the SQLite index
+/// in sync with on-disk state. Distinct from `WatcherState`, which is
+/// per-open-file and surfaces `external-change`/`external-delete` to the
+/// editor.
+struct NotesIndexWatcher(Mutex<Debouncer<RecommendedWatcher, RecommendedCache>>);
 
 #[tauri::command]
 fn read_file(path: String) -> Result<FileContents, String> {
@@ -336,6 +343,77 @@ pub fn run() {
                 last_write: Mutex::new(None),
             });
             app.manage(Mutex::new(AudioState { recording: None }));
+
+            // Open the SQLite index, run migrations, and reconcile against
+            // disk. Reconcile is fast on the happy path (a single
+            // count+max_mtime check); only diverging state triggers reads.
+            let mut conn = index::open_or_init(&paths::index_db_path())
+                .map_err(|e| format!("open index db: {e}"))?;
+            if let Err(e) = index::reconcile(&mut conn, &paths::notes_dir()) {
+                eprintln!("index reconcile failed at boot: {e}");
+            }
+            app.manage(Mutex::new(conn));
+
+            // Recursive watcher over `~/.margin/notes/`. Keeps the index
+            // in sync when notes are touched outside the editor (external
+            // edits, finder moves, sync clients). Distinct from the
+            // per-file watcher above, which surfaces external-change to
+            // the open editor.
+            let app_handle = app.handle().clone();
+            let notes_dir = paths::notes_dir();
+            let deb = new_debouncer(
+                Duration::from_millis(300),
+                None,
+                move |res: DebounceEventResult| {
+                    let Ok(events) = res else { return };
+                    let conn_state = app_handle.state::<Mutex<rusqlite::Connection>>();
+                    let mut conn = match conn_state.lock() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let notes_root = paths::notes_dir();
+                    for ev in events {
+                        for path in &ev.paths {
+                            if path.file_name().and_then(|s| s.to_str())
+                                != Some(notes::NOTE_FILENAME)
+                            {
+                                continue;
+                            }
+                            use notify::EventKind::*;
+                            match ev.kind {
+                                Remove(_) => {
+                                    if let Err(e) = index::remove(&mut conn, path) {
+                                        eprintln!("index remove failed: {e}");
+                                    }
+                                }
+                                Modify(_) | Create(_) | Any => {
+                                    if path.exists() {
+                                        if let Err(e) = index::upsert(&mut conn, path) {
+                                            eprintln!("index upsert failed: {e}");
+                                        }
+                                    } else if let Err(e) = index::remove(&mut conn, path) {
+                                        eprintln!("index remove failed: {e}");
+                                    }
+                                }
+                                _ => {
+                                    let _ = notes_root;
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+            .map_err(|e| format!("notes-dir watcher: {e}"))?;
+            app.manage(NotesIndexWatcher(Mutex::new(deb)));
+            // Begin watching the notes dir recursively.
+            {
+                let watcher_state = app.state::<NotesIndexWatcher>();
+                let mut guard = watcher_state.0.lock().map_err(|e| e.to_string())?;
+                guard
+                    .watch(&notes_dir, RecursiveMode::Recursive)
+                    .map_err(|e| format!("watch notes dir: {e}"))?;
+            }
+
             // macOS Liquid Glass / NSVisualEffectView under the window so
             // the sidebar can show real desktop blur. Failure is purely
             // cosmetic (older macOS, future API drift) — fall through to

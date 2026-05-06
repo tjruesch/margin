@@ -56,19 +56,25 @@ pub fn notes_dir() -> String {
 
 /// Create a new owned bundle and return the path to the empty `note.md`.
 #[tauri::command]
-pub fn create_note() -> Result<NoteRef, String> {
+pub fn create_note(
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<NoteRef, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let dir = paths::notes_dir().join(&id);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let note_path = dir.join(NOTE_FILENAME);
     fs::write(&note_path, "").map_err(|e| e.to_string())?;
+    touch_index(&conn, &note_path, false);
     Ok(new_note_ref(id, note_path))
 }
 
 /// Promote an external markdown file to an owned note by copying it into
 /// a fresh bundle. The original file is left in place.
 #[tauri::command]
-pub fn convert_external(source_path: String) -> Result<NoteRef, String> {
+pub fn convert_external(
+    source_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<NoteRef, String> {
     let src = PathBuf::from(&source_path);
     if !src.is_file() {
         return Err("Source file not found".into());
@@ -85,6 +91,7 @@ pub fn convert_external(source_path: String) -> Result<NoteRef, String> {
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let note_path = dir.join(NOTE_FILENAME);
     fs::copy(&src, &note_path).map_err(|e| e.to_string())?;
+    touch_index(&conn, &note_path, false);
     Ok(new_note_ref(id, note_path))
 }
 
@@ -120,7 +127,7 @@ pub fn bundle_dir_for(note_path: &Path) -> Option<PathBuf> {
     bundle_dir_for_in(note_path, &paths::notes_dir())
 }
 
-fn bundle_dir_for_in(note_path: &Path, notes_dir: &Path) -> Option<PathBuf> {
+pub(crate) fn bundle_dir_for_in(note_path: &Path, notes_dir: &Path) -> Option<PathBuf> {
     let parent = note_path.parent()?;
     if parent.parent()? == notes_dir {
         Some(parent.to_path_buf())
@@ -129,83 +136,16 @@ fn bundle_dir_for_in(note_path: &Path, notes_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Scan `~/.margin/notes/*/note.md` and return one item per bundle.
-/// Sorted newest-first by mtime.
+/// Return all owned notes, newest-first by `modified_ms`. Reads from
+/// the SQLite index — see `index.rs`. The index stays in sync via the
+/// recursive notes-dir watcher in `lib.rs` plus the per-command upsert
+/// calls below.
 #[tauri::command]
-pub fn list_notes() -> Result<Vec<NoteListItem>, String> {
-    let dir = paths::notes_dir();
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut out = Vec::new();
-    for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let bundle_dir = entry.path();
-        if !bundle_dir.is_dir() {
-            continue;
-        }
-        let note_path = bundle_dir.join(NOTE_FILENAME);
-        if !note_path.exists() {
-            continue;
-        }
-
-        let meta = match fs::metadata(&note_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let modified_ms = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-
-        let raw = fs::read_to_string(&note_path).unwrap_or_default();
-        let (frontmatter_yaml, body) = split_frontmatter(&raw);
-        let frontmatter = frontmatter_yaml
-            .map(parse_frontmatter)
-            .unwrap_or_default();
-        let tags = read_tags(&frontmatter);
-
-        let title = body
-            .lines()
-            .find_map(|l| {
-                let trimmed = l.trim_start();
-                trimmed
-                    .strip_prefix("# ")
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-            })
-            .unwrap_or_else(|| "Untitled note".to_string());
-
-        let transcript_path = bundle_dir.join(TRANSCRIPT_FILENAME);
-        let duration_ms = if transcript_path.exists() {
-            fs::read_to_string(&transcript_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-                .and_then(|v| v.get("duration_ms").and_then(|d| d.as_u64()))
-        } else {
-            None
-        };
-
-        let preview = extract_preview(body);
-
-        out.push(NoteListItem {
-            note_path: note_path.to_string_lossy().into_owned(),
-            title,
-            modified_ms,
-            duration_ms,
-            preview,
-            tags,
-        });
-    }
-
-    out.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
-    Ok(out)
+pub fn list_notes(
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<NoteListItem>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    crate::index::list_all(&c).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -245,7 +185,7 @@ pub struct NoteContent {
 /// Split a leading YAML frontmatter block off the raw note text. Returns
 /// `(yaml_chunk_without_delimiters, body)`. If no frontmatter is present
 /// (or the closing `---` is missing), returns `(None, raw)`.
-fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
+pub(crate) fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     // Be lenient about a leading BOM, but don't otherwise allow whitespace
     // before the opening delimiter.
     let stripped = raw.strip_prefix('\u{FEFF}').unwrap_or(raw);
@@ -277,11 +217,11 @@ fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     (None, raw)
 }
 
-fn parse_frontmatter(yaml: &str) -> Mapping {
+pub(crate) fn parse_frontmatter(yaml: &str) -> Mapping {
     serde_yml::from_str::<Mapping>(yaml).unwrap_or_default()
 }
 
-fn read_tags(map: &Mapping) -> Vec<String> {
+pub(crate) fn read_tags(map: &Mapping) -> Vec<String> {
     let raw = match map.get(serde_yml::Value::String("tags".into())) {
         Some(v) => v,
         None => return Vec::new(),
@@ -349,6 +289,7 @@ pub fn write_note(
     tags: Vec<String>,
     frontmatter_extras: Mapping,
     guard: tauri::State<'_, crate::WriteGuard>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
     let normalized = normalize_tags(tags);
     let mut map = frontmatter_extras;
@@ -367,6 +308,7 @@ pub fn write_note(
     let merged = write_with_frontmatter(&map, &body);
     fs::write(&note_path, merged).map_err(|e| e.to_string())?;
     *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    touch_index(&conn, Path::new(&note_path), false);
     Ok(())
 }
 
@@ -377,6 +319,7 @@ pub fn set_note_tags(
     note_path: String,
     tags: Vec<String>,
     guard: tauri::State<'_, crate::WriteGuard>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
     let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
     let (yaml, body) = split_frontmatter(&raw);
@@ -397,6 +340,7 @@ pub fn set_note_tags(
     let merged = write_with_frontmatter(&map, body);
     fs::write(&note_path, merged).map_err(|e| e.to_string())?;
     *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    touch_index(&conn, Path::new(&note_path), false);
     Ok(())
 }
 
@@ -406,7 +350,7 @@ const PREVIEW_MAX_CHARS: usize = 160;
 /// markdown body. Skips headings and code-fence delimiters; strips
 /// list/quote markers and inline emphasis/links so the result reads as
 /// prose. Truncates to ~160 chars at a word boundary with `…`.
-fn extract_preview(body: &str) -> String {
+pub(crate) fn extract_preview(body: &str) -> String {
     let mut paragraph: Vec<String> = Vec::new();
     let mut in_code_fence = false;
     let mut started = false;
@@ -594,7 +538,10 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
 /// `note.md` intact (the user might still want their hand-notes minus
 /// the recording).
 #[tauri::command]
-pub fn discard_recording(note_path: String) -> Result<(), String> {
+pub fn discard_recording(
+    note_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
     let p = PathBuf::from(&note_path);
     let dir = bundle_dir_for(&p).ok_or("Not an owned note")?;
     for name in [AUDIO_FILENAME, TRANSCRIPT_FILENAME] {
@@ -603,6 +550,8 @@ pub fn discard_recording(note_path: String) -> Result<(), String> {
             fs::remove_file(&path).map_err(|e| e.to_string())?;
         }
     }
+    // duration_ms cleared from the indexed row.
+    touch_index(&conn, &p, false);
     Ok(())
 }
 
@@ -613,8 +562,14 @@ pub fn discard_recording(note_path: String) -> Result<(), String> {
 /// Refuses non-owned paths, so a path that slips through the IPC layer
 /// can't ask us to nuke arbitrary directories.
 #[tauri::command]
-pub fn delete_note(note_path: String) -> Result<(), String> {
-    delete_note_in(Path::new(&note_path), &paths::notes_dir())
+pub fn delete_note(
+    note_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let p = PathBuf::from(&note_path);
+    delete_note_in(&p, &paths::notes_dir())?;
+    touch_index(&conn, &p, true);
+    Ok(())
 }
 
 fn delete_note_in(p: &Path, notes_dir: &Path) -> Result<(), String> {
@@ -627,6 +582,32 @@ fn delete_note_in(p: &Path, notes_dir: &Path) -> Result<(), String> {
     }
     fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Refresh the index for `note_path`. `removed=true` drops the row;
+/// otherwise re-reads the file and upserts. Failures are logged so a
+/// transient SQLite error doesn't surface as an IPC error to the user —
+/// the next watcher event or boot reconcile heals.
+fn touch_index(
+    conn_state: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+    note_path: &Path,
+    removed: bool,
+) {
+    let mut c = match conn_state.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("index lock poisoned: {e}");
+            return;
+        }
+    };
+    let result = if removed {
+        crate::index::remove(&mut c, note_path)
+    } else {
+        crate::index::upsert(&mut c, note_path)
+    };
+    if let Err(e) = result {
+        eprintln!("index touch failed for {note_path:?}: {e}");
+    }
 }
 
 #[cfg(test)]
