@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { type NoteListItem } from "./file";
 import { MoreMenu } from "./MoreMenu";
 import {
+  IconArchive,
   IconArrowRight,
   IconBell,
   IconCalendar,
@@ -27,14 +28,21 @@ type Props = {
   notes: NoteListItem[];
   notesLoading: boolean;
   allTags: string[];
+  /** "active" → home feed; "archived" → archive view. App owns this so
+   *  refreshNotes can fetch the right scope. */
+  scope: "active" | "archived";
+  onScopeChange: (next: "active" | "archived") => void;
   onOpen: (path: string) => void;
   onNewNote: () => void;
   onNewMeeting: () => void;
   onOpenSettings: () => void;
   onDeleteRow?: (path: string) => void;
+  /** Toggle archived for a row. Caller passes `nextArchived` since the
+   *  row only knows the current view's scope, not the per-row state. */
+  onArchiveRow?: (path: string, nextArchived: boolean) => void;
 };
 
-type NavId = "home" | "actions" | "meetings" | "shared" | "favorites";
+type NavId = "home" | "actions" | "meetings" | "shared" | "favorites" | "archive";
 type FilterId = "all" | "notes" | "meetings" | "shared";
 
 // Stub data for sections whose backends don't exist yet (#27, #28).
@@ -47,13 +55,23 @@ export function Home({
   notes,
   notesLoading,
   allTags,
+  scope,
+  onScopeChange,
   onOpen,
   onNewNote,
   onNewMeeting,
   onOpenSettings,
   onDeleteRow,
+  onArchiveRow,
 }: Props) {
-  const [nav, setNav] = useState<NavId>("home");
+  const [nav, setNav] = useState<NavId>(scope === "archived" ? "archive" : "home");
+
+  // Map sidebar nav → backend scope. Only home and archive currently
+  // map to actual scopes; the other nav items are still placeholders.
+  useEffect(() => {
+    const next: "active" | "archived" = nav === "archive" ? "archived" : "active";
+    if (next !== scope) onScopeChange(next);
+  }, [nav, scope, onScopeChange]);
   const [filter, setFilter] = useState<FilterId>("all");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
@@ -146,6 +164,8 @@ export function Home({
           onClearTagFilter={() => setTagFilter(null)}
           onOpen={onOpen}
           onDeleteRow={onDeleteRow}
+          onArchiveRow={onArchiveRow}
+          archivedScope={scope === "archived"}
         />
 
         <div className="home-spacer" />
@@ -224,6 +244,12 @@ function Sidebar({
           label="Favorites"
           active={active === "favorites"}
           onClick={() => onSelect("favorites")}
+        />
+        <NavItem
+          icon={<IconArchive size={14} sw={1.7} />}
+          label="Archive"
+          active={active === "archive"}
+          onClick={() => onSelect("archive")}
         />
       </nav>
 
@@ -489,6 +515,8 @@ function NotesFeed({
   onClearTagFilter,
   onOpen,
   onDeleteRow,
+  onArchiveRow,
+  archivedScope,
 }: {
   loading: boolean;
   grouped: Map<string, NoteListItem[]>;
@@ -499,6 +527,8 @@ function NotesFeed({
   onClearTagFilter: () => void;
   onOpen: (path: string) => void;
   onDeleteRow?: (path: string) => void;
+  onArchiveRow?: (path: string, nextArchived: boolean) => void;
+  archivedScope: boolean;
 }) {
   const filters: { id: FilterId; label: string }[] = [
     { id: "all", label: "All" },
@@ -548,8 +578,14 @@ function NotesFeed({
         <p className="home-empty">Loading…</p>
       ) : totalNotes === 0 ? (
         <p className="home-empty">
-          No notes yet — press <kbd>⌘N</kbd> for a new note,{" "}
-          <kbd>⌘⇧M</kbd> to start one with a recording.
+          {archivedScope
+            ? "No archived notes yet."
+            : (
+              <>
+                No notes yet — press <kbd>⌘N</kbd> for a new note,{" "}
+                <kbd>⌘⇧M</kbd> to start one with a recording.
+              </>
+            )}
         </p>
       ) : grouped.size === 0 ? (
         <p className="home-empty">
@@ -572,6 +608,8 @@ function NotesFeed({
                   item={m}
                   onOpen={onOpen}
                   onDelete={onDeleteRow}
+                  onArchive={onArchiveRow}
+                  archived={archivedScope}
                 />
               ))}
             </div>
@@ -586,10 +624,16 @@ function NoteRow({
   item,
   onOpen,
   onDelete,
+  onArchive,
+  archived,
 }: {
   item: NoteListItem;
   onOpen: (path: string) => void;
   onDelete?: (path: string) => void;
+  onArchive?: (path: string, nextArchived: boolean) => void;
+  /** Whether the row's note is archived. Determined by the feed's scope:
+   *  in active view it's always false, in archive view always true. */
+  archived?: boolean;
 }) {
   const isMeeting = item.duration_ms !== null;
   const [moreOpen, setMoreOpen] = useState(false);
@@ -649,6 +693,12 @@ function NoteRow({
             <MoreMenu
               onClose={() => setMoreOpen(false)}
               onDelete={onDelete ? () => onDelete(item.note_path) : undefined}
+              onArchive={
+                onArchive
+                  ? () => onArchive(item.note_path, !archived)
+                  : undefined
+              }
+              archived={archived}
             />
           )}
         </div>

@@ -30,6 +30,7 @@ import {
   readFile,
   readNote,
   reconcileNotes,
+  setArchived as setArchivedFile,
   setNoteTags,
   startMeetingRecording,
   stopMeetingRecording,
@@ -181,7 +182,9 @@ export default function App() {
   // never sees the YAML frontmatter; tag mutations write the disk via
   // set_note_tags so the in-flight buffer isn't disturbed.
   const [tags, setTags] = useState<string[]>([]);
+  const [archived, setArchived] = useState<boolean>(false);
   const [frontmatterExtras, setFrontmatterExtras] = useState<Record<string, unknown>>({});
+  const [notesScope, setNotesScope] = useState<"active" | "archived">("active");
 
   // Single source of truth for the home feed AND for the note-header tag
   // autocomplete. Loaded once on mount, refreshed on home navigation and
@@ -204,7 +207,9 @@ export default function App() {
   const editorRef = useRef<ReactCodeMirrorRef>(null);
   const notesDirRef = useRef<string | null>(null);
   const tagsRef = useRef<string[]>(tags);
+  const archivedRef = useRef<boolean>(archived);
   const frontmatterExtrasRef = useRef<Record<string, unknown>>(frontmatterExtras);
+  const notesScopeRef = useRef<"active" | "archived">(notesScope);
   useEffect(() => {
     recentFilesRef.current = recentFiles;
   }, [recentFiles]);
@@ -230,8 +235,14 @@ export default function App() {
     tagsRef.current = tags;
   }, [tags]);
   useEffect(() => {
+    archivedRef.current = archived;
+  }, [archived]);
+  useEffect(() => {
     frontmatterExtrasRef.current = frontmatterExtras;
   }, [frontmatterExtras]);
+  useEffect(() => {
+    notesScopeRef.current = notesScope;
+  }, [notesScope]);
 
   /** True iff `p` lives under the owned-notes directory. Cheaper than the
    *  Tauri `isOwnedNote` round-trip; safe to call before notesDir loads
@@ -244,10 +255,11 @@ export default function App() {
   }, []);
 
   /** Re-scan owned notes from disk and update the shared state. The home
-   *  feed and the note-header tag autocomplete both read from this. */
+   *  feed and the note-header tag autocomplete both read from this.
+   *  Scopes by `notesScope` — Home toggles between active and archive views. */
   const refreshNotes = useCallback(async () => {
     try {
-      const items = await listNotes();
+      const items = await listNotes(notesScopeRef.current);
       setNotes(items);
     } catch (err) {
       console.error("listNotes failed:", err);
@@ -298,6 +310,7 @@ export default function App() {
           setContent(note.body);
           setSavedContent(note.body);
           setTags(note.tags);
+          setArchived(note.archived);
           setFrontmatterExtras(note.frontmatter_extras ?? {});
         } else {
           const file = await readFile(p);
@@ -305,6 +318,7 @@ export default function App() {
           setContent(file.content);
           setSavedContent(file.content);
           setTags([]);
+          setArchived(false);
           setFrontmatterExtras({});
         }
         setMode("edit");
@@ -413,7 +427,13 @@ export default function App() {
         // the user just paid for. Don't lose it to a window close.
         try {
           if (isOwnedPath(notePath)) {
-            await writeNote(notePath, md, tagsRef.current, frontmatterExtrasRef.current);
+            await writeNote(
+              notePath,
+              md,
+              tagsRef.current,
+              archivedRef.current,
+              frontmatterExtrasRef.current,
+            );
           } else {
             await writeFile(notePath, md);
           }
@@ -544,6 +564,7 @@ export default function App() {
           target,
           contentRef.current,
           tagsRef.current,
+          archivedRef.current,
           frontmatterExtrasRef.current,
         );
       } else {
@@ -699,7 +720,13 @@ export default function App() {
     const t = setTimeout(async () => {
       try {
         if (isOwnedPath(path)) {
-          await writeNote(path, content, tagsRef.current, frontmatterExtrasRef.current);
+          await writeNote(
+            path,
+            content,
+            tagsRef.current,
+            archivedRef.current,
+            frontmatterExtrasRef.current,
+          );
         } else {
           await writeFile(path, content);
         }
@@ -718,11 +745,13 @@ export default function App() {
       try {
         let nextBody: string;
         let nextTags: string[] | null = null;
+        let nextArchived: boolean | null = null;
         let nextExtras: Record<string, unknown> | null = null;
         if (isOwnedPath(e.payload)) {
           const note = await readNote(e.payload);
           nextBody = note.body;
           nextTags = note.tags;
+          nextArchived = note.archived;
           nextExtras = note.frontmatter_extras ?? {};
         } else {
           const f = await readFile(e.payload);
@@ -732,6 +761,7 @@ export default function App() {
           // The body didn't change. Pick up any tag-only edits made via
           // an external editor and move on without disturbing the buffer.
           if (nextTags) setTags(nextTags);
+          if (nextArchived !== null) setArchived(nextArchived);
           if (nextExtras) setFrontmatterExtras(nextExtras);
           return;
         }
@@ -739,6 +769,7 @@ export default function App() {
           setContent(nextBody);
           setSavedContent(nextBody);
           if (nextTags) setTags(nextTags);
+          if (nextArchived !== null) setArchived(nextArchived);
           if (nextExtras) setFrontmatterExtras(nextExtras);
           setExternalChange(null);
         } else {
@@ -769,6 +800,7 @@ export default function App() {
         setContent(note.body);
         setSavedContent(note.body);
         setTags(note.tags);
+        setArchived(note.archived);
         setFrontmatterExtras(note.frontmatter_extras ?? {});
       } else {
         const f = await readFile(externalChange.path);
@@ -838,13 +870,13 @@ export default function App() {
     void refreshNotes();
   }, []);
 
-  // Re-scan notes whenever the user enters home so the feed reflects any
-  // edits made in the editor since the last visit.
+  // Re-scan notes whenever the user enters home or flips between active
+  // and archive scopes so the feed reflects any edits since last visit.
   useEffect(() => {
     if (mode === "home") void refreshNotes();
     // refreshNotes is stable (defined below with empty deps)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode]);
+  }, [mode, notesScope]);
 
   const onTagsChange = useCallback(
     async (next: string[]) => {
@@ -906,6 +938,7 @@ export default function App() {
         setContent(WELCOME);
         setSavedContent(WELCOME);
         setTags([]);
+        setArchived(false);
         setFrontmatterExtras({});
         setRecording({ kind: "none", hasTranscript: false });
         setExternalChange(null);
@@ -914,6 +947,47 @@ export default function App() {
 
       await refreshNotes();
       if (wasOpen) setMode("home");
+    },
+    [isOwnedPath, refreshNotes],
+  );
+
+  /** Toggle a note's archived flag.
+   *  - `target` defaults to the open note when omitted.
+   *  - `nextArchived` defaults to flipping the current state for the open
+   *    note. Row callers should always pass it explicitly since they may
+   *    not know the per-row flag (in this UI, scope already implies it).
+   */
+  const onArchiveNote = useCallback(
+    async (target?: string, nextArchived?: boolean) => {
+      const note = target ?? pathRef.current;
+      if (!note || !isOwnedPath(note)) return;
+      const wasOpen = note === pathRef.current;
+      const next =
+        nextArchived ?? (wasOpen ? !archivedRef.current : true);
+
+      try {
+        await setArchivedFile(note, next);
+      } catch (err) {
+        console.error("setArchived failed:", err);
+        alert("Could not update archive state. See console for details.");
+        return;
+      }
+
+      if (wasOpen) {
+        setArchived(next);
+      }
+
+      await refreshNotes();
+
+      // If we archived the currently-open note while in active scope (or
+      // un-archived it while in archive scope), it no longer belongs in the
+      // current view — kick back to home so the user isn't stranded.
+      if (wasOpen) {
+        const scopeMatchesNew =
+          (next && notesScopeRef.current === "archived") ||
+          (!next && notesScopeRef.current === "active");
+        if (!scopeMatchesNew) setMode("home");
+      }
     },
     [isOwnedPath, refreshNotes],
   );
@@ -1015,6 +1089,12 @@ export default function App() {
               ? () => void onDeleteNote()
               : undefined
           }
+          onArchive={
+            isOwned && recording.kind === "none"
+              ? () => void onArchiveNote()
+              : undefined
+          }
+          archived={archived}
         />
       )}
 
@@ -1094,11 +1174,14 @@ export default function App() {
             notes={notes}
             notesLoading={notesLoading}
             allTags={allTags}
+            scope={notesScope}
+            onScopeChange={setNotesScope}
             onOpen={(p) => void loadFile(p)}
             onNewNote={() => void onNewNote()}
             onNewMeeting={() => void onNewMeeting()}
             onOpenSettings={() => tryNavigate("settings")}
             onDeleteRow={(p) => void onDeleteNote(p)}
+            onArchiveRow={(p, next) => void onArchiveNote(p, next)}
           />
         )}
       </main>

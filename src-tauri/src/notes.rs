@@ -40,6 +40,15 @@ pub struct NoteListItem {
     pub tags: Vec<String>,
 }
 
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum NoteScope {
+    #[default]
+    Active,
+    Archived,
+    All,
+}
+
 fn new_note_ref(id: String, note_path: PathBuf) -> NoteRef {
     NoteRef {
         id,
@@ -136,16 +145,17 @@ pub(crate) fn bundle_dir_for_in(note_path: &Path, notes_dir: &Path) -> Option<Pa
     }
 }
 
-/// Return all owned notes, newest-first by `modified_ms`. Reads from
-/// the SQLite index — see `index.rs`. The index stays in sync via the
-/// recursive notes-dir watcher in `lib.rs` plus the per-command upsert
-/// calls below.
+/// Return all owned notes, newest-first by `modified_ms`. Default scope
+/// is `Active` (excludes archived). Reads from the SQLite index — see
+/// `index.rs`. The index stays in sync via the recursive notes-dir
+/// watcher in `lib.rs` plus the per-command upsert calls below.
 #[tauri::command]
 pub fn list_notes(
+    scope: Option<NoteScope>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<Vec<NoteListItem>, String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
-    crate::index::list_all(&c).map_err(|e| e.to_string())
+    crate::index::list_all(&c, scope.unwrap_or_default()).map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -177,8 +187,9 @@ const TAGS_MAX_PER_NOTE: usize = 16;
 pub struct NoteContent {
     pub body: String,
     pub tags: Vec<String>,
-    /// Frontmatter keys other than `tags`, preserved verbatim. Round-trips
-    /// through the frontend so user-added YAML survives a save.
+    pub archived: bool,
+    /// Frontmatter keys other than `tags`/`archived`, preserved verbatim.
+    /// Round-trips through the frontend so user-added YAML survives a save.
     pub frontmatter_extras: Mapping,
 }
 
@@ -219,6 +230,18 @@ pub(crate) fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
 
 pub(crate) fn parse_frontmatter(yaml: &str) -> Mapping {
     serde_yml::from_str::<Mapping>(yaml).unwrap_or_default()
+}
+
+pub(crate) fn read_archived(map: &Mapping) -> bool {
+    match map.get(serde_yml::Value::String("archived".into())) {
+        Some(serde_yml::Value::Bool(b)) => *b,
+        // Tolerate `archived: "true"` / `"yes"` / `"1"` from hand-edited
+        // frontmatter; everything else is false.
+        Some(serde_yml::Value::String(s)) => {
+            matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1")
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn read_tags(map: &Mapping) -> Vec<String> {
@@ -263,18 +286,21 @@ fn write_with_frontmatter(map: &Mapping, body: &str) -> String {
     format!("---\n{yaml}---\n{body}")
 }
 
-/// Parse a note from disk into body + tags + extras. Used by the editor
-/// flow so the textarea never sees the YAML.
+/// Parse a note from disk into body + tags + archived + extras. Used by
+/// the editor flow so the textarea never sees the YAML.
 #[tauri::command]
 pub fn read_note(note_path: String) -> Result<NoteContent, String> {
     let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
     let (yaml, body) = split_frontmatter(&raw);
     let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
     let tags = read_tags(&map);
+    let archived = read_archived(&map);
     map.remove(serde_yml::Value::String("tags".into()));
+    map.remove(serde_yml::Value::String("archived".into()));
     Ok(NoteContent {
         body: body.to_string(),
         tags,
+        archived,
         frontmatter_extras: map,
     })
 }
@@ -287,6 +313,7 @@ pub fn write_note(
     note_path: String,
     body: String,
     tags: Vec<String>,
+    archived: bool,
     frontmatter_extras: Mapping,
     guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
@@ -304,6 +331,14 @@ pub fn write_note(
         );
     } else {
         map.remove(serde_yml::Value::String("tags".into()));
+    }
+    if archived {
+        map.insert(
+            serde_yml::Value::String("archived".into()),
+            serde_yml::Value::Bool(true),
+        );
+    } else {
+        map.remove(serde_yml::Value::String("archived".into()));
     }
     let merged = write_with_frontmatter(&map, &body);
     fs::write(&note_path, merged).map_err(|e| e.to_string())?;
@@ -336,6 +371,34 @@ pub fn set_note_tags(
             serde_yml::Value::String("tags".into()),
             serde_yml::Value::Sequence(seq),
         );
+    }
+    let merged = write_with_frontmatter(&map, body);
+    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
+    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    touch_index(&conn, Path::new(&note_path), false);
+    Ok(())
+}
+
+/// Flip the archived flag on a note's frontmatter. Doesn't disturb the
+/// body, tags, or any other frontmatter — same surgical pattern as
+/// `set_note_tags`.
+#[tauri::command]
+pub fn set_archived(
+    note_path: String,
+    archived: bool,
+    guard: tauri::State<'_, crate::WriteGuard>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
+    if archived {
+        map.insert(
+            serde_yml::Value::String("archived".into()),
+            serde_yml::Value::Bool(true),
+        );
+    } else {
+        map.remove(serde_yml::Value::String("archived".into()));
     }
     let merged = write_with_frontmatter(&map, body);
     fs::write(&note_path, merged).map_err(|e| e.to_string())?;
@@ -621,6 +684,30 @@ mod tests {
         let note = dir.join(NOTE_FILENAME);
         fs::write(&note, "# hi\n").unwrap();
         note
+    }
+
+    #[test]
+    fn read_archived_default_false() {
+        let map: Mapping = serde_yml::from_str("tags: []").unwrap();
+        assert!(!read_archived(&map));
+    }
+
+    #[test]
+    fn read_archived_true() {
+        let map: Mapping = serde_yml::from_str("archived: true").unwrap();
+        assert!(read_archived(&map));
+    }
+
+    #[test]
+    fn read_archived_false_explicit() {
+        let map: Mapping = serde_yml::from_str("archived: false").unwrap();
+        assert!(!read_archived(&map));
+    }
+
+    #[test]
+    fn read_archived_tolerates_string_yes() {
+        let map: Mapping = serde_yml::from_str("archived: \"yes\"").unwrap();
+        assert!(read_archived(&map));
     }
 
     #[test]

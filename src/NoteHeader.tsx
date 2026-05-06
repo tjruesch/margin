@@ -44,6 +44,10 @@ type Props = {
   /** When omitted, the Delete item is hidden from the More menu. The
    *  parent decides eligibility (owned bundle + idle recording state). */
   onDelete?: () => void;
+  /** When omitted, the Archive item stays a no-op stub. */
+  onArchive?: () => void;
+  /** Whether the open note is archived — flips the Archive item's label. */
+  archived?: boolean;
 };
 
 export function NoteHeader({
@@ -63,6 +67,8 @@ export function NoteHeader({
   onTagsChange,
   onBack,
   onDelete,
+  onArchive,
+  archived,
 }: Props) {
   const [moreOpen, setMoreOpen] = useState(false);
 
@@ -112,7 +118,12 @@ export function NoteHeader({
             <IconMore size={16} sw={1.8} />
           </button>
           {moreOpen && (
-            <MoreMenu onClose={() => setMoreOpen(false)} onDelete={onDelete} />
+            <MoreMenu
+              onClose={() => setMoreOpen(false)}
+              onDelete={onDelete}
+              onArchive={onArchive}
+              archived={archived}
+            />
           )}
         </div>
       </div>

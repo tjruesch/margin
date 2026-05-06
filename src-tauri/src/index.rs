@@ -23,13 +23,14 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 
 use crate::notes::{
-    bundle_dir_for_in, extract_preview, parse_frontmatter, read_tags, split_frontmatter,
-    NoteListItem, NOTE_FILENAME, TRANSCRIPT_FILENAME,
+    bundle_dir_for_in, extract_preview, parse_frontmatter, read_archived, read_tags,
+    split_frontmatter, NoteListItem, NoteScope, NOTE_FILENAME, TRANSCRIPT_FILENAME,
 };
 use crate::paths;
 
 const SCHEMA_V1: &str = include_str!("migrations/001_init.sql");
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_V2: &str = include_str!("migrations/002_archived.sql");
+const SCHEMA_VERSION: i64 = 2;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -47,6 +48,10 @@ pub fn open_or_init(db_path: &Path) -> Result<Connection> {
 }
 
 fn apply_migrations(conn: &Connection) -> Result<()> {
+    // `meta` doesn't exist on a fresh DB — `query_row` returns
+    // QueryReturnedNoRows in that case (mapped to None via `optional`),
+    // but the table-missing error is a different shape and would surface
+    // here. Keep the unwrap_or so a fresh DB falls into the V1 branch.
     let current: Option<i64> = conn
         .query_row(
             "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'schema_version'",
@@ -56,12 +61,17 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         .optional()
         .unwrap_or(None);
 
-    if current.is_none() {
+    let mut version = current.unwrap_or(0);
+    if version == 0 {
         conn.execute_batch(SCHEMA_V1)?;
-    } else if current == Some(SCHEMA_VERSION) {
-        // Up to date.
-    } else {
-        // Future: forward-only migrations from N+1.
+        version = 1;
+    }
+    if version == 1 {
+        conn.execute_batch(SCHEMA_V2)?;
+        version = 2;
+    }
+    if version != SCHEMA_VERSION {
+        // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(())
@@ -91,13 +101,20 @@ pub fn remove(conn: &mut Connection, note_path: &Path) -> Result<()> {
     tx.commit()
 }
 
-/// All indexed notes, newest-first by `modified_ms`. Same shape as the
-/// pre-DB `notes::list_notes` so the frontend doesn't need to change.
-pub fn list_all(conn: &Connection) -> Result<Vec<NoteListItem>> {
-    let mut stmt = conn.prepare(
+/// All indexed notes within `scope`, newest-first by `modified_ms`.
+/// Same row shape as the pre-DB `notes::list_notes` so the frontend
+/// doesn't need to change.
+pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>> {
+    let where_clause = match scope {
+        NoteScope::Active => "WHERE n.archived = 0",
+        NoteScope::Archived => "WHERE n.archived = 1",
+        NoteScope::All => "",
+    };
+    let sql = format!(
         "SELECT n.note_path, n.title, n.modified_ms, n.duration_ms, n.preview \
-         FROM notes n ORDER BY n.modified_ms DESC",
-    )?;
+         FROM notes n {where_clause} ORDER BY n.modified_ms DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
         Ok(NoteRow {
             note_path: r.get(0)?,
@@ -230,6 +247,7 @@ struct Indexable {
     duration_ms: Option<u64>,
     preview: String,
     body_size: i64,
+    archived: bool,
     tags: Vec<String>,
     body: String,
 }
@@ -282,6 +300,7 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
     let (yaml, body) = split_frontmatter(&raw);
     let frontmatter = yaml.map(parse_frontmatter).unwrap_or_default();
     let tags = read_tags(&frontmatter);
+    let archived = read_archived(&frontmatter);
     let title = body
         .lines()
         .find_map(|l| {
@@ -311,6 +330,7 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
         duration_ms,
         preview,
         body_size,
+        archived,
         tags,
         body: body.to_string(),
     })
@@ -318,15 +338,16 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
 
 fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<()> {
     tx.execute(
-        "INSERT INTO notes(note_path, bundle_id, title, modified_ms, duration_ms, preview, body_size) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+        "INSERT INTO notes(note_path, bundle_id, title, modified_ms, duration_ms, preview, body_size, archived) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
          ON CONFLICT(note_path) DO UPDATE SET \
             bundle_id = excluded.bundle_id, \
             title = excluded.title, \
             modified_ms = excluded.modified_ms, \
             duration_ms = excluded.duration_ms, \
             preview = excluded.preview, \
-            body_size = excluded.body_size",
+            body_size = excluded.body_size, \
+            archived = excluded.archived",
         params![
             note_path,
             p.bundle_id,
@@ -335,6 +356,7 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
             p.duration_ms.map(|v| v as i64),
             p.preview,
             p.body_size,
+            p.archived as i64,
         ],
     )?;
 
@@ -389,7 +411,7 @@ mod tests {
 
     fn fresh_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA_V1).unwrap();
+        apply_migrations(&conn).unwrap();
         conn
     }
 
@@ -413,10 +435,51 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
         // FTS table reachable.
         conn.query_row("SELECT count(*) FROM notes_fts", [], |r| r.get::<_, i64>(0))
             .unwrap();
+    }
+
+    #[test]
+    fn migration_v1_to_v2_adds_archived_column() {
+        // Simulate an old install: a DB at schema_version = 1.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        let v: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, 1, "fixture must start at v1");
+
+        apply_migrations(&conn).unwrap();
+        let v: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, 2);
+
+        // archived column exists and defaults to 0.
+        conn.execute(
+            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
+             VALUES ('/x/abc/note.md', 'abc', 't', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let archived: i64 = conn
+            .query_row(
+                "SELECT archived FROM notes WHERE note_path='/x/abc/note.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, 0);
     }
 
     #[test]
@@ -433,7 +496,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, 2);
     }
 
     #[test]
@@ -448,7 +511,7 @@ mod tests {
         let mut conn = fresh_conn();
         upsert_in(&mut conn, &note, &notes).unwrap();
 
-        let items = list_all(&conn).unwrap();
+        let items = list_all(&conn, NoteScope::Active).unwrap();
         assert_eq!(items.len(), 1);
         let item = &items[0];
         assert_eq!(item.title, "Hello");
@@ -473,7 +536,7 @@ mod tests {
         let report = reconcile(&mut conn, &notes).unwrap();
         assert_eq!(report.upserted, 2);
         assert_eq!(report.removed, 0);
-        let items = list_all(&conn).unwrap();
+        let items = list_all(&conn, NoteScope::Active).unwrap();
         assert_eq!(items.len(), 2);
     }
 
@@ -497,13 +560,13 @@ mod tests {
         let note = write_bundle(&notes, "aaa", "# A\n\nbody\n");
         let mut conn = fresh_conn();
         reconcile(&mut conn, &notes).unwrap();
-        assert_eq!(list_all(&conn).unwrap().len(), 1);
+        assert_eq!(list_all(&conn, NoteScope::Active).unwrap().len(), 1);
 
         // Remove the bundle directory and reconcile.
         fs::remove_dir_all(note.parent().unwrap()).unwrap();
         let report = reconcile(&mut conn, &notes).unwrap();
         assert_eq!(report.removed, 1);
-        assert_eq!(list_all(&conn).unwrap().len(), 0);
+        assert_eq!(list_all(&conn, NoteScope::Active).unwrap().len(), 0);
     }
 
     #[test]
@@ -517,6 +580,7 @@ mod tests {
             duration_ms: None,
             preview: "v1".into(),
             body_size: 1,
+            archived: false,
             tags: vec!["a".into()],
             body: "v1".into(),
         };
@@ -530,7 +594,7 @@ mod tests {
         upsert_in_tx(&tx, &path, &p).unwrap();
         tx.commit().unwrap();
 
-        let items = list_all(&conn).unwrap();
+        let items = list_all(&conn, NoteScope::Active).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Second");
         assert_eq!(items[0].tags, vec!["b".to_string(), "c".to_string()]);
@@ -547,6 +611,7 @@ mod tests {
             duration_ms: None,
             preview: "p".into(),
             body_size: 1,
+            archived: false,
             tags: vec!["a".into(), "b".into()],
             body: "body".into(),
         };
@@ -573,6 +638,50 @@ mod tests {
     }
 
     #[test]
+    fn list_all_filters_by_scope() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        write_bundle(&notes, "act1", "# A\n\nactive one\n");
+        write_bundle(
+            &notes,
+            "arc1",
+            "---\narchived: true\n---\n# Z\n\narchived one\n",
+        );
+        write_bundle(&notes, "act2", "# B\n\nanother active\n");
+        let mut conn = fresh_conn();
+        reconcile(&mut conn, &notes).unwrap();
+
+        let active = list_all(&conn, NoteScope::Active).unwrap();
+        let archived = list_all(&conn, NoteScope::Archived).unwrap();
+        let all = list_all(&conn, NoteScope::All).unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].title, "Z");
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn upsert_indexes_archived_flag() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let note = write_bundle(
+            &notes,
+            "abc",
+            "---\narchived: true\n---\n# Hi\n\nbody\n",
+        );
+        let mut conn = fresh_conn();
+        upsert_in(&mut conn, &note, &notes).unwrap();
+        let archived: i64 = conn
+            .query_row(
+                "SELECT archived FROM notes WHERE bundle_id='abc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, 1);
+    }
+
+    #[test]
     fn list_all_returns_newest_first() {
         let mut conn = fresh_conn();
         let mk = |id: &str, mtime: i64| Indexable {
@@ -582,6 +691,7 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: 0,
+            archived: false,
             tags: vec![],
             body: String::new(),
         };
@@ -591,7 +701,7 @@ mod tests {
         upsert_in_tx(&tx, "/n/new/note.md", &mk("new", 900)).unwrap();
         tx.commit().unwrap();
 
-        let items = list_all(&conn).unwrap();
+        let items = list_all(&conn, NoteScope::Active).unwrap();
         let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, vec!["new", "mid", "old"]);
     }

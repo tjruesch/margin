@@ -27,10 +27,16 @@ function logStub(label: string, issue: number) {
 export function MoreMenu({
   onClose,
   onDelete,
+  onArchive,
+  archived,
 }: {
   onClose: () => void;
   /** When omitted, the Delete item is hidden. */
   onDelete?: () => void;
+  /** When omitted, the Archive item stays a no-op stub. */
+  onArchive?: () => void;
+  /** When true, the Archive item's label flips to "Move to notes". */
+  archived?: boolean;
 }) {
   // Hide Delete when the parent hasn't authorized it, then drop any
   // separator that would dangle as a result.
@@ -46,34 +52,42 @@ export function MoreMenu({
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => e.stopPropagation()}
     >
-      {cleaned.map((it) =>
-        "label" in it ? (
+      {cleaned.map((it) => {
+        if (!("label" in it)) {
+          return <div key="sep" className="nh-more-sep" />;
+        }
+        const isArchive = it.id === "arc";
+        const archiveWired = isArchive && onArchive !== undefined;
+        const label =
+          isArchive && archived ? "Move to notes" : it.label;
+        const wired =
+          (it.id === "del" && onDelete !== undefined) || archiveWired;
+        return (
           <button
             key={it.id}
             type="button"
             className={"nh-more-item" + (it.danger ? " danger" : "")}
-            title={
-              it.id === "del" && onDelete
-                ? it.label
-                : `${it.label} — coming soon (issue #${it.issue})`
-            }
+            title={wired ? label : `${label} — coming soon (issue #${it.issue})`}
             onClick={() => {
               if (it.id === "del" && onDelete) {
                 onDelete();
                 onClose();
                 return;
               }
-              logStub(it.label, it.issue);
+              if (archiveWired) {
+                onArchive!();
+                onClose();
+                return;
+              }
+              logStub(label, it.issue);
               onClose();
             }}
           >
             {it.icon}
-            <span>{it.label}</span>
+            <span>{label}</span>
           </button>
-        ) : (
-          <div key="sep" className="nh-more-sep" />
-        ),
-      )}
+        );
+      })}
     </div>
   );
 }
