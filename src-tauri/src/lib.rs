@@ -309,6 +309,23 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .menu(build_menu)
         .on_menu_event(handle_menu_event)
+        // Standard macOS behavior: the red close button hides the window
+        // instead of quitting. Cmd+Q (which routes through the app menu's
+        // Quit item) still exits cleanly. Reopen handling below brings the
+        // window back when the user clicks the dock icon.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                #[cfg(target_os = "macos")]
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (api, window);
+                }
+            }
+        })
         .setup(|app| {
             paths::init().map_err(|e| e.to_string())?;
             app.manage(Mutex::new(WatcherState {
@@ -356,9 +373,9 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
+        .run(|app, event| match event {
             // Runtime "Open With…" on macOS (app already running).
-            if let tauri::RunEvent::Opened { urls } = event {
+            tauri::RunEvent::Opened { urls } => {
                 for url in urls {
                     if let Ok(path) = url.to_file_path() {
                         if let Some(s) = path.to_str() {
@@ -367,5 +384,20 @@ pub fn run() {
                     }
                 }
             }
+            // Dock-icon click after we've hidden the window via the red
+            // button. macOS conventionally re-shows the main window in
+            // this case.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows, ..
+            } => {
+                if !has_visible_windows {
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                }
+            }
+            _ => {}
         });
 }
