@@ -23,14 +23,15 @@ use std::time::UNIX_EPOCH;
 use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 
 use crate::notes::{
-    bundle_dir_for_in, extract_preview, parse_frontmatter, read_archived, read_tags,
-    split_frontmatter, NoteListItem, NoteScope, NOTE_FILENAME, TRANSCRIPT_FILENAME,
+    bundle_dir_for_in, extract_preview, parse_frontmatter, read_archived, read_favorite,
+    read_tags, split_frontmatter, NoteListItem, NoteScope, NOTE_FILENAME, TRANSCRIPT_FILENAME,
 };
 use crate::paths;
 
 const SCHEMA_V1: &str = include_str!("migrations/001_init.sql");
 const SCHEMA_V2: &str = include_str!("migrations/002_archived.sql");
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_V3: &str = include_str!("migrations/003_favorite.sql");
+const SCHEMA_VERSION: i64 = 3;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -70,6 +71,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V2)?;
         version = 2;
     }
+    if version == 2 {
+        conn.execute_batch(SCHEMA_V3)?;
+        version = 3;
+    }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
@@ -106,12 +111,16 @@ pub fn remove(conn: &mut Connection, note_path: &Path) -> Result<()> {
 /// doesn't need to change.
 pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>> {
     let where_clause = match scope {
+        // Active scope hides archived. Favorited notes that are also
+        // archived stay hidden — archive takes precedence (a deliberate
+        // choice; a user wanting them visible should unarchive).
         NoteScope::Active => "WHERE n.archived = 0",
         NoteScope::Archived => "WHERE n.archived = 1",
+        NoteScope::Favorites => "WHERE n.favorite = 1 AND n.archived = 0",
         NoteScope::All => "",
     };
     let sql = format!(
-        "SELECT n.note_path, n.title, n.modified_ms, n.duration_ms, n.preview \
+        "SELECT n.note_path, n.title, n.modified_ms, n.duration_ms, n.preview, n.favorite \
          FROM notes n {where_clause} ORDER BY n.modified_ms DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -122,6 +131,7 @@ pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>
             modified_ms: r.get(2)?,
             duration_ms: r.get(3)?,
             preview: r.get(4)?,
+            favorite: r.get::<_, i64>(5)? != 0,
         })
     })?;
 
@@ -141,6 +151,7 @@ pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>
             modified_ms: r.modified_ms,
             duration_ms: r.duration_ms.map(|v| v as u64),
             preview: r.preview,
+            favorite: r.favorite,
         })
         .collect())
 }
@@ -232,6 +243,7 @@ struct NoteRow {
     modified_ms: i64,
     duration_ms: Option<i64>,
     preview: String,
+    favorite: bool,
 }
 
 struct DiskEntry {
@@ -248,6 +260,7 @@ struct Indexable {
     preview: String,
     body_size: i64,
     archived: bool,
+    favorite: bool,
     tags: Vec<String>,
     body: String,
 }
@@ -301,6 +314,7 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
     let frontmatter = yaml.map(parse_frontmatter).unwrap_or_default();
     let tags = read_tags(&frontmatter);
     let archived = read_archived(&frontmatter);
+    let favorite = read_favorite(&frontmatter);
     let title = body
         .lines()
         .find_map(|l| {
@@ -331,6 +345,7 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
         preview,
         body_size,
         archived,
+        favorite,
         tags,
         body: body.to_string(),
     })
@@ -338,8 +353,8 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
 
 fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<()> {
     tx.execute(
-        "INSERT INTO notes(note_path, bundle_id, title, modified_ms, duration_ms, preview, body_size, archived) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+        "INSERT INTO notes(note_path, bundle_id, title, modified_ms, duration_ms, preview, body_size, archived, favorite) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
          ON CONFLICT(note_path) DO UPDATE SET \
             bundle_id = excluded.bundle_id, \
             title = excluded.title, \
@@ -347,7 +362,8 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
             duration_ms = excluded.duration_ms, \
             preview = excluded.preview, \
             body_size = excluded.body_size, \
-            archived = excluded.archived",
+            archived = excluded.archived, \
+            favorite = excluded.favorite",
         params![
             note_path,
             p.bundle_id,
@@ -357,6 +373,7 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
             p.preview,
             p.body_size,
             p.archived as i64,
+            p.favorite as i64,
         ],
     )?;
 
@@ -435,14 +452,14 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         // FTS table reachable.
         conn.query_row("SELECT count(*) FROM notes_fts", [], |r| r.get::<_, i64>(0))
             .unwrap();
     }
 
     #[test]
-    fn migration_v1_to_v2_adds_archived_column() {
+    fn migration_v1_to_latest_adds_columns() {
         // Simulate an old install: a DB at schema_version = 1.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
@@ -463,23 +480,55 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, SCHEMA_VERSION);
 
-        // archived column exists and defaults to 0.
+        // archived + favorite columns exist and default to 0.
         conn.execute(
             "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
              VALUES ('/x/abc/note.md', 'abc', 't', 1, 0)",
             [],
         )
         .unwrap();
-        let archived: i64 = conn
+        let (archived, favorite): (i64, i64) = conn
             .query_row(
-                "SELECT archived FROM notes WHERE note_path='/x/abc/note.md'",
+                "SELECT archived, favorite FROM notes WHERE note_path='/x/abc/note.md'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archived, 0);
+        assert_eq!(favorite, 0);
+    }
+
+    #[test]
+    fn migration_v2_to_v3_adds_favorite_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        // Now at v2.
+        apply_migrations(&conn).unwrap();
+        let v: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(archived, 0);
+        assert_eq!(v, 3);
+        conn.execute(
+            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
+             VALUES ('/x/zzz/note.md', 'zzz', 't', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let favorite: i64 = conn
+            .query_row(
+                "SELECT favorite FROM notes WHERE note_path='/x/zzz/note.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(favorite, 0);
     }
 
     #[test]
@@ -496,7 +545,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
     }
 
     #[test]
@@ -581,6 +630,7 @@ mod tests {
             preview: "v1".into(),
             body_size: 1,
             archived: false,
+            favorite: false,
             tags: vec!["a".into()],
             body: "v1".into(),
         };
@@ -612,6 +662,7 @@ mod tests {
             preview: "p".into(),
             body_size: 1,
             archived: false,
+            favorite: false,
             tags: vec!["a".into(), "b".into()],
             body: "body".into(),
         };
@@ -661,6 +712,57 @@ mod tests {
     }
 
     #[test]
+    fn upsert_indexes_favorite_flag() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let note = write_bundle(
+            &notes,
+            "abc",
+            "---\nfavorite: true\n---\n# Hi\n\nbody\n",
+        );
+        let mut conn = fresh_conn();
+        upsert_in(&mut conn, &note, &notes).unwrap();
+        let favorite: i64 = conn
+            .query_row(
+                "SELECT favorite FROM notes WHERE bundle_id='abc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(favorite, 1);
+        let items = list_all(&conn, NoteScope::Favorites).unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].favorite);
+    }
+
+    #[test]
+    fn list_all_filters_by_favorites_scope() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        write_bundle(&notes, "plain", "# Plain\n");
+        write_bundle(
+            &notes,
+            "fav1",
+            "---\nfavorite: true\n---\n# Fav One\n",
+        );
+        write_bundle(
+            &notes,
+            "fav-arc",
+            "---\nfavorite: true\narchived: true\n---\n# Hidden\n",
+        );
+        let mut conn = fresh_conn();
+        reconcile(&mut conn, &notes).unwrap();
+
+        let active = list_all(&conn, NoteScope::Active).unwrap();
+        let favorites = list_all(&conn, NoteScope::Favorites).unwrap();
+        let archived = list_all(&conn, NoteScope::Archived).unwrap();
+        assert_eq!(active.len(), 2, "plain + fav1 (fav-arc archived out)");
+        assert_eq!(favorites.len(), 1, "fav1 only — archived favorites hidden");
+        assert_eq!(favorites[0].title, "Fav One");
+        assert_eq!(archived.len(), 1);
+    }
+
+    #[test]
     fn upsert_indexes_archived_flag() {
         let tmp = TempDir::new().unwrap();
         let notes = tmp.path().to_path_buf();
@@ -692,6 +794,7 @@ mod tests {
             preview: String::new(),
             body_size: 0,
             archived: false,
+            favorite: false,
             tags: vec![],
             body: String::new(),
         };

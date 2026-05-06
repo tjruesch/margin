@@ -38,6 +38,7 @@ pub struct NoteListItem {
     pub duration_ms: Option<u64>,
     pub preview: String,
     pub tags: Vec<String>,
+    pub favorite: bool,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -46,6 +47,7 @@ pub enum NoteScope {
     #[default]
     Active,
     Archived,
+    Favorites,
     All,
 }
 
@@ -188,8 +190,10 @@ pub struct NoteContent {
     pub body: String,
     pub tags: Vec<String>,
     pub archived: bool,
-    /// Frontmatter keys other than `tags`/`archived`, preserved verbatim.
-    /// Round-trips through the frontend so user-added YAML survives a save.
+    pub favorite: bool,
+    /// Frontmatter keys other than `tags`/`archived`/`favorite`, preserved
+    /// verbatim. Round-trips through the frontend so user-added YAML
+    /// survives a save.
     pub frontmatter_extras: Mapping,
 }
 
@@ -233,9 +237,17 @@ pub(crate) fn parse_frontmatter(yaml: &str) -> Mapping {
 }
 
 pub(crate) fn read_archived(map: &Mapping) -> bool {
-    match map.get(serde_yml::Value::String("archived".into())) {
+    read_bool_flag(map, "archived")
+}
+
+pub(crate) fn read_favorite(map: &Mapping) -> bool {
+    read_bool_flag(map, "favorite")
+}
+
+fn read_bool_flag(map: &Mapping, key: &str) -> bool {
+    match map.get(serde_yml::Value::String(key.into())) {
         Some(serde_yml::Value::Bool(b)) => *b,
-        // Tolerate `archived: "true"` / `"yes"` / `"1"` from hand-edited
+        // Tolerate `<key>: "true"` / `"yes"` / `"1"` from hand-edited
         // frontmatter; everything else is false.
         Some(serde_yml::Value::String(s)) => {
             matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1")
@@ -295,12 +307,15 @@ pub fn read_note(note_path: String) -> Result<NoteContent, String> {
     let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
     let tags = read_tags(&map);
     let archived = read_archived(&map);
+    let favorite = read_favorite(&map);
     map.remove(serde_yml::Value::String("tags".into()));
     map.remove(serde_yml::Value::String("archived".into()));
+    map.remove(serde_yml::Value::String("favorite".into()));
     Ok(NoteContent {
         body: body.to_string(),
         tags,
         archived,
+        favorite,
         frontmatter_extras: map,
     })
 }
@@ -314,6 +329,7 @@ pub fn write_note(
     body: String,
     tags: Vec<String>,
     archived: bool,
+    favorite: bool,
     frontmatter_extras: Mapping,
     guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
@@ -332,19 +348,24 @@ pub fn write_note(
     } else {
         map.remove(serde_yml::Value::String("tags".into()));
     }
-    if archived {
-        map.insert(
-            serde_yml::Value::String("archived".into()),
-            serde_yml::Value::Bool(true),
-        );
-    } else {
-        map.remove(serde_yml::Value::String("archived".into()));
-    }
+    set_bool_key(&mut map, "archived", archived);
+    set_bool_key(&mut map, "favorite", favorite);
     let merged = write_with_frontmatter(&map, &body);
     fs::write(&note_path, merged).map_err(|e| e.to_string())?;
     *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
     touch_index(&conn, Path::new(&note_path), false);
     Ok(())
+}
+
+fn set_bool_key(map: &mut Mapping, key: &str, value: bool) {
+    if value {
+        map.insert(
+            serde_yml::Value::String(key.into()),
+            serde_yml::Value::Bool(true),
+        );
+    } else {
+        map.remove(serde_yml::Value::String(key.into()));
+    }
 }
 
 /// Convenience for header chip mutations: read → replace tags → write.
@@ -389,21 +410,36 @@ pub fn set_archived(
     guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
+    set_bool_in_frontmatter(&note_path, "archived", archived, &guard, &conn)
+}
+
+/// Flip the favorite flag on a note's frontmatter. Surgical, same shape
+/// as `set_archived`.
+#[tauri::command]
+pub fn set_favorite(
+    note_path: String,
+    favorite: bool,
+    guard: tauri::State<'_, crate::WriteGuard>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    set_bool_in_frontmatter(&note_path, "favorite", favorite, &guard, &conn)
+}
+
+fn set_bool_in_frontmatter(
+    note_path: &str,
+    key: &str,
+    value: bool,
+    guard: &tauri::State<'_, crate::WriteGuard>,
+    conn: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let raw = fs::read_to_string(note_path).map_err(|e| e.to_string())?;
     let (yaml, body) = split_frontmatter(&raw);
     let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
-    if archived {
-        map.insert(
-            serde_yml::Value::String("archived".into()),
-            serde_yml::Value::Bool(true),
-        );
-    } else {
-        map.remove(serde_yml::Value::String("archived".into()));
-    }
+    set_bool_key(&mut map, key, value);
     let merged = write_with_frontmatter(&map, body);
-    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
+    fs::write(note_path, merged).map_err(|e| e.to_string())?;
     *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
-    touch_index(&conn, Path::new(&note_path), false);
+    touch_index(conn, Path::new(note_path), false);
     Ok(())
 }
 
@@ -708,6 +744,24 @@ mod tests {
     fn read_archived_tolerates_string_yes() {
         let map: Mapping = serde_yml::from_str("archived: \"yes\"").unwrap();
         assert!(read_archived(&map));
+    }
+
+    #[test]
+    fn read_favorite_default_false() {
+        let map: Mapping = serde_yml::from_str("tags: []").unwrap();
+        assert!(!read_favorite(&map));
+    }
+
+    #[test]
+    fn read_favorite_true() {
+        let map: Mapping = serde_yml::from_str("favorite: true").unwrap();
+        assert!(read_favorite(&map));
+    }
+
+    #[test]
+    fn read_favorite_tolerates_string_yes() {
+        let map: Mapping = serde_yml::from_str("favorite: \"yes\"").unwrap();
+        assert!(read_favorite(&map));
     }
 
     #[test]

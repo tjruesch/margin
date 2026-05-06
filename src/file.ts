@@ -60,14 +60,17 @@ export type NoteListItem = {
   duration_ms: number | null;
   preview: string;
   tags: string[];
+  favorite: boolean;
 };
 
 export type NoteContent = {
   body: string;
   tags: string[];
   archived: boolean;
-  /** Frontmatter keys other than `tags`/`archived`, opaque to the frontend.
-   *  Round-trip unchanged on writes so user-added YAML survives. */
+  favorite: boolean;
+  /** Frontmatter keys other than `tags`/`archived`/`favorite`, opaque to
+   *  the frontend. Round-trip unchanged on writes so user-added YAML
+   *  survives. */
   frontmatter_extras: Record<string, unknown>;
 };
 
@@ -80,6 +83,7 @@ export async function writeNote(
   body: string,
   tags: string[],
   archived: boolean,
+  favorite: boolean,
   frontmatterExtras: Record<string, unknown>,
 ): Promise<void> {
   await invoke<void>("write_note", {
@@ -87,6 +91,7 @@ export async function writeNote(
     body,
     tags,
     archived,
+    favorite,
     frontmatterExtras,
   });
 }
@@ -97,6 +102,10 @@ export async function setNoteTags(notePath: string, tags: string[]): Promise<voi
 
 export async function setArchived(notePath: string, archived: boolean): Promise<void> {
   await invoke<void>("set_archived", { notePath, archived });
+}
+
+export async function setFavorite(notePath: string, favorite: boolean): Promise<void> {
+  await invoke<void>("set_favorite", { notePath, favorite });
 }
 
 export async function notesDir(): Promise<string> {
@@ -115,7 +124,7 @@ export async function isOwnedNote(path: string): Promise<boolean> {
   return invoke<boolean>("is_owned_note", { path });
 }
 
-export type NoteScope = "active" | "archived" | "all";
+export type NoteScope = "active" | "archived" | "favorites" | "all";
 
 export async function listNotes(scope: NoteScope = "active"): Promise<NoteListItem[]> {
   return invoke<NoteListItem[]>("list_notes", { scope });

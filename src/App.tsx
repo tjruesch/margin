@@ -31,6 +31,7 @@ import {
   readNote,
   reconcileNotes,
   setArchived as setArchivedFile,
+  setFavorite as setFavoriteFile,
   setNoteTags,
   startMeetingRecording,
   stopMeetingRecording,
@@ -183,8 +184,11 @@ export default function App() {
   // set_note_tags so the in-flight buffer isn't disturbed.
   const [tags, setTags] = useState<string[]>([]);
   const [archived, setArchived] = useState<boolean>(false);
+  const [favorite, setFavorite] = useState<boolean>(false);
   const [frontmatterExtras, setFrontmatterExtras] = useState<Record<string, unknown>>({});
-  const [notesScope, setNotesScope] = useState<"active" | "archived">("active");
+  const [notesScope, setNotesScope] = useState<"active" | "archived" | "favorites">(
+    "active",
+  );
 
   // Single source of truth for the home feed AND for the note-header tag
   // autocomplete. Loaded once on mount, refreshed on home navigation and
@@ -208,8 +212,9 @@ export default function App() {
   const notesDirRef = useRef<string | null>(null);
   const tagsRef = useRef<string[]>(tags);
   const archivedRef = useRef<boolean>(archived);
+  const favoriteRef = useRef<boolean>(favorite);
   const frontmatterExtrasRef = useRef<Record<string, unknown>>(frontmatterExtras);
-  const notesScopeRef = useRef<"active" | "archived">(notesScope);
+  const notesScopeRef = useRef<"active" | "archived" | "favorites">(notesScope);
   useEffect(() => {
     recentFilesRef.current = recentFiles;
   }, [recentFiles]);
@@ -237,6 +242,9 @@ export default function App() {
   useEffect(() => {
     archivedRef.current = archived;
   }, [archived]);
+  useEffect(() => {
+    favoriteRef.current = favorite;
+  }, [favorite]);
   useEffect(() => {
     frontmatterExtrasRef.current = frontmatterExtras;
   }, [frontmatterExtras]);
@@ -311,6 +319,7 @@ export default function App() {
           setSavedContent(note.body);
           setTags(note.tags);
           setArchived(note.archived);
+          setFavorite(note.favorite);
           setFrontmatterExtras(note.frontmatter_extras ?? {});
         } else {
           const file = await readFile(p);
@@ -319,6 +328,7 @@ export default function App() {
           setSavedContent(file.content);
           setTags([]);
           setArchived(false);
+          setFavorite(false);
           setFrontmatterExtras({});
         }
         setMode("edit");
@@ -432,6 +442,7 @@ export default function App() {
               md,
               tagsRef.current,
               archivedRef.current,
+              favoriteRef.current,
               frontmatterExtrasRef.current,
             );
           } else {
@@ -565,6 +576,7 @@ export default function App() {
           contentRef.current,
           tagsRef.current,
           archivedRef.current,
+          favoriteRef.current,
           frontmatterExtrasRef.current,
         );
       } else {
@@ -725,6 +737,7 @@ export default function App() {
             content,
             tagsRef.current,
             archivedRef.current,
+            favoriteRef.current,
             frontmatterExtrasRef.current,
           );
         } else {
@@ -746,12 +759,14 @@ export default function App() {
         let nextBody: string;
         let nextTags: string[] | null = null;
         let nextArchived: boolean | null = null;
+        let nextFavorite: boolean | null = null;
         let nextExtras: Record<string, unknown> | null = null;
         if (isOwnedPath(e.payload)) {
           const note = await readNote(e.payload);
           nextBody = note.body;
           nextTags = note.tags;
           nextArchived = note.archived;
+          nextFavorite = note.favorite;
           nextExtras = note.frontmatter_extras ?? {};
         } else {
           const f = await readFile(e.payload);
@@ -762,6 +777,7 @@ export default function App() {
           // an external editor and move on without disturbing the buffer.
           if (nextTags) setTags(nextTags);
           if (nextArchived !== null) setArchived(nextArchived);
+          if (nextFavorite !== null) setFavorite(nextFavorite);
           if (nextExtras) setFrontmatterExtras(nextExtras);
           return;
         }
@@ -770,6 +786,7 @@ export default function App() {
           setSavedContent(nextBody);
           if (nextTags) setTags(nextTags);
           if (nextArchived !== null) setArchived(nextArchived);
+          if (nextFavorite !== null) setFavorite(nextFavorite);
           if (nextExtras) setFrontmatterExtras(nextExtras);
           setExternalChange(null);
         } else {
@@ -801,6 +818,7 @@ export default function App() {
         setSavedContent(note.body);
         setTags(note.tags);
         setArchived(note.archived);
+        setFavorite(note.favorite);
         setFrontmatterExtras(note.frontmatter_extras ?? {});
       } else {
         const f = await readFile(externalChange.path);
@@ -939,6 +957,7 @@ export default function App() {
         setSavedContent(WELCOME);
         setTags([]);
         setArchived(false);
+        setFavorite(false);
         setFrontmatterExtras({});
         setRecording({ kind: "none", hasTranscript: false });
         setExternalChange(null);
@@ -987,6 +1006,43 @@ export default function App() {
           (next && notesScopeRef.current === "archived") ||
           (!next && notesScopeRef.current === "active");
         if (!scopeMatchesNew) setMode("home");
+      }
+    },
+    [isOwnedPath, refreshNotes],
+  );
+
+  /** Toggle a note's favorite flag.
+   *  - `target` defaults to the open note.
+   *  - `nextFavorited` defaults to flipping current state for the open
+   *    note. Row callers should always pass it explicitly.
+   */
+  const onFavoriteNote = useCallback(
+    async (target?: string, nextFavorited?: boolean) => {
+      const note = target ?? pathRef.current;
+      if (!note || !isOwnedPath(note)) return;
+      const wasOpen = note === pathRef.current;
+      const next =
+        nextFavorited ?? (wasOpen ? !favoriteRef.current : true);
+
+      try {
+        await setFavoriteFile(note, next);
+      } catch (err) {
+        console.error("setFavorite failed:", err);
+        alert("Could not update favorite state. See console for details.");
+        return;
+      }
+
+      if (wasOpen) {
+        setFavorite(next);
+      }
+
+      await refreshNotes();
+
+      // If the open note no longer matches the favorites scope, kick to
+      // home. (Active scope keeps un-favorited notes; only the favorites
+      // view filters them out.)
+      if (wasOpen && notesScopeRef.current === "favorites" && !next) {
+        setMode("home");
       }
     },
     [isOwnedPath, refreshNotes],
@@ -1095,6 +1151,12 @@ export default function App() {
               : undefined
           }
           archived={archived}
+          onFavorite={
+            isOwned && recording.kind === "none"
+              ? () => void onFavoriteNote()
+              : undefined
+          }
+          favorited={favorite}
         />
       )}
 
@@ -1182,6 +1244,7 @@ export default function App() {
             onOpenSettings={() => tryNavigate("settings")}
             onDeleteRow={(p) => void onDeleteNote(p)}
             onArchiveRow={(p, next) => void onArchiveNote(p, next)}
+            onFavoriteRow={(p, next) => void onFavoriteNote(p, next)}
           />
         )}
       </main>

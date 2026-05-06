@@ -1341,6 +1341,11 @@ select.settings-input {
   justify-content: center;
   transition: opacity 120ms ease, background 120ms ease;
 }
+.home-note-fav-star {
+  display: inline-flex;
+  align-items: center;
+  color: #f5b400;
+}
 .home-note-row:hover .home-note-more,
 .home-note-more.is-open {
   opacity: 1;
@@ -2086,6 +2091,10 @@ input.nh-title {
 }
 .nh-chip:hover {
   background: var(--nh-bg-chip-hover);
+}
+.nh-chip-fav {
+  color: #f5b400;
+  padding: 0 6px;
 }
 .nh-chip-add {
   height: 26px;

@@ -28,10 +28,11 @@ type Props = {
   notes: NoteListItem[];
   notesLoading: boolean;
   allTags: string[];
-  /** "active" → home feed; "archived" → archive view. App owns this so
-   *  refreshNotes can fetch the right scope. */
-  scope: "active" | "archived";
-  onScopeChange: (next: "active" | "archived") => void;
+  /** "active" → home feed; "archived" → archive view; "favorites" →
+   *  favorited-only. App owns this so refreshNotes can fetch the right
+   *  scope. */
+  scope: "active" | "archived" | "favorites";
+  onScopeChange: (next: "active" | "archived" | "favorites") => void;
   onOpen: (path: string) => void;
   onNewNote: () => void;
   onNewMeeting: () => void;
@@ -40,6 +41,9 @@ type Props = {
   /** Toggle archived for a row. Caller passes `nextArchived` since the
    *  row only knows the current view's scope, not the per-row state. */
   onArchiveRow?: (path: string, nextArchived: boolean) => void;
+  /** Toggle favorite for a row. Caller passes `nextFavorited` based on
+   *  the row's per-row `favorite` field. */
+  onFavoriteRow?: (path: string, nextFavorited: boolean) => void;
 };
 
 type NavId = "home" | "actions" | "meetings" | "shared" | "favorites" | "archive";
@@ -63,13 +67,17 @@ export function Home({
   onOpenSettings,
   onDeleteRow,
   onArchiveRow,
+  onFavoriteRow,
 }: Props) {
-  const [nav, setNav] = useState<NavId>(scope === "archived" ? "archive" : "home");
+  const [nav, setNav] = useState<NavId>(
+    scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
+  );
 
-  // Map sidebar nav → backend scope. Only home and archive currently
-  // map to actual scopes; the other nav items are still placeholders.
+  // Map sidebar nav → backend scope. Only home, archive, and favorites
+  // currently map to scopes; the other nav items are placeholders.
   useEffect(() => {
-    const next: "active" | "archived" = nav === "archive" ? "archived" : "active";
+    const next: "active" | "archived" | "favorites" =
+      nav === "archive" ? "archived" : nav === "favorites" ? "favorites" : "active";
     if (next !== scope) onScopeChange(next);
   }, [nav, scope, onScopeChange]);
   const [filter, setFilter] = useState<FilterId>("all");
@@ -165,7 +173,9 @@ export function Home({
           onOpen={onOpen}
           onDeleteRow={onDeleteRow}
           onArchiveRow={onArchiveRow}
+          onFavoriteRow={onFavoriteRow}
           archivedScope={scope === "archived"}
+          favoritesScope={scope === "favorites"}
         />
 
         <div className="home-spacer" />
@@ -516,7 +526,9 @@ function NotesFeed({
   onOpen,
   onDeleteRow,
   onArchiveRow,
+  onFavoriteRow,
   archivedScope,
+  favoritesScope,
 }: {
   loading: boolean;
   grouped: Map<string, NoteListItem[]>;
@@ -528,7 +540,9 @@ function NotesFeed({
   onOpen: (path: string) => void;
   onDeleteRow?: (path: string) => void;
   onArchiveRow?: (path: string, nextArchived: boolean) => void;
+  onFavoriteRow?: (path: string, nextFavorited: boolean) => void;
   archivedScope: boolean;
+  favoritesScope: boolean;
 }) {
   const filters: { id: FilterId; label: string }[] = [
     { id: "all", label: "All" },
@@ -580,12 +594,14 @@ function NotesFeed({
         <p className="home-empty">
           {archivedScope
             ? "No archived notes yet."
-            : (
-              <>
-                No notes yet — press <kbd>⌘N</kbd> for a new note,{" "}
-                <kbd>⌘⇧M</kbd> to start one with a recording.
-              </>
-            )}
+            : favoritesScope
+              ? "No favorites yet — star a note from its More menu to pin it here."
+              : (
+                <>
+                  No notes yet — press <kbd>⌘N</kbd> for a new note,{" "}
+                  <kbd>⌘⇧M</kbd> to start one with a recording.
+                </>
+              )}
         </p>
       ) : grouped.size === 0 ? (
         <p className="home-empty">
@@ -610,6 +626,7 @@ function NotesFeed({
                   onDelete={onDeleteRow}
                   onArchive={onArchiveRow}
                   archived={archivedScope}
+                  onFavorite={onFavoriteRow}
                 />
               ))}
             </div>
@@ -626,6 +643,7 @@ function NoteRow({
   onDelete,
   onArchive,
   archived,
+  onFavorite,
 }: {
   item: NoteListItem;
   onOpen: (path: string) => void;
@@ -634,6 +652,7 @@ function NoteRow({
   /** Whether the row's note is archived. Determined by the feed's scope:
    *  in active view it's always false, in archive view always true. */
   archived?: boolean;
+  onFavorite?: (path: string, nextFavorited: boolean) => void;
 }) {
   const isMeeting = item.duration_ms !== null;
   const [moreOpen, setMoreOpen] = useState(false);
@@ -675,6 +694,11 @@ function NoteRow({
       </div>
       <div className="home-note-meta">
         {item.tags.length > 0 && <TagChips tags={item.tags} max={2} />}
+        {item.favorite && (
+          <span className="home-note-fav-star" title="Favorite" aria-label="Favorite">
+            <IconStar size={12} sw={1.7} />
+          </span>
+        )}
         <span className="home-note-time">{formatTime(item.modified_ms)}</span>
         <div className="nh-popover-anchor home-note-more-anchor">
           <button
@@ -699,6 +723,12 @@ function NoteRow({
                   : undefined
               }
               archived={archived}
+              onFavorite={
+                onFavorite
+                  ? () => onFavorite(item.note_path, !item.favorite)
+                  : undefined
+              }
+              favorited={item.favorite}
             />
           )}
         </div>

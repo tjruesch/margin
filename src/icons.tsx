@@ -79,7 +79,10 @@ export const IconMore = (p: Props) => (
 );
 export const IconStar = (p: Props) => (
   <Icon {...p}>
-    <path d="M12 3.5l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17.6 6.6 20.4l1-6.1L3.2 10l6.1-.9L12 3.5z" />
+    <path
+      d="M12 3.5l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17.6 6.6 20.4l1-6.1L3.2 10l6.1-.9L12 3.5z"
+      fill="currentColor"
+    />
   </Icon>
 );
 export const IconCopy = (p: Props) => (

@@ -10,6 +10,7 @@ import {
   IconMore,
   IconPlus,
   IconShare,
+  IconStar,
 } from "./icons";
 import { MoreMenu } from "./MoreMenu";
 
@@ -48,6 +49,10 @@ type Props = {
   onArchive?: () => void;
   /** Whether the open note is archived — flips the Archive item's label. */
   archived?: boolean;
+  /** When omitted, the Favorites item stays a no-op stub. */
+  onFavorite?: () => void;
+  /** Whether the open note is favorited — flips the Favorites item's label. */
+  favorited?: boolean;
 };
 
 export function NoteHeader({
@@ -69,6 +74,8 @@ export function NoteHeader({
   onDelete,
   onArchive,
   archived,
+  onFavorite,
+  favorited,
 }: Props) {
   const [moreOpen, setMoreOpen] = useState(false);
 
@@ -123,6 +130,8 @@ export function NoteHeader({
               onDelete={onDelete}
               onArchive={onArchive}
               archived={archived}
+              onFavorite={onFavorite}
+              favorited={favorited}
             />
           )}
         </div>
@@ -130,6 +139,11 @@ export function NoteHeader({
 
       <div className="note-header-row2">
         <div className="nh-chips">
+          {favorited && (
+            <span className="nh-chip nh-chip-fav" title="Favorite" aria-label="Favorite">
+              <IconStar size={12} sw={1.7} />
+            </span>
+          )}
           {modifiedMs !== null && (
             <span className="nh-chip" title="Modified">
               <IconCalendar size={12} sw={1.7} />

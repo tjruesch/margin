@@ -449,7 +449,8 @@ pub fn run() {
             notes::read_note,
             notes::write_note,
             notes::set_note_tags,
-            notes::set_archived
+            notes::set_archived,
+            notes::set_favorite
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
