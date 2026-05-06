@@ -367,6 +367,7 @@ pub fn run() {
             notes::list_notes,
             notes::note_meta,
             notes::discard_recording,
+            notes::delete_note,
             notes::read_note,
             notes::write_note,
             notes::set_note_tags

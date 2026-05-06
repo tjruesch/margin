@@ -191,3 +191,14 @@ export async function addRecentFile(path: string, current: string[]): Promise<st
   await s.save();
   return next;
 }
+
+/// Drop `path` from recents and persist. Returns the new list, or the
+/// original reference unchanged if `path` wasn't present.
+export async function removeRecentFile(path: string, current: string[]): Promise<string[]> {
+  const next = current.filter((p) => p !== path);
+  if (next.length === current.length) return current;
+  const s = getStore();
+  await s.set("recentFiles", next);
+  await s.save();
+  return next;
+}

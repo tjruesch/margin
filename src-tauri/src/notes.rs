@@ -91,19 +91,17 @@ pub fn convert_external(source_path: String) -> Result<NoteRef, String> {
 /// True iff `path` is `~/.margin/notes/<uuid>/note.md`.
 #[tauri::command]
 pub fn is_owned_note(path: String) -> bool {
-    let p = PathBuf::from(&path);
-    if p.file_name().and_then(|s| s.to_str()) != Some(NOTE_FILENAME) {
+    is_owned_note_in(Path::new(&path), &paths::notes_dir())
+}
+
+fn is_owned_note_in(path: &Path, notes_dir: &Path) -> bool {
+    if path.file_name().and_then(|s| s.to_str()) != Some(NOTE_FILENAME) {
         return false;
     }
-    let parent = match p.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-    let grandparent = match parent.parent() {
-        Some(p) => p,
-        None => return false,
-    };
-    grandparent == paths::notes_dir().as_path()
+    match path.parent().and_then(|p| p.parent()) {
+        Some(gp) => gp == notes_dir,
+        None => false,
+    }
 }
 
 fn is_under_notes_dir(path: &Path) -> bool {
@@ -119,8 +117,12 @@ fn is_under_notes_dir(path: &Path) -> bool {
 /// `~/.margin/notes/<uuid>/...`. Used to resolve where audio.wav and
 /// transcript.json should live for the active note.
 pub fn bundle_dir_for(note_path: &Path) -> Option<PathBuf> {
+    bundle_dir_for_in(note_path, &paths::notes_dir())
+}
+
+fn bundle_dir_for_in(note_path: &Path, notes_dir: &Path) -> Option<PathBuf> {
     let parent = note_path.parent()?;
-    if parent.parent()? == paths::notes_dir().as_path() {
+    if parent.parent()? == notes_dir {
         Some(parent.to_path_buf())
     } else {
         None
@@ -602,4 +604,94 @@ pub fn discard_recording(note_path: String) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Delete an owned note bundle entirely (note.md, audio.wav,
+/// transcript.json, anything else under the bundle dir). Hard delete —
+/// recoverability is the Archive feature's job (#17).
+///
+/// Refuses non-owned paths, so a path that slips through the IPC layer
+/// can't ask us to nuke arbitrary directories.
+#[tauri::command]
+pub fn delete_note(note_path: String) -> Result<(), String> {
+    delete_note_in(Path::new(&note_path), &paths::notes_dir())
+}
+
+fn delete_note_in(p: &Path, notes_dir: &Path) -> Result<(), String> {
+    if !is_owned_note_in(p, notes_dir) {
+        return Err("Refusing to delete: not an owned note path".into());
+    }
+    let dir = bundle_dir_for_in(p, notes_dir).ok_or("Could not resolve bundle directory")?;
+    if !dir.is_dir() {
+        return Err("Bundle directory missing".into());
+    }
+    fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_bundle(notes_dir: &Path, id: &str) -> PathBuf {
+        let dir = notes_dir.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let note = dir.join(NOTE_FILENAME);
+        fs::write(&note, "# hi\n").unwrap();
+        note
+    }
+
+    #[test]
+    fn rejects_path_with_wrong_filename() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let bundle = notes.join("abc");
+        fs::create_dir_all(&bundle).unwrap();
+        let bogus = bundle.join("audio.wav");
+        fs::write(&bogus, b"").unwrap();
+        assert!(delete_note_in(&bogus, &notes).is_err());
+        assert!(bundle.exists(), "bundle must remain after rejection");
+    }
+
+    #[test]
+    fn rejects_path_outside_notes_dir() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let elsewhere = tmp.path().join("elsewhere").join("xyz");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let stray = elsewhere.join(NOTE_FILENAME);
+        fs::write(&stray, b"").unwrap();
+        assert!(delete_note_in(&stray, &notes).is_err());
+        assert!(stray.exists(), "stray file must remain after rejection");
+    }
+
+    #[test]
+    fn rejects_path_with_no_grandparent() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let lone = PathBuf::from(NOTE_FILENAME);
+        assert!(delete_note_in(&lone, &notes).is_err());
+    }
+
+    #[test]
+    fn deletes_owned_bundle() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let note = make_bundle(&notes, "11111111-1111-1111-1111-111111111111");
+        let bundle = note.parent().unwrap().to_path_buf();
+        assert!(bundle.exists());
+        delete_note_in(&note, &notes).unwrap();
+        assert!(!bundle.exists(), "bundle dir should be gone");
+    }
+
+    #[test]
+    fn errors_when_bundle_already_missing() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        fs::create_dir_all(&notes).unwrap();
+        let phantom = notes.join("ghost").join(NOTE_FILENAME);
+        assert!(delete_note_in(&phantom, &notes).is_err());
+    }
 }

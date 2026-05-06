@@ -122,6 +122,10 @@ export async function discardRecording(notePath: string): Promise<void> {
   await invoke<void>("discard_recording", { notePath });
 }
 
+export async function deleteNote(notePath: string): Promise<void> {
+  await invoke<void>("delete_note", { notePath });
+}
+
 // --- Recording + transcription -------------------------------------------
 
 export type Segment = {

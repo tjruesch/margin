@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  IconArchive,
   IconCalendar,
   IconChevLeft,
-  IconCopy,
   IconEdit,
   IconEye,
   IconFileText,
@@ -12,10 +10,8 @@ import {
   IconMore,
   IconPlus,
   IconShare,
-  IconSparkle,
-  IconStar,
-  IconTrash,
 } from "./icons";
+import { MoreMenu } from "./MoreMenu";
 
 export type ViewMode = "edit" | "preview" | "transcript";
 
@@ -45,6 +41,9 @@ type Props = {
   tagsEditable: boolean;
   onTagsChange: (next: string[]) => void;
   onBack: () => void;
+  /** When omitted, the Delete item is hidden from the More menu. The
+   *  parent decides eligibility (owned bundle + idle recording state). */
+  onDelete?: () => void;
 };
 
 export function NoteHeader({
@@ -63,6 +62,7 @@ export function NoteHeader({
   tagsEditable,
   onTagsChange,
   onBack,
+  onDelete,
 }: Props) {
   const [moreOpen, setMoreOpen] = useState(false);
 
@@ -111,7 +111,9 @@ export function NoteHeader({
           >
             <IconMore size={16} sw={1.8} />
           </button>
-          {moreOpen && <MoreMenu onClose={() => setMoreOpen(false)} />}
+          {moreOpen && (
+            <MoreMenu onClose={() => setMoreOpen(false)} onDelete={onDelete} />
+          )}
         </div>
       </div>
 
@@ -230,52 +232,6 @@ function ShareCluster({
       >
         <IconLink size={13} sw={1.7} />
       </button>
-    </div>
-  );
-}
-
-function MoreMenu({ onClose }: { onClose: () => void }) {
-  type Item =
-    | { id: "sep" }
-    | {
-        id: string;
-        label: string;
-        icon: React.ReactNode;
-        issue: number;
-        danger?: boolean;
-      };
-  const items: Item[] = [
-    { id: "fav", icon: <IconStar size={14} />, label: "Add to favorites", issue: 16 },
-    { id: "dup", icon: <IconCopy size={14} />, label: "Duplicate", issue: 18 },
-    { id: "ai", icon: <IconSparkle size={14} />, label: "Summarize with AI", issue: 19 },
-    { id: "sep" },
-    { id: "arc", icon: <IconArchive size={14} />, label: "Archive", issue: 17 },
-    { id: "del", icon: <IconTrash size={14} />, label: "Delete", issue: 20, danger: true },
-  ];
-  return (
-    <div
-      className="nh-popover nh-more-popover"
-      onMouseDown={(e) => e.stopPropagation()}
-    >
-      {items.map((it) =>
-        "label" in it ? (
-          <button
-            key={it.id}
-            type="button"
-            className={"nh-more-item" + (it.danger ? " danger" : "")}
-            title={`${it.label} — coming soon (issue #${it.issue})`}
-            onClick={() => {
-              stub(it.label, it.issue);
-              onClose();
-            }}
-          >
-            {it.icon}
-            <span>{it.label}</span>
-          </button>
-        ) : (
-          <div key="sep" className="nh-more-sep" />
-        ),
-      )}
     </div>
   );
 }

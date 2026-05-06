@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ask } from "@tauri-apps/plugin-dialog";
 import {
   deleteAnthropicApiKey,
   hasAnthropicApiKey,
@@ -263,7 +264,13 @@ function AISection({ ai, onChange }: AISectionProps) {
   };
 
   const onRemoveKey = async () => {
-    if (!confirm("Remove the saved Anthropic API key?")) return;
+    const ok = await ask("This will clear the Anthropic API key from your keychain. You can paste it back in any time.", {
+      title: "Remove API key?",
+      kind: "warning",
+      okLabel: "Remove",
+      cancelLabel: "Cancel",
+    });
+    if (!ok) return;
     setSaving(true);
     setError(null);
     try {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { undo, redo } from "@codemirror/commands";
@@ -14,6 +15,7 @@ import { TranscriptView } from "./Transcript";
 import {
   convertExternal,
   createNote,
+  deleteNote,
   discardRecording,
   getInitialFile,
   hasAnthropicApiKey,
@@ -41,6 +43,7 @@ import {
   DEFAULT_SETTINGS,
   addRecentFile,
   loadSettings,
+  removeRecentFile,
   saveAI,
   saveTheme,
   type AISettings,
@@ -863,6 +866,58 @@ export default function App() {
     [isOwnedPath],
   );
 
+  const onDeleteNote = useCallback(
+    async (explicitPath?: string) => {
+      const target = explicitPath ?? pathRef.current;
+      if (!target || !isOwnedPath(target)) return;
+      const ok = await ask("This note and any associated recording will be permanently deleted.", {
+        title: "Delete note?",
+        kind: "warning",
+        okLabel: "Delete",
+        cancelLabel: "Cancel",
+      });
+      if (!ok) return;
+
+      try {
+        await deleteNote(target);
+      } catch (err) {
+        console.error("deleteNote failed:", err);
+        alert("Could not delete the note. See console for details.");
+        return;
+      }
+
+      try {
+        const nextRecent = await removeRecentFile(target, recentFilesRef.current);
+        setRecentFiles(nextRecent);
+      } catch (err) {
+        console.warn("removeRecentFile failed:", err);
+      }
+
+      // Tear down editor state only if we deleted the currently-open note.
+      // Deleting an unrelated row from Home leaves the editor untouched.
+      const wasOpen = target === pathRef.current;
+      if (wasOpen) {
+        try {
+          await unwatchFile();
+        } catch {
+          /* ignore */
+        }
+        setPath(null);
+        setContent(WELCOME);
+        setSavedContent(WELCOME);
+        setTags([]);
+        setFrontmatterExtras({});
+        setRecording({ kind: "none", hasTranscript: false });
+        setExternalChange(null);
+        setExternallyDeleted(false);
+      }
+
+      await refreshNotes();
+      if (wasOpen) setMode("home");
+    },
+    [isOwnedPath, refreshNotes],
+  );
+
   // Refresh API-key status whenever settings change (or banner re-enters idle).
   useEffect(() => {
     if (mode === "settings" || recording.kind === "none" || recording.kind === "ready") {
@@ -955,6 +1010,11 @@ export default function App() {
           tagsEditable={isOwned}
           onTagsChange={(next) => void onTagsChange(next)}
           onBack={() => tryNavigate("home")}
+          onDelete={
+            isOwned && recording.kind === "none"
+              ? () => void onDeleteNote()
+              : undefined
+          }
         />
       )}
 
@@ -1038,6 +1098,7 @@ export default function App() {
             onNewNote={() => void onNewNote()}
             onNewMeeting={() => void onNewMeeting()}
             onOpenSettings={() => tryNavigate("settings")}
+            onDeleteRow={(p) => void onDeleteNote(p)}
           />
         )}
       </main>

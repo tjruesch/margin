@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { type NoteListItem } from "./file";
+import { MoreMenu } from "./MoreMenu";
 import {
   IconArrowRight,
   IconBell,
@@ -30,6 +31,7 @@ type Props = {
   onNewNote: () => void;
   onNewMeeting: () => void;
   onOpenSettings: () => void;
+  onDeleteRow?: (path: string) => void;
 };
 
 type NavId = "home" | "actions" | "meetings" | "shared" | "favorites";
@@ -49,6 +51,7 @@ export function Home({
   onNewNote,
   onNewMeeting,
   onOpenSettings,
+  onDeleteRow,
 }: Props) {
   const [nav, setNav] = useState<NavId>("home");
   const [filter, setFilter] = useState<FilterId>("all");
@@ -142,6 +145,7 @@ export function Home({
           tagFilter={tagFilter}
           onClearTagFilter={() => setTagFilter(null)}
           onOpen={onOpen}
+          onDeleteRow={onDeleteRow}
         />
 
         <div className="home-spacer" />
@@ -484,6 +488,7 @@ function NotesFeed({
   tagFilter,
   onClearTagFilter,
   onOpen,
+  onDeleteRow,
 }: {
   loading: boolean;
   grouped: Map<string, NoteListItem[]>;
@@ -493,6 +498,7 @@ function NotesFeed({
   tagFilter: string | null;
   onClearTagFilter: () => void;
   onOpen: (path: string) => void;
+  onDeleteRow?: (path: string) => void;
 }) {
   const filters: { id: FilterId; label: string }[] = [
     { id: "all", label: "All" },
@@ -561,7 +567,12 @@ function NotesFeed({
             </div>
             <div className="home-day-rows">
               {items.map((m) => (
-                <NoteRow key={m.note_path} item={m} onOpen={onOpen} />
+                <NoteRow
+                  key={m.note_path}
+                  item={m}
+                  onOpen={onOpen}
+                  onDelete={onDeleteRow}
+                />
               ))}
             </div>
           </div>
@@ -574,11 +585,22 @@ function NotesFeed({
 function NoteRow({
   item,
   onOpen,
+  onDelete,
 }: {
   item: NoteListItem;
   onOpen: (path: string) => void;
+  onDelete?: (path: string) => void;
 }) {
   const isMeeting = item.duration_ms !== null;
+  const [moreOpen, setMoreOpen] = useState(false);
+
+  useEffect(() => {
+    if (!moreOpen) return;
+    const close = () => setMoreOpen(false);
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [moreOpen]);
+
   return (
     <div
       className="home-note-row"
@@ -610,18 +632,26 @@ function NoteRow({
       <div className="home-note-meta">
         {item.tags.length > 0 && <TagChips tags={item.tags} max={2} />}
         <span className="home-note-time">{formatTime(item.modified_ms)}</span>
-        <button
-          type="button"
-          className="home-note-more"
-          aria-label="More"
-          title="More — coming soon (issue #35)"
-          onClick={(e) => {
-            e.stopPropagation();
-            stub("Note row menu", 35);
-          }}
-        >
-          <IconMore size={14} sw={1.8} />
-        </button>
+        <div className="nh-popover-anchor home-note-more-anchor">
+          <button
+            type="button"
+            className={"home-note-more" + (moreOpen ? " is-open" : "")}
+            aria-label="More"
+            title="More"
+            onClick={(e) => {
+              e.stopPropagation();
+              setMoreOpen((v) => !v);
+            }}
+          >
+            <IconMore size={14} sw={1.8} />
+          </button>
+          {moreOpen && (
+            <MoreMenu
+              onClose={() => setMoreOpen(false)}
+              onDelete={onDelete ? () => onDelete(item.note_path) : undefined}
+            />
+          )}
+        </div>
       </div>
     </div>
   );

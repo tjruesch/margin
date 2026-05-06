@@ -1341,11 +1341,16 @@ select.settings-input {
   justify-content: center;
   transition: opacity 120ms ease, background 120ms ease;
 }
-.home-note-row:hover .home-note-more {
+.home-note-row:hover .home-note-more,
+.home-note-more.is-open {
   opacity: 1;
 }
-.home-note-more:hover {
+.home-note-more:hover,
+.home-note-more.is-open {
   background: var(--home-chip);
+}
+.home-note-more-anchor {
+  display: inline-flex;
 }
 
 /* ----- Tag chips ----- */
@@ -1965,10 +1970,10 @@ select.settings-input {
   position: absolute;
   top: 38px;
   right: 0;
-  background: var(--nh-bg-elev);
+  background: var(--bg);
   border-radius: 12px;
   box-shadow: 0 10px 30px color-mix(in srgb, #000 35%, transparent),
-              0 0 0 0.5px var(--nh-line-strong);
+              0 0 0 0.5px var(--border);
   z-index: 20;
   animation: nh-pop-in 140ms ease-out;
 }
@@ -1992,21 +1997,21 @@ select.settings-input {
   background: transparent;
   border: none;
   cursor: pointer;
-  color: var(--nh-ink-2);
+  color: var(--fg);
   font: inherit;
   font-size: 13px;
   font-weight: 500;
   text-align: left;
 }
 .nh-more-item:hover {
-  background: var(--nh-bg-chip);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
 .nh-more-item.danger {
   color: #e5484d;
 }
 .nh-more-sep {
   height: 1px;
-  background: var(--nh-line);
+  background: var(--border-muted);
   margin: 4px 6px;
 }
 
