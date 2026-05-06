@@ -1958,6 +1958,17 @@ select.settings-input {
   gap: 6px;
   padding: 0 12px 0 11px;
 }
+.nh-share-solo {
+  background: var(--nh-ink);
+  border: 0.5px solid var(--nh-ink);
+  border-radius: 15px;
+  height: 30px;
+  padding: 0 12px 0 10px;
+}
+.nh-share-solo:hover {
+  background: color-mix(in srgb, var(--nh-ink) 88%, var(--bg));
+  border-color: color-mix(in srgb, var(--nh-ink) 88%, var(--bg));
+}
 .nh-share-divider {
   width: 0.5px;
   background: color-mix(in srgb, var(--bg) 30%, transparent);
