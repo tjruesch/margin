@@ -131,3 +131,59 @@ export const IconFileText = (p: Props) => (
     <path d="M9 13h6M9 17h6M9 9h2" />
   </Icon>
 );
+export const IconChecklist = (p: Props) => (
+  <Icon {...p}>
+    <path d="M4 6l1.5 1.5L8 5" />
+    <path d="M4 12l1.5 1.5L8 10" />
+    <path d="M4 18l1.5 1.5L8 16" />
+    <path d="M11 6h9M11 12h9M11 18h9" />
+  </Icon>
+);
+export const IconUsers = (p: Props) => (
+  <Icon {...p}>
+    <circle cx="9" cy="8" r="3.2" />
+    <path d="M3 20c0-3 2.7-5 6-5s6 2 6 5" />
+    <path d="M16 11a3 3 0 000-6" />
+    <path d="M21 20c0-2.5-2-4.5-4.5-5" />
+  </Icon>
+);
+export const IconSearch = (p: Props) => (
+  <Icon {...p}>
+    <circle cx="11" cy="11" r="6" />
+    <path d="M20 20l-4.5-4.5" />
+  </Icon>
+);
+export const IconBell = (p: Props) => (
+  <Icon {...p}>
+    <path d="M6 8a6 6 0 1112 0v5l1.5 2.5h-15L6 13V8z" />
+    <path d="M10 19a2 2 0 004 0" />
+  </Icon>
+);
+export const IconSidebar = (p: Props) => (
+  <Icon {...p}>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <path d="M9 5v14" />
+  </Icon>
+);
+export const IconChevRight = (p: Props) => (
+  <Icon {...p}>
+    <path d="M9 6l6 6-6 6" />
+  </Icon>
+);
+export const IconArrowRight = (p: Props) => (
+  <Icon {...p}>
+    <path d="M5 12h14M13 6l6 6-6 6" />
+  </Icon>
+);
+export const IconMic = (p: Props) => (
+  <Icon {...p}>
+    <rect x="9" y="3" width="6" height="11" rx="3" />
+    <path d="M5 11a7 7 0 0014 0" />
+    <path d="M12 18v3M9 21h6" />
+  </Icon>
+);
+export const IconCheck = (p: Props) => (
+  <Icon {...p}>
+    <path d="M5 12.5l4.5 4.5L19 7" />
+  </Icon>
+);

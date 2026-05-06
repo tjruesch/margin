@@ -760,7 +760,7 @@ export default function App() {
 
   return (
     <div className="app" data-theme={theme}>
-      {!showTabbar && <div className="drag-bar" data-tauri-drag-region />}
+      {!showTabbar && mode !== "home" && <div className="drag-bar" data-tauri-drag-region />}
       {showTabbar && (
         <NoteHeader
           title={noteTitle}
@@ -858,12 +858,14 @@ export default function App() {
         )}
       </main>
 
-      <footer className="statusbar">
-        <span>
-          {content.length.toLocaleString()} chars · {content.split(/\n/).length.toLocaleString()} lines
-          {dirty ? " · Modified" : ""}
-        </span>
-      </footer>
+      {mode !== "home" && (
+        <footer className="statusbar">
+          <span>
+            {content.length.toLocaleString()} chars · {content.split(/\n/).length.toLocaleString()} lines
+            {dirty ? " · Modified" : ""}
+          </span>
+        </footer>
+      )}
     </div>
   );
 }

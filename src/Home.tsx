@@ -1,6 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { listNotes, type NoteListItem } from "./file";
+import {
+  IconArrowRight,
+  IconBell,
+  IconCalendar,
+  IconCheck,
+  IconChecklist,
+  IconChevRight,
+  IconFileText,
+  IconHome,
+  IconMic,
+  IconMore,
+  IconPlus,
+  IconSearch,
+  IconSidebar,
+  IconSparkle,
+  IconStar,
+  IconUsers,
+} from "./icons";
 
 type Props = {
   recentFiles: string[];
@@ -9,9 +27,31 @@ type Props = {
   onNewMeeting: () => void;
 };
 
-export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
+type NavId = "home" | "actions" | "meetings" | "shared" | "favorites";
+type FilterId = "all" | "notes" | "meetings" | "shared";
+
+// Stub data for sections whose backends don't exist yet (#27, #28).
+// These return empty arrays so the sections hide gracefully; swapping in
+// live data later is a one-line change.
+const UPCOMING_EVENTS: UpcomingEvent[] = [];
+const ACTION_ITEMS: ActionItem[] = [];
+
+export function Home({ onOpen, onNewNote, onNewMeeting }: Props) {
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [nav, setNav] = useState<NavId>("home");
+  const [filter, setFilter] = useState<FilterId>("all");
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {
+    return typeof localStorage === "undefined"
+      ? true
+      : localStorage.getItem("home.sidebarOpen") !== "0";
+  });
+
+  useEffect(() => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem("home.sidebarOpen", sidebarOpen ? "1" : "0");
+    }
+  }, [sidebarOpen]);
 
   useEffect(() => {
     let alive = true;
@@ -28,89 +68,648 @@ export function Home({ recentFiles, onOpen, onNewNote, onNewMeeting }: Props) {
     };
   }, []);
 
-  const grouped = useMemo(() => groupByDay(notes), [notes]);
+  const filteredNotes = useMemo(() => {
+    switch (filter) {
+      case "notes":
+        return notes.filter((n) => n.duration_ms === null);
+      case "meetings":
+        return notes.filter((n) => n.duration_ms !== null);
+      case "shared":
+        return [];
+      default:
+        return notes;
+    }
+  }, [notes, filter]);
+
+  const grouped = useMemo(() => groupByDay(filteredNotes), [filteredNotes]);
+
+  const openActionCount = ACTION_ITEMS.filter((a) => !a.done).length;
 
   return (
-    <div className="home-scroll">
-      <div className="home-inner">
-        <header className="home-header">
-          <div className="home-title">
-            <h1>Margin</h1>
-            <p className="home-subtitle">Your notes.</p>
-          </div>
-          <div className="home-cta">
-            <button className="home-btn home-btn-secondary" onClick={onNewNote}>
-              + New note
-            </button>
-            <button className="home-btn home-btn-primary" onClick={onNewMeeting}>
-              + New meeting
-            </button>
-          </div>
-        </header>
+    <div className={"home" + (sidebarOpen ? "" : " home-collapsed")}>
+      {sidebarOpen && (
+        <Sidebar
+          active={nav}
+          onSelect={setNav}
+          actionCount={openActionCount}
+          meetingCount={UPCOMING_EVENTS.length}
+        />
+      )}
+      <div className="home-main">
+        <div className="home-toolbar">
+          <button
+            type="button"
+            className="home-icon-btn"
+            title={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+            aria-label="Toggle sidebar"
+            onClick={() => setSidebarOpen((v) => !v)}
+          >
+            <IconSidebar size={14} sw={1.6} />
+          </button>
+          <button
+            type="button"
+            className="home-icon-btn"
+            title="Notifications — coming soon (issue #37)"
+            aria-label="Notifications"
+            onClick={() => stub("Notifications", 37)}
+          >
+            <IconBell size={14} sw={1.6} />
+          </button>
+        </div>
 
-        <section className="home-section">
-          <h2 className="home-section-title">Notes</h2>
-          {loading ? (
-            <p className="home-empty">Loading…</p>
-          ) : notes.length === 0 ? (
-            <p className="home-empty">
-              No notes yet — press <kbd>⌘N</kbd> for a new note, <kbd>⌘⇧M</kbd> to start one with a
-              recording.
-            </p>
-          ) : (
-            <div className="home-meetings">
-              {[...grouped.entries()].map(([dayKey, items]) => (
-                <div key={dayKey} className="home-day-group">
-                  <div className="home-day-heading">{formatDayHeading(dayKey)}</div>
-                  <div className="home-day-cards">
-                    {items.map((m) => (
-                      <button
-                        key={m.note_path}
-                        className="home-card"
-                        onClick={() => onOpen(m.note_path)}
-                      >
-                        <div className="home-card-row">
-                          <span className="home-card-title">
-                            {m.duration_ms !== null && (
-                              <span className="home-card-glyph" aria-label="has recording">
-                                🎙
-                              </span>
-                            )}
-                            {m.title || "Untitled note"}
-                          </span>
-                          <span className="home-card-time">{formatTime(m.modified_ms)}</span>
-                        </div>
-                        <div className="home-card-meta">
-                          {m.duration_ms !== null
-                            ? `${formatDuration(m.duration_ms)} · transcribed`
-                            : "Note"}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
+        <Greeting
+          upcomingCount={UPCOMING_EVENTS.length}
+          nextEvent={UPCOMING_EVENTS[0] ?? null}
+          onNewNote={onNewNote}
+          onNewMeeting={onNewMeeting}
+        />
 
-        {recentFiles.length > 0 && (
-          <section className="home-section">
-            <h2 className="home-section-title">Recent files</h2>
-            <ul className="home-recents">
-              {recentFiles.map((p) => (
-                <li key={p}>
-                  <button className="home-recent-row" onClick={() => onOpen(p)}>
-                    <span className="home-recent-name">{filename(p)}</span>
-                    <span className="home-recent-path">{prettyPath(p)}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </section>
+        {UPCOMING_EVENTS.length > 0 && <UpcomingStrip events={UPCOMING_EVENTS} />}
+
+        {openActionCount > 0 && (
+          <ActionItemsTeaser items={ACTION_ITEMS} />
         )}
+
+        <NotesFeed
+          loading={loading}
+          grouped={grouped}
+          totalNotes={notes.length}
+          filter={filter}
+          onFilterChange={setFilter}
+          onOpen={onOpen}
+        />
+
+        <div className="home-spacer" />
+        <AskBar />
       </div>
     </div>
+  );
+}
+
+// ---------- Sidebar -------------------------------------------------------
+
+const SIDEBAR_TAGS = [
+  { label: "investigation", color: "rgba(196,74,31,0.14)" },
+  { label: "cbr", color: "rgba(58,93,168,0.14)" },
+  { label: "todo", color: "rgba(79,138,63,0.16)" },
+  { label: "idea", color: "rgba(110,79,168,0.14)" },
+];
+
+function Sidebar({
+  active,
+  onSelect,
+  actionCount,
+  meetingCount,
+}: {
+  active: NavId;
+  onSelect: (id: NavId) => void;
+  actionCount: number;
+  meetingCount: number;
+}) {
+  return (
+    <aside className="home-sidebar">
+      <div className="home-search-wrap">
+        <div
+          className="home-search"
+          title="Search — coming soon (issue #31)"
+          onClick={() => stub("Search", 31)}
+        >
+          <IconSearch size={13} sw={1.8} />
+          <span className="home-search-placeholder">Search notes…</span>
+          <span className="home-search-kbd">⌘K</span>
+        </div>
+      </div>
+
+      <nav className="home-nav">
+        <NavItem
+          icon={<IconHome size={14} sw={1.7} />}
+          label="Home"
+          active={active === "home"}
+          onClick={() => onSelect("home")}
+        />
+        <NavItem
+          icon={<IconChecklist size={14} sw={1.7} />}
+          label="Action items"
+          badge={actionCount > 0 ? String(actionCount) : null}
+          active={active === "actions"}
+          onClick={() => onSelect("actions")}
+        />
+        <NavItem
+          icon={<IconCalendar size={14} sw={1.7} />}
+          label="Meetings"
+          badge={meetingCount > 0 ? String(meetingCount) : null}
+          active={active === "meetings"}
+          onClick={() => onSelect("meetings")}
+        />
+        <NavItem
+          icon={<IconUsers size={14} sw={1.7} />}
+          label="Shared with me"
+          active={active === "shared"}
+          onClick={() => onSelect("shared")}
+        />
+        <NavItem
+          icon={<IconStar size={14} sw={1.7} />}
+          label="Favorites"
+          active={active === "favorites"}
+          onClick={() => onSelect("favorites")}
+        />
+      </nav>
+
+      <div className="home-side-section">
+        <div className="home-side-header">
+          <span>Tags</span>
+          <button
+            type="button"
+            className="home-side-add"
+            title="New tag — coming soon (issue #14)"
+            aria-label="New tag"
+            onClick={() => stub("Tag", 14)}
+          >
+            <IconPlus size={11} sw={2} />
+          </button>
+        </div>
+        <div className="home-side-tags">
+          {SIDEBAR_TAGS.map((t) => (
+            <span
+              key={t.label}
+              className="home-side-tag"
+              style={{ background: t.color }}
+            >
+              {t.label}
+            </span>
+          ))}
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+function NavItem({
+  icon,
+  label,
+  active,
+  badge,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  active: boolean;
+  badge?: string | null;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={"home-nav-item" + (active ? " active" : "")}
+      onClick={onClick}
+    >
+      <span className="home-nav-icon">{icon}</span>
+      <span className="home-nav-label">{label}</span>
+      {badge && <span className="home-nav-badge">{badge}</span>}
+    </button>
+  );
+}
+
+// ---------- Greeting ------------------------------------------------------
+
+function Greeting({
+  upcomingCount,
+  nextEvent,
+  onNewNote,
+  onNewMeeting,
+}: {
+  upcomingCount: number;
+  nextEvent: UpcomingEvent | null;
+  onNewNote: () => void;
+  onNewMeeting: () => void;
+}) {
+  const now = new Date();
+  const dateStr = now.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+  const greeting = greetingFor(now.getHours());
+  const displayName = inferDisplayName();
+
+  return (
+    <header className="home-greeting">
+      <div className="home-greeting-text">
+        <div className="home-greeting-eyebrow">{dateStr}</div>
+        <h1 className="home-greeting-title">
+          {greeting}
+          {displayName ? `, ${displayName}` : ""}
+        </h1>
+        {upcomingCount > 0 && (
+          <div className="home-greeting-sub">
+            You have {upcomingCount} meeting{upcomingCount === 1 ? "" : "s"} today
+            {nextEvent ? (
+              <>
+                {" "}and{" "}
+                <span className="home-greeting-accent">
+                  1 starts {nextEvent.when.toLowerCase()}
+                </span>
+              </>
+            ) : (
+              "."
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="home-greeting-cta">
+        <button type="button" className="home-cta-secondary" onClick={onNewNote}>
+          <IconPlus size={13} sw={1.9} />
+          New note
+        </button>
+        <button type="button" className="home-cta-primary" onClick={onNewMeeting}>
+          <span className="home-cta-dot" />
+          New meeting
+        </button>
+      </div>
+    </header>
+  );
+}
+
+// ---------- Upcoming meetings strip --------------------------------------
+
+type UpcomingEvent = {
+  id: string;
+  when: string;
+  tStart: string;
+  tEnd: string;
+  title: string;
+  attendees: string[];
+  tags: string[];
+  color: string;
+  live?: boolean;
+};
+
+function UpcomingStrip({ events }: { events: UpcomingEvent[] }) {
+  return (
+    <section className="home-section">
+      <SectionTitle eyebrow="Upcoming" title="Coming up" actionLabel="View calendar" actionIssue={27} />
+      <div className="home-upcoming">
+        {events.map((ev) => (
+          <button key={ev.id} type="button" className="home-upcoming-card">
+            <span className="home-upcoming-strip" style={{ background: ev.color }} />
+            <div className="home-upcoming-row">
+              <span className={"home-upcoming-when" + (ev.live ? " live" : "")}>
+                {ev.live && <span className="home-upcoming-pulse" />}
+                {ev.when}
+              </span>
+              <span className="home-upcoming-time">
+                {ev.tStart}–{ev.tEnd}
+              </span>
+            </div>
+            <div className="home-upcoming-title">{ev.title}</div>
+            <div className="home-upcoming-foot">
+              <AttendeeStack attendees={ev.attendees} />
+              <TagChips tags={ev.tags} max={2} />
+            </div>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function AttendeeStack({ attendees }: { attendees: string[] }) {
+  return (
+    <div className="home-attendees">
+      {attendees.slice(0, 4).map((a, i) => (
+        <span
+          key={`${a}-${i}`}
+          className="home-attendee"
+          style={{ background: avatarColor(a) }}
+        >
+          {a}
+        </span>
+      ))}
+      {attendees.length > 4 && (
+        <span className="home-attendee home-attendee-more">+{attendees.length - 4}</span>
+      )}
+    </div>
+  );
+}
+
+// ---------- Action items teaser ------------------------------------------
+
+type ActionItem = {
+  id: string;
+  text: string;
+  done: boolean;
+  due?: string;
+  dueState?: "today" | "soon" | "later";
+  source: { kind: "note" | "meeting"; title: string };
+  tags?: string[];
+};
+
+function ActionItemsTeaser({ items }: { items: ActionItem[] }) {
+  const order = { today: 0, soon: 1, later: 2 } as const;
+  const top = items
+    .filter((it) => !it.done)
+    .sort((a, b) => (order[a.dueState ?? "later"] ?? 3) - (order[b.dueState ?? "later"] ?? 3))
+    .slice(0, 3);
+  if (top.length === 0) return null;
+
+  return (
+    <section className="home-section">
+      <SectionTitle
+        eyebrow="Action items"
+        title="Things to do"
+        actionLabel={`View all (${items.filter((i) => !i.done).length})`}
+        actionIssue={28}
+      />
+      <div className="home-actions">
+        {top.map((it) => (
+          <div key={it.id} className="home-action-row">
+            <button
+              type="button"
+              className={"home-checkbox" + (it.done ? " done" : "")}
+              aria-label={it.done ? "Mark as open" : "Mark as done"}
+              onClick={() => stub("Toggle action", 28)}
+            >
+              {it.done && <IconCheck size={12} sw={2.6} />}
+            </button>
+            <div className="home-action-body">
+              <div className={"home-action-text" + (it.done ? " done" : "")}>{it.text}</div>
+              <div className="home-action-meta">
+                <span className="home-action-source">
+                  {it.source.kind === "meeting" ? (
+                    <IconMic size={11} sw={1.7} />
+                  ) : (
+                    <IconFileText size={11} sw={1.7} />
+                  )}
+                  {it.source.title}
+                </span>
+                {it.due && (
+                  <span className={"home-due " + (it.dueState ?? "later")}>{it.due}</span>
+                )}
+                <TagChips tags={it.tags ?? []} max={3} />
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ---------- Notes feed ----------------------------------------------------
+
+function NotesFeed({
+  loading,
+  grouped,
+  totalNotes,
+  filter,
+  onFilterChange,
+  onOpen,
+}: {
+  loading: boolean;
+  grouped: Map<string, NoteListItem[]>;
+  totalNotes: number;
+  filter: FilterId;
+  onFilterChange: (id: FilterId) => void;
+  onOpen: (path: string) => void;
+}) {
+  const filters: { id: FilterId; label: string }[] = [
+    { id: "all", label: "All" },
+    { id: "notes", label: "Notes" },
+    { id: "meetings", label: "Meetings" },
+    { id: "shared", label: "Shared" },
+  ];
+
+  return (
+    <section className="home-section">
+      <div className="home-section-head">
+        <div>
+          <div className="home-section-eyebrow">Library</div>
+          <h2 className="home-section-title">Your notes</h2>
+        </div>
+        <div className="home-filter">
+          {filters.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              className={"home-filter-chip" + (filter === f.id ? " active" : "")}
+              onClick={() => onFilterChange(f.id)}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {loading ? (
+        <p className="home-empty">Loading…</p>
+      ) : totalNotes === 0 ? (
+        <p className="home-empty">
+          No notes yet — press <kbd>⌘N</kbd> for a new note,{" "}
+          <kbd>⌘⇧M</kbd> to start one with a recording.
+        </p>
+      ) : grouped.size === 0 ? (
+        <p className="home-empty">
+          {filter === "shared"
+            ? "Sharing is coming soon — see issue #15 / #32."
+            : "Nothing matches this filter."}
+        </p>
+      ) : (
+        [...grouped.entries()].map(([dayKey, items]) => (
+          <div key={dayKey} className="home-day-group">
+            <div className="home-day-heading">
+              <span>{formatDayHeading(dayKey)}</span>
+              <span className="home-day-rule" />
+              <span className="home-day-count">{items.length} items</span>
+            </div>
+            <div className="home-day-rows">
+              {items.map((m) => (
+                <NoteRow key={m.note_path} item={m} onOpen={onOpen} />
+              ))}
+            </div>
+          </div>
+        ))
+      )}
+    </section>
+  );
+}
+
+function NoteRow({
+  item,
+  onOpen,
+}: {
+  item: NoteListItem;
+  onOpen: (path: string) => void;
+}) {
+  const isMeeting = item.duration_ms !== null;
+  return (
+    <div
+      className="home-note-row"
+      role="button"
+      tabIndex={0}
+      onClick={() => onOpen(item.note_path)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen(item.note_path);
+        }
+      }}
+    >
+      <NoteThumb item={item} />
+      <div className="home-note-body">
+        <div className="home-note-row1">
+          <span className="home-note-title">{item.title || "Untitled note"}</span>
+          {isMeeting && (
+            <span className="home-note-duration">
+              <Waveform />
+              {formatDuration(item.duration_ms)}
+            </span>
+          )}
+        </div>
+        <div className="home-note-preview">
+          {isMeeting ? "Recorded meeting" : "Note"}
+        </div>
+      </div>
+      <div className="home-note-meta">
+        <span className="home-note-time">{formatTime(item.modified_ms)}</span>
+        <button
+          type="button"
+          className="home-note-more"
+          aria-label="More"
+          title="More — coming soon (issue #35)"
+          onClick={(e) => {
+            e.stopPropagation();
+            stub("Note row menu", 35);
+          }}
+        >
+          <IconMore size={14} sw={1.8} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function NoteThumb({ item }: { item: NoteListItem }) {
+  if (item.duration_ms !== null) {
+    return (
+      <div className="home-note-thumb home-note-thumb-meeting">
+        <IconMic size={16} sw={1.7} />
+      </div>
+    );
+  }
+  const ch = (item.title || "U").charAt(0).toUpperCase();
+  return <div className="home-note-thumb home-note-thumb-note">{ch}</div>;
+}
+
+function Waveform() {
+  const heights = [3, 6, 4, 8, 5, 7, 3];
+  return (
+    <svg width="14" height="10" viewBox="0 0 14 10" fill="none" aria-hidden="true">
+      {heights.map((h, i) => (
+        <rect
+          key={i}
+          x={i * 2}
+          y={(10 - h) / 2}
+          width="1.2"
+          height={h}
+          rx="0.6"
+          fill="currentColor"
+        />
+      ))}
+    </svg>
+  );
+}
+
+// ---------- Ask bar -------------------------------------------------------
+
+function AskBar() {
+  return (
+    <div className="home-askbar">
+      <div className="home-ask">
+        <span className="home-ask-icon">
+          <IconSparkle size={16} sw={1.6} />
+        </span>
+        <input
+          className="home-ask-input"
+          placeholder="Ask Margin anything — summarize a meeting, find a decision, draft an email…"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              stub("Ask Margin", 29);
+            }
+          }}
+          aria-label="Ask Margin"
+        />
+        <button
+          type="button"
+          className="home-ask-send"
+          title="Ask — coming soon (issue #29)"
+          aria-label="Send"
+          onClick={() => stub("Ask Margin", 29)}
+        >
+          <IconArrowRight size={13} sw={2} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Section title -------------------------------------------------
+
+function SectionTitle({
+  eyebrow,
+  title,
+  actionLabel,
+  actionIssue,
+}: {
+  eyebrow: string;
+  title: string;
+  actionLabel?: string;
+  actionIssue?: number;
+}) {
+  return (
+    <div className="home-section-head">
+      <div>
+        <div className="home-section-eyebrow">{eyebrow}</div>
+        <h2 className="home-section-title">{title}</h2>
+      </div>
+      {actionLabel && (
+        <button
+          type="button"
+          className="home-section-action"
+          onClick={() => actionIssue && stub(actionLabel, actionIssue)}
+        >
+          {actionLabel}
+          <IconChevRight size={12} sw={1.9} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------- Tag chips -----------------------------------------------------
+
+const TAG_COLORS: Record<string, string> = {
+  investigation: "rgba(196,74,31,0.14)",
+  cbr: "rgba(58,93,168,0.14)",
+  todo: "rgba(79,138,63,0.16)",
+  idea: "rgba(110,79,168,0.14)",
+  transcribed: "rgba(0,0,0,0.06)",
+};
+
+function TagChips({ tags, max }: { tags: string[]; max?: number }) {
+  if (!tags || tags.length === 0) return null;
+  const list = max ? tags.slice(0, max) : tags;
+  const overflow = max && tags.length > max ? tags.length - max : 0;
+  return (
+    <span className="home-tagchips">
+      {list.map((t) => (
+        <span key={t} className="home-tagchip" style={{ background: TAG_COLORS[t] ?? "rgba(0,0,0,0.06)" }}>
+          {t}
+        </span>
+      ))}
+      {overflow > 0 && <span className="home-tagchip-more">+{overflow}</span>}
+    </span>
   );
 }
 
@@ -162,6 +761,9 @@ function formatDayHeading(key: string): string {
   yesterday.setDate(today.getDate() - 1);
   if (date.getTime() === today.getTime()) return "Today";
   if (date.getTime() === yesterday.getTime()) return "Yesterday";
+  const oneWeekAgo = new Date(today);
+  oneWeekAgo.setDate(today.getDate() - 7);
+  if (date.getTime() >= oneWeekAgo.getTime()) return "Earlier this week";
   return date.toLocaleDateString(undefined, {
     weekday: "short",
     month: "short",
@@ -169,11 +771,26 @@ function formatDayHeading(key: string): string {
   });
 }
 
-function filename(path: string): string {
-  return path.split("/").pop() ?? path;
+function greetingFor(hour: number): string {
+  if (hour < 5) return "Good evening";
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
 }
 
-function prettyPath(path: string): string {
-  const home = "/Users/" + (path.split("/")[2] ?? "");
-  return path.startsWith(home) ? "~" + path.slice(home.length) : path;
+function inferDisplayName(): string | null {
+  // No profile system yet — greet anonymously. When settings grows a
+  // displayName field, return it here.
+  return null;
+}
+
+function avatarColor(initials: string): string {
+  const palette = ["#C44A1F", "#3A5DA8", "#4F8A3F", "#6E4FA8", "#A88B3A"];
+  let hash = 0;
+  for (let i = 0; i < initials.length; i++) hash = (hash * 31 + initials.charCodeAt(i)) | 0;
+  return palette[Math.abs(hash) % palette.length];
+}
+
+function stub(label: string, issue: number) {
+  console.log(`[stub] ${label} clicked — see issue #${issue}`);
 }
