@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { listNotes, type NoteListItem } from "./file";
+import { type NoteListItem } from "./file";
 import {
   IconArrowRight,
   IconBell,
@@ -23,6 +23,9 @@ import {
 
 type Props = {
   recentFiles: string[];
+  notes: NoteListItem[];
+  notesLoading: boolean;
+  allTags: string[];
   onOpen: (path: string) => void;
   onNewNote: () => void;
   onNewMeeting: () => void;
@@ -38,9 +41,15 @@ type FilterId = "all" | "notes" | "meetings" | "shared";
 const UPCOMING_EVENTS: UpcomingEvent[] = [];
 const ACTION_ITEMS: ActionItem[] = [];
 
-export function Home({ onOpen, onNewNote, onNewMeeting, onOpenSettings }: Props) {
-  const [notes, setNotes] = useState<NoteListItem[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
+export function Home({
+  notes,
+  notesLoading,
+  allTags,
+  onOpen,
+  onNewNote,
+  onNewMeeting,
+  onOpenSettings,
+}: Props) {
   const [nav, setNav] = useState<NavId>("home");
   const [filter, setFilter] = useState<FilterId>("all");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
@@ -55,29 +64,6 @@ export function Home({ onOpen, onNewNote, onNewMeeting, onOpenSettings }: Props)
       localStorage.setItem("home.sidebarOpen", sidebarOpen ? "1" : "0");
     }
   }, [sidebarOpen]);
-
-  useEffect(() => {
-    let alive = true;
-    listNotes()
-      .then((items) => {
-        if (alive) setNotes(items);
-      })
-      .catch((err) => console.error("listNotes failed:", err))
-      .finally(() => {
-        if (alive) setLoading(false);
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  // Sidebar tags = union of every tag across the loaded notes. Avoids a
-  // second disk walk that `list_all_tags` used to do.
-  const allTags = useMemo(() => {
-    const set = new Set<string>();
-    for (const n of notes) for (const t of n.tags) set.add(t);
-    return Array.from(set).sort();
-  }, [notes]);
 
   const filteredNotes = useMemo(() => {
     let list = notes;
@@ -148,7 +134,7 @@ export function Home({ onOpen, onNewNote, onNewMeeting, onOpenSettings }: Props)
         )}
 
         <NotesFeed
-          loading={loading}
+          loading={notesLoading}
           grouped={grouped}
           totalNotes={notes.length}
           filter={filter}

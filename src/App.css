@@ -2105,15 +2105,24 @@ input.nh-title {
   color: var(--nh-ink-2);
 }
 .nh-chip-tag-x {
+  display: inline-block;
   font-size: 14px;
   line-height: 1;
   color: var(--nh-ink-4);
-  margin-left: 1px;
+  margin-left: 0;
+  width: 0;
+  overflow: hidden;
   opacity: 0;
-  transition: opacity 120ms ease;
+  transition: width 140ms ease, margin-left 140ms ease, opacity 140ms ease;
 }
 .nh-chip-tag:hover .nh-chip-tag-x {
+  width: 10px;
+  margin-left: 3px;
   opacity: 1;
+}
+/* Make the suggestion buttons full-width inside the popover. */
+.nh-tag-suggestion {
+  width: 100%;
 }
 
 /* Add-tag popover */

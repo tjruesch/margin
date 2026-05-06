@@ -19,6 +19,7 @@ import {
   hasAnthropicApiKey,
   isOwnedNote,
   listNotes,
+  type NoteListItem,
   noteMeta,
   notesDir as fetchNotesDir,
   type Transcript,
@@ -178,7 +179,18 @@ export default function App() {
   // set_note_tags so the in-flight buffer isn't disturbed.
   const [tags, setTags] = useState<string[]>([]);
   const [frontmatterExtras, setFrontmatterExtras] = useState<Record<string, unknown>>({});
-  const [allTags, setAllTags] = useState<string[]>([]);
+
+  // Single source of truth for the home feed AND for the note-header tag
+  // autocomplete. Loaded once on mount, refreshed on home navigation and
+  // after note mutations; updated optimistically on tag edits so the
+  // sidebar / autocomplete stay in sync without an extra disk walk.
+  const [notes, setNotes] = useState<NoteListItem[]>([]);
+  const [notesLoading, setNotesLoading] = useState<boolean>(true);
+  const allTags = useMemo(() => {
+    const set = new Set<string>();
+    for (const n of notes) for (const t of n.tags) set.add(t);
+    return Array.from(set).sort();
+  }, [notes]);
 
   const contentRef = useRef(content);
   const pathRef = useRef(path);
@@ -226,6 +238,19 @@ export default function App() {
     if (!dir) return false;
     const prefix = dir.endsWith("/") ? dir : dir + "/";
     return p.startsWith(prefix);
+  }, []);
+
+  /** Re-scan owned notes from disk and update the shared state. The home
+   *  feed and the note-header tag autocomplete both read from this. */
+  const refreshNotes = useCallback(async () => {
+    try {
+      const items = await listNotes();
+      setNotes(items);
+    } catch (err) {
+      console.error("listNotes failed:", err);
+    } finally {
+      setNotesLoading(false);
+    }
   }, []);
 
   // Detect whether the bundle has a transcript on disk, and whether that
@@ -807,32 +832,28 @@ export default function App() {
     hasAnthropicApiKey()
       .then(setHasKey)
       .catch(() => setHasKey(false));
-    // Seed the autocomplete pool from the existing notes' frontmatter.
-    // We piggy-back on list_notes (one disk walk) instead of a dedicated
-    // list_all_tags command, which would re-scan every bundle a second
-    // time. Subsequent mutations union into the pool below.
-    listNotes()
-      .then((items) => {
-        const set = new Set<string>();
-        for (const n of items) for (const t of n.tags) set.add(t);
-        setAllTags(Array.from(set).sort());
-      })
-      .catch((err) => console.error("listNotes (seed tags) failed:", err));
+    void refreshNotes();
   }, []);
+
+  // Re-scan notes whenever the user enters home so the feed reflects any
+  // edits made in the editor since the last visit.
+  useEffect(() => {
+    if (mode === "home") void refreshNotes();
+    // refreshNotes is stable (defined below with empty deps)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode]);
 
   const onTagsChange = useCallback(
     async (next: string[]) => {
       const target = pathRef.current;
       if (!target || !isOwnedPath(target)) return;
       setTags(next);
-      // Optimistically union new tags into the autocomplete pool. Tags
-      // that *no* note has anymore linger as suggestions until the next
-      // app start; that's a deliberate tradeoff for not re-scanning all
-      // notes on every header edit.
-      setAllTags((prev) => {
-        if (next.every((t) => prev.includes(t))) return prev;
-        return Array.from(new Set([...prev, ...next])).sort();
-      });
+      // Optimistically reflect the change in the shared `notes` state so
+      // the home feed and the note-header autocomplete re-derive `allTags`
+      // immediately — no extra disk walk required.
+      setNotes((prev) =>
+        prev.map((n) => (n.note_path === target ? { ...n, tags: next } : n)),
+      );
       try {
         await setNoteTags(target, next);
       } catch (err) {
@@ -1010,6 +1031,9 @@ export default function App() {
         {mode === "home" && (
           <Home
             recentFiles={recentFiles}
+            notes={notes}
+            notesLoading={notesLoading}
+            allTags={allTags}
             onOpen={(p) => void loadFile(p)}
             onNewNote={() => void onNewNote()}
             onNewMeeting={() => void onNewMeeting()}
