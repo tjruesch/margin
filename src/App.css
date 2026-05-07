@@ -2300,8 +2300,12 @@ input.nh-title {
   width: 100%;
 }
 
-/* Add-tag popover */
+/* Add-tag popover — anchored to the LEFT of the "+" chip (which sits near
+   the left edge of the tags row), unlike .nh-more-popover which hangs off
+   the right side of the header. */
 .nh-tag-popover {
+  left: 0;
+  right: auto;
   width: 220px;
   padding: 6px;
   display: flex;
