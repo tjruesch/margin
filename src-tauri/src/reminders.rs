@@ -3,9 +3,11 @@
 //! due action via `tauri-plugin-notification`, and stamps
 //! `reminder_sent_ms` so the same row never re-fires.
 //!
-//! Click-to-open is handled by emitting the existing `"open-file"` event
-//! — the frontend already routes that to `loadFile()` (App.tsx) which
-//! navigates to edit mode on the target note.
+//! Notifications are informational only: the body identifies the action
+//! and source note so the user can navigate manually. Native click →
+//! open-note routing isn't wired because tauri-plugin-notification v2's
+//! `.show()` builder doesn't expose a per-notification click callback
+//! on macOS; revisiting click delegation is its own follow-up.
 //!
 //! Reminders only fire while the app is running. Background launch via a
 //! macOS launch agent is out of scope (#43).
@@ -14,7 +16,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::{params, Connection};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 const TICK_SECONDS: u64 = 60;
@@ -22,7 +24,6 @@ const TICK_SECONDS: u64 = 60;
 #[derive(Debug, Clone)]
 struct DueRow {
     id: String,
-    note_path: String,
     note_title: String,
     text: String,
 }
@@ -64,15 +65,6 @@ fn tick_once(app: &AppHandle) -> Result<(), String> {
                 if let Err(e) = mark_sent(app, &row.id, now_ms) {
                     eprintln!("[reminders] mark sent failed for {}: {e}", row.id);
                 }
-                // Open-the-note on click: tauri-plugin-notification v2
-                // doesn't expose a per-notification click callback on
-                // macOS, so we fall back to emitting the event here.
-                // The user clicking the notification raises the app
-                // window; the frontend can offer a "go to most recent
-                // due action" affordance later if needed.
-                let _ = app
-                    .emit("open-file", row.note_path.clone())
-                    .map_err(|e| eprintln!("[reminders] emit open-file: {e}"));
             }
             Err(e) => {
                 eprintln!("[reminders] notification show failed: {e}");
@@ -87,7 +79,7 @@ fn collect_due(app: &AppHandle, now_ms: i64) -> Result<Vec<DueRow>, String> {
     let conn = conn_state.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT a.id, a.note_path, n.title, a.text \
+            "SELECT a.id, n.title, a.text \
              FROM actions a JOIN notes n ON n.note_path = a.note_path \
              WHERE a.done = 0 AND a.due_ms IS NOT NULL \
                AND a.due_ms <= ?1 AND a.reminder_sent_ms IS NULL \
@@ -98,9 +90,8 @@ fn collect_due(app: &AppHandle, now_ms: i64) -> Result<Vec<DueRow>, String> {
         .query_map([now_ms], |r| {
             Ok(DueRow {
                 id: r.get(0)?,
-                note_path: r.get(1)?,
-                note_title: r.get(2)?,
-                text: r.get(3)?,
+                note_title: r.get(1)?,
+                text: r.get(2)?,
             })
         })
         .map_err(|e| e.to_string())?;
