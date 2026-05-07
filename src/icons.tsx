@@ -187,6 +187,6 @@ export const IconMic = (p: Props) => (
 );
 export const IconCheck = (p: Props) => (
   <Icon {...p}>
-    <path d="M5 12.5l4.5 4.5L19 7" />
+    <path d="M2 13l7 7L22 4" />
   </Icon>
 );

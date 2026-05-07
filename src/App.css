@@ -1435,6 +1435,9 @@ select.settings-input {
 .home-action-bucket.bucket-later {
   border-left-color: var(--home-line-strong);
 }
+.home-action-bucket.bucket-undated {
+  border-left-color: var(--home-line);
+}
 .home-action-bucket-head {
   display: inline-flex;
   align-items: center;
@@ -1489,6 +1492,11 @@ select.settings-input {
 .home-checkbox.done {
   background: var(--accent);
   border-color: var(--accent);
+}
+.home-checkbox svg {
+  width: 11px;
+  height: 11px;
+  overflow: visible;
 }
 .home-action-body {
   flex: 1;
