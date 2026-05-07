@@ -7,6 +7,7 @@ mod keychain;
 mod notes;
 mod paths;
 mod reconcile;
+mod reminders;
 mod sharing;
 mod sysaudio;
 mod transcribe;
@@ -348,6 +349,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_notification::init())
         .menu(build_menu)
         .on_menu_event(handle_menu_event)
         // Standard macOS behavior: the red close button hides the window
@@ -455,6 +457,12 @@ pub fn run() {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = apply_vibrancy(&win, NSVisualEffectMaterial::Sidebar, None, None);
             }
+
+            // Reminders ticker: polls the index every 60s and fires a
+            // system notification per newly-due action item (#43). The
+            // task lives until the app exits.
+            reminders::start(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

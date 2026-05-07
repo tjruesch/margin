@@ -10,6 +10,7 @@
     "core:window:allow-toggle-maximize",
     "opener:default",
     "dialog:default",
-    "store:default"
+    "store:default",
+    "notification:default"
   ]
 }
