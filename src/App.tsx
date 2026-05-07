@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
+import { DueDatePopover } from "./editor/dueDatePopover";
 import { Home } from "./Home";
 import { Preview } from "./Preview";
 import { RecordingBanner, type NoteRecording } from "./RecordingBanner";
@@ -1402,6 +1403,8 @@ export default function App() {
           </span>
         </footer>
       )}
+
+      <DueDatePopover />
     </div>
   );
 }

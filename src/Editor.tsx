@@ -11,6 +11,8 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { Tag, styleTags, tags as t } from "@lezer/highlight";
 
+import { dueChipClickHandler, dueChipPlugin } from "./editor/dueDateChip";
+
 // Toggle a markdown wrapper (e.g., `**`, `*`, `~~`) around the current
 // selection. Per-range behaviour:
 //   - Selection wrapped by markers on both sides (whether they're inside
@@ -173,6 +175,8 @@ export const Editor = forwardRef<ReactCodeMirrorRef, Props>(function Editor(
       indentUnit.of(useTabs ? "\t" : " ".repeat(tabSize)),
       syntaxHighlighting(themedHighlight),
       taskCheckboxClickPlugin,
+      dueChipPlugin,
+      dueChipClickHandler,
       markdownFormatKeymap,
       EditorView.theme({
         "&": {
