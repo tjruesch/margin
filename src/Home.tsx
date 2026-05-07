@@ -555,6 +555,60 @@ function ActionItemsTeaser({
   );
 }
 
+// Order in which due-buckets render. The string keys match the values
+// returned by `dueBucket` from dueLabel.ts; the labels are human copy.
+const BUCKET_ORDER = [
+  { key: "overdue", label: "Overdue" },
+  { key: "today", label: "Today" },
+  { key: "soon", label: "This week" },
+  { key: "later", label: "Later" },
+] as const;
+
+function ActionRow({
+  it,
+  onToggle,
+  onOpenNote,
+  showNoteLink,
+}: {
+  it: ActionListItem;
+  onToggle: (id: string, nextDone: boolean) => void;
+  onOpenNote: (path: string) => void;
+  /** When true, render the source-note button as row meta. Used in
+   *  due-bucket groups where the rows aren't already visually grouped
+   *  by note. */
+  showNoteLink: boolean;
+}) {
+  return (
+    <div className="home-action-row">
+      <button
+        type="button"
+        className={"home-checkbox" + (it.done ? " done" : "")}
+        aria-label={it.done ? "Mark as open" : "Mark as done"}
+        onClick={() => onToggle(it.id, !it.done)}
+      >
+        {it.done && <IconCheck size={12} sw={2.6} />}
+      </button>
+      <div className="home-action-body">
+        <div className={"home-action-text" + (it.done ? " done" : "")}>{it.text}</div>
+        {showNoteLink && (
+          <div className="home-action-meta">
+            <button
+              type="button"
+              className="home-action-source"
+              onClick={() => onOpenNote(it.note_path)}
+              title={`Open ${it.note_title}`}
+            >
+              <IconFileText size={11} sw={1.7} />
+              {it.note_title}
+            </button>
+          </div>
+        )}
+      </div>
+      <DueChip dueMs={it.due_ms} />
+    </div>
+  );
+}
+
 function ActionsFeed({
   actions,
   onToggle,
@@ -564,17 +618,28 @@ function ActionsFeed({
   onToggle: (id: string, nextDone: boolean) => void;
   onOpenNote: (path: string) => void;
 }) {
-  // Group by source note. Map iteration preserves insertion order, and
-  // `actions` is already sorted (note mtime desc, then line asc) by the
-  // backend — so groups appear newest-note-first.
-  const grouped = useMemo(() => {
-    const map = new Map<string, ActionListItem[]>();
+  // Split dated vs. undated, then bucket the dated half by urgency.
+  // Backend already orders dated rows by `due_ms ASC`, so each bucket is
+  // chronological without further sorting.
+  const { byBucket, byNote } = useMemo(() => {
+    const now = Date.now();
+    const buckets: Record<string, ActionListItem[]> = {
+      overdue: [],
+      today: [],
+      soon: [],
+      later: [],
+    };
+    const notes = new Map<string, ActionListItem[]>();
     for (const a of actions) {
-      const arr = map.get(a.note_path);
-      if (arr) arr.push(a);
-      else map.set(a.note_path, [a]);
+      if (a.due_ms != null) {
+        buckets[dueBucket(a.due_ms, now)].push(a);
+      } else {
+        const arr = notes.get(a.note_path);
+        if (arr) arr.push(a);
+        else notes.set(a.note_path, [a]);
+      }
     }
-    return map;
+    return { byBucket: buckets, byNote: notes };
   }, [actions]);
 
   if (actions.length === 0) {
@@ -588,10 +653,14 @@ function ActionsFeed({
         </div>
         <p className="home-empty">
           No open action items. Add <code>- [ ] task</code> lines to any note.
+          Trail with <code>@2026-01-15</code>, <code>@tomorrow</code>, or
+          <code>@friday</code> to schedule.
         </p>
       </section>
     );
   }
+
+  const datedTotal = BUCKET_ORDER.reduce((n, b) => n + byBucket[b.key].length, 0);
 
   return (
     <section className="home-section">
@@ -601,40 +670,68 @@ function ActionsFeed({
           <h2 className="home-section-title">Things to do</h2>
         </div>
       </div>
-      {[...grouped.entries()].map(([notePath, items]) => (
-        <div key={notePath} className="home-action-group">
-          <button
-            type="button"
-            className="home-action-group-head"
-            onClick={() => onOpenNote(notePath)}
-            title={`Open ${items[0].note_title}`}
-          >
-            <IconFileText size={13} sw={1.7} />
-            <span className="home-action-group-title">{items[0].note_title}</span>
-            <span className="home-action-group-count">
-              {items.filter((i) => !i.done).length} open
-            </span>
-          </button>
-          <div className="home-actions">
-            {items.map((it) => (
-              <div key={it.id} className="home-action-row">
-                <button
-                  type="button"
-                  className={"home-checkbox" + (it.done ? " done" : "")}
-                  aria-label={it.done ? "Mark as open" : "Mark as done"}
-                  onClick={() => onToggle(it.id, !it.done)}
-                >
-                  {it.done && <IconCheck size={12} sw={2.6} />}
-                </button>
-                <div className="home-action-body">
-                  <div className={"home-action-text" + (it.done ? " done" : "")}>{it.text}</div>
+
+      {datedTotal > 0 && (
+        <div className="home-action-section">
+          <div className="home-action-section-head">Schedule</div>
+          {BUCKET_ORDER.map(({ key, label }) => {
+            const items = byBucket[key];
+            if (items.length === 0) return null;
+            return (
+              <div key={key} className={`home-action-bucket bucket-${key}`}>
+                <div className="home-action-bucket-head">
+                  <span className="home-action-bucket-label">{label}</span>
+                  <span className="home-action-bucket-count">{items.length}</span>
                 </div>
-                <DueChip dueMs={it.due_ms} />
+                <div className="home-actions">
+                  {items.map((it) => (
+                    <ActionRow
+                      key={it.id}
+                      it={it}
+                      onToggle={onToggle}
+                      onOpenNote={onOpenNote}
+                      showNoteLink
+                    />
+                  ))}
+                </div>
               </div>
-            ))}
-          </div>
+            );
+          })}
         </div>
-      ))}
+      )}
+
+      {byNote.size > 0 && (
+        <div className="home-action-section">
+          {datedTotal > 0 && <div className="home-action-section-head">By note</div>}
+          {[...byNote.entries()].map(([notePath, items]) => (
+            <div key={notePath} className="home-action-group">
+              <button
+                type="button"
+                className="home-action-group-head"
+                onClick={() => onOpenNote(notePath)}
+                title={`Open ${items[0].note_title}`}
+              >
+                <IconFileText size={13} sw={1.7} />
+                <span className="home-action-group-title">{items[0].note_title}</span>
+                <span className="home-action-group-count">
+                  {items.filter((i) => !i.done).length} open
+                </span>
+              </button>
+              <div className="home-actions">
+                {items.map((it) => (
+                  <ActionRow
+                    key={it.id}
+                    it={it}
+                    onToggle={onToggle}
+                    onOpenNote={onOpenNote}
+                    showNoteLink={false}
+                  />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }

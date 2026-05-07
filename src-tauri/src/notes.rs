@@ -1200,6 +1200,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_actions_user_repro_real_lines() {
+        // Lines copied verbatim from a real note that wasn't getting
+        // chips on the Action items page.
+        let body = "- [ ] Follow up with Staatsanwaltschaft Heilbronn; propose Rahmenvertrag. @2026-05-11\n\
+                    - [ ] Send SUND login by Friday (refine over weekend if needed). @2026-05-08\n\
+                    - [x] Add upgrade button/page to Bridge app today (within 1\u{2013}2 hours), then notify so Siegfried email can go out. @2026-05-07 00:00\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 3, "expected three actions, got: {:?}", got.iter().map(|a| &a.text).collect::<Vec<_>>());
+        for a in &got {
+            assert!(a.due_ms.is_some(), "due_ms missing for: {:?}", a.text);
+            assert!(!a.text.contains('@'), "text not stripped: {:?}", a.text);
+        }
+    }
+
+    #[test]
     fn parse_actions_strips_absolute_due_token() {
         let body = "- [ ] Submit invoice @2026-05-15\n";
         let got = parse_actions(body);

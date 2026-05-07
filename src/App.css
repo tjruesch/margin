@@ -1391,6 +1391,71 @@ select.settings-input {
 .home-action-group .home-actions {
   margin-top: 6px;
 }
+
+/* Top-level section split for due-date scheduling: dated rows live in a
+   "Schedule" section organized by urgency bucket; undated rows fall
+   through to the legacy "By note" section. */
+.home-action-section {
+  margin-top: 18px;
+}
+.home-action-section:first-of-type {
+  margin-top: 14px;
+}
+.home-action-section-head {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  padding: 0 4px 8px;
+  border-bottom: 0.5px solid var(--home-line);
+  margin-bottom: 12px;
+}
+
+/* Per-urgency bucket inside the Schedule section. The left-edge stripe
+   reuses the chip color so visual urgency stays consistent between the
+   bucket header and the row chips. */
+.home-action-bucket {
+  margin-top: 14px;
+  border-left: 2px solid transparent;
+  padding-left: 10px;
+}
+.home-action-bucket:first-of-type {
+  margin-top: 0;
+}
+.home-action-bucket.bucket-overdue {
+  border-left-color: #c43541;
+}
+.home-action-bucket.bucket-today {
+  border-left-color: var(--accent);
+}
+.home-action-bucket.bucket-soon {
+  border-left-color: #3a5da8;
+}
+.home-action-bucket.bucket-later {
+  border-left-color: var(--home-line-strong);
+}
+.home-action-bucket-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.home-action-bucket-label {
+  font-weight: 600;
+}
+.home-action-bucket-count {
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.home-action-bucket .home-actions {
+  margin-top: 6px;
+}
 .home-action-row {
   display: flex;
   align-items: flex-start;
