@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
+import { dispatchDiff } from "./editor/applyDiff";
 import { DueDatePopover } from "./editor/dueDatePopover";
 import { Home } from "./Home";
 import { Preview } from "./Preview";
@@ -479,7 +480,12 @@ export default function App() {
               frontmatterExtrasRef.current,
             );
             if (result.rewritten_body && result.rewritten_body !== md) {
-              setContent(result.rewritten_body);
+              const view = editorRef.current?.view;
+              if (view) {
+                dispatchDiff(view, md, result.rewritten_body);
+              } else {
+                setContent(result.rewritten_body);
+              }
               nextSaved = result.rewritten_body;
             }
           } else {
@@ -607,22 +613,28 @@ export default function App() {
       if (!target) return;
     }
     try {
-      let nextSaved = contentRef.current;
+      const before = contentRef.current;
+      let nextSaved = before;
       if (isOwnedPath(target)) {
         const result = await writeNote(
           target,
-          contentRef.current,
+          before,
           tagsRef.current,
           archivedRef.current,
           favoriteRef.current,
           frontmatterExtrasRef.current,
         );
-        if (result.rewritten_body && result.rewritten_body !== contentRef.current) {
-          setContent(result.rewritten_body);
+        if (result.rewritten_body && result.rewritten_body !== before) {
+          const view = editorRef.current?.view;
+          if (view) {
+            dispatchDiff(view, before, result.rewritten_body);
+          } else {
+            setContent(result.rewritten_body);
+          }
           nextSaved = result.rewritten_body;
         }
       } else {
-        await writeFile(target, contentRef.current);
+        await writeFile(target, before);
       }
       setPath(target);
       setSavedContent(nextSaved);
@@ -784,11 +796,18 @@ export default function App() {
             frontmatterExtrasRef.current,
           );
           // Rust may have rewritten relative due-date tokens
-          // (`@today`/`@tomorrow`/`@<weekday>`) to absolute ISO. Swap the
-          // editor's text so it stays in sync with disk; otherwise the next
-          // save would re-resolve the now-stale relative token.
+          // (`@today`/`@tomorrow`/`@<weekday>`) to absolute ISO. Push the
+          // narrow diff straight at the editor view so CodeMirror's
+          // selection-mapping preserves cursor and scroll; a full-doc
+          // setContent here would collapse selection to 0 and jump the
+          // viewport to the top.
           if (result.rewritten_body && result.rewritten_body !== content) {
-            setContent(result.rewritten_body);
+            const view = editorRef.current?.view;
+            if (view) {
+              dispatchDiff(view, content, result.rewritten_body);
+            } else {
+              setContent(result.rewritten_body);
+            }
             nextSaved = result.rewritten_body;
           }
         } else {
