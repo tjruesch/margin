@@ -63,6 +63,10 @@ pub struct ActionListItem {
     pub done: bool,
     pub line: i64,
     pub created_ms: i64,
+    /// Absolute due-date timestamp (Unix ms) parsed from a trailing
+    /// `@YYYY-MM-DD[ HH:MM]` token on the action line. `None` means the
+    /// action has no due date.
+    pub due_ms: Option<i64>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -390,6 +394,16 @@ pub fn read_note(note_path: String) -> Result<NoteContent, String> {
     })
 }
 
+/// Result envelope for `write_note`. `rewritten_body` is `Some` when the
+/// Rust side rewrote relative due-date tokens (`@today`, `@tomorrow`,
+/// `@<weekday>`) to their absolute `@YYYY-MM-DD` forms — the frontend
+/// uses it to swap the editor's in-memory text so it stays in sync with
+/// disk.
+#[derive(Serialize)]
+pub struct WriteNoteResult {
+    pub rewritten_body: Option<String>,
+}
+
 /// Write a note by merging tags + extras into a frontmatter block above
 /// the body. The caller must pass back any `frontmatter_extras` it got
 /// from `read_note` so unknown keys round-trip unchanged.
@@ -403,7 +417,16 @@ pub fn write_note(
     frontmatter_extras: Mapping,
     guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
+) -> Result<WriteNoteResult, String> {
+    let today = chrono::Local::now().date_naive();
+    let (final_body, rewritten_body) = match rewrite_relative_due_tokens(&body, today) {
+        Some(new_body) => {
+            let echo = new_body.clone();
+            (new_body, Some(echo))
+        }
+        None => (body, None),
+    };
+
     let normalized = normalize_tags(tags);
     let mut map = frontmatter_extras;
     if !normalized.is_empty() {
@@ -420,11 +443,11 @@ pub fn write_note(
     }
     set_bool_key(&mut map, "archived", archived);
     set_bool_key(&mut map, "favorite", favorite);
-    let merged = write_with_frontmatter(&map, &body);
+    let merged = write_with_frontmatter(&map, &final_body);
     fs::write(&note_path, merged).map_err(|e| e.to_string())?;
     *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
     touch_index(&conn, Path::new(&note_path), false);
-    Ok(())
+    Ok(WriteNoteResult { rewritten_body })
 }
 
 fn set_bool_key(map: &mut Mapping, key: &str, value: bool) {
@@ -518,7 +541,7 @@ pub fn set_action_done(
 
     let mut target_idx: Option<usize> = None;
     if cached_line >= 1 && cached_line <= lines.len() {
-        if let Some((line_text, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
+        if let Some((line_text, _, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
             if action_text_hash(&line_text) == want_hash {
                 target_idx = Some(cached_line - 1);
             }
@@ -526,7 +549,7 @@ pub fn set_action_done(
     }
     if target_idx.is_none() {
         for (i, line) in lines.iter().enumerate() {
-            if let Some((line_text, _)) = parse_action_line(line.trim_start()) {
+            if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
                 if action_text_hash(&line_text) == want_hash {
                     target_idx = Some(i);
                     break;
@@ -602,6 +625,12 @@ pub(crate) struct ParsedAction {
     pub line: usize,
     pub text: String,
     pub done: bool,
+    /// Absolute due-date timestamp (Unix ms) if a recognized
+    /// `@YYYY-MM-DD[ HH:MM]` token trails the action text. Relative
+    /// tokens (`@today`, `@tomorrow`, `@<weekday>`) are stripped from
+    /// `text` but leave `due_ms` as `None`; they get normalized to
+    /// absolute on the next `write_note` call.
+    pub due_ms: Option<i64>,
 }
 
 /// Walk a note body and return every markdown task line as a
@@ -619,18 +648,19 @@ pub(crate) fn parse_actions(body: &str) -> Vec<ParsedAction> {
         if in_code_fence {
             continue;
         }
-        if let Some((text, done)) = parse_action_line(trimmed) {
+        if let Some((text, done, due_ms)) = parse_action_line(trimmed) {
             out.push(ParsedAction {
                 line: i + 1,
                 text,
                 done,
+                due_ms,
             });
         }
     }
     out
 }
 
-fn parse_action_line(line: &str) -> Option<(String, bool)> {
+fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
     let after_bullet = line
         .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
@@ -646,15 +676,158 @@ fn parse_action_line(line: &str) -> Option<(String, bool)> {
         b'x' | b'X' => true,
         _ => return None,
     };
-    let text = after_bullet[4..].trim().to_string();
-    if text.is_empty() {
+    let raw_text = after_bullet[4..].trim();
+    if raw_text.is_empty() {
         return None;
     }
-    Some((text, done))
+    let (text, due_ms) = strip_trailing_due_token(raw_text);
+    if text.is_empty() {
+        // Token consumed the entire body. Treat as a no-text action and
+        // skip — same rule as the bare `- [ ]` case.
+        return None;
+    }
+    Some((text, done, due_ms))
+}
+
+/// If `s` ends with a recognized ` @<token>`, return `(text_without_token,
+/// due_ms)` where `due_ms` is `Some` for absolute ISO tokens and `None`
+/// for relative ones (still stripped from text). If no recognizable token
+/// trails, returns the input unchanged with `due_ms = None`.
+fn strip_trailing_due_token(s: &str) -> (String, Option<i64>) {
+    let Some((prefix, token)) = take_trailing_at_token(s) else {
+        return (s.to_string(), None);
+    };
+    if let Some(due) = crate::dates::try_parse_absolute(&token) {
+        return (prefix, Some(due.timestamp_ms));
+    }
+    if crate::dates::is_relative(&token) {
+        return (prefix, None);
+    }
+    // Unrecognized → leave the @token in the text so the user can see
+    // and fix the typo. Don't punish them with a vanishing date.
+    (s.to_string(), None)
+}
+
+/// Resolve any trailing relative `@<token>` (today/tomorrow/weekday) on
+/// checkbox lines to its absolute `@YYYY-MM-DD` form, against `today`.
+/// Returns `Some(new_body)` if at least one substitution happened,
+/// `None` if the body was already canonical. Code-fenced lines are
+/// skipped — same heuristic as `parse_actions`.
+pub(crate) fn rewrite_relative_due_tokens(
+    body: &str,
+    today: chrono::NaiveDate,
+) -> Option<String> {
+    let mut out = String::with_capacity(body.len());
+    let mut in_code_fence = false;
+    let mut changed = false;
+    let mut first = true;
+    for raw in body.split('\n') {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_fence = !in_code_fence;
+            out.push_str(raw);
+            continue;
+        }
+        if in_code_fence {
+            out.push_str(raw);
+            continue;
+        }
+        let Some(rewritten) = rewrite_checkbox_line(raw, today) else {
+            out.push_str(raw);
+            continue;
+        };
+        out.push_str(&rewritten);
+        changed = true;
+    }
+    if changed {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// If `line` is a checkbox line with a trailing relative `@<token>`,
+/// return the line with that token swapped for `@<absolute>`. Returns
+/// `None` if the line is not a checkbox, has no token, or the token is
+/// already absolute / unrecognized.
+fn rewrite_checkbox_line(line: &str, today: chrono::NaiveDate) -> Option<String> {
+    // Detect leading whitespace and bullet so we can preserve them.
+    let leading_ws_len = line.len() - line.trim_start().len();
+    let trimmed = &line[leading_ws_len..];
+    let (bullet_len, after_bullet) = if let Some(rest) = trimmed.strip_prefix("- ") {
+        (2, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("* ") {
+        (2, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("+ ") {
+        (2, rest)
+    } else {
+        return None;
+    };
+    let bytes = after_bullet.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'[' || bytes[2] != b']' || bytes[3] != b' ' {
+        return None;
+    }
+    if !matches!(bytes[1], b' ' | b'x' | b'X') {
+        return None;
+    }
+    let body_after_checkbox = &after_bullet[4..];
+    // Preserve trailing whitespace verbatim (we only rewrite the token).
+    let body_trimmed = body_after_checkbox.trim_end();
+    let trailing_ws = &body_after_checkbox[body_trimmed.len()..];
+
+    let (prefix, token) = take_trailing_at_token(body_trimmed)?;
+    if !crate::dates::is_relative(&token) {
+        return None;
+    }
+    let due = crate::dates::parse_due_token(&token, today)?;
+    let absolute = crate::dates::render_absolute(&due);
+
+    let mut out = String::with_capacity(line.len() + 8);
+    out.push_str(&line[..leading_ws_len]);
+    out.push_str(&trimmed[..bullet_len]);
+    out.push_str(&after_bullet[..4]);
+    out.push_str(&prefix);
+    out.push(' ');
+    out.push('@');
+    out.push_str(&absolute);
+    out.push_str(trailing_ws);
+    Some(out)
+}
+
+/// Find the last `@` in `s` that's at the start or preceded by whitespace,
+/// and return `(text_before_token, token_after_at)`. The token may itself
+/// contain a single space (for the `@YYYY-MM-DD HH:MM` form). Returns
+/// `None` if no candidate `@` is present, the token is empty, or the
+/// prefix collapses to empty.
+fn take_trailing_at_token(s: &str) -> Option<(String, String)> {
+    let bytes = s.as_bytes();
+    let mut at_pos: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'@' && (i == 0 || bytes[i - 1].is_ascii_whitespace()) {
+            at_pos = Some(i);
+        }
+    }
+    let pos = at_pos?;
+    let prefix = s[..pos].trim_end().to_string();
+    let token = s[pos + 1..].trim().to_string();
+    if prefix.is_empty() || token.is_empty() {
+        return None;
+    }
+    Some((prefix, token))
 }
 
 /// Stable per-text hash for action IDs. FNV-1a 64-bit, keep low 32 bits
 /// as 8 hex chars. No new dep; deterministic across builds.
+///
+/// The hash is computed over the *stripped* `text` (trailing `@<token>`
+/// already removed by `parse_action_line`), so insert-side and
+/// `set_action_done` lookup-side hashes always match. Any future change
+/// to what gets stripped from the action body must be applied
+/// symmetrically on both sides or row identity will drift.
 pub(crate) fn action_text_hash(text: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in text.bytes() {
@@ -1024,6 +1197,79 @@ mod tests {
     #[test]
     fn action_text_hash_stable_for_same_text() {
         assert_eq!(action_text_hash("hello"), action_text_hash("hello"));
+    }
+
+    #[test]
+    fn parse_actions_strips_absolute_due_token() {
+        let body = "- [ ] Submit invoice @2026-05-15\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "Submit invoice");
+        assert!(got[0].due_ms.is_some());
+    }
+
+    #[test]
+    fn parse_actions_strips_absolute_due_with_time() {
+        let body = "- [ ] Stand-up @2026-05-15 09:00\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "Stand-up");
+        assert!(got[0].due_ms.is_some());
+    }
+
+    #[test]
+    fn parse_actions_strips_relative_token_but_no_due_ms() {
+        // Relative tokens are recognized and stripped from text, but due_ms
+        // stays None until rewrite_relative_due_tokens runs at write_note time.
+        let body = "- [ ] Schedule retro @tomorrow\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "Schedule retro");
+        assert!(got[0].due_ms.is_none());
+    }
+
+    #[test]
+    fn parse_actions_leaves_unrecognized_token_in_text() {
+        let body = "- [ ] Email someone@example.com\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "Email someone@example.com");
+        assert!(got[0].due_ms.is_none());
+    }
+
+    #[test]
+    fn parse_actions_leaves_garbage_at_token_in_text() {
+        let body = "- [ ] Task @notadate\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "Task @notadate");
+        assert!(got[0].due_ms.is_none());
+    }
+
+    #[test]
+    fn rewrite_relative_due_tokens_substitutes_in_place() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
+        let body = "# Plan\n\n- [ ] Schedule retro @tomorrow\n- [ ] Pay invoice @2026-06-01\n";
+        let rewritten = rewrite_relative_due_tokens(body, today).unwrap();
+        assert!(rewritten.contains("@2026-05-08"));
+        assert!(rewritten.contains("@2026-06-01"));
+        assert!(!rewritten.contains("@tomorrow"));
+    }
+
+    #[test]
+    fn rewrite_relative_due_tokens_returns_none_when_already_canonical() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
+        let body = "- [ ] Pay invoice @2026-06-01\n- [ ] No date\n";
+        assert!(rewrite_relative_due_tokens(body, today).is_none());
+    }
+
+    #[test]
+    fn rewrite_relative_due_tokens_skips_code_fences() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
+        let body = "```\n- [ ] Inside fence @tomorrow\n```\n- [ ] After fence @tomorrow\n";
+        let rewritten = rewrite_relative_due_tokens(body, today).unwrap();
+        assert!(rewritten.contains("@tomorrow"), "fenced line keeps token");
+        assert!(rewritten.contains("@2026-05-08"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
+import { dueBucket, friendlyDueLabel } from "./dueLabel";
 import { type ActionListItem, type NoteListItem } from "./file";
 import { MoreMenu } from "./MoreMenu";
 import {
@@ -53,6 +54,21 @@ type Props = {
 
 type NavId = "home" | "actions" | "meetings" | "shared" | "favorites" | "archive";
 type FilterId = "all" | "notes" | "meetings" | "shared";
+
+function DueChip({ dueMs }: { dueMs: number | null }) {
+  if (dueMs == null) return null;
+  // Recompute on each render so label flips at midnight when the user
+  // returns to the page. Cheap; the home feed already re-renders often.
+  const now = Date.now();
+  return (
+    <span
+      className={`home-due ${dueBucket(dueMs, now)}`}
+      title={new Date(dueMs).toLocaleString()}
+    >
+      {friendlyDueLabel(dueMs, now)}
+    </span>
+  );
+}
 
 // Stub data for sections whose backends don't exist yet (#27 calendar).
 // Returns empty so the section hides gracefully; swap in live data when
@@ -531,6 +547,7 @@ function ActionItemsTeaser({
                 </button>
               </div>
             </div>
+            <DueChip dueMs={it.due_ms} />
           </div>
         ))}
       </div>
@@ -612,6 +629,7 @@ function ActionsFeed({
                 <div className="home-action-body">
                   <div className={"home-action-text" + (it.done ? " done" : "")}>{it.text}</div>
                 </div>
+                <DueChip dueMs={it.due_ms} />
               </div>
             ))}
           </div>

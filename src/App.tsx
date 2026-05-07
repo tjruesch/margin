@@ -467,8 +467,9 @@ export default function App() {
         // the autosave debounce isn't a strong enough guarantee for output
         // the user just paid for. Don't lose it to a window close.
         try {
+          let nextSaved = md;
           if (isOwnedPath(notePath)) {
-            await writeNote(
+            const result = await writeNote(
               notePath,
               md,
               tagsRef.current,
@@ -476,10 +477,14 @@ export default function App() {
               favoriteRef.current,
               frontmatterExtrasRef.current,
             );
+            if (result.rewritten_body && result.rewritten_body !== md) {
+              setContent(result.rewritten_body);
+              nextSaved = result.rewritten_body;
+            }
           } else {
             await writeFile(notePath, md);
           }
-          setSavedContent(md);
+          setSavedContent(nextSaved);
         } catch (err) {
           console.error("post-reconcile save failed:", err);
         }
@@ -601,8 +606,9 @@ export default function App() {
       if (!target) return;
     }
     try {
+      let nextSaved = contentRef.current;
       if (isOwnedPath(target)) {
-        await writeNote(
+        const result = await writeNote(
           target,
           contentRef.current,
           tagsRef.current,
@@ -610,11 +616,15 @@ export default function App() {
           favoriteRef.current,
           frontmatterExtrasRef.current,
         );
+        if (result.rewritten_body && result.rewritten_body !== contentRef.current) {
+          setContent(result.rewritten_body);
+          nextSaved = result.rewritten_body;
+        }
       } else {
         await writeFile(target, contentRef.current);
       }
       setPath(target);
-      setSavedContent(contentRef.current);
+      setSavedContent(nextSaved);
       setExternalChange(null);
       setExternallyDeleted(false);
     } catch (err) {
@@ -762,8 +772,9 @@ export default function App() {
     if (externalChange || externallyDeleted) return;
     const t = setTimeout(async () => {
       try {
+        let nextSaved = content;
         if (isOwnedPath(path)) {
-          await writeNote(
+          const result = await writeNote(
             path,
             content,
             tagsRef.current,
@@ -771,10 +782,18 @@ export default function App() {
             favoriteRef.current,
             frontmatterExtrasRef.current,
           );
+          // Rust may have rewritten relative due-date tokens
+          // (`@today`/`@tomorrow`/`@<weekday>`) to absolute ISO. Swap the
+          // editor's text so it stays in sync with disk; otherwise the next
+          // save would re-resolve the now-stale relative token.
+          if (result.rewritten_body && result.rewritten_body !== content) {
+            setContent(result.rewritten_body);
+            nextSaved = result.rewritten_body;
+          }
         } else {
           await writeFile(path, content);
         }
-        setSavedContent(content);
+        setSavedContent(nextSaved);
       } catch (err) {
         console.error("autosave failed:", err);
       }

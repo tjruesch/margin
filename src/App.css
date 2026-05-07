@@ -1298,10 +1298,19 @@ select.settings-input {
   color: var(--fg-muted);
 }
 .home-due {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 2px;
   font-size: 11px;
   font-weight: 600;
   padding: 2px 8px;
   border-radius: 10px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.home-due.overdue {
+  background: rgba(196, 53, 65, 0.12);
+  color: #c43541;
 }
 .home-due.today {
   background: color-mix(in srgb, var(--accent) 12%, transparent);

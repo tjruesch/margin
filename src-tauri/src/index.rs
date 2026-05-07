@@ -33,7 +33,8 @@ const SCHEMA_V1: &str = include_str!("migrations/001_init.sql");
 const SCHEMA_V2: &str = include_str!("migrations/002_archived.sql");
 const SCHEMA_V3: &str = include_str!("migrations/003_favorite.sql");
 const SCHEMA_V4: &str = include_str!("migrations/004_actions.sql");
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_V5: &str = include_str!("migrations/005_due_dates.sql");
+const SCHEMA_VERSION: i64 = 5;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -87,6 +88,14 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         // actions for free.
         conn.execute("UPDATE notes SET body_size = -1", [])?;
         version = 4;
+    }
+    if version == 4 {
+        // Adds `due_ms` and `reminder_sent_ms` to actions for inline
+        // due-date scheduling (#43). The migration also sets
+        // body_size = -1 so reconcile re-reads every note and back-fills
+        // due_ms for any pre-existing absolute `@YYYY-MM-DD` tokens.
+        conn.execute_batch(SCHEMA_V5)?;
+        version = 5;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
@@ -181,10 +190,10 @@ pub fn list_actions(conn: &Connection, scope: ActionScope) -> Result<Vec<ActionL
         ActionScope::All => "",
     };
     let sql = format!(
-        "SELECT a.id, a.note_path, n.title, a.text, a.done, a.line, a.created_ms \
+        "SELECT a.id, a.note_path, n.title, a.text, a.done, a.line, a.created_ms, a.due_ms \
          FROM actions a JOIN notes n ON n.note_path = a.note_path \
          WHERE n.archived = 0 {where_done} \
-         ORDER BY n.modified_ms DESC, a.line ASC"
+         ORDER BY (a.due_ms IS NULL), a.due_ms ASC, n.modified_ms DESC, a.line ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
@@ -196,6 +205,7 @@ pub fn list_actions(conn: &Connection, scope: ActionScope) -> Result<Vec<ActionL
             done: r.get::<_, i64>(4)? != 0,
             line: r.get(5)?,
             created_ms: r.get(6)?,
+            due_ms: r.get(7)?,
         })
     })?;
     let mut out = Vec::new();
@@ -454,8 +464,8 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
     {
         let now_ms = current_unix_ms();
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO actions(id, note_path, line, text, done, created_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO actions(id, note_path, line, text, done, created_ms, due_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
         )?;
         for a in &p.actions {
             let id = action_id(&p.bundle_id, &a.text);
@@ -466,6 +476,7 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
                 a.text,
                 a.done as i64,
                 now_ms,
+                a.due_ms,
             ])?;
         }
     }
@@ -535,7 +546,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, SCHEMA_VERSION);
         // FTS table reachable.
         conn.query_row("SELECT count(*) FROM notes_fts", [], |r| r.get::<_, i64>(0))
             .unwrap();
@@ -597,7 +608,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, SCHEMA_VERSION);
         conn.execute(
             "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
              VALUES ('/x/zzz/note.md', 'zzz', 't', 1, 0)",
@@ -615,6 +626,58 @@ mod tests {
     }
 
     #[test]
+    fn migration_v4_to_v5_adds_due_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.execute_batch(SCHEMA_V4).unwrap();
+        // Insert a pre-v5 actions row to confirm ALTERs don't disturb it.
+        conn.execute(
+            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
+             VALUES ('/x/dd/note.md', 'dd', 't', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO actions(id, note_path, line, text, done, created_ms) \
+             VALUES ('dd:00000000', '/x/dd/note.md', 1, 'old', 0, 1)",
+            [],
+        )
+        .unwrap();
+
+        apply_migrations(&conn).unwrap();
+        let v: i64 = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+
+        // due_ms column exists, defaults to NULL on the pre-existing row.
+        let due_ms: Option<i64> = conn
+            .query_row(
+                "SELECT due_ms FROM actions WHERE id='dd:00000000'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(due_ms.is_none());
+
+        // body_size = -1 sentinel applied to all notes so reconcile re-reads.
+        let bs: i64 = conn
+            .query_row(
+                "SELECT body_size FROM notes WHERE note_path='/x/dd/note.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bs, -1);
+    }
+
+    #[test]
     fn open_or_init_idempotent_on_existing_db() {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("idx.db");
@@ -628,7 +691,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, SCHEMA_VERSION);
     }
 
     #[test]
@@ -868,6 +931,26 @@ mod tests {
         let done: Vec<ActionListItem> = list_actions(&conn, ActionScope::Done).unwrap();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].text, "done one");
+    }
+
+    #[test]
+    fn upsert_indexes_actions_with_due_ms() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().to_path_buf();
+        let note = write_bundle(
+            &notes,
+            "due-bundle",
+            "# Plan\n\n- [ ] Pay invoice @2026-06-01\n- [ ] No date here\n",
+        );
+        let mut conn = fresh_conn();
+        upsert_in(&mut conn, &note, &notes).unwrap();
+        let opens = list_actions(&conn, ActionScope::Open).unwrap();
+        assert_eq!(opens.len(), 2);
+        // Sort: dated row leads (ORDER BY due_ms IS NULL), then by due_ms ASC.
+        assert_eq!(opens[0].text, "Pay invoice");
+        assert!(opens[0].due_ms.is_some());
+        assert_eq!(opens[1].text, "No date here");
+        assert!(opens[1].due_ms.is_none());
     }
 
     #[test]

@@ -78,6 +78,14 @@ export async function readNote(notePath: string): Promise<NoteContent> {
   return invoke<NoteContent>("read_note", { notePath });
 }
 
+/** When the Rust side rewrites relative due-date tokens (`@today`,
+ *  `@tomorrow`, `@<weekday>`) to their absolute `@YYYY-MM-DD` forms,
+ *  `rewritten_body` carries the new body so the editor can swap its
+ *  in-memory text to match disk. `null` if no rewrite happened. */
+export type WriteNoteResult = {
+  rewritten_body: string | null;
+};
+
 export async function writeNote(
   notePath: string,
   body: string,
@@ -85,8 +93,8 @@ export async function writeNote(
   archived: boolean,
   favorite: boolean,
   frontmatterExtras: Record<string, unknown>,
-): Promise<void> {
-  await invoke<void>("write_note", {
+): Promise<WriteNoteResult> {
+  return invoke<WriteNoteResult>("write_note", {
     notePath,
     body,
     tags,
@@ -124,6 +132,9 @@ export type ActionListItem = {
   done: boolean;
   line: number;
   created_ms: number;
+  /** Absolute due-date timestamp (Unix ms) parsed from a trailing
+   *  `@YYYY-MM-DD[ HH:MM]` token. `null` means the action has no due date. */
+  due_ms: number | null;
 };
 
 export async function listActions(scope: ActionScope = "open"): Promise<ActionListItem[]> {

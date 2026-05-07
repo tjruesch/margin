@@ -1,5 +1,6 @@
 mod audio;
 mod chunker;
+mod dates;
 mod diarize;
 mod index;
 mod keychain;
