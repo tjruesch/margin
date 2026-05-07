@@ -702,6 +702,10 @@ select.settings-input {
   flex-shrink: 0;
 }
 .home-main-titlebar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
   height: 28px;
   flex-shrink: 0;
 }
@@ -910,6 +914,10 @@ select.settings-input {
 }
 
 .home-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
   display: flex;
   justify-content: flex-end;
   gap: 4px;
