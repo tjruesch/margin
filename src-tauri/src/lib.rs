@@ -1,4 +1,5 @@
 mod audio;
+mod chunker;
 mod diarize;
 mod index;
 mod keychain;
@@ -30,12 +31,23 @@ struct AudioState {
 /// `~/.margin/notes/<uuid>/note.md`; the audio backend resolves the bundle
 /// dir and writes audio.wav alongside the note.
 #[tauri::command]
-fn start_meeting_recording(
+async fn start_meeting_recording(
     app: AppHandle,
     state: State<'_, Mutex<AudioState>>,
     note_path: String,
     with_system_audio: Option<bool>,
 ) -> Result<String, String> {
+    // Fetch the Silero VAD model so the streaming chunker (#21) can cut on
+    // silence boundaries. Failure here must not block recording — the
+    // chunker degrades to forced time-based cuts.
+    let vad_model = match chunker::ensure_vad_model(&app).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("[audio] VAD model unavailable, time-only chunking: {e}");
+            None
+        }
+    };
+
     let mut s = state.lock().map_err(|e| e.to_string())?;
     if s.recording.is_some() {
         return Err("already recording".into());
@@ -44,6 +56,7 @@ fn start_meeting_recording(
         app,
         PathBuf::from(&note_path),
         with_system_audio.unwrap_or(false),
+        vad_model.as_deref(),
     )?;
     let path = r.note_path.to_string_lossy().into_owned();
     s.recording = Some(r);

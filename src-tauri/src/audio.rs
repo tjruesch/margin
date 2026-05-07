@@ -28,7 +28,7 @@
 //! Meeting UI level meter wants.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -36,6 +36,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 use tauri::{AppHandle, Emitter};
 
+use crate::chunker::{AudioChunk, Chunker};
 use crate::{notes, sysaudio};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -55,6 +56,7 @@ pub struct Recording {
     mic_join: std::thread::JoinHandle<Result<(), String>>,
     sys_join: Option<std::thread::JoinHandle<Result<(), String>>>,
     mix_join: std::thread::JoinHandle<Result<(), String>>,
+    chunk_drain_join: std::thread::JoinHandle<()>,
 }
 
 impl Recording {
@@ -77,6 +79,9 @@ impl Recording {
         self.mix_join
             .join()
             .map_err(|_| "mixer thread panicked".to_string())??;
+        // The mixer drops its chunk sender on the way out; the drain thread
+        // sees the channel close and returns.
+        let _ = self.chunk_drain_join.join();
         Ok(self.wav_path)
     }
 }
@@ -85,6 +90,7 @@ pub fn start(
     app: AppHandle,
     note_path: PathBuf,
     with_system_audio: bool,
+    vad_model: Option<&Path>,
 ) -> Result<Recording, String> {
     let bundle_dir = notes::bundle_dir_for(&note_path)
         .ok_or_else(|| "Recording requires an owned note (path under ~/.margin/notes/)".to_string())?;
@@ -93,6 +99,10 @@ pub fn start(
     // Channels carry 16 kHz mono f32 chunks from each source to the mixer.
     let (mic_tx, mic_rx) = bounded::<Vec<f32>>(64);
     let (sys_tx, sys_rx) = bounded::<Vec<f32>>(64);
+
+    // Streaming-pipeline chunk channel. Unbounded so a slow downstream
+    // consumer never back-pressures the audio mixer.
+    let (chunk_tx, chunk_rx) = unbounded::<AudioChunk>();
 
     // Mic thread control.
     let (mic_ctrl_tx, mic_ctrl_rx) = unbounded::<Cmd>();
@@ -125,11 +135,29 @@ pub fn start(
     let mixer_sys_rx = if sys_join.is_some() { Some(sys_rx) } else { None };
     drop(sys_tx);
 
+    let chunker = Chunker::new(chunk_tx, vad_model);
+
     let mix_app = app.clone();
     let wav_for_mixer = wav_path.clone();
     let mix_join = std::thread::Builder::new()
         .name("margin-audio-mixer".into())
-        .spawn(move || run_mixer_thread(mix_app, &wav_for_mixer, mic_rx, mixer_sys_rx))
+        .spawn(move || run_mixer_thread(mix_app, &wav_for_mixer, mic_rx, mixer_sys_rx, chunker))
+        .map_err(|e| e.to_string())?;
+
+    // Temporary chunk consumer for #21. Replaced by a Whisper worker in #22.
+    let chunk_drain_join = std::thread::Builder::new()
+        .name("margin-chunk-drain".into())
+        .spawn(move || {
+            for chunk in chunk_rx.iter() {
+                eprintln!(
+                    "[chunker] {}..{} ms {:?} ({} samples)",
+                    chunk.start_ms,
+                    chunk.end_ms,
+                    chunk.boundary,
+                    chunk.samples.len()
+                );
+            }
+        })
         .map_err(|e| e.to_string())?;
 
     Ok(Recording {
@@ -140,6 +168,7 @@ pub fn start(
         mic_join,
         sys_join,
         mix_join,
+        chunk_drain_join,
     })
 }
 
@@ -327,7 +356,8 @@ fn run_mixer_thread(
     wav_path: &PathBuf,
     mic_rx: Receiver<Vec<f32>>,
     sys_rx: Option<Receiver<Vec<f32>>>,
-    ) -> Result<(), String> {
+    mut chunker: Chunker,
+) -> Result<(), String> {
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: TARGET_SAMPLE_RATE,
@@ -340,6 +370,8 @@ fn run_mixer_thread(
     let mut sys_buf = VecDeque::<f32>::new();
     let mut mic_open = true;
     let mut sys_open = sys_rx.is_some();
+    // Reused per-iteration to feed chunker once per drain loop.
+    let mut mixed_batch: Vec<f32> = Vec::with_capacity(MAX_RING_LAG_SAMPLES);
 
     while mic_open || (sys_open && !mic_buf.is_empty()) {
         // Block on whichever leg has work or is alive.
@@ -383,6 +415,7 @@ fn run_mixer_thread(
             mic_buf.len()
         };
 
+        mixed_batch.clear();
         for _ in 0..drain_n {
             let m = mic_buf.pop_front().unwrap_or(0.0);
             let mixed = if sys_rx.is_some() {
@@ -393,6 +426,10 @@ fn run_mixer_thread(
             };
             let v = (mixed * 32767.0) as i16;
             wav.write_sample(v).map_err(|e| e.to_string())?;
+            mixed_batch.push(mixed);
+        }
+        if !mixed_batch.is_empty() {
+            chunker.push(&mixed_batch);
         }
 
         // Drift handling: drop the front of any ring that's lagged > 1 sec
@@ -412,10 +449,19 @@ fn run_mixer_thread(
     }
 
     // Flush whatever mic samples remained after one or both senders closed.
+    mixed_batch.clear();
     for &m in mic_buf.iter() {
-        let v = (m.clamp(-1.0, 1.0) * 32767.0) as i16;
+        let clamped = m.clamp(-1.0, 1.0);
+        let v = (clamped * 32767.0) as i16;
         wav.write_sample(v).map_err(|e| e.to_string())?;
+        mixed_batch.push(clamped);
     }
+    if !mixed_batch.is_empty() {
+        chunker.push(&mixed_batch);
+    }
+
+    chunker.flush();
+    drop(chunker);
 
     wav.finalize().map_err(|e| e.to_string())
 }
