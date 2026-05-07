@@ -63,14 +63,39 @@ pub struct Transcript {
     /// the Generate CTA is suppressed.
     #[serde(default)]
     pub reconciled_at: Option<u64>,
+    /// True if any chunk transcription failed during the streaming pipeline
+    /// (#22). Read by #24's router to decide whether to fall back to a
+    /// whole-WAV re-transcribe at Stop. Default false — single-shot and
+    /// pre-#24 transcripts never set it.
+    #[serde(default)]
+    pub had_errors: bool,
 }
 
 /// Whisper's hard cap is `n_text_ctx / 2 = 224` tokens for `initial_prompt`.
 /// 800 chars is a defensive char-based estimate (~200 tokens) leaving headroom.
 const INITIAL_PROMPT_MAX_CHARS: usize = 800;
 
+/// Stop-time entry point. Routes between the streaming finalize path
+/// (#22's `transcript-partial.json` is complete → atomic-rename, return
+/// in <1 s) and the legacy whole-WAV transcribe (the indefinite safety
+/// net for streaming failures, missing models, mid-meeting crashes, and
+/// pre-#24 bundles).
 #[tauri::command]
 pub async fn transcribe(
+    app: AppHandle,
+    audio_path: String,
+    glossary: Vec<String>,
+    model: Option<String>,
+) -> Result<Transcript, String> {
+    if let Some(t) = try_finalize_streaming(&audio_path)? {
+        eprintln!("[transcribe] finalized streaming partial");
+        return Ok(t);
+    }
+    eprintln!("[transcribe] no usable streaming partial; running whole-WAV");
+    full_transcribe(app, audio_path, glossary, model).await
+}
+
+async fn full_transcribe(
     app: AppHandle,
     audio_path: String,
     glossary: Vec<String>,
@@ -188,6 +213,7 @@ pub async fn transcribe(
             duration_ms,
             num_speakers: None,
             reconciled_at: None,
+            had_errors: false,
         };
 
         // Sidecar JSON for re-summarization without re-transcribing.
@@ -199,6 +225,77 @@ pub async fn transcribe(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ---------- streaming finalize (issue #24) ---------------------------------
+
+/// How far behind the WAV's true duration we'll tolerate `partial.duration_ms`
+/// before declaring the streaming pipeline incomplete. 2 s covers the in-flight
+/// tail at Stop and minor accounting drift; bigger gaps mean we lost a chunk.
+const FINALIZE_DURATION_TOLERANCE_MS: u64 = 2_000;
+
+/// Try to finalize a streaming-produced `transcript-partial.json` into the
+/// final `transcript.json`. Returns `Ok(Some(_))` on a clean atomic rename,
+/// `Ok(None)` to indicate the caller should fall through to whole-WAV. On
+/// `Ok(None)` paths, any incomplete/corrupt partial is deleted so retries
+/// don't re-evaluate stale data.
+fn try_finalize_streaming(audio_path: &str) -> Result<Option<Transcript>, String> {
+    let audio = Path::new(audio_path);
+    let partial = audio.with_file_name(crate::notes::TRANSCRIPT_PARTIAL_FILENAME);
+    let final_path = audio.with_file_name(crate::notes::TRANSCRIPT_FILENAME);
+
+    if !partial.exists() {
+        return Ok(None);
+    }
+
+    let bytes = match std::fs::read(&partial) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[transcribe] partial read failed ({e}); deleting and falling through");
+            let _ = std::fs::remove_file(&partial);
+            return Ok(None);
+        }
+    };
+    let transcript: Transcript = match serde_json::from_slice(&bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[transcribe] partial parse failed ({e}); deleting and falling through");
+            let _ = std::fs::remove_file(&partial);
+            return Ok(None);
+        }
+    };
+
+    if transcript.had_errors {
+        eprintln!("[transcribe] partial has had_errors=true; deleting and falling through");
+        let _ = std::fs::remove_file(&partial);
+        return Ok(None);
+    }
+
+    let wav_ms = wav_duration_ms(audio).map_err(|e| format!("wav header: {e}"))?;
+    if transcript.duration_ms + FINALIZE_DURATION_TOLERANCE_MS < wav_ms {
+        eprintln!(
+            "[transcribe] partial duration {} ms < wav {} ms (tolerance {}); falling through",
+            transcript.duration_ms, wav_ms, FINALIZE_DURATION_TOLERANCE_MS
+        );
+        let _ = std::fs::remove_file(&partial);
+        return Ok(None);
+    }
+
+    std::fs::rename(&partial, &final_path)
+        .map_err(|e| format!("promote partial: {e}"))?;
+    Ok(Some(transcript))
+}
+
+/// Read just the WAV header to get the recording duration in milliseconds.
+/// Microsecond-cheap — used on the Stop-blocking path.
+fn wav_duration_ms(path: &Path) -> Result<u64, String> {
+    let reader = hound::WavReader::open(path).map_err(|e| e.to_string())?;
+    let frames = reader.duration() as u64;
+    let sr = reader.spec().sample_rate as u64;
+    if sr == 0 {
+        return Err("wav sample_rate is zero".into());
+    }
+    Ok((frames * 1000) / sr)
 }
 
 /// Format a glossary (and optionally the prior chunk's transcript tail) into
@@ -392,6 +489,7 @@ pub fn run_streaming_worker(
         duration_ms: 0,
         num_speakers: None,
         reconciled_at: None,
+        had_errors: false,
     };
     let mut prev_tail: Option<String> = None;
     let mut chunk_index: u32 = 0;
@@ -456,8 +554,13 @@ pub fn run_streaming_worker(
                     "[transcribe-worker] chunk {} ({}..{} ms) failed: {e}",
                     chunk_index, chunk.start_ms, chunk.end_ms
                 );
-                // Keep going — partial state on disk is still useful and
-                // #24's fallback handles the master WAV if needed.
+                acc.had_errors = true;
+                // Persist the flag so #24's router falls back to whole-WAV
+                // even if the worker crashes before the next successful
+                // chunk would have flushed it to disk.
+                if let Err(e) = write_partial(&partial_path, &acc) {
+                    eprintln!("[transcribe-worker] partial write failed: {e}");
+                }
             }
         }
         chunk_index += 1;
@@ -618,5 +721,112 @@ mod tests {
     fn tail_chars_returns_suffix_when_no_whitespace() {
         let s = "abcdefghij";
         assert_eq!(tail_chars(s, 4), "ghij");
+    }
+
+    // ---- try_finalize_streaming (issue #24) -----------------------------
+
+    use tempfile::TempDir;
+
+    /// Write a 16 kHz mono int16 WAV of `duration_ms` of silence — gives the
+    /// tests a real header to read for the duration check.
+    fn write_silent_wav(path: &Path, duration_ms: u64) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        let n = (16_000 * duration_ms / 1000) as usize;
+        for _ in 0..n {
+            w.write_sample(0i16).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn make_transcript(duration_ms: u64, had_errors: bool) -> Transcript {
+        Transcript {
+            segments: vec![Segment {
+                start_ms: 0,
+                end_ms: duration_ms,
+                text: "hello".into(),
+                speaker: None,
+            }],
+            full_text: "hello".into(),
+            language: "en".into(),
+            duration_ms,
+            num_speakers: None,
+            reconciled_at: None,
+            had_errors,
+        }
+    }
+
+    #[test]
+    fn try_finalize_returns_none_when_partial_missing() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("audio.wav");
+        write_silent_wav(&audio, 30_000);
+        let result = try_finalize_streaming(audio.to_str().unwrap()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_finalize_returns_none_when_had_errors_true() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("audio.wav");
+        let partial = dir.path().join(crate::notes::TRANSCRIPT_PARTIAL_FILENAME);
+        write_silent_wav(&audio, 30_000);
+        let t = make_transcript(30_000, true);
+        std::fs::write(&partial, serde_json::to_vec_pretty(&t).unwrap()).unwrap();
+
+        let result = try_finalize_streaming(audio.to_str().unwrap()).unwrap();
+        assert!(result.is_none());
+        assert!(!partial.exists(), "stale partial should be deleted");
+    }
+
+    #[test]
+    fn try_finalize_returns_none_when_duration_short() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("audio.wav");
+        let partial = dir.path().join(crate::notes::TRANSCRIPT_PARTIAL_FILENAME);
+        write_silent_wav(&audio, 30_000);
+        // Partial covers only 20 s of a 30 s WAV — outside the 2 s tolerance.
+        let t = make_transcript(20_000, false);
+        std::fs::write(&partial, serde_json::to_vec_pretty(&t).unwrap()).unwrap();
+
+        let result = try_finalize_streaming(audio.to_str().unwrap()).unwrap();
+        assert!(result.is_none());
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn try_finalize_returns_none_on_corrupt_partial() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("audio.wav");
+        let partial = dir.path().join(crate::notes::TRANSCRIPT_PARTIAL_FILENAME);
+        write_silent_wav(&audio, 30_000);
+        std::fs::write(&partial, b"not json {{{{").unwrap();
+
+        let result = try_finalize_streaming(audio.to_str().unwrap()).unwrap();
+        assert!(result.is_none());
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn try_finalize_promotes_when_complete() {
+        let dir = TempDir::new().unwrap();
+        let audio = dir.path().join("audio.wav");
+        let partial = dir.path().join(crate::notes::TRANSCRIPT_PARTIAL_FILENAME);
+        let final_path = dir.path().join(crate::notes::TRANSCRIPT_FILENAME);
+        write_silent_wav(&audio, 30_000);
+        // Within tolerance: partial 29.5s, wav 30s.
+        let t = make_transcript(29_500, false);
+        std::fs::write(&partial, serde_json::to_vec_pretty(&t).unwrap()).unwrap();
+
+        let result = try_finalize_streaming(audio.to_str().unwrap()).unwrap();
+        let promoted = result.expect("expected Some(Transcript)");
+        assert_eq!(promoted.duration_ms, 29_500);
+        assert!(!partial.exists(), "partial should be renamed away");
+        assert!(final_path.exists(), "final transcript should exist");
     }
 }
