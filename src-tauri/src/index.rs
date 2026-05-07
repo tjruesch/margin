@@ -234,8 +234,24 @@ pub fn reconcile(conn: &mut Connection, notes_dir: &Path) -> Result<ReconcileRep
         )
         .unwrap_or((0, 0));
 
+    // Migrations set `body_size = -1` on rows that need a forced re-read
+    // (e.g. when a parser change means the cached `text` is stale). Skip
+    // the global count+max-mtime shortcut whenever any such sentinel
+    // exists, otherwise the migration's intent gets bypassed and the new
+    // parser never runs against unchanged files.
+    let pending_resync: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM notes WHERE body_size < 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     let disk_max_mtime = disk.iter().map(|d| d.modified_ms).max().unwrap_or(0);
-    if db_count as usize == disk.len() && db_max_mtime == disk_max_mtime {
+    if pending_resync == 0
+        && db_count as usize == disk.len()
+        && db_max_mtime == disk_max_mtime
+    {
         return Ok(ReconcileReport {
             skipped: disk.len(),
             ..Default::default()
