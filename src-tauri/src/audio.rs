@@ -91,6 +91,8 @@ pub fn start(
     note_path: PathBuf,
     with_system_audio: bool,
     vad_model: Option<&Path>,
+    whisper_model: Option<PathBuf>,
+    glossary: Vec<String>,
 ) -> Result<Recording, String> {
     let bundle_dir = notes::bundle_dir_for(&note_path)
         .ok_or_else(|| "Recording requires an owned note (path under ~/.margin/notes/)".to_string())?;
@@ -144,19 +146,21 @@ pub fn start(
         .spawn(move || run_mixer_thread(mix_app, &wav_for_mixer, mic_rx, mixer_sys_rx, chunker))
         .map_err(|e| e.to_string())?;
 
-    // Temporary chunk consumer for #21. Replaced by a Whisper worker in #22.
+    // Streaming Whisper worker (#22). Drains the chunk channel, transcribes
+    // each chunk, and writes <bundle>/transcript-partial.json. Exits when
+    // the mixer drops its sender.
+    let worker_app = app.clone();
+    let worker_bundle = bundle_dir.clone();
     let chunk_drain_join = std::thread::Builder::new()
-        .name("margin-chunk-drain".into())
+        .name("margin-transcribe-worker".into())
         .spawn(move || {
-            for chunk in chunk_rx.iter() {
-                eprintln!(
-                    "[chunker] {}..{} ms {:?} ({} samples)",
-                    chunk.start_ms,
-                    chunk.end_ms,
-                    chunk.boundary,
-                    chunk.samples.len()
-                );
-            }
+            crate::transcribe::run_streaming_worker(
+                worker_app,
+                chunk_rx,
+                worker_bundle,
+                whisper_model,
+                glossary,
+            );
         })
         .map_err(|e| e.to_string())?;
 

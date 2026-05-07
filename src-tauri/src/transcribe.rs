@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+use crate::chunker::AudioChunk;
 use crate::paths;
 
 /// Whisper models we expose in the picker. All multilingual — language is
@@ -14,6 +16,16 @@ const DEFAULT_MODEL: &str = "large-v3-turbo";
 
 fn model_filename(model: &str) -> String {
     format!("ggml-{model}.bin")
+}
+
+/// Validate a frontend-supplied model name against the picker allowlist,
+/// falling back to the default. Used by both the streaming worker preload
+/// and the existing single-shot transcribe command.
+pub fn resolve_model(model: Option<&str>) -> String {
+    model
+        .filter(|m| ALLOWED_MODELS.contains(m))
+        .unwrap_or(DEFAULT_MODEL)
+        .to_string()
 }
 
 fn model_url(model: &str) -> String {
@@ -67,14 +79,10 @@ pub async fn transcribe(
     let path = PathBuf::from(audio_path);
     // Validate against the picker's allowlist; unknown values fall back to
     // the default rather than asking the OS to download an arbitrary URL.
-    let model = model
-        .as_deref()
-        .filter(|m| ALLOWED_MODELS.contains(m))
-        .unwrap_or(DEFAULT_MODEL)
-        .to_string();
+    let model = resolve_model(model.as_deref());
     let model_path = ensure_model(&app, &model).await?;
     let app2 = app.clone();
-    let initial_prompt = build_initial_prompt(&glossary);
+    let initial_prompt = build_initial_prompt(&glossary, None);
 
     tauri::async_runtime::spawn_blocking(move || -> Result<Transcript, String> {
         // Load Whisper model + state (Metal acceleration on Apple Silicon).
@@ -193,43 +201,96 @@ pub async fn transcribe(
     .map_err(|e| e.to_string())?
 }
 
-/// Format a glossary into a sentence-form prompt that whisper.cpp's decoder
-/// can use as prior context. Returns None for an empty glossary so the caller
-/// can skip `set_initial_prompt` entirely (passing an empty string to the
-/// binding is safe but pointless).
+/// Format a glossary (and optionally the prior chunk's transcript tail) into
+/// a sentence-form prompt for whisper.cpp's decoder context.
 ///
-/// Truncation: drop terms from the end until under the char cap, preserving
-/// the user's ordering from the textarea.
-fn build_initial_prompt(glossary: &[String]) -> Option<String> {
+/// For the single-shot fallback path, `prev_tail` is `None` and the entire
+/// `INITIAL_PROMPT_MAX_CHARS` budget is available for glossary terms.
+///
+/// For the streaming worker (#22), `prev_tail` carries the last few hundred
+/// characters of the accumulated transcript so cross-chunk continuity is
+/// preserved. Budget split: 60% glossary / 40% tail. If glossary is short,
+/// the unused budget rolls over to tail (and vice versa).
+///
+/// Returns `None` when there's nothing to feed Whisper — the caller can then
+/// skip `set_initial_prompt` entirely.
+fn build_initial_prompt(glossary: &[String], prev_tail: Option<&str>) -> Option<String> {
+    const GLOSSARY_PREFIX: &str = "Domain terms used in this recording: ";
+    const TAIL_SEP: &str = " ";
+    const GLOSSARY_BUDGET: usize = INITIAL_PROMPT_MAX_CHARS * 60 / 100; // 480
+    const TAIL_BUDGET: usize = INITIAL_PROMPT_MAX_CHARS - GLOSSARY_BUDGET; // 320
+
     let terms: Vec<&str> = glossary
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    if terms.is_empty() {
-        return None;
-    }
-    let prefix = "Domain terms used in this recording: ";
-    let mut included: Vec<&str> = Vec::with_capacity(terms.len());
-    let mut len = prefix.len() + 1; // +1 for trailing "."
-    for t in terms {
-        let extra = t.len() + if included.is_empty() { 0 } else { 2 }; // ", "
-        if len + extra > INITIAL_PROMPT_MAX_CHARS {
-            break;
+
+    let glossary_part = if terms.is_empty() {
+        None
+    } else {
+        let mut included: Vec<&str> = Vec::with_capacity(terms.len());
+        let mut len = GLOSSARY_PREFIX.len() + 1; // +1 for trailing "."
+        for t in terms {
+            let extra = t.len() + if included.is_empty() { 0 } else { 2 }; // ", "
+            if len + extra > GLOSSARY_BUDGET {
+                break;
+            }
+            included.push(t);
+            len += extra;
         }
-        included.push(t);
-        len += extra;
+        if included.is_empty() {
+            None
+        } else {
+            Some((format!("{}{}.", GLOSSARY_PREFIX, included.join(", ")), len))
+        }
+    };
+
+    let tail_text = prev_tail.map(str::trim).filter(|s| !s.is_empty());
+    let glossary_used = glossary_part.as_ref().map(|(_, l)| *l).unwrap_or(0);
+    // Roll unused glossary budget into tail.
+    let tail_budget = if glossary_used < GLOSSARY_BUDGET {
+        TAIL_BUDGET + (GLOSSARY_BUDGET - glossary_used)
+    } else {
+        TAIL_BUDGET
+    };
+
+    let tail_trimmed = tail_text.and_then(|t| {
+        // Need to leave room for a single space separator.
+        let max = tail_budget.saturating_sub(TAIL_SEP.len());
+        if max == 0 {
+            return None;
+        }
+        if t.len() <= max {
+            return Some(t.to_string());
+        }
+        // Cut from the head, then snap forward to a whitespace boundary so we
+        // don't feed Whisper a half-word fragment.
+        let start = t.len() - max;
+        let suffix = &t[start..];
+        let snapped = match suffix.find(char::is_whitespace) {
+            Some(i) => &suffix[i + 1..],
+            None => suffix, // single long word — pass as-is
+        };
+        if snapped.is_empty() {
+            None
+        } else {
+            Some(snapped.to_string())
+        }
+    });
+
+    match (glossary_part, tail_trimmed) {
+        (None, None) => None,
+        (Some((g, _)), None) => Some(g),
+        (None, Some(t)) => Some(t),
+        (Some((g, _)), Some(t)) => Some(format!("{g}{TAIL_SEP}{t}")),
     }
-    if included.is_empty() {
-        return None;
-    }
-    Some(format!("{}{}.", prefix, included.join(", ")))
 }
 
 /// Returns the local path to the requested Whisper model, downloading it
 /// from Hugging Face on first use. Atomic via `.part` rename so a torn
 /// download isn't silently loaded as a corrupt model on next run.
-async fn ensure_model(app: &AppHandle, model: &str) -> Result<PathBuf, String> {
+pub async fn ensure_model(app: &AppHandle, model: &str) -> Result<PathBuf, String> {
     let path = paths::models_dir().join(model_filename(model));
     if path.exists() {
         return Ok(path);
@@ -267,4 +328,295 @@ async fn ensure_model(app: &AppHandle, model: &str) -> Result<PathBuf, String> {
         .map_err(|e| e.to_string())?;
 
     Ok(path)
+}
+
+// ---------- streaming worker (issue #22) -----------------------------------
+
+/// Tail length carried into the next chunk's `set_initial_prompt`. Matches
+/// the tail budget in `build_initial_prompt` so we never over-buffer.
+const STREAMING_TAIL_CHARS: usize = INITIAL_PROMPT_MAX_CHARS - (INITIAL_PROMPT_MAX_CHARS * 60 / 100);
+
+/// Backlog above which we log a warning per `recv()` — the worker is
+/// falling behind realtime and finalize will be slower at Stop.
+const BACKLOG_WARN_THRESHOLD: usize = 3;
+
+/// Long-running thread spawned by `audio::start`. Drains `chunk_rx`, runs
+/// Whisper per chunk, accumulates segments, persists `transcript-partial.json`
+/// after each chunk, and emits Tauri events for the live UI (#25).
+///
+/// Exits cleanly when the chunker drops its sender (mixer thread on Stop).
+/// On any internal error, logs and continues — recording must never fail
+/// because the streaming pipeline broke. #24's fallback path will pick up
+/// the master `audio.wav` in that case.
+pub fn run_streaming_worker(
+    app: AppHandle,
+    chunk_rx: Receiver<AudioChunk>,
+    bundle_dir: PathBuf,
+    model_path: Option<PathBuf>,
+    glossary: Vec<String>,
+) {
+    let model_path = match model_path {
+        Some(p) => p,
+        None => {
+            eprintln!("[transcribe-worker] no model preloaded; streaming disabled");
+            // Drain so the channel doesn't block the mixer; #24 falls back to
+            // whole-WAV transcription at Stop.
+            for _ in chunk_rx.iter() {}
+            return;
+        }
+    };
+
+    // Load Whisper context once. Heavy (~1 GB on large-v3-turbo); the first
+    // chunk doesn't arrive for ~120 s, so latency is hidden.
+    let mut ctx_params = WhisperContextParameters::default();
+    ctx_params.use_gpu = true;
+    let ctx = match model_path
+        .to_str()
+        .ok_or_else(|| "model path not utf-8".to_string())
+        .and_then(|p| WhisperContext::new_with_params(p, ctx_params).map_err(|e| e.to_string()))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[transcribe-worker] WhisperContext init failed: {e}");
+            for _ in chunk_rx.iter() {}
+            return;
+        }
+    };
+
+    let partial_path = bundle_dir.join(crate::notes::TRANSCRIPT_PARTIAL_FILENAME);
+
+    let mut acc = Transcript {
+        segments: Vec::new(),
+        full_text: String::new(),
+        language: String::new(),
+        duration_ms: 0,
+        num_speakers: None,
+        reconciled_at: None,
+    };
+    let mut prev_tail: Option<String> = None;
+    let mut chunk_index: u32 = 0;
+
+    while let Ok(chunk) = chunk_rx.recv() {
+        let backlog = chunk_rx.len();
+        if backlog > BACKLOG_WARN_THRESHOLD {
+            eprintln!(
+                "[transcribe-worker] backlog of {} chunks; finalize will be slower",
+                backlog
+            );
+        }
+
+        let initial_prompt = build_initial_prompt(&glossary, prev_tail.as_deref());
+        match transcribe_one_chunk(&ctx, &chunk.samples, initial_prompt.as_deref(), chunk.start_ms)
+        {
+            Ok((segments, chunk_text, lang_id)) => {
+                if acc.language.is_empty() {
+                    acc.language = lang_id
+                        .filter(|id| *id >= 0)
+                        .and_then(whisper_rs::get_lang_str)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "und".to_string());
+                }
+                acc.full_text.push_str(&chunk_text);
+                let segments_for_event = segments.clone();
+                acc.segments.extend(segments);
+                acc.duration_ms = chunk.end_ms;
+
+                prev_tail = Some(tail_chars(&acc.full_text, STREAMING_TAIL_CHARS));
+
+                if let Err(e) = write_partial(&partial_path, &acc) {
+                    eprintln!("[transcribe-worker] partial write failed: {e}");
+                }
+
+                let _ = app.emit(
+                    "chunk-processed",
+                    serde_json::json!({
+                        "chunk_index": chunk_index,
+                        "end_ms": chunk.end_ms,
+                    }),
+                );
+                let _ = app.emit(
+                    "chunk-transcribed",
+                    serde_json::json!({
+                        "chunk_index": chunk_index,
+                        "segments": segments_for_event,
+                    }),
+                );
+                eprintln!(
+                    "[transcribe-worker] chunk {} done ({}..{} ms, {:?}, {} segments, lang={})",
+                    chunk_index,
+                    chunk.start_ms,
+                    chunk.end_ms,
+                    chunk.boundary,
+                    segments_for_event.len(),
+                    acc.language,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[transcribe-worker] chunk {} ({}..{} ms) failed: {e}",
+                    chunk_index, chunk.start_ms, chunk.end_ms
+                );
+                // Keep going — partial state on disk is still useful and
+                // #24's fallback handles the master WAV if needed.
+            }
+        }
+        chunk_index += 1;
+    }
+}
+
+/// Run Whisper on one chunk's samples. Returns the segments (with absolute
+/// timestamps offset by `chunk_offset_ms`), the chunk's contribution to
+/// `full_text`, and the detected language id (if any).
+fn transcribe_one_chunk(
+    ctx: &WhisperContext,
+    pcm_f32: &[f32],
+    initial_prompt: Option<&str>,
+    chunk_offset_ms: u64,
+) -> Result<(Vec<Segment>, String, Option<i32>), String> {
+    let mut state = ctx.create_state().map_err(|e| e.to_string())?;
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(None);
+    params.set_no_context(true);
+    params.set_translate(false);
+    params.set_print_progress(false);
+    params.set_print_special(false);
+    params.set_print_realtime(false);
+    if let Some(p) = initial_prompt {
+        params.set_initial_prompt(p);
+    }
+
+    state.full(params, pcm_f32).map_err(|e| e.to_string())?;
+
+    let lang_id = state.full_lang_id_from_state();
+    let lang = if lang_id >= 0 { Some(lang_id) } else { None };
+
+    let n = state.full_n_segments();
+    let mut segments = Vec::with_capacity(n as usize);
+    let mut chunk_text = String::new();
+    for i in 0..n {
+        let seg = state
+            .get_segment(i)
+            .ok_or_else(|| format!("missing segment {i}"))?;
+        // whisper.cpp t0/t1 are 10-ms ticks relative to the chunk's t=0.
+        let start_ms = (seg.start_timestamp() as u64 * 10) + chunk_offset_ms;
+        let end_ms = (seg.end_timestamp() as u64 * 10) + chunk_offset_ms;
+        let text = seg.to_str().map_err(|e| e.to_string())?.to_string();
+        chunk_text.push_str(&text);
+        segments.push(Segment {
+            start_ms,
+            end_ms,
+            text,
+            speaker: None,
+        });
+    }
+
+    Ok((segments, chunk_text, lang))
+}
+
+fn write_partial(path: &Path, transcript: &Transcript) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(transcript).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Take the last `max` chars of `s`, snapped forward to a whitespace boundary
+/// so we don't carry a half-word into the next chunk's prompt.
+fn tail_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let start = s.len() - max;
+    let suffix = &s[start..];
+    match suffix.find(char::is_whitespace) {
+        Some(i) => suffix[i + 1..].to_string(),
+        None => suffix.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_initial_prompt_glossary_only() {
+        let g: Vec<String> = vec!["foo".into(), "bar".into()];
+        let p = build_initial_prompt(&g, None).unwrap();
+        assert_eq!(p, "Domain terms used in this recording: foo, bar.");
+    }
+
+    #[test]
+    fn build_initial_prompt_returns_none_when_empty() {
+        let g: Vec<String> = vec![];
+        assert!(build_initial_prompt(&g, None).is_none());
+        assert!(build_initial_prompt(&g, Some("   ")).is_none());
+    }
+
+    #[test]
+    fn build_initial_prompt_with_tail_appends() {
+        let g: Vec<String> = vec!["foo".into()];
+        let tail = "and then we discussed the roadmap";
+        let p = build_initial_prompt(&g, Some(tail)).unwrap();
+        assert!(p.starts_with("Domain terms used in this recording: foo."));
+        assert!(p.ends_with(tail));
+    }
+
+    #[test]
+    fn build_initial_prompt_tail_only() {
+        let g: Vec<String> = vec![];
+        let tail = "previous chunk text";
+        let p = build_initial_prompt(&g, Some(tail)).unwrap();
+        assert_eq!(p, tail);
+    }
+
+    #[test]
+    fn build_initial_prompt_tail_truncates_at_word_boundary() {
+        // Force tail truncation by choosing a tail longer than the full
+        // budget (since glossary is empty, tail gets the whole budget).
+        let g: Vec<String> = vec![];
+        let long_tail: String = (0..200).map(|i| format!("word{i} ")).collect();
+        let p = build_initial_prompt(&g, Some(&long_tail)).unwrap();
+        assert!(p.len() <= INITIAL_PROMPT_MAX_CHARS);
+        // No leading partial word — must start with "wordN " (full token).
+        assert!(p.starts_with("word"));
+        let first_word_end = p.find(' ').unwrap();
+        let first_word = &p[..first_word_end];
+        // Confirm the first word is a complete "wordN" token.
+        assert!(first_word.starts_with("word"));
+        assert!(first_word[4..].chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn build_initial_prompt_glossary_overflow_does_not_starve_tail() {
+        // Glossary that fits inside its 60% budget (480 chars), plus a
+        // short tail — both should appear in the result.
+        let big_term: String = "x".repeat(400);
+        let g: Vec<String> = vec![big_term];
+        let tail = "carry over";
+        let p = build_initial_prompt(&g, Some(tail)).unwrap();
+        assert!(p.contains("xxxxxxxxxx"));
+        assert!(p.ends_with("carry over"));
+    }
+
+    #[test]
+    fn tail_chars_returns_whole_when_short() {
+        assert_eq!(tail_chars("hello world", 100), "hello world");
+    }
+
+    #[test]
+    fn tail_chars_snaps_forward_to_whitespace() {
+        // max=7 puts the cut at index 8 ("baz qux"); the suffix starts
+        // mid-word at "ar baz qux" if max=10 → snap past "ar" to "baz qux".
+        assert_eq!(tail_chars("foo bar baz qux", 10), "baz qux");
+        // max=6 → suffix "z qux", snap past "z" → "qux".
+        assert_eq!(tail_chars("foo bar baz qux", 6), "qux");
+    }
+
+    #[test]
+    fn tail_chars_returns_suffix_when_no_whitespace() {
+        let s = "abcdefghij";
+        assert_eq!(tail_chars(s, 4), "ghij");
+    }
 }

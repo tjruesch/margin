@@ -380,7 +380,12 @@ export default function App() {
     if (!owned) return;
     if (recordingRef.current.kind !== "none") return;
     try {
-      await startMeetingRecording(current, aiRef.current.recordSystemAudio);
+      await startMeetingRecording(
+        current,
+        aiRef.current.recordSystemAudio,
+        aiRef.current.glossary,
+        aiRef.current.whisperModel,
+      );
       setSysAvailable(true);
       setRecording({ kind: "recording", startedAt: Date.now() });
     } catch (err) {

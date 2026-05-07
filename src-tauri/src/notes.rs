@@ -23,6 +23,9 @@ pub const NOTE_FILENAME: &str = "note.md";
 pub const AUDIO_FILENAME: &str = "audio.wav";
 /// Per-bundle filename for the transcript sidecar (only if transcribed).
 pub const TRANSCRIPT_FILENAME: &str = "transcript.json";
+/// In-progress streaming transcript written by the chunked Whisper worker
+/// during a meeting. Promoted to `TRANSCRIPT_FILENAME` at end-of-meeting (#24).
+pub const TRANSCRIPT_PARTIAL_FILENAME: &str = "transcript-partial.json";
 
 #[derive(Serialize)]
 pub struct NoteRef {

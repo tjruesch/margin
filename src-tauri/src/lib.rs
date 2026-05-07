@@ -36,6 +36,8 @@ async fn start_meeting_recording(
     state: State<'_, Mutex<AudioState>>,
     note_path: String,
     with_system_audio: Option<bool>,
+    glossary: Option<Vec<String>>,
+    model: Option<String>,
 ) -> Result<String, String> {
     // Fetch the Silero VAD model so the streaming chunker (#21) can cut on
     // silence boundaries. Failure here must not block recording — the
@@ -44,6 +46,19 @@ async fn start_meeting_recording(
         Ok(p) => Some(p),
         Err(e) => {
             eprintln!("[audio] VAD model unavailable, time-only chunking: {e}");
+            None
+        }
+    };
+
+    // Pre-load the user's Whisper model so the streaming worker (#22) can
+    // open it instantly when the first chunk arrives. Failure must not
+    // block recording — the worker drains chunks and #24's fallback path
+    // re-transcribes the master WAV at Stop.
+    let resolved_model = transcribe::resolve_model(model.as_deref());
+    let whisper_model = match transcribe::ensure_model(&app, &resolved_model).await {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("[audio] Whisper model unavailable, streaming disabled: {e}");
             None
         }
     };
@@ -57,6 +72,8 @@ async fn start_meeting_recording(
         PathBuf::from(&note_path),
         with_system_audio.unwrap_or(false),
         vad_model.as_deref(),
+        whisper_model,
+        glossary.unwrap_or_default(),
     )?;
     let path = r.note_path.to_string_lossy().into_owned();
     s.recording = Some(r);

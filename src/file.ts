@@ -197,8 +197,15 @@ export type Transcript = {
 export async function startMeetingRecording(
   notePath: string,
   withSystemAudio = false,
+  glossary: string[] = [],
+  model?: string,
 ): Promise<string> {
-  return invoke<string>("start_meeting_recording", { notePath, withSystemAudio });
+  return invoke<string>("start_meeting_recording", {
+    notePath,
+    withSystemAudio,
+    glossary,
+    model,
+  });
 }
 
 export async function stopMeetingRecording(): Promise<string> {
