@@ -482,6 +482,7 @@ pub fn run() {
             reconcile::reconcile_notes,
             notes::notes_dir,
             notes::create_note,
+            notes::ensure_inbox_note,
             notes::convert_external,
             notes::duplicate_note,
             notes::is_owned_note,

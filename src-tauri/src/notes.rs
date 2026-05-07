@@ -106,6 +106,28 @@ pub fn create_note(
     Ok(new_note_ref(id, note_path))
 }
 
+/// Reserved bundle id for the catch-all "Inbox" note that holds quick
+/// todos created without a source note. Stable across sessions so the
+/// frontend can find-or-create with a single call.
+pub const INBOX_BUNDLE_ID: &str = "inbox";
+
+/// Find-or-create the Inbox bundle and return its NoteRef. Quick todos
+/// from the Action items page get appended to this note's body via the
+/// normal `write_note` round-trip.
+#[tauri::command]
+pub fn ensure_inbox_note(
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<NoteRef, String> {
+    let dir = paths::notes_dir().join(INBOX_BUNDLE_ID);
+    let note_path = dir.join(NOTE_FILENAME);
+    if !note_path.exists() {
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        fs::write(&note_path, "# Inbox\n").map_err(|e| e.to_string())?;
+        touch_index(&conn, &note_path, false);
+    }
+    Ok(new_note_ref(INBOX_BUNDLE_ID.to_string(), note_path))
+}
+
 /// Promote an external markdown file to an owned note by copying it into
 /// a fresh bundle. The original file is left in place.
 #[tauri::command]

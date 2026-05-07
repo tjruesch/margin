@@ -20,6 +20,7 @@ import {
   deleteNote,
   discardRecording,
   duplicateNote,
+  ensureInboxNote,
   getInitialFile,
   hasAnthropicApiKey,
   isOwnedNote,
@@ -1153,6 +1154,36 @@ export default function App() {
    *  strikethrough) instead of having it vanish mid-click. The next
    *  navigation back into Home triggers `refreshActions()` which
    *  re-fetches the open scope and drops the now-done row naturally. */
+  /** Append a quick todo to the catch-all Inbox bundle and refresh the
+   *  actions feed. The Inbox bundle is find-or-created on the Rust side
+   *  by `ensure_inbox_note`. The action goes through the normal write
+   *  path, so any relative date token gets resolved to absolute on save. */
+  const onAddInboxTodo = useCallback(
+    async (text: string, dueToken: string | null) => {
+      try {
+        const ref = await ensureInboxNote();
+        const note = await readNote(ref.note_path);
+        const trimmedBody = note.body.replace(/\s+$/, "");
+        const sep = trimmedBody.length === 0 ? "" : "\n\n";
+        const dueSuffix = dueToken && dueToken.trim() ? ` @${dueToken.trim()}` : "";
+        const nextBody = `${trimmedBody}${sep}- [ ] ${text}${dueSuffix}\n`;
+        await writeNote(
+          ref.note_path,
+          nextBody,
+          note.tags,
+          note.archived,
+          note.favorite,
+          note.frontmatter_extras,
+        );
+        await refreshActions();
+      } catch (err) {
+        console.error("onAddInboxTodo failed:", err);
+        alert("Could not add the todo. See console for details.");
+      }
+    },
+    [refreshActions],
+  );
+
   const onToggleAction = useCallback(async (id: string, nextDone: boolean) => {
     setActions((curr) =>
       curr.map((a) => (a.id === id ? { ...a, done: nextDone } : a)),
@@ -1401,6 +1432,7 @@ export default function App() {
             onDuplicateRow={(p) => void onDuplicateNote(p)}
             actions={actions}
             onToggleAction={(id, next) => void onToggleAction(id, next)}
+            onAddInboxTodo={onAddInboxTodo}
           />
         )}
       </main>

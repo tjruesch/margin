@@ -153,6 +153,13 @@ export async function createNote(): Promise<NoteRef> {
   return invoke<NoteRef>("create_note");
 }
 
+/** Find-or-create the catch-all "Inbox" bundle that holds quick todos
+ *  added from the Action items page. Stable bundle id so subsequent
+ *  calls return the same NoteRef. */
+export async function ensureInboxNote(): Promise<NoteRef> {
+  return invoke<NoteRef>("ensure_inbox_note");
+}
+
 export async function convertExternal(sourcePath: string): Promise<NoteRef> {
   return invoke<NoteRef>("convert_external", { sourcePath });
 }

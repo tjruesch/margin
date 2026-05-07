@@ -1438,6 +1438,172 @@ select.settings-input {
 .home-action-bucket.bucket-undated {
   border-left-color: var(--home-line);
 }
+
+/* Inbox composer at the top of the Action items page. Adds quick todos
+   to the catch-all Inbox bundle without leaving the page. Collapsed by
+   default; expands inline on click. */
+.inbox-composer-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 14px 0 0;
+  padding: 6px 12px;
+  border: 0.5px solid var(--home-line);
+  background: var(--home-card);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+.inbox-composer-toggle:hover {
+  background: var(--home-card-hover);
+  color: var(--fg);
+}
+.inbox-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding: 12px 14px;
+  border: 0.5px solid var(--home-line);
+  background: var(--home-card);
+  border-radius: 10px;
+}
+.inbox-composer-text {
+  width: 100%;
+  padding: 6px 0;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+  caret-color: var(--accent);
+}
+/* Let WebKit render the system date/time pickers — appearance: auto
+   restores the native chrome (the calendar dropdown is already native;
+   the field itself just needs to stop being overridden). The font-size
+   matches the rest of the row so the native control sits naturally. */
+.inbox-composer-date,
+.inbox-composer-time {
+  appearance: auto;
+  -webkit-appearance: auto;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--fg);
+  accent-color: var(--accent);
+  background-color: color-mix(in srgb, var(--fg) 22%, transparent);
+  border: none;
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+/* WebKit highlights the active digit field on input[type=date|time]
+   with the system selection color, which renders as dark text on a
+   medium-blue background — hard to read. WebKit's internal styling
+   stubbornly clings to the field text color even with `!important`,
+   so we use a lighter tint of the accent that keeps the existing dark
+   text legible across every field. */
+.inbox-composer-date::-webkit-datetime-edit-day-field:focus,
+.inbox-composer-date::-webkit-datetime-edit-month-field:focus,
+.inbox-composer-date::-webkit-datetime-edit-year-field:focus,
+.inbox-composer-time::-webkit-datetime-edit-hour-field:focus,
+.inbox-composer-time::-webkit-datetime-edit-minute-field:focus,
+.inbox-composer-time::-webkit-datetime-edit-second-field:focus,
+.inbox-composer-time::-webkit-datetime-edit-ampm-field:focus {
+  background-color: color-mix(in srgb, var(--accent) 30%, transparent) !important;
+  color: var(--fg) !important;
+  outline: none;
+}
+.inbox-composer-timetoggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--fg);
+  cursor: pointer;
+  user-select: none;
+}
+/* Custom-styled toggle that mimics the macOS pill switch — there's no
+   native HTML primitive for it, so we override the checkbox chrome and
+   draw our own track + thumb. Sliding thumb is a CSS transform on the
+   ::before pseudo-element. */
+.inbox-composer-timetoggle input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 28px;
+  height: 16px;
+  margin: 0;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 22%, transparent);
+  position: relative;
+  cursor: pointer;
+  transition: background 180ms ease;
+  flex-shrink: 0;
+}
+.inbox-composer-timetoggle input[type="checkbox"]::before {
+  content: "";
+  position: absolute;
+  top: 1.5px;
+  left: 1.5px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.05);
+  transition: transform 180ms ease;
+}
+.inbox-composer-timetoggle input[type="checkbox"]:checked {
+  background: var(--accent);
+}
+.inbox-composer-timetoggle input[type="checkbox"]:checked::before {
+  transform: translateX(12px);
+}
+.inbox-composer-timetoggle input[type="checkbox"]:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  outline-offset: 2px;
+}
+.inbox-composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.inbox-composer-spacer {
+  flex: 1;
+}
+.inbox-composer-cancel,
+.inbox-composer-save {
+  padding: 5px 12px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+.inbox-composer-cancel {
+  background: transparent;
+  border: none;
+  color: var(--fg-muted);
+}
+.inbox-composer-cancel:hover {
+  color: var(--fg);
+}
+.inbox-composer-save {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  font-weight: 600;
+}
+.inbox-composer-save:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.inbox-composer-save:not(:disabled):hover {
+  filter: brightness(1.05);
+}
 .home-action-bucket-head {
   display: inline-flex;
   align-items: center;

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { dueBucket, friendlyDueLabel } from "./dueLabel";
 import { type ActionListItem, type NoteListItem } from "./file";
@@ -49,6 +49,10 @@ type Props = {
   actions: ActionListItem[];
   /** Flip an action item's done state. Optimistic upstream. */
   onToggleAction: (id: string, nextDone: boolean) => void;
+  /** Append a quick todo to the catch-all Inbox note. `dueToken` is the
+   *  optional payload after `@` (e.g. `2026-05-15` or `2026-05-15 09:00`);
+   *  Rust resolves any relative form during write_note. */
+  onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
 };
 
 type NavId = "home" | "actions" | "meetings" | "shared" | "favorites" | "archive";
@@ -90,6 +94,7 @@ export function Home({
   onDuplicateRow,
   actions,
   onToggleAction,
+  onAddInboxTodo,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -185,6 +190,7 @@ export function Home({
             actions={actions}
             onToggle={onToggleAction}
             onOpenNote={onOpen}
+            onAddInboxTodo={onAddInboxTodo}
           />
         ) : (
           <>
@@ -589,14 +595,140 @@ function ActionRow({
   );
 }
 
+// ---- Inbox composer -----------------------------------------------------
+
+function InboxComposer({
+  onAdd,
+}: {
+  onAdd: (text: string, dueToken: string | null) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [dateStr, setDateStr] = useState("");
+  const [includeTime, setIncludeTime] = useState(false);
+  const [timeStr, setTimeStr] = useState("09:00");
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (open) inputRef.current?.focus();
+  }, [open]);
+
+  const reset = () => {
+    setText("");
+    setDateStr("");
+    setIncludeTime(false);
+    setTimeStr("09:00");
+  };
+
+  const submit = async () => {
+    const trimmed = text.trim();
+    if (!trimmed || busy) return;
+    const dueToken = dateStr
+      ? includeTime
+        ? `${dateStr} ${timeStr}`
+        : dateStr
+      : null;
+    setBusy(true);
+    try {
+      await onAdd(trimmed, dueToken);
+      reset();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        className="inbox-composer-toggle"
+        onClick={() => setOpen(true)}
+      >
+        <IconPlus size={12} sw={1.8} />
+        New todo
+      </button>
+    );
+  }
+
+  return (
+    <div className="inbox-composer">
+      <input
+        ref={inputRef}
+        type="text"
+        className="inbox-composer-text"
+        placeholder="What needs doing?"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            void submit();
+          } else if (e.key === "Escape") {
+            setOpen(false);
+            reset();
+          }
+        }}
+      />
+      <div className="inbox-composer-actions">
+        <input
+          type="date"
+          className="inbox-composer-date"
+          lang="de-DE"
+          value={dateStr}
+          onChange={(e) => setDateStr(e.target.value)}
+        />
+        <label className="inbox-composer-timetoggle">
+          <input
+            type="checkbox"
+            checked={includeTime}
+            onChange={(e) => setIncludeTime(e.target.checked)}
+          />
+          Time
+        </label>
+        {includeTime && (
+          <input
+            type="time"
+            className="inbox-composer-time"
+            lang="de-DE"
+            value={timeStr}
+            onChange={(e) => setTimeStr(e.target.value)}
+          />
+        )}
+        <div className="inbox-composer-spacer" />
+        <button
+          type="button"
+          className="inbox-composer-cancel"
+          onClick={() => {
+            setOpen(false);
+            reset();
+          }}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="inbox-composer-save"
+          disabled={!text.trim() || busy}
+          onClick={() => void submit()}
+        >
+          {busy ? "Adding…" : "Add"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ActionsFeed({
   actions,
   onToggle,
   onOpenNote,
+  onAddInboxTodo,
 }: {
   actions: ActionListItem[];
   onToggle: (id: string, nextDone: boolean) => void;
   onOpenNote: (path: string) => void;
+  onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
 }) {
   // Split dated vs. undated, then bucket the dated half by urgency.
   // Backend already orders dated rows by `due_ms ASC`, so each bucket is
@@ -630,10 +762,11 @@ function ActionsFeed({
             <h2 className="home-section-title">Things to do</h2>
           </div>
         </div>
+        <InboxComposer onAdd={onAddInboxTodo} />
         <p className="home-empty">
-          No open action items. Add <code>- [ ] task</code> lines to any note.
-          Trail with <code>@2026-01-15</code>, <code>@tomorrow</code>, or
-          <code>@friday</code> to schedule.
+          No open action items. Add <code>- [ ] task</code> lines to any note,
+          trail with <code>@2026-01-15</code> / <code>@tomorrow</code> /{" "}
+          <code>@friday</code> to schedule, or hit <em>New todo</em> above.
         </p>
       </section>
     );
@@ -647,6 +780,8 @@ function ActionsFeed({
           <h2 className="home-section-title">Things to do</h2>
         </div>
       </div>
+
+      <InboxComposer onAdd={onAddInboxTodo} />
 
       {BUCKET_ORDER.map(({ key, label }) => {
         const items = byBucket[key];
