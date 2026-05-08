@@ -325,6 +325,12 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  /* Lock the document scroll. Internal panes (`.pane`, CodeMirror's
+     `.cm-scroller`, the home main column, etc.) own scrolling. Without
+     this, transient overflow from a child during reflow can scroll the
+     whole document, leaving the chrome and header hanging off the top
+     of the window with no visible way back. */
+  overflow: hidden;
 }
 
 body {
@@ -2767,6 +2773,10 @@ input.nh-title {
 .nh-chip-tag {
   background: var(--nh-bg-chip);
   color: var(--nh-ink-2);
+  /* The chip's flex `gap: 6px` would reserve phantom space between the
+     label and the zero-width × at rest. Drop it; the × manages its own
+     left-margin when expanded on hover. */
+  gap: 0;
 }
 .nh-chip-tag-x {
   display: inline-block;
