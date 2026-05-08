@@ -135,6 +135,12 @@ export type ActionListItem = {
   /** Absolute due-date timestamp (Unix ms) parsed from a trailing
    *  `@YYYY-MM-DD[ HH:MM]` token. `null` means the action has no due date. */
   due_ms: number | null;
+  /** team_members.id when the leading "Owner — " segment in the action's
+   *  text matched exactly one team member (#49), else `null`. */
+  assignee_id: string | null;
+  /** Canonical display name from team_members, joined for render so the
+   *  frontend can show an avatar chip without a second IPC round-trip. */
+  assignee_display_name: string | null;
 };
 
 export async function listActions(scope: ActionScope = "open"): Promise<ActionListItem[]> {

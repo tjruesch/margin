@@ -35,7 +35,8 @@ const SCHEMA_V3: &str = include_str!("migrations/003_favorite.sql");
 const SCHEMA_V4: &str = include_str!("migrations/004_actions.sql");
 const SCHEMA_V5: &str = include_str!("migrations/005_due_dates.sql");
 const SCHEMA_V6: &str = include_str!("migrations/006_team_members.sql");
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_V7: &str = include_str!("migrations/007_action_owners.sql");
+const SCHEMA_VERSION: i64 = 7;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -101,6 +102,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 5 {
         conn.execute_batch(SCHEMA_V6)?;
         version = 6;
+    }
+    if version == 6 {
+        conn.execute_batch(SCHEMA_V7)?;
+        version = 7;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
@@ -195,8 +200,11 @@ pub fn list_actions(conn: &Connection, scope: ActionScope) -> Result<Vec<ActionL
         ActionScope::All => "",
     };
     let sql = format!(
-        "SELECT a.id, a.note_path, n.title, a.text, a.done, a.line, a.created_ms, a.due_ms \
-         FROM actions a JOIN notes n ON n.note_path = a.note_path \
+        "SELECT a.id, a.note_path, n.title, a.text, a.done, a.line, a.created_ms, a.due_ms, \
+                a.assignee_id, t.display_name \
+         FROM actions a \
+         JOIN notes n ON n.note_path = a.note_path \
+         LEFT JOIN team_members t ON t.id = a.assignee_id \
          WHERE n.archived = 0 {where_done} \
          ORDER BY (a.due_ms IS NULL), a.due_ms ASC, n.modified_ms DESC, a.line ASC"
     );
@@ -211,6 +219,8 @@ pub fn list_actions(conn: &Connection, scope: ActionScope) -> Result<Vec<ActionL
             line: r.get(5)?,
             created_ms: r.get(6)?,
             due_ms: r.get(7)?,
+            assignee_id: r.get(8)?,
+            assignee_display_name: r.get(9)?,
         })
     })?;
     let mut out = Vec::new();
@@ -481,15 +491,31 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
     // Actions: replace wholesale. Two open checkboxes with identical
     // text in one note collapse to one row via the PRIMARY KEY (id is
     // <bundle>:<hash(text)>). Documented as the v1 trade-off.
+    //
+    // Owner resolution (#49) runs in this same pass: build the
+    // `OwnerResolver` once from the current team_members snapshot, then
+    // resolve each action's `owner_candidate` to a member id when
+    // unambiguous. Ambiguous and unmatched candidates leave assignee_id
+    // NULL.
+    let team_members = crate::team::list_team_members_raw(tx).unwrap_or_else(|e| {
+        eprintln!("[index] list_team_members_raw failed: {e}");
+        Vec::new()
+    });
+    let resolver = crate::team::OwnerResolver::from_members(&team_members);
+
     tx.execute("DELETE FROM actions WHERE note_path = ?1", params![note_path])?;
     {
         let now_ms = current_unix_ms();
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO actions(id, note_path, line, text, done, created_ms, due_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO actions(id, note_path, line, text, done, created_ms, due_ms, assignee_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO NOTHING",
         )?;
         for a in &p.actions {
             let id = action_id(&p.bundle_id, &a.text);
+            let assignee_id = a
+                .owner_candidate
+                .as_deref()
+                .and_then(|c| resolver.resolve(c));
             stmt.execute(params![
                 id,
                 note_path,
@@ -498,6 +524,7 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
                 a.done as i64,
                 now_ms,
                 a.due_ms,
+                assignee_id,
             ])?;
         }
     }

@@ -67,6 +67,15 @@ pub struct ActionListItem {
     /// `@YYYY-MM-DD[ HH:MM]` token on the action line. `None` means the
     /// action has no due date.
     pub due_ms: Option<i64>,
+    /// `team_members.id` when the leading `Owner — ` segment in `text`
+    /// matched exactly one team member (#49). `None` when the action has
+    /// no owner candidate, the candidate didn't match any member, or
+    /// the candidate matched multiple members ambiguously.
+    pub assignee_id: Option<String>,
+    /// Canonical display name from `team_members`, joined for render so
+    /// the frontend can surface an avatar chip without a second
+    /// round-trip (#50/#51).
+    pub assignee_display_name: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -653,6 +662,12 @@ pub(crate) struct ParsedAction {
     /// `text` but leave `due_ms` as `None`; they get normalized to
     /// absolute on the next `write_note` call.
     pub due_ms: Option<i64>,
+    /// Leading `Owner — ` segment extracted from `text`, or `None` when
+    /// the line has no recognizable space-flanked separator (#49). The
+    /// candidate name is preserved verbatim — case + accents — so the
+    /// resolver in `team::OwnerResolver` can normalize once and the raw
+    /// form is still available for diagnostics.
+    pub owner_candidate: Option<String>,
 }
 
 /// Walk a note body and return every markdown task line as a
@@ -671,15 +686,42 @@ pub(crate) fn parse_actions(body: &str) -> Vec<ParsedAction> {
             continue;
         }
         if let Some((text, done, due_ms)) = parse_action_line(trimmed) {
+            let owner_candidate = extract_owner_candidate(&text);
             out.push(ParsedAction {
                 line: i + 1,
                 text,
                 done,
                 due_ms,
+                owner_candidate,
             });
         }
     }
     out
+}
+
+/// Extract a leading `{Owner} {sep} ` segment from action text where
+/// `{sep}` is one of `—` (em-dash), `–` (en-dash), or `--` (double
+/// hyphen). The separator must be flanked by spaces — bare hyphens in
+/// natural language (`self-driving`, `Tom—task`) are never treated as
+/// owner separators (#49). Returns the trimmed owner candidate, or
+/// `None`.
+pub(crate) fn extract_owner_candidate(text: &str) -> Option<String> {
+    const SEPARATORS: &[&str] = &[" — ", " – ", " -- "];
+    let mut earliest: Option<usize> = None;
+    for sep in SEPARATORS {
+        if let Some(idx) = text.find(sep) {
+            earliest = Some(match earliest {
+                Some(cur) => cur.min(idx),
+                None => idx,
+            });
+        }
+    }
+    let cut = earliest?;
+    let owner = text[..cut].trim();
+    if owner.is_empty() {
+        return None;
+    }
+    Some(owner.to_string())
 }
 
 fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
@@ -1371,5 +1413,70 @@ mod tests {
         fs::create_dir_all(&notes).unwrap();
         let phantom = notes.join("ghost").join(NOTE_FILENAME);
         assert!(delete_note_in(&phantom, &notes).is_err());
+    }
+
+    // ---------- #49 owner extraction ----------------------------------
+
+    #[test]
+    fn extract_owner_candidate_em_dash_with_spaces() {
+        assert_eq!(
+            extract_owner_candidate("Tom — write spec"),
+            Some("Tom".into())
+        );
+    }
+
+    #[test]
+    fn extract_owner_candidate_en_dash() {
+        assert_eq!(
+            extract_owner_candidate("Tom – write spec"),
+            Some("Tom".into())
+        );
+    }
+
+    #[test]
+    fn extract_owner_candidate_double_hyphen() {
+        assert_eq!(
+            extract_owner_candidate("Tom -- write spec"),
+            Some("Tom".into())
+        );
+    }
+
+    #[test]
+    fn extract_owner_candidate_handles_full_names() {
+        assert_eq!(
+            extract_owner_candidate("Sarah Smith — review the deck"),
+            Some("Sarah Smith".into())
+        );
+    }
+
+    #[test]
+    fn extract_owner_candidate_rejects_compact_dashes() {
+        assert_eq!(extract_owner_candidate("Tom—task"), None);
+        assert_eq!(extract_owner_candidate("Refactor self-driving cars"), None);
+    }
+
+    #[test]
+    fn extract_owner_candidate_rejects_no_separator() {
+        assert_eq!(extract_owner_candidate("write spec"), None);
+        assert_eq!(extract_owner_candidate(""), None);
+    }
+
+    #[test]
+    fn extract_owner_candidate_takes_first_separator_only() {
+        assert_eq!(
+            extract_owner_candidate("Tom — finalize the API — by Friday"),
+            Some("Tom".into())
+        );
+    }
+
+    #[test]
+    fn parse_actions_populates_owner_candidate() {
+        let body = "- [ ] Tom — write spec\n- [ ] no owner here\n";
+        let got = parse_actions(body);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].owner_candidate.as_deref(), Some("Tom"));
+        assert_eq!(got[0].text, "Tom — write spec");
+        assert_eq!(got[1].owner_candidate, None);
+        assert_eq!(got[1].text, "no owner here");
     }
 }

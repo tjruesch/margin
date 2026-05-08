@@ -10,11 +10,13 @@
 //! a single `is_self = 1` row if none exists. The partial unique index
 //! `idx_team_self` guarantees there can never be more than one Self.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::paths;
 
@@ -149,16 +151,16 @@ pub fn bootstrap_self_if_missing(conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub fn list_team_members(
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<Vec<TeamMember>, String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
+/// Internal helper used by both the Tauri command and the indexer
+/// (#49). Same query as the command — kept here so callers with direct
+/// `&Connection` access (e.g. inside a transaction) don't need to go
+/// through Tauri's invoke_handler.
+pub(crate) fn list_team_members_raw(conn: &Connection) -> Result<Vec<TeamMember>, String> {
     let sql = format!(
         "SELECT {SELECT_MEMBER_COLS} FROM team_members \
          ORDER BY is_self DESC, display_name COLLATE NOCASE ASC"
     );
-    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
             Ok(row_to_member(
@@ -178,6 +180,70 @@ pub fn list_team_members(
         out.push(row.map_err(|e| e.to_string())?);
     }
     Ok(out)
+}
+
+#[tauri::command]
+pub fn list_team_members(
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<TeamMember>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    list_team_members_raw(&c)
+}
+
+/// NFD-decompose, drop combining marks (the diacritics), then lowercase.
+/// Used by `OwnerResolver` to match action-item owner candidates against
+/// `display_name ∪ aliases` regardless of case or accent (#49).
+fn fold_for_match(s: &str) -> String {
+    s.nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Case- and accent-insensitive lookup from a candidate name to a team
+/// member id. Built once per indexer pass from the current team_members
+/// snapshot (#49). `resolve` returns `Some(id)` only when the normalized
+/// candidate maps to exactly one member; ambiguous and unmatched
+/// candidates both return `None`.
+pub(crate) struct OwnerResolver {
+    by_key: HashMap<String, Vec<String>>, // normalized → member ids
+}
+
+impl OwnerResolver {
+    pub(crate) fn from_members(members: &[TeamMember]) -> Self {
+        let mut by_key: HashMap<String, Vec<String>> = HashMap::new();
+        for m in members {
+            let mut keys: Vec<String> = Vec::with_capacity(1 + m.aliases.len());
+            keys.push(fold_for_match(&m.display_name));
+            for a in &m.aliases {
+                let k = fold_for_match(a);
+                if !k.is_empty() {
+                    keys.push(k);
+                }
+            }
+            for k in keys {
+                if k.is_empty() {
+                    continue;
+                }
+                let entry = by_key.entry(k).or_default();
+                if !entry.contains(&m.id) {
+                    entry.push(m.id.clone());
+                }
+            }
+        }
+        Self { by_key }
+    }
+
+    pub(crate) fn resolve(&self, candidate: &str) -> Option<String> {
+        let key = fold_for_match(candidate.trim());
+        if key.is_empty() {
+            return None;
+        }
+        match self.by_key.get(&key) {
+            Some(ids) if ids.len() == 1 => Some(ids[0].clone()),
+            _ => None,
+        }
+    }
 }
 
 #[tauri::command]
@@ -427,5 +493,65 @@ mod tests {
     fn aliases_to_json_empty_is_empty_array() {
         let v: Vec<String> = Vec::new();
         assert_eq!(aliases_to_json(&v), "[]");
+    }
+
+    fn make_member(id: &str, name: &str, aliases: &[&str]) -> TeamMember {
+        TeamMember {
+            id: id.into(),
+            display_name: name.into(),
+            role: String::new(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            profile_md_path: String::new(),
+            is_self: false,
+            created_ms: 0,
+            updated_ms: 0,
+        }
+    }
+
+    #[test]
+    fn fold_for_match_strips_diacritics_and_lowers_case() {
+        assert_eq!(fold_for_match("José"), "jose");
+        assert_eq!(fold_for_match("Müller"), "muller");
+        assert_eq!(fold_for_match("Tom Ruesch"), "tom ruesch");
+        assert_eq!(fold_for_match(""), "");
+    }
+
+    #[test]
+    fn owner_resolver_matches_display_name_and_aliases() {
+        let members = vec![make_member("tom-id", "Tom Ruesch", &["TJ", "Tom"])];
+        let r = OwnerResolver::from_members(&members);
+        assert_eq!(r.resolve("Tom"), Some("tom-id".into()));
+        assert_eq!(r.resolve("tom"), Some("tom-id".into()));
+        assert_eq!(r.resolve("TJ"), Some("tom-id".into()));
+        assert_eq!(r.resolve("Tom Ruesch"), Some("tom-id".into()));
+    }
+
+    #[test]
+    fn owner_resolver_returns_none_when_ambiguous() {
+        let members = vec![
+            make_member("tom-id", "Tom Ruesch", &["TR"]),
+            make_member("tina-id", "Tina Romero", &["TR"]),
+        ];
+        let r = OwnerResolver::from_members(&members);
+        assert_eq!(r.resolve("TR"), None);
+        // Unambiguous full names still resolve.
+        assert_eq!(r.resolve("Tom Ruesch"), Some("tom-id".into()));
+    }
+
+    #[test]
+    fn owner_resolver_returns_none_when_unknown() {
+        let members = vec![make_member("tom-id", "Tom Ruesch", &["TJ"])];
+        let r = OwnerResolver::from_members(&members);
+        assert_eq!(r.resolve("Sarah"), None);
+        assert_eq!(r.resolve(""), None);
+        assert_eq!(r.resolve("   "), None);
+    }
+
+    #[test]
+    fn owner_resolver_folds_accents_in_lookups() {
+        let members = vec![make_member("jose-id", "José", &[])];
+        let r = OwnerResolver::from_members(&members);
+        assert_eq!(r.resolve("Jose"), Some("jose-id".into()));
+        assert_eq!(r.resolve("JOSÉ"), Some("jose-id".into()));
     }
 }
