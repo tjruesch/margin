@@ -1,10 +1,11 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     keychain,
+    team::TeamMember,
     transcribe::{AudioSource, Transcript},
 };
 
@@ -208,6 +209,34 @@ empty-notes placeholder). Stop there. Never emit a `## Transcript` section \
 and never paste the transcript text into the document. No preamble, no code \
 fences around the whole document, no commentary.";
 
+/// Third cached system block (#48). Defines how the model should weigh the
+/// per-meeting `## Attendees` section in the user message and the
+/// `[mic]` / `[system]` channel hints in the transcript. Independent cache
+/// breakpoint from `SYSTEM_PROMPT` so this policy can evolve without busting
+/// the larger prompt's cache.
+const ATTENDEE_POLICY_PROMPT: &str = "## Attendees and channel hints
+
+The user message may include an `## Attendees` section listing the people who attended this meeting. When attributing actions, decisions, or quoted statements:
+
+- Use canonical display names from that list. Never invent names not in the list.
+- Aliases are informal alternatives a speaker may use; prefer the canonical display name in your output.
+- `(You)` next to a name marks the user reading this output. First-person statements (\"I'll handle X\") attributed to that person should still use their canonical display name in action items, not the literal word \"you\".
+- When the speaker is ambiguous or the action's owner is unclear, leave the owner blank rather than guess. `- [ ] task` (no owner) is always preferable to a wrong attribution.
+
+Channel hints `[mic]` / `[system]` are audio-capture metadata, not identity claims:
+
+- `[mic]` is audio captured by the user's microphone. Usually carries the user's voice, but can include speaker bleed (no headphones), in-person colleagues, or shared-room audio.
+- `[system]` is audio captured from system audio output. Usually carries remote participants' voices, but can include playback echo of the user's own voice.
+- Treat channel as one signal alongside the attendee list and conversation content. An unambiguous content signal (\"Tom: …\") overrides the channel.
+- When content is ambiguous, weight `[mic]` toward the user (if Self is among attendees) and `[system]` toward remote attendees.
+
+Action items in your output MUST use canonical display names from the attendee list, or be left unowned (`- [ ] task`) when ownership is unclear.";
+
+/// Cap on profile-body chars copied into the `## Attendees` section per
+/// attendee. ~600 chars × ~5 attendees ≈ 3K chars per reconcile — small
+/// next to the transcript and well within budget.
+const PROFILE_EXCERPT_CHARS: usize = 600;
+
 /// Format the transcript for the reconcile user message. Rendering rules:
 ///
 /// - Speaker + source present  →  `Speaker N [src]: text`
@@ -270,6 +299,97 @@ fn format_segment_label(speaker: Option<u32>, source: Option<AudioSource>) -> Op
         (None, Some(src)) => Some(format!("[{}]", source_tag(src))),
         (None, None) => None,
     }
+}
+
+/// Take the first `max` chars of `body` at a whitespace boundary, after
+/// stripping a leading `# {display_name}` H1 if present (the bootstrap stub
+/// duplicates the name; no value to the model). Returns the trimmed result
+/// with a trailing `…` only when truncation actually happened. Empty string
+/// if there's nothing useful left.
+fn excerpt_profile(body: &str, display_name: &str, max: usize) -> String {
+    let trimmed = body.trim_start();
+    let after_h1 = strip_matching_h1(trimmed, display_name);
+    let cleaned = after_h1.trim();
+    if cleaned.is_empty() {
+        return String::new();
+    }
+    let chars: Vec<char> = cleaned.chars().collect();
+    if chars.len() <= max {
+        return cleaned.to_string();
+    }
+    // Snap the cut backward to the last whitespace within `max` so we don't
+    // truncate mid-word.
+    let mut cut = max;
+    while cut > 0 && !chars[cut - 1].is_whitespace() {
+        cut -= 1;
+    }
+    if cut == 0 {
+        // No whitespace found — take the hard cap and append the ellipsis.
+        cut = max;
+    }
+    let head: String = chars[..cut].iter().collect::<String>().trim_end().to_string();
+    format!("{head}…")
+}
+
+fn strip_matching_h1<'a>(body: &'a str, display_name: &str) -> &'a str {
+    let line_end = body.find('\n').unwrap_or(body.len());
+    let first_line = body[..line_end].trim();
+    let expected = format!("# {display_name}");
+    if first_line.eq_ignore_ascii_case(&expected) {
+        // Skip the line and any blank lines that follow.
+        let rest = &body[line_end..];
+        rest.trim_start_matches(|c: char| c == '\n' || c == '\r' || c == ' ' || c == '\t')
+    } else {
+        body
+    }
+}
+
+/// Render a single attendee block. `excerpt` is the (already truncated)
+/// profile body — empty string when the attendee has no profile content.
+fn format_attendee_entry(member: &TeamMember, excerpt: &str) -> String {
+    let mut s = String::new();
+    s.push_str("- **");
+    s.push_str(&member.display_name);
+    s.push_str("**");
+    if member.is_self {
+        s.push_str(" (You)");
+    }
+    let role = member.role.trim();
+    if !role.is_empty() {
+        s.push_str(" — ");
+        s.push_str(role);
+    }
+    let alias_list: Vec<&str> = member
+        .aliases
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| !a.is_empty())
+        .collect();
+    if !alias_list.is_empty() {
+        s.push_str("\n  Aliases: ");
+        s.push_str(&alias_list.join(", "));
+    }
+    if !excerpt.is_empty() {
+        s.push_str("\n  Background: ");
+        s.push_str(excerpt);
+    }
+    s
+}
+
+/// Build the full `## Attendees` user-message section. Returns None when
+/// `entries` is empty so the caller can omit the heading entirely.
+fn format_attendees_section(entries: &[(TeamMember, String)]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("## Attendees\n\n");
+    for (i, (m, excerpt)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format_attendee_entry(m, excerpt));
+    }
+    Some(out)
 }
 
 /// Format the user's glossary as a small system-block addendum that nudges
@@ -403,15 +523,57 @@ pub async fn reconcile_notes(
         title.trim().to_string()
     };
 
+    // Fetch the attendee list for this meeting (#48). Derive the note path
+    // from the transcript path — they're siblings under the bundle dir.
+    let note_path: Option<String> = Path::new(&transcript_path)
+        .parent()
+        .map(|p| p.join(crate::notes::NOTE_FILENAME).to_string_lossy().into_owned());
+
+    let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+    let attendees: Vec<TeamMember> = if let Some(np) = note_path.as_deref() {
+        match conn_state.lock() {
+            Ok(c) => crate::team::list_meeting_attendees(&c, np).unwrap_or_else(|e| {
+                eprintln!("[reconcile] list_meeting_attendees failed: {e}");
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Read each attendee's profile.md (best-effort) and build truncated
+    // excerpts. A read error degrades to an empty excerpt for that member —
+    // the rest of the prompt is unaffected.
+    let mut entries: Vec<(TeamMember, String)> = Vec::with_capacity(attendees.len());
+    for m in attendees {
+        let body = match tokio::fs::read_to_string(&m.profile_md_path).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "[reconcile] read profile {} failed: {e}",
+                    m.profile_md_path
+                );
+                String::new()
+            }
+        };
+        let excerpt = excerpt_profile(&body, &m.display_name, PROFILE_EXCERPT_CHARS);
+        entries.push((m, excerpt));
+    }
+    let attendees_section = format_attendees_section(&entries);
+
     // Hand-notes formatting: pass through as-is. The model is told to keep
     // them verbatim under ## Notes.
     let transcript_body = format_transcript(&transcript);
-    let user_message = format!(
-        "Title: {}\n\n## My notes\n\n{}\n\n## Transcript\n\n{}",
-        resolved_title,
-        hand_notes.trim(),
-        transcript_body.trim(),
-    );
+    let mut user_message = format!("Title: {}", resolved_title);
+    if let Some(section) = attendees_section.as_deref() {
+        user_message.push_str("\n\n");
+        user_message.push_str(section);
+    }
+    user_message.push_str("\n\n## My notes\n\n");
+    user_message.push_str(hand_notes.trim());
+    user_message.push_str("\n\n## Transcript\n\n");
+    user_message.push_str(transcript_body.trim());
 
     let model = model.as_deref().unwrap_or(DEFAULT_MODEL);
 
@@ -433,6 +595,15 @@ pub async fn reconcile_notes(
             cache_control: CacheControl { kind: "ephemeral" },
         });
     }
+    // Attendee-attribution + channel-hint policy (#48). Installed on every
+    // call regardless of whether attendees are attached — the channel-hint
+    // half is still relevant when the transcript carries [mic]/[system]
+    // tags from #47.
+    system.push(SystemBlock {
+        kind: "text",
+        text: ATTENDEE_POLICY_PROMPT,
+        cache_control: CacheControl { kind: "ephemeral" },
+    });
 
     let body = ReqBody {
         model,
@@ -597,5 +768,88 @@ mod tests {
         );
         let got = format_transcript(&t);
         assert_eq!(got, "first part second part");
+    }
+
+    fn member(name: &str, role: &str, aliases: &[&str], is_self: bool) -> TeamMember {
+        TeamMember {
+            id: format!("{}-id", name.to_ascii_lowercase()),
+            display_name: name.into(),
+            role: role.into(),
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            profile_md_path: format!("/tmp/{}.md", name),
+            is_self,
+            created_ms: 0,
+            updated_ms: 0,
+        }
+    }
+
+    #[test]
+    fn excerpt_profile_strips_matching_h1() {
+        let body = "# Tom Ruesch\n\nLeads engineering and product.";
+        let got = excerpt_profile(body, "Tom Ruesch", 600);
+        assert_eq!(got, "Leads engineering and product.");
+    }
+
+    #[test]
+    fn excerpt_profile_keeps_non_matching_h1() {
+        let body = "# Other heading\n\nbody text";
+        let got = excerpt_profile(body, "Tom Ruesch", 600);
+        assert_eq!(got, "# Other heading\n\nbody text");
+    }
+
+    #[test]
+    fn excerpt_profile_truncates_at_word_boundary_with_ellipsis() {
+        // Build a body well over the cap with simple word boundaries.
+        let mut body = String::new();
+        for _ in 0..200 {
+            body.push_str("alpha beta gamma ");
+        }
+        let max = 50;
+        let got = excerpt_profile(&body, "Anyone", max);
+        assert!(got.ends_with('…'), "missing ellipsis: {got:?}");
+        // With max=50, the excerpt is ≤ 51 chars (50 + the ellipsis).
+        let n = got.chars().count();
+        assert!(n <= max + 1, "too long: {n} chars");
+        // Last char before the ellipsis is alphabetic — no mid-word cut.
+        let last = got
+            .chars()
+            .rev()
+            .nth(1)
+            .expect("at least 2 chars in result");
+        assert!(last.is_ascii_alphabetic(), "mid-word cut: {got:?}");
+    }
+
+    #[test]
+    fn excerpt_profile_returns_empty_when_only_h1() {
+        let body = "# Tom Ruesch\n";
+        let got = excerpt_profile(body, "Tom Ruesch", 600);
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn format_attendees_section_marks_self_and_omits_empty_fields() {
+        let entries = vec![
+            (
+                member("Tom Ruesch", "CEO", &["TJ", "Tom"], true),
+                "Leads engineering.".to_string(),
+            ),
+            (member("Sarah Smith", "", &[], false), String::new()),
+        ];
+        let got = format_attendees_section(&entries).expect("non-empty");
+        assert!(got.starts_with("## Attendees\n\n"));
+        assert!(got.contains("**Tom Ruesch** (You) — CEO"));
+        assert!(got.contains("Aliases: TJ, Tom"));
+        assert!(got.contains("Background: Leads engineering."));
+        // Sarah has no role, no aliases, no profile — single-line entry.
+        assert!(got.contains("**Sarah Smith**"));
+        assert!(!got.contains("Sarah Smith** —"));
+        assert!(!got.contains("Aliases: \n"));
+        assert!(!got.contains("Background: \n"));
+    }
+
+    #[test]
+    fn format_attendees_section_returns_none_when_empty() {
+        let got = format_attendees_section(&[]);
+        assert!(got.is_none());
     }
 }

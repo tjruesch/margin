@@ -334,12 +334,14 @@ pub fn set_meeting_attendees(
     Ok(())
 }
 
-#[tauri::command]
-pub fn get_meeting_attendees(
-    note_path: String,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+/// Internal helper used by both the Tauri command and `reconcile.rs`'s
+/// in-process attendee fetch (#48). Same query as the command — kept here
+/// so reconcile_notes doesn't have to duplicate the SQL or go through
+/// Tauri's invoke_handler when it already holds the AppHandle.
+pub(crate) fn list_meeting_attendees(
+    conn: &Connection,
+    note_path: &str,
 ) -> Result<Vec<TeamMember>, String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
     let sql = format!(
         "SELECT {} FROM team_members t \
          JOIN meeting_attendees a ON a.member_id = t.id \
@@ -351,7 +353,7 @@ pub fn get_meeting_attendees(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![note_path], |r| {
             Ok(row_to_member(
@@ -371,6 +373,15 @@ pub fn get_meeting_attendees(
         out.push(row.map_err(|e| e.to_string())?);
     }
     Ok(out)
+}
+
+#[tauri::command]
+pub fn get_meeting_attendees(
+    note_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<TeamMember>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    list_meeting_attendees(&c, &note_path)
 }
 
 #[tauri::command]
