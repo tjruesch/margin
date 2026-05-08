@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use rusqlite::{params, Connection};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 const TICK_SECONDS: u64 = 60;
@@ -24,6 +24,7 @@ const TICK_SECONDS: u64 = 60;
 #[derive(Debug, Clone)]
 struct DueRow {
     id: String,
+    note_path: String,
     note_title: String,
     text: String,
 }
@@ -62,6 +63,18 @@ fn tick_once(app: &AppHandle) -> Result<(), String> {
             .show()
         {
             Ok(_) => {
+                // Surface the same event in the in-app notifications
+                // panel (#37). Additive — the native toast above still
+                // fires through the OS notification center.
+                let _ = app.emit(
+                    "notification:reminder",
+                    serde_json::json!({
+                        "action_id": row.id,
+                        "note_path": row.note_path,
+                        "note_title": row.note_title,
+                        "action_text": row.text,
+                    }),
+                );
                 if let Err(e) = mark_sent(app, &row.id, now_ms) {
                     eprintln!("[reminders] mark sent failed for {}: {e}", row.id);
                 }
@@ -79,7 +92,7 @@ fn collect_due(app: &AppHandle, now_ms: i64) -> Result<Vec<DueRow>, String> {
     let conn = conn_state.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT a.id, n.title, a.text \
+            "SELECT a.id, a.note_path, n.title, a.text \
              FROM actions a JOIN notes n ON n.note_path = a.note_path \
              WHERE a.done = 0 AND a.due_ms IS NOT NULL \
                AND a.due_ms <= ?1 AND a.reminder_sent_ms IS NULL \
@@ -90,8 +103,9 @@ fn collect_due(app: &AppHandle, now_ms: i64) -> Result<Vec<DueRow>, String> {
         .query_map([now_ms], |r| {
             Ok(DueRow {
                 id: r.get(0)?,
-                note_title: r.get(1)?,
-                text: r.get(2)?,
+                note_path: r.get(1)?,
+                note_title: r.get(2)?,
+                text: r.get(3)?,
             })
         })
         .map_err(|e| e.to_string())?;

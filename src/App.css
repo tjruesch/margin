@@ -3492,3 +3492,137 @@ input.nh-title {
   right: auto;
   width: 240px;
 }
+
+/* ----- Notifications panel (#37) ----- */
+
+.notifications-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.home-icon-btn-dot {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 1.5px solid var(--bg);
+  pointer-events: none;
+}
+
+.notifications-popover {
+  position: absolute;
+  top: 30px;
+  right: 0;
+  z-index: 30;
+  width: 320px;
+  max-height: 420px;
+  overflow-y: auto;
+  border-radius: 10px;
+  border: 0.5px solid var(--home-line);
+  background: var(--bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18),
+    0 4px 12px rgba(0, 0, 0, 0.08);
+  animation: nh-pop-in 140ms ease-out;
+  padding: 6px 0;
+}
+
+.notifications-empty {
+  padding: 22px 16px;
+  text-align: center;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+}
+
+.notifications-group {
+  display: flex;
+  flex-direction: column;
+}
+.notifications-group + .notifications-group {
+  margin-top: 4px;
+}
+
+.notifications-group-label {
+  padding: 8px 14px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+
+.notifications-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 14px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--fg);
+  text-align: left;
+  position: relative;
+}
+.notifications-row:hover {
+  background: var(--home-card-hover);
+}
+.notifications-row.unread::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 14px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.notifications-row-icon {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+.notifications-row-icon.kind-action-item-reminder {
+  background: color-mix(in srgb, #c44a1f 14%, transparent);
+  color: #c44a1f;
+}
+
+.notifications-row-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.notifications-row-title {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.notifications-row-text {
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.notifications-row-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--fg-muted);
+  align-self: flex-start;
+  margin-top: 2px;
+}

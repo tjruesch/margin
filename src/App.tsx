@@ -9,6 +9,14 @@ import { Editor } from "./Editor";
 import { dispatchDiff } from "./editor/applyDiff";
 import { AssigneePopover } from "./editor/assigneePopover";
 import { DueDatePopover } from "./editor/dueDatePopover";
+import {
+  loadNotifications,
+  makeNotificationId,
+  markAllRead,
+  pushNotification,
+  saveNotifications,
+  type NotificationRecord,
+} from "./notifications";
 import { Home } from "./Home";
 import { Preview } from "./Preview";
 import { RecordingBanner, type NoteRecording } from "./RecordingBanner";
@@ -258,6 +266,43 @@ export default function App() {
   // edits / deletes done on the Team page are reflected next time the
   // user is back on Home or the Action items page.
   const [members, setMembers] = useState<TeamMember[]>([]);
+  // In-app notifications surfaced by the title-bar bell (#37). Persisted
+  // via tauri-plugin-store; survives app restarts. Capped at 50.
+  const [notifications, setNotifications] = useState<NotificationRecord[]>(
+    [],
+  );
+  // Load persisted notifications once on mount.
+  useEffect(() => {
+    let cancelled = false;
+    void loadNotifications().then((list) => {
+      if (!cancelled) setNotifications(list);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const pushNotificationAndPersist = useCallback(
+    (rec: Omit<NotificationRecord, "id" | "created_ms">) => {
+      const full: NotificationRecord = {
+        ...rec,
+        id: makeNotificationId(),
+        created_ms: Date.now(),
+      };
+      setNotifications((curr) => {
+        const next = pushNotification(curr, full);
+        void saveNotifications(next);
+        return next;
+      });
+    },
+    [],
+  );
+  const markNotificationsRead = useCallback(() => {
+    setNotifications((curr) => {
+      const next = markAllRead(curr);
+      if (next !== curr) void saveNotifications(next);
+      return next;
+    });
+  }, []);
   const allTags = useMemo(() => {
     const set = new Set<string>();
     for (const n of notes) for (const t of n.tags) set.add(t);
@@ -266,6 +311,11 @@ export default function App() {
 
   const contentRef = useRef(content);
   const pathRef = useRef(path);
+  // Mirror noteTitle in a ref so background callbacks (transcription
+  // complete, reconcile complete) can label notification records
+  // without taking the title as an explicit dep. Updated by an effect
+  // alongside noteTitle's useMemo declaration further down.
+  const noteTitleRef = useRef("");
   const savedRef = useRef(savedContent);
   const recentFilesRef = useRef<string[]>(recentFiles);
   const recordingRef = useRef<NoteRecording>(recording);
@@ -445,19 +495,32 @@ export default function App() {
     }
   }, []);
 
-  const runTranscribe = useCallback(async (wavPath: string) => {
-    try {
-      await transcribe(wavPath, aiRef.current.glossary, aiRef.current.whisperModel);
-      const notePath = pathRef.current;
-      const tp = notePath ? transcriptPathFor(notePath) : wavPath.replace(/\/audio\.wav$/, "/transcript.json");
-      setRecording({ kind: "ready", transcriptPath: tp });
-    } catch (err) {
-      setRecording({
-        kind: "error",
-        message: typeof err === "string" ? err : "Transcription failed.",
-      });
-    }
-  }, []);
+  const runTranscribe = useCallback(
+    async (wavPath: string) => {
+      try {
+        await transcribe(wavPath, aiRef.current.glossary, aiRef.current.whisperModel);
+        const notePath = pathRef.current;
+        const tp = notePath ? transcriptPathFor(notePath) : wavPath.replace(/\/audio\.wav$/, "/transcript.json");
+        setRecording({ kind: "ready", transcriptPath: tp });
+        // Surface in the notifications panel (#37). Title comes from
+        // the live noteTitle ref so it reflects whatever the user has
+        // typed by the time transcription resolves.
+        if (notePath) {
+          pushNotificationAndPersist({
+            kind: "transcription-complete",
+            note_path: notePath,
+            note_title: noteTitleRef.current,
+          });
+        }
+      } catch (err) {
+        setRecording({
+          kind: "error",
+          message: typeof err === "string" ? err : "Transcription failed.",
+        });
+      }
+    },
+    [pushNotificationAndPersist],
+  );
 
   const onStopRecording = useCallback(async () => {
     if (recordingRef.current.kind !== "recording") return;
@@ -637,6 +700,44 @@ export default function App() {
       unSys.then((u) => u());
     };
   }, []);
+
+  // Listeners for the in-app notifications panel (#37). Reconcile
+  // emits "reconcile-progress" with payload "done"; reminders emit
+  // a structured object on "notification:reminder". Transcription
+  // completion is pushed directly from `runTranscribe` (it has the
+  // resolved note path in scope).
+  useEffect(() => {
+    const unRec = listen<string>("reconcile-progress", (e) => {
+      if (e.payload !== "done") return;
+      const np = pathRef.current;
+      if (!np) return;
+      pushNotificationAndPersist({
+        kind: "reconcile-complete",
+        note_path: np,
+        note_title: noteTitleRef.current,
+      });
+    });
+    const unRem = listen<{
+      action_id?: string;
+      note_path?: string;
+      note_title?: string;
+      action_text?: string;
+    }>("notification:reminder", (e) => {
+      const p = e.payload;
+      if (!p || !p.note_path || !p.note_title) return;
+      pushNotificationAndPersist({
+        kind: "action-item-reminder",
+        note_path: p.note_path,
+        note_title: p.note_title,
+        action_id: p.action_id,
+        body: p.action_text,
+      });
+    });
+    return () => {
+      unRec.then((u) => u());
+      unRem.then((u) => u());
+    };
+  }, [pushNotificationAndPersist]);
 
   // ----- new note / new meeting -----------------------------------------
 
@@ -1412,6 +1513,9 @@ export default function App() {
   const showRestrictedBanner = mode === "edit" && !isOwned && path !== null;
 
   const noteTitle = useMemo(() => deriveTitle(content, fileName), [content, fileName]);
+  useEffect(() => {
+    noteTitleRef.current = noteTitle;
+  }, [noteTitle]);
 
   // Has the active note's transcript already been reconciled at least
   // once? Read from transcript.json's `reconciled_at` field via the
@@ -1604,6 +1708,8 @@ export default function App() {
             editor={{ tabSize, useTabs, softWrap, fontSize }}
             members={members}
             onReassignAction={onReassignAction}
+            notifications={notifications}
+            onMarkAllNotificationsRead={markNotificationsRead}
           />
         )}
       </main>

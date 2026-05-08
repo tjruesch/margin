@@ -5,6 +5,8 @@ import { dueBucket, friendlyDueLabel } from "./dueLabel";
 import { type ActionListItem, type NoteListItem, type TeamMember } from "./file";
 import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
+import { type NotificationRecord, unreadCount } from "./notifications";
+import { NotificationsPanel } from "./NotificationsPanel";
 import { TeamView, type EditorSettings as TeamEditorSettings } from "./Team";
 import {
   IconArchive,
@@ -66,6 +68,11 @@ type Props = {
    *  Body-rewrites the source line; the upstream refetch picks up the
    *  new assignee_id via the resolver. */
   onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
+  /** In-app notification queue surfaced by the bell button (#37). */
+  notifications: NotificationRecord[];
+  /** Stamp `read_at` on every unread notification. Called when the
+   *  user opens the panel. */
+  onMarkAllNotificationsRead: () => void;
 };
 
 type NavId =
@@ -118,10 +125,14 @@ export function Home({
   editor,
   members,
   onReassignAction,
+  notifications,
+  onMarkAllNotificationsRead,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
   );
+  const [panelOpen, setPanelOpen] = useState(false);
+  const unreadBadge = useMemo(() => unreadCount(notifications), [notifications]);
 
   // Map sidebar nav → backend scope. Only home, archive, and favorites
   // currently map to scopes; the other nav items are placeholders.
@@ -212,15 +223,32 @@ export function Home({
           >
             <IconSidebar size={14} sw={1.6} />
           </button>
-          <button
-            type="button"
-            className="home-icon-btn"
-            title="Notifications — coming soon (issue #37)"
-            aria-label="Notifications"
-            onClick={() => stub("Notifications", 37)}
-          >
-            <IconBell size={14} sw={1.6} />
-          </button>
+          <div className="notifications-anchor">
+            <button
+              type="button"
+              className={"home-icon-btn" + (panelOpen ? " active" : "")}
+              title="Notifications"
+              aria-label="Notifications"
+              onClick={(e) => {
+                e.stopPropagation();
+                const opening = !panelOpen;
+                setPanelOpen(opening);
+                if (opening) onMarkAllNotificationsRead();
+              }}
+            >
+              <IconBell size={14} sw={1.6} />
+              {unreadBadge > 0 && <span className="home-icon-btn-dot" />}
+            </button>
+            <NotificationsPanel
+              open={panelOpen}
+              notifications={notifications}
+              onClose={() => setPanelOpen(false)}
+              onOpenNote={(p) => {
+                setPanelOpen(false);
+                onOpen(p);
+              }}
+            />
+          </div>
         </div>
 
         <Greeting
