@@ -11,7 +11,14 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { Tag, styleTags, tags as t } from "@lezer/highlight";
 
+import { actionTextHash } from "./editor/actionHash";
+import {
+  actionsByHash,
+  assigneeChipClickHandler,
+  assigneeChipPlugin,
+} from "./editor/assigneeChip";
 import { dueChipClickHandler, dueChipPlugin } from "./editor/dueDateChip";
+import type { ActionListItem } from "./file";
 
 // Toggle a markdown wrapper (e.g., `**`, `*`, `~~`) around the current
 // selection. Per-range behaviour:
@@ -159,12 +166,22 @@ type Props = {
   useTabs: boolean;
   softWrap: boolean;
   fontSize: number;
+  /** Action items in the currently-open note (#53). The Editor builds a
+   *  `Map<textHash, ActionListItem>` and feeds it to the assignee-chip
+   *  plugin via the `actionsByHash` Facet. Empty array disables the
+   *  inline chip without disabling the plugin. */
+  actions: ActionListItem[];
 };
 
 export const Editor = forwardRef<ReactCodeMirrorRef, Props>(function Editor(
-  { value, onChange, tabSize, useTabs, softWrap, fontSize },
+  { value, onChange, tabSize, useTabs, softWrap, fontSize, actions },
   ref,
 ) {
+  const actionMap = useMemo(() => {
+    const m = new Map<string, ActionListItem>();
+    for (const a of actions) m.set(actionTextHash(a.text), a);
+    return m;
+  }, [actions]);
   const extensions = useMemo<Extension[]>(() => {
     const exts: Extension[] = [
       markdown({
@@ -177,6 +194,9 @@ export const Editor = forwardRef<ReactCodeMirrorRef, Props>(function Editor(
       taskCheckboxClickPlugin,
       dueChipPlugin,
       dueChipClickHandler,
+      actionsByHash.of(actionMap),
+      assigneeChipPlugin,
+      assigneeChipClickHandler,
       markdownFormatKeymap,
       EditorView.theme({
         "&": {
@@ -245,7 +265,7 @@ export const Editor = forwardRef<ReactCodeMirrorRef, Props>(function Editor(
     ];
     if (softWrap) exts.push(EditorView.lineWrapping);
     return exts;
-  }, [softWrap, tabSize, useTabs, fontSize]);
+  }, [softWrap, tabSize, useTabs, fontSize, actionMap]);
 
   return (
     <CodeMirror

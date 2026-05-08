@@ -3434,3 +3434,61 @@ input.nh-title {
 .assignee-popover-unassign:hover {
   background: color-mix(in srgb, #c44a1f 10%, transparent);
 }
+
+/* ----- Inline assignee chip in the markdown editor (#53) ----- */
+
+.cm-assignee-chip,
+.cm-assignee-chip-empty {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  margin-left: 12px;
+  vertical-align: middle;
+  cursor: pointer;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  user-select: none;
+  white-space: nowrap;
+  transition: filter 100ms ease, border-color 100ms ease, background 100ms ease;
+  /* Reset font from the surrounding monospace so initials read clearly. */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
+    Helvetica, Arial, sans-serif;
+}
+.cm-assignee-chip {
+  border: 1.5px solid var(--bg);
+  color: #fff;
+  /* `style.background` set inline by the widget; box-shadow gives the
+     chip a faint perimeter so it reads against any background tint. */
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+}
+.cm-assignee-chip:hover {
+  filter: brightness(1.08);
+}
+.cm-assignee-chip-empty {
+  border: 1px dashed color-mix(in srgb, var(--fg) 35%, transparent);
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+.cm-assignee-chip-empty:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* The popover from assigneePopover.tsx is a portal and inherits the
+   .assignee-popover styles. The .floating modifier disables the
+   default `position: absolute` (anchored to a row chip) in favor of
+   the portal's `position: fixed` left/top values. */
+.assignee-popover.assignee-popover-floating {
+  position: fixed;
+  top: auto;
+  right: auto;
+  width: 240px;
+}

@@ -25,6 +25,12 @@ export type EditorSettings = {
   fontSize: number;
 };
 
+// Stable empty array for Editor's `actions` prop — profile.md bodies
+// don't carry action items, but the prop is required by Editor's type.
+// Reusing the same reference avoids busting the Editor's `useMemo` for
+// extensions on every TeamView re-render.
+const EMPTY_ACTIONS: ActionListItem[] = [];
+
 export function TeamView({
   editor,
   onOpenNote,
@@ -517,6 +523,7 @@ function TeamDetail({
             useTabs={editor.useTabs}
             softWrap={editor.softWrap}
             fontSize={editor.fontSize}
+            actions={EMPTY_ACTIONS}
           />
         )}
       </div>

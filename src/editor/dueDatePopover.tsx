@@ -5,7 +5,7 @@
 // transaction that replaces the trailing `@<token>` range with the new
 // absolute token (or deletes it entirely on "Clear").
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { EditorView } from "@codemirror/view";
 
@@ -70,6 +70,37 @@ export function DueDatePopover() {
   const [includeTime, setIncludeTime] = useState(false);
   const [timeStr, setTimeStr] = useState("09:00");
   const popoverRef = useRef<HTMLDivElement | null>(null);
+  // Measured position. The `for` field pins each measurement to a
+  // specific `active` instance so we can detect a stale position on
+  // the first render after a new chip click and keep the popover
+  // hidden until the layout effect re-measures.
+  const [pos, setPos] = useState<
+    { top: number; left: number; for: Active } | null
+  >(null);
+
+  // Single layout pass: measure the rendered popover and set its final
+  // coords. Mirrors the assignee popover's pattern.
+  useLayoutEffect(() => {
+    if (!active) {
+      setPos(null);
+      return;
+    }
+    const el = popoverRef.current;
+    if (!el) return;
+    const popH = el.offsetHeight;
+    const popW = el.offsetWidth;
+    const margin = 8;
+    let top = active.rect.bottom + margin;
+    if (top + popH > window.innerHeight - margin) {
+      top = Math.max(margin, active.rect.top - popH - margin);
+    }
+    let left = active.rect.left;
+    if (left + popW > window.innerWidth - margin) {
+      left = Math.max(margin, active.rect.right - popW);
+    }
+    if (left < margin) left = margin;
+    setPos({ top, left, for: active });
+  }, [active]);
 
   // Subscribe to chip-click events from dueDateChip.ts.
   useEffect(() => {
@@ -141,25 +172,19 @@ export function DueDatePopover() {
     setActive(null);
   };
 
-  // Position below chip; flip above if the popover would overflow.
-  const POP_W = 280;
-  const POP_H = 240;
-  const margin = 8;
-  let top = active.rect.bottom + margin;
-  let left = active.rect.left;
-  if (top + POP_H > window.innerHeight) {
-    top = Math.max(margin, active.rect.top - POP_H - margin);
-  }
-  if (left + POP_W > window.innerWidth - margin) {
-    left = window.innerWidth - POP_W - margin;
-  }
-  if (left < margin) left = margin;
+  // Pre-measure render: place off-screen with visibility hidden so
+  // the user doesn't see an unpositioned flash. We treat `pos` as
+  // stale when it was measured for a previous `active` instance.
+  const measured = pos !== null && pos.for === active;
+  const style: React.CSSProperties = measured
+    ? { top: pos.top, left: pos.left, width: 280 }
+    : { top: -9999, left: -9999, width: 280, visibility: "hidden" };
 
   return createPortal(
     <div
       ref={popoverRef}
       className="due-popover"
-      style={{ top, left, width: POP_W }}
+      style={style}
       onMouseDown={(e) => e.stopPropagation()}
     >
       <div className="due-popover-quick">

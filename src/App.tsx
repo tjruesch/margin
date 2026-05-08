@@ -7,6 +7,7 @@ import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
 import { dispatchDiff } from "./editor/applyDiff";
+import { AssigneePopover } from "./editor/assigneePopover";
 import { DueDatePopover } from "./editor/dueDatePopover";
 import { Home } from "./Home";
 import { Preview } from "./Preview";
@@ -1274,6 +1275,23 @@ export default function App() {
     }
   }, []);
 
+  // Slice of actions belonging to the currently-open note (#53). The
+  // Editor uses this to decorate inline checkbox lines with the
+  // assignee chip. Empty when no note is open.
+  const noteActions = useMemo(
+    () => (path ? actions.filter((a) => a.note_path === path) : []),
+    [actions, path],
+  );
+
+  // Refresh actions whenever the on-disk saved content changes for the
+  // current note. Catches autosave, manual save, and the reconcile
+  // write path so the inline chips (#53) pick up freshly-resolved
+  // assignee_ids without a separate notification.
+  useEffect(() => {
+    if (!path) return;
+    void refreshActions();
+  }, [path, savedContent, refreshActions]);
+
   // Refresh team-member list. Cheap; runs on mount and on every
   // `margin:nav` event (fires when the user changes sidebar nav).
   useEffect(() => {
@@ -1544,6 +1562,7 @@ export default function App() {
             useTabs={useTabs}
             softWrap={softWrap}
             fontSize={fontSize}
+            actions={noteActions}
           />
         )}
         {mode === "preview" && (
@@ -1599,6 +1618,10 @@ export default function App() {
       )}
 
       <DueDatePopover />
+      <AssigneePopover
+        members={members}
+        onPick={(actionId, memberId) => onReassignAction(actionId, memberId)}
+      />
       {pickerState && (
         <AttendeePicker
           notePath={pickerState.notePath}
