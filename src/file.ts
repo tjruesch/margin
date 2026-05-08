@@ -252,11 +252,17 @@ export async function setActionAssignee(
 
 // --- Recording + transcription -------------------------------------------
 
+export type AudioSource = "mic" | "system";
+
 export type Segment = {
   start_ms: number;
   end_ms: number;
   text: string;
   speaker?: number | null;
+  /** Dominant audio channel during this segment's chunk window (#47). Hint
+   *  for who's speaking; not authoritative. `null`/missing on legacy
+   *  transcripts and on the whole-WAV fallback path. */
+  source?: AudioSource | null;
 };
 export type Transcript = {
   segments: Segment[];

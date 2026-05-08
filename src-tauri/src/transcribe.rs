@@ -35,6 +35,18 @@ fn model_url(model: &str) -> String {
     )
 }
 
+/// Audio capture channel for a segment. Used as a hint by the reconcile
+/// prompt — `Mic` audio usually but not always comes from the user; `System`
+/// audio usually but not always comes from remote participants. Mic-bleed,
+/// echo, speakerphone, and shared-room recordings all break that mapping,
+/// so the prompt treats this as one signal among several, not ground truth.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioSource {
+    Mic,
+    System,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Segment {
     pub start_ms: u64,
@@ -45,6 +57,12 @@ pub struct Segment {
     /// no overlapping span for this segment.
     #[serde(default)]
     pub speaker: Option<u32>,
+    /// Dominant audio channel during this segment's chunk window (#47). `None`
+    /// for transcripts produced before #47, when system audio wasn't enabled
+    /// and no labeling happened, or when the segment came from the whole-WAV
+    /// fallback path (per-channel RMS history isn't available there).
+    #[serde(default)]
+    pub source: Option<AudioSource>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -193,6 +211,7 @@ async fn full_transcribe(
                 end_ms,
                 text,
                 speaker: None,
+                source: None,
             });
         }
 
@@ -506,7 +525,7 @@ pub fn run_streaming_worker(
         let initial_prompt = build_initial_prompt(&glossary, prev_tail.as_deref());
         match transcribe_one_chunk(&ctx, &chunk.samples, initial_prompt.as_deref(), chunk.start_ms)
         {
-            Ok((segments, chunk_text, lang_id)) => {
+            Ok((mut segments, chunk_text, lang_id)) => {
                 if acc.language.is_empty() {
                     acc.language = lang_id
                         .filter(|id| *id >= 0)
@@ -515,6 +534,12 @@ pub fn run_streaming_worker(
                         .unwrap_or_else(|| "und".to_string());
                 }
                 acc.full_text.push_str(&chunk_text);
+                // Stamp the chunk's dominant-channel label onto every segment
+                // it produced. Sub-chunk channel switches collapse to one
+                // label; acceptable for a hint (#47).
+                for seg in segments.iter_mut() {
+                    seg.source = chunk.source;
+                }
                 let segments_for_event = segments.clone();
                 acc.segments.extend(segments);
                 acc.duration_ms = chunk.end_ms;
@@ -611,6 +636,7 @@ fn transcribe_one_chunk(
             end_ms,
             text,
             speaker: None,
+            source: None,
         });
     }
 
@@ -751,6 +777,7 @@ mod tests {
                 end_ms: duration_ms,
                 text: "hello".into(),
                 speaker: None,
+                source: None,
             }],
             full_text: "hello".into(),
             language: "en".into(),

@@ -17,6 +17,7 @@ use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 use tauri::{AppHandle, Emitter};
 
 use crate::paths;
+use crate::transcribe::AudioSource;
 
 const SAMPLE_RATE: u32 = 16_000;
 const SAMPLES_PER_MS: u64 = 16; // 16_000 / 1000
@@ -37,6 +38,11 @@ pub struct AudioChunk {
     pub end_ms: u64,
     pub samples: Vec<f32>,
     pub boundary: BoundaryKind,
+    /// Dominant audio channel during this chunk's window (#47). `None` when
+    /// system audio wasn't enabled or we have no labeling for any other
+    /// reason. Propagated to every segment whisper produces from this chunk
+    /// so the reconcile prompt can use it as one signal among several.
+    pub source: Option<AudioSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +68,10 @@ pub struct Chunker {
     /// Absolute sample offset of the current chunk's start, since chunker
     /// creation. Drives `start_ms` / `end_ms` on emitted chunks.
     chunk_start_sample: u64,
+    /// Most recent dominant-channel label observed via `push` since the last
+    /// emit. Stamped on the next chunk emission and reset. `None` when no
+    /// caller has supplied a label (system audio off, or pre-#47 plumbing).
+    pending_source: Option<AudioSource>,
 }
 
 impl Chunker {
@@ -78,11 +88,17 @@ impl Chunker {
             buffer: Vec::with_capacity((FORCED_CHUNK_MS * SAMPLES_PER_MS) as usize),
             silence_track: VecDeque::new(),
             chunk_start_sample: 0,
+            pending_source: None,
         }
     }
 
     /// Append mixed mono samples and emit any chunks that crossed thresholds.
-    pub fn push(&mut self, samples: &[f32]) {
+    /// `source` is the dominant-channel label currently in effect (#47); the
+    /// most recent non-None value is stamped on the next emitted chunk.
+    pub fn push(&mut self, samples: &[f32], source: Option<AudioSource>) {
+        if let Some(s) = source {
+            self.pending_source = Some(s);
+        }
         if samples.is_empty() {
             return;
         }
@@ -166,6 +182,7 @@ impl Chunker {
             end_ms,
             samples,
             boundary,
+            source: self.pending_source,
         };
         // If the receiver is gone, the meeting is being torn down — drop.
         let _ = self.out.send(chunk);
@@ -419,7 +436,7 @@ mod tests {
         // Push 250 s of zeros in 1-second slabs.
         let one_sec: Vec<f32> = vec![0.0; SAMPLE_RATE as usize];
         for _ in 0..250 {
-            ck.push(&one_sec);
+            ck.push(&one_sec, None);
         }
         ck.flush();
         drop(ck);

@@ -3,7 +3,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
-use crate::{keychain, transcribe::Transcript};
+use crate::{
+    keychain,
+    transcribe::{AudioSource, Transcript},
+};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
@@ -205,45 +208,68 @@ empty-notes placeholder). Stop there. Never emit a `## Transcript` section \
 and never paste the transcript text into the document. No preamble, no code \
 fences around the whole document, no commentary.";
 
-/// Format the transcript for the reconcile user message. When any segment
-/// carries a speaker label, render one line per segment as `Speaker N: text`
-/// so Claude can attribute statements. Otherwise fall back to the plain
-/// concatenated `full_text` (preserves backwards compat with non-diarized
-/// transcripts already on disk).
+/// Format the transcript for the reconcile user message. Rendering rules:
+///
+/// - Speaker + source present  →  `Speaker N [src]: text`
+/// - Speaker only              →  `Speaker N: text`            (today's behaviour)
+/// - Source only               →  `[src] text`                  (#47 channel hint)
+/// - Neither, on every segment →  fall back to `full_text.trim()` (legacy)
+///
+/// Consecutive segments sharing the same `(speaker, source)` tuple are joined
+/// into one paragraph so the model doesn't see redundant tag repetition. A
+/// channel flip starts a new paragraph even when the speaker hasn't changed.
+///
+/// `[src]` is a channel hint, never an identity claim — see #47/#48 for the
+/// policy the system prompt installs around it.
 fn format_transcript(t: &Transcript) -> String {
-    let any_labeled = t.segments.iter().any(|s| s.speaker.is_some());
+    let any_labeled = t
+        .segments
+        .iter()
+        .any(|s| s.speaker.is_some() || s.source.is_some());
     if !any_labeled {
         return t.full_text.trim().to_string();
     }
 
     let mut out = String::with_capacity(t.full_text.len() + t.segments.len() * 12);
-    let mut prev_speaker: Option<u32> = None;
+    let mut prev_key: Option<(Option<u32>, Option<AudioSource>)> = None;
     for seg in &t.segments {
         let text = seg.text.trim();
         if text.is_empty() {
             continue;
         }
-        let speaker_label = match seg.speaker {
-            Some(n) => format!("Speaker {n}"),
-            None => "Unknown".to_string(),
-        };
-        // Group consecutive segments by the same speaker into one paragraph
-        // so the transcript reads naturally and Claude doesn't see needless
-        // line-by-line repetition of the speaker tag.
-        if prev_speaker == seg.speaker {
+        let key = (seg.speaker, seg.source);
+        if Some(key) == prev_key {
             out.push(' ');
             out.push_str(text);
-        } else {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str(&speaker_label);
-            out.push_str(": ");
-            out.push_str(text);
-            prev_speaker = seg.speaker;
+            continue;
         }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        if let Some(label) = format_segment_label(seg.speaker, seg.source) {
+            out.push_str(&label);
+            out.push_str(": ");
+        }
+        out.push_str(text);
+        prev_key = Some(key);
     }
     out
+}
+
+fn source_tag(source: AudioSource) -> &'static str {
+    match source {
+        AudioSource::Mic => "mic",
+        AudioSource::System => "system",
+    }
+}
+
+fn format_segment_label(speaker: Option<u32>, source: Option<AudioSource>) -> Option<String> {
+    match (speaker, source) {
+        (Some(n), Some(src)) => Some(format!("Speaker {n} [{}]", source_tag(src))),
+        (Some(n), None) => Some(format!("Speaker {n}")),
+        (None, Some(src)) => Some(format!("[{}]", source_tag(src))),
+        (None, None) => None,
+    }
 }
 
 /// Format the user's glossary as a small system-block addendum that nudges
@@ -493,4 +519,83 @@ pub async fn reconcile_notes(
 
     let _ = app.emit("reconcile-progress", "done");
     Ok(assembled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcribe::{AudioSource, Segment, Transcript};
+
+    fn seg(text: &str, speaker: Option<u32>, source: Option<AudioSource>) -> Segment {
+        Segment {
+            start_ms: 0,
+            end_ms: 1000,
+            text: text.into(),
+            speaker,
+            source,
+        }
+    }
+
+    fn tx(segments: Vec<Segment>, full_text: &str) -> Transcript {
+        Transcript {
+            segments,
+            full_text: full_text.into(),
+            language: "en".into(),
+            duration_ms: 0,
+            num_speakers: None,
+            reconciled_at: None,
+            had_errors: false,
+        }
+    }
+
+    #[test]
+    fn format_transcript_renders_source_only_when_no_diarization() {
+        let t = tx(
+            vec![
+                seg("hello there", None, Some(AudioSource::Mic)),
+                seg("right back", None, Some(AudioSource::Mic)),
+                seg("understood", None, Some(AudioSource::System)),
+                seg("got it", None, Some(AudioSource::System)),
+            ],
+            "ignored — segments take precedence",
+        );
+        let got = format_transcript(&t);
+        assert_eq!(
+            got,
+            "[mic]: hello there right back\n\n[system]: understood got it"
+        );
+    }
+
+    #[test]
+    fn format_transcript_layers_source_after_speaker() {
+        let t = tx(
+            vec![
+                seg("good morning", Some(1), Some(AudioSource::Mic)),
+                seg("how are you", Some(1), Some(AudioSource::Mic)),
+                // Same speaker, channel flipped — must start a new paragraph.
+                seg("playback running", Some(1), Some(AudioSource::System)),
+                // Different speaker, mic again.
+                seg("hi", Some(2), Some(AudioSource::Mic)),
+            ],
+            "",
+        );
+        let got = format_transcript(&t);
+        assert_eq!(
+            got,
+            "Speaker 1 [mic]: good morning how are you\n\nSpeaker 1 [system]: playback running\n\nSpeaker 2 [mic]: hi"
+        );
+    }
+
+    #[test]
+    fn format_transcript_falls_back_to_full_text_when_neither_is_set() {
+        let t = tx(
+            vec![
+                seg("first part", None, None),
+                seg("second part", None, None),
+            ],
+            "first part second part",
+        );
+        let got = format_transcript(&t);
+        assert_eq!(got, "first part second part");
+    }
 }

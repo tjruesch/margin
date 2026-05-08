@@ -37,6 +37,7 @@ use rubato::{FastFixedIn, PolynomialDegree, Resampler};
 use tauri::{AppHandle, Emitter};
 
 use crate::chunker::{AudioChunk, Chunker};
+use crate::transcribe::AudioSource;
 use crate::{notes, sysaudio};
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -353,6 +354,70 @@ impl MonoResampler {
     }
 }
 
+// ---------- dominant-channel tracker (#47) ------------------------------
+
+/// Window over which we average mic and system RMS before deciding which
+/// channel is dominant. 100 ms at 16 kHz = 1600 samples — short enough to
+/// react to channel switches within a sentence, long enough to ride out
+/// individual phonemes.
+const DOMINANT_WINDOW_SAMPLES: usize = 1600;
+
+/// Hysteresis margin on the squared-RMS ratio. Mic is only labeled dominant
+/// when its squared-RMS exceeds the system's by ≥ HYSTERESIS_RATIO (and vice
+/// versa). 4.0 ≈ 6 dB on the linear amplitude axis. Inside the band, the
+/// previous label sticks — prevents flapping during simultaneous speech or
+/// quiet stretches.
+const HYSTERESIS_RATIO: f64 = 4.0;
+
+/// Below this squared-RMS floor on both channels, treat the window as silence
+/// and keep the previous label. Avoids flapping from background hiss alone.
+const SILENCE_FLOOR_SQ: f64 = 1e-6;
+
+/// Tracks rolling mic vs system squared-RMS over a fixed sample window and
+/// emits a `Mic` / `System` label every time the window fills. Used by the
+/// mixer thread to stamp each chunker push with the channel that's been
+/// driving the audio energy. The label is a hint for the reconcile prompt
+/// (#48), not an identity claim — see #47.
+struct DominantTracker {
+    mic_sq: f64,
+    sys_sq: f64,
+    counted: usize,
+    current: Option<AudioSource>,
+}
+
+impl DominantTracker {
+    fn new() -> Self {
+        Self {
+            mic_sq: 0.0,
+            sys_sq: 0.0,
+            counted: 0,
+            current: None,
+        }
+    }
+
+    fn observe(&mut self, mic: f32, sys: f32) {
+        self.mic_sq += (mic as f64) * (mic as f64);
+        self.sys_sq += (sys as f64) * (sys as f64);
+        self.counted += 1;
+        if self.counted >= DOMINANT_WINDOW_SAMPLES {
+            let m = self.mic_sq;
+            let s = self.sys_sq;
+            self.mic_sq = 0.0;
+            self.sys_sq = 0.0;
+            self.counted = 0;
+            if m < SILENCE_FLOOR_SQ && s < SILENCE_FLOOR_SQ {
+                return; // silence — keep previous label
+            }
+            if m > s * HYSTERESIS_RATIO {
+                self.current = Some(AudioSource::Mic);
+            } else if s > m * HYSTERESIS_RATIO {
+                self.current = Some(AudioSource::System);
+            }
+            // Otherwise within hysteresis band — keep previous.
+        }
+    }
+}
+
 // ---------- mixer / writer thread ----------------------------------------
 
 fn run_mixer_thread(
@@ -376,6 +441,14 @@ fn run_mixer_thread(
     let mut sys_open = sys_rx.is_some();
     // Reused per-iteration to feed chunker once per drain loop.
     let mut mixed_batch: Vec<f32> = Vec::with_capacity(MAX_RING_LAG_SAMPLES);
+    // When system audio isn't part of this recording the source is trivially
+    // mic for every sample; skip the tracker. Otherwise observe per-sample
+    // RMS and let the tracker emit dominant-channel labels.
+    let mut tracker = DominantTracker::new();
+    let mic_only = sys_rx.is_none();
+    if mic_only {
+        tracker.current = Some(AudioSource::Mic);
+    }
 
     while mic_open || (sys_open && !mic_buf.is_empty()) {
         // Block on whichever leg has work or is alive.
@@ -424,6 +497,7 @@ fn run_mixer_thread(
             let m = mic_buf.pop_front().unwrap_or(0.0);
             let mixed = if sys_rx.is_some() {
                 let s = sys_buf.pop_front().unwrap_or(0.0);
+                tracker.observe(m, s);
                 (MIX_GAIN * m + MIX_GAIN * s).clamp(-1.0, 1.0)
             } else {
                 m.clamp(-1.0, 1.0)
@@ -433,7 +507,7 @@ fn run_mixer_thread(
             mixed_batch.push(mixed);
         }
         if !mixed_batch.is_empty() {
-            chunker.push(&mixed_batch);
+            chunker.push(&mixed_batch, tracker.current);
         }
 
         // Drift handling: drop the front of any ring that's lagged > 1 sec
@@ -453,6 +527,8 @@ fn run_mixer_thread(
     }
 
     // Flush whatever mic samples remained after one or both senders closed.
+    // Sys leg is closed at this point; whatever's left is mic-only audio, so
+    // attribute the residual to mic regardless of what was dominant before.
     mixed_batch.clear();
     for &m in mic_buf.iter() {
         let clamped = m.clamp(-1.0, 1.0);
@@ -461,7 +537,7 @@ fn run_mixer_thread(
         mixed_batch.push(clamped);
     }
     if !mixed_batch.is_empty() {
-        chunker.push(&mixed_batch);
+        chunker.push(&mixed_batch, Some(AudioSource::Mic));
     }
 
     chunker.flush();
