@@ -80,6 +80,31 @@ import "./App.css";
 
 type Mode = "home" | "edit" | "preview" | "transcript" | "settings";
 
+/// A background op tied to a specific source note. Decoupled from the
+/// quiescent `recording` state so the user can navigate away from a
+/// meeting while transcription or reconcile finishes. At most one op
+/// is in flight at a time (enforced by the entry-point callbacks).
+type InFlightOp =
+  | {
+      kind: "recording";
+      notePath: string;
+      noteTitle: string;
+      startedAt: number;
+    }
+  | {
+      kind: "transcribing";
+      notePath: string;
+      noteTitle: string;
+      phase: "asr" | "diar";
+      pct: number;
+      modelDl?: { downloaded: number; total: number };
+    }
+  | {
+      kind: "reconciling";
+      notePath: string;
+      noteTitle: string;
+    };
+
 function systemTheme(): "light" | "dark" {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
@@ -179,6 +204,19 @@ export default function App() {
     kind: "none",
     hasTranscript: false,
   });
+  // The single in-flight background op (if any). Split from `recording`
+  // so the user can navigate between notes while transcription /
+  // reconciliation runs without erasing or polluting either's state.
+  // `recording` continues to track the *quiescent* state of the
+  // currently-displayed note (none / ready / error / actively recording);
+  // `inFlight` carries the source-note path of any background op, so
+  // banner rendering and completion handlers know which note the result
+  // belongs to.
+  const [inFlight, setInFlight] = useState<InFlightOp | null>(null);
+  const inFlightRef = useRef<InFlightOp | null>(null);
+  useEffect(() => {
+    inFlightRef.current = inFlight;
+  }, [inFlight]);
   const [modifiedMs, setModifiedMs] = useState<number | null>(null);
 
   // Resolve the active theme id from settings + system appearance.
@@ -227,18 +265,14 @@ export default function App() {
     };
   }, [path, isOwned]);
 
-  const recordingExclusive =
-    recording.kind === "recording" ||
-    recording.kind === "transcribing" ||
-    recording.kind === "reconciling";
-
-  const tryNavigate = useCallback(
-    (next: Mode) => {
-      if (recordingExclusive) return;
-      setMode(next);
-    },
-    [recordingExclusive],
-  );
+  // Active audio recording is the only state that blocks navigation —
+  // a live mic is foreground by nature. Transcription and reconcile
+  // run as true background ops via the inFlight slot, so navigating
+  // away from the source note while they run is safe.
+  const tryNavigate = useCallback((next: Mode) => {
+    if (inFlightRef.current?.kind === "recording") return;
+    setMode(next);
+  }, []);
 
   const dirty = content !== savedContent;
   const fileName = path ? path.split("/").pop() ?? "Untitled.md" : "Untitled.md";
@@ -478,6 +512,7 @@ export default function App() {
     const owned = await isOwnedNote(current);
     if (!owned) return;
     if (recordingRef.current.kind !== "none") return;
+    if (inFlightRef.current) return; // refuse a second op while another is running
     try {
       await startMeetingRecording(
         current,
@@ -486,7 +521,14 @@ export default function App() {
         aiRef.current.whisperModel,
       );
       setSysAvailable(true);
-      setRecording({ kind: "recording", startedAt: Date.now() });
+      const startedAt = Date.now();
+      setRecording({ kind: "recording", startedAt });
+      setInFlight({
+        kind: "recording",
+        notePath: current,
+        noteTitle: noteTitleRef.current,
+        startedAt,
+      });
     } catch (err) {
       setRecording({
         kind: "error",
@@ -496,27 +538,53 @@ export default function App() {
   }, []);
 
   const runTranscribe = useCallback(
-    async (wavPath: string) => {
+    async (
+      wavPath: string,
+      snapshot: { notePath: string; noteTitle: string },
+    ) => {
+      setInFlight({
+        kind: "transcribing",
+        notePath: snapshot.notePath,
+        noteTitle: snapshot.noteTitle,
+        phase: "asr",
+        pct: 0,
+      });
       try {
         await transcribe(wavPath, aiRef.current.glossary, aiRef.current.whisperModel);
-        const notePath = pathRef.current;
-        const tp = notePath ? transcriptPathFor(notePath) : wavPath.replace(/\/audio\.wav$/, "/transcript.json");
-        setRecording({ kind: "ready", transcriptPath: tp });
-        // Surface in the notifications panel (#37). Title comes from
-        // the live noteTitle ref so it reflects whatever the user has
-        // typed by the time transcription resolves.
-        if (notePath) {
-          pushNotificationAndPersist({
-            kind: "transcription-complete",
-            note_path: notePath,
-            note_title: noteTitleRef.current,
-          });
+        const tp = transcriptPathFor(snapshot.notePath);
+
+        // Notify regardless of where the user is now.
+        pushNotificationAndPersist({
+          kind: "transcription-complete",
+          note_path: snapshot.notePath,
+          note_title: snapshot.noteTitle,
+        });
+
+        // Refresh the per-note quiescent state only if the user is
+        // still on the source note. Otherwise loadFile will pick up
+        // the new transcript next time they navigate back.
+        if (pathRef.current === snapshot.notePath) {
+          setRecording({ kind: "ready", transcriptPath: tp });
         }
       } catch (err) {
-        setRecording({
-          kind: "error",
-          message: typeof err === "string" ? err : "Transcription failed.",
+        const message = typeof err === "string" ? err : "Transcription failed.";
+        pushNotificationAndPersist({
+          kind: "transcription-complete",
+          note_path: snapshot.notePath,
+          note_title: snapshot.noteTitle,
+          body: message,
         });
+        if (pathRef.current === snapshot.notePath) {
+          setRecording({ kind: "error", message });
+        }
+      } finally {
+        setInFlight((curr) =>
+          curr &&
+          curr.kind === "transcribing" &&
+          curr.notePath === snapshot.notePath
+            ? null
+            : curr,
+        );
       }
     },
     [pushNotificationAndPersist],
@@ -524,15 +592,25 @@ export default function App() {
 
   const onStopRecording = useCallback(async () => {
     if (recordingRef.current.kind !== "recording") return;
+    const sourceNotePath = pathRef.current;
+    const sourceNoteTitle = noteTitleRef.current;
     try {
       const wavPath = await stopMeetingRecording();
-      setRecording({ kind: "transcribing", phase: "asr", pct: 0 });
-      void runTranscribe(wavPath);
+      // Reset the quiescent state now that recording has ended; the
+      // transcription op takes over via inFlight.
+      setRecording({ kind: "none", hasTranscript: false });
+      if (sourceNotePath) {
+        void runTranscribe(wavPath, {
+          notePath: sourceNotePath,
+          noteTitle: sourceNoteTitle,
+        });
+      }
     } catch (err) {
       setRecording({
         kind: "error",
         message: typeof err === "string" ? err : "Failed to stop recording.",
       });
+      setInFlight((curr) => (curr && curr.kind === "recording" ? null : curr));
     }
   }, [runTranscribe]);
 
@@ -554,72 +632,126 @@ export default function App() {
       }
     }
     setRecording({ kind: "none", hasTranscript: false });
+    // Drop the in-flight recording op too so a fresh recording can
+    // start immediately after the discard.
+    setInFlight((curr) => (curr && curr.kind === "recording" ? null : curr));
   }, []);
 
   const runReconcile = useCallback(
     async (transcriptPath: string) => {
       const notePath = pathRef.current;
       if (!notePath) return;
+
+      // Snapshot every input we might need at completion time. Reading
+      // refs after the await would otherwise pick up whichever note
+      // the user has navigated to in the meantime — which would write
+      // the source meeting's frontmatter with the wrong tags / archived
+      // / favorite, and overwrite the visible buffer with reconciled
+      // markdown belonging to a different note.
       const fallback = (notePath.split("/").pop() ?? "Untitled note").replace(
         /\.md$/,
         "",
       );
-      const title = deriveTitle(contentRef.current, fallback);
-      setRecording({ kind: "reconciling" });
+      const snapshot = {
+        notePath,
+        noteTitle: deriveTitle(contentRef.current, fallback),
+        body: contentRef.current,
+        tags: tagsRef.current,
+        archived: archivedRef.current,
+        favorite: favoriteRef.current,
+        frontmatterExtras: frontmatterExtrasRef.current,
+      };
+
+      setInFlight({
+        kind: "reconciling",
+        notePath: snapshot.notePath,
+        noteTitle: snapshot.noteTitle,
+      });
+
       try {
         const md = await reconcileNotes(
-          contentRef.current,
+          snapshot.body,
           transcriptPath,
-          title,
+          snapshot.noteTitle,
           aiRef.current.summaryModel,
           aiRef.current.glossary,
         );
-        setContent(md);
-        // Persist immediately — reconcile is expensive (a Claude call) and
-        // the autosave debounce isn't a strong enough guarantee for output
-        // the user just paid for. Don't lose it to a window close.
+
+        // Persist via the snapshotted side fields — never the live
+        // refs.
+        let nextSaved = md;
         try {
-          let nextSaved = md;
-          if (isOwnedPath(notePath)) {
+          if (isOwnedPath(snapshot.notePath)) {
             const result = await writeNote(
-              notePath,
+              snapshot.notePath,
               md,
-              tagsRef.current,
-              archivedRef.current,
-              favoriteRef.current,
-              frontmatterExtrasRef.current,
+              snapshot.tags,
+              snapshot.archived,
+              snapshot.favorite,
+              snapshot.frontmatterExtras,
             );
             if (result.rewritten_body && result.rewritten_body !== md) {
-              const view = editorRef.current?.view;
-              if (view) {
-                dispatchDiff(view, md, result.rewritten_body);
-              } else {
-                setContent(result.rewritten_body);
-              }
               nextSaved = result.rewritten_body;
             }
           } else {
-            await writeFile(notePath, md);
+            await writeFile(snapshot.notePath, md);
           }
-          setSavedContent(nextSaved);
         } catch (err) {
           console.error("post-reconcile save failed:", err);
         }
-        setRecording({
-          kind: "none",
-          hasTranscript: true,
-          transcriptPath,
-          reconciled: true,
+
+        // Notification fires regardless of where the user is now.
+        pushNotificationAndPersist({
+          kind: "reconcile-complete",
+          note_path: snapshot.notePath,
+          note_title: snapshot.noteTitle,
         });
+
+        // Visual updates ONLY when the user is still on the source
+        // note. Otherwise loadFile picks up the new body next time
+        // they navigate back.
+        if (pathRef.current === snapshot.notePath) {
+          const view = editorRef.current?.view;
+          if (nextSaved !== snapshot.body && view) {
+            dispatchDiff(view, snapshot.body, nextSaved);
+          } else {
+            setContent(nextSaved);
+          }
+          setSavedContent(nextSaved);
+          setRecording({
+            kind: "none",
+            hasTranscript: true,
+            transcriptPath,
+            reconciled: true,
+          });
+        }
       } catch (err) {
-        setRecording({
-          kind: "error",
-          message: typeof err === "string" ? err : "Reconciliation failed.",
-          transcriptPath,
+        const message =
+          typeof err === "string" ? err : "Reconciliation failed.";
+        pushNotificationAndPersist({
+          kind: "reconcile-complete",
+          note_path: snapshot.notePath,
+          note_title: snapshot.noteTitle,
+          body: message,
         });
+        if (pathRef.current === snapshot.notePath) {
+          setRecording({
+            kind: "error",
+            message,
+            transcriptPath,
+          });
+        }
+      } finally {
+        setInFlight((curr) =>
+          curr &&
+          curr.kind === "reconciling" &&
+          curr.notePath === snapshot.notePath
+            ? null
+            : curr,
+        );
       }
     },
-    [],
+    [isOwnedPath, pushNotificationAndPersist],
   );
 
   // Promise-based modal: resolves with the chosen member IDs, or null on
@@ -639,6 +771,11 @@ export default function App() {
   }, []);
 
   const onGenerate = useCallback(async () => {
+    // Refuse a second op while one is in flight. The user-facing path
+    // here is rare — the Generate CTA only renders when the visible
+    // banner is in a quiescent "ready" state — but a stale click during
+    // the modal flow could otherwise queue a second reconcile.
+    if (inFlightRef.current) return;
     const r = recordingRef.current;
     let tp: string | undefined;
     if (r.kind === "ready") tp = r.transcriptPath;
@@ -666,27 +803,39 @@ export default function App() {
     void refreshRecordingState(pathRef.current);
   }, [refreshRecordingState]);
 
-  // transcribe-progress + model-download-progress
+  // transcribe-progress + model-download-progress. These now write to
+  // the in-flight slot so progress survives the user navigating away
+  // from the source note mid-transcription.
   useEffect(() => {
     const unTr = listen<number>("transcribe-progress", (e) => {
       const pct = typeof e.payload === "number" ? e.payload : 0;
-      setRecording((s) => (s.kind === "transcribing" ? { ...s, pct } : s));
+      setInFlight((curr) =>
+        curr && curr.kind === "transcribing" ? { ...curr, pct } : curr,
+      );
     });
     const unDl = listen<{ downloaded: number; total: number }>(
       "model-download-progress",
       (e) => {
         if (!e.payload) return;
-        setRecording((s) =>
-          s.kind === "transcribing"
-            ? { ...s, modelDl: { downloaded: e.payload.downloaded, total: e.payload.total } }
-            : s,
+        setInFlight((curr) =>
+          curr && curr.kind === "transcribing"
+            ? {
+                ...curr,
+                modelDl: {
+                  downloaded: e.payload.downloaded,
+                  total: e.payload.total,
+                },
+              }
+            : curr,
         );
       },
     );
     const unPhase = listen<string>("transcribe-phase", (e) => {
       if (e.payload === "diarizing") {
-        setRecording((s) =>
-          s.kind === "transcribing" ? { ...s, phase: "diar", modelDl: undefined } : s,
+        setInFlight((curr) =>
+          curr && curr.kind === "transcribing"
+            ? { ...curr, phase: "diar", modelDl: undefined }
+            : curr,
         );
       }
     });
@@ -758,7 +907,14 @@ export default function App() {
       // queued; explicitly start once the next tick rolls in.
       await startMeetingRecording(ref.note_path, aiRef.current.recordSystemAudio);
       setSysAvailable(true);
-      setRecording({ kind: "recording", startedAt: Date.now() });
+      const startedAt = Date.now();
+      setRecording({ kind: "recording", startedAt });
+      setInFlight({
+        kind: "recording",
+        notePath: ref.note_path,
+        noteTitle: noteTitleRef.current,
+        startedAt,
+      });
     } catch (err) {
       console.error("new meeting failed:", err);
       setRecording({
@@ -1523,6 +1679,29 @@ export default function App() {
   // Generate-notes CTA after the user has run it.
   const notesGenerated = recording.kind === "none" && !!recording.reconciled;
 
+  // Banner shows the in-flight op when one is running for the
+  // currently-displayed note, otherwise the per-note quiescent
+  // recording state. Decoupling these is what makes navigating away
+  // during transcription / reconcile safe — neither slot writes to the
+  // other.
+  const bannerState = useMemo<NoteRecording>(() => {
+    if (inFlight && inFlight.notePath === path) {
+      if (inFlight.kind === "recording") {
+        return { kind: "recording", startedAt: inFlight.startedAt };
+      }
+      if (inFlight.kind === "transcribing") {
+        return {
+          kind: "transcribing",
+          phase: inFlight.phase,
+          pct: inFlight.pct,
+          modelDl: inFlight.modelDl,
+        };
+      }
+      return { kind: "reconciling" };
+    }
+    return recording;
+  }, [inFlight, recording, path]);
+
   const onTitleChange = useCallback((next: string) => {
     setContent((cur) => rewriteH1(cur, next));
   }, []);
@@ -1642,7 +1821,7 @@ export default function App() {
 
       {showRecordingBanner && (
         <RecordingBanner
-          state={recording}
+          state={bannerState}
           recordingSysAudio={aiSettings.recordSystemAudio}
           sysAvailable={sysAvailable}
           summaryModel={aiSettings.summaryModel}
