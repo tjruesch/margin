@@ -255,14 +255,17 @@ pub fn list_notes(
 
 /// Return action items across all non-archived owned notes, scoped to
 /// open / done / all. Default `Open`. Joins on the notes table for the
-/// source note's title.
+/// source note's title. When `assignee_id` is set, the result is
+/// filtered to actions resolved to that team member (#50).
 #[tauri::command]
 pub fn list_actions(
     scope: Option<ActionScope>,
+    assignee_id: Option<String>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<Vec<ActionListItem>, String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
-    crate::index::list_actions(&c, scope.unwrap_or_default()).map_err(|e| e.to_string())
+    crate::index::list_actions(&c, scope.unwrap_or_default(), assignee_id.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]

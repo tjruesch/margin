@@ -193,12 +193,20 @@ pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>
 /// note's title for direct display in the actions feed. Archived notes
 /// are excluded from `Open` view since their actions are out of sight
 /// (mirrors the `Active` notes scope).
-pub fn list_actions(conn: &Connection, scope: ActionScope) -> Result<Vec<ActionListItem>> {
+pub fn list_actions(
+    conn: &Connection,
+    scope: ActionScope,
+    assignee_id: Option<&str>,
+) -> Result<Vec<ActionListItem>> {
     let where_done = match scope {
         ActionScope::Open => "AND a.done = 0",
         ActionScope::Done => "AND a.done = 1",
         ActionScope::All => "",
     };
+    // Always bind ?1 (assignee_id, NULL when no filter); the SQL
+    // `(?1 IS NULL OR a.assignee_id = ?1)` short-circuits to "no
+    // filter" when ?1 is NULL. Avoids the lifetime gymnastics of
+    // building a dynamic params vec.
     let sql = format!(
         "SELECT a.id, a.note_path, n.title, a.text, a.done, a.line, a.created_ms, a.due_ms, \
                 a.assignee_id, t.display_name \
@@ -206,10 +214,11 @@ pub fn list_actions(conn: &Connection, scope: ActionScope) -> Result<Vec<ActionL
          JOIN notes n ON n.note_path = a.note_path \
          LEFT JOIN team_members t ON t.id = a.assignee_id \
          WHERE n.archived = 0 {where_done} \
+           AND (?1 IS NULL OR a.assignee_id = ?1) \
          ORDER BY (a.due_ms IS NULL), a.due_ms ASC, n.modified_ms DESC, a.line ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map(params![assignee_id], |r| {
         Ok(ActionListItem {
             id: r.get(0)?,
             note_path: r.get(1)?,
@@ -973,10 +982,10 @@ mod tests {
             .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2);
-        let opens: Vec<ActionListItem> = list_actions(&conn, ActionScope::Open).unwrap();
+        let opens: Vec<ActionListItem> = list_actions(&conn, ActionScope::Open, None).unwrap();
         assert_eq!(opens.len(), 1);
         assert_eq!(opens[0].text, "open one");
-        let done: Vec<ActionListItem> = list_actions(&conn, ActionScope::Done).unwrap();
+        let done: Vec<ActionListItem> = list_actions(&conn, ActionScope::Done, None).unwrap();
         assert_eq!(done.len(), 1);
         assert_eq!(done[0].text, "done one");
     }
@@ -992,7 +1001,7 @@ mod tests {
         );
         let mut conn = fresh_conn();
         upsert_in(&mut conn, &note, &notes).unwrap();
-        let opens = list_actions(&conn, ActionScope::Open).unwrap();
+        let opens = list_actions(&conn, ActionScope::Open, None).unwrap();
         assert_eq!(opens.len(), 2);
         // Sort: dated row leads (ORDER BY due_ms IS NULL), then by due_ms ASC.
         assert_eq!(opens[0].text, "Pay invoice");
@@ -1011,7 +1020,7 @@ mod tests {
         // Rewrite with a different action text.
         std::fs::write(&note, "# T\n\n- [ ] beta\n").unwrap();
         upsert_in(&mut conn, &note, &notes).unwrap();
-        let opens = list_actions(&conn, ActionScope::Open).unwrap();
+        let opens = list_actions(&conn, ActionScope::Open, None).unwrap();
         assert_eq!(opens.len(), 1);
         assert_eq!(opens[0].text, "beta");
     }
@@ -1028,7 +1037,7 @@ mod tests {
         );
         let mut conn = fresh_conn();
         reconcile(&mut conn, &notes).unwrap();
-        let opens = list_actions(&conn, ActionScope::Open).unwrap();
+        let opens = list_actions(&conn, ActionScope::Open, None).unwrap();
         assert_eq!(opens.len(), 1);
         assert_eq!(opens[0].text, "visible");
     }

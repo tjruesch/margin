@@ -143,8 +143,11 @@ export type ActionListItem = {
   assignee_display_name: string | null;
 };
 
-export async function listActions(scope: ActionScope = "open"): Promise<ActionListItem[]> {
-  return invoke<ActionListItem[]>("list_actions", { scope });
+export async function listActions(
+  scope: ActionScope = "open",
+  assigneeId?: string,
+): Promise<ActionListItem[]> {
+  return invoke<ActionListItem[]>("list_actions", { scope, assigneeId });
 }
 
 export async function setActionDone(id: string, done: boolean): Promise<void> {

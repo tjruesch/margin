@@ -1,12 +1,16 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 
+import { dueBucket } from "./dueLabel";
 import { Editor } from "./Editor";
+import { ActionRow, BUCKET_ORDER } from "./Home";
 import { IconChevLeft, IconPlus, IconTrash } from "./icons";
 import {
+  type ActionListItem,
   type TeamMember,
   createTeamMember,
   deleteTeamMember,
+  listActions,
   listTeamMembers,
   readFile,
   updateTeamMember,
@@ -21,7 +25,15 @@ export type EditorSettings = {
   fontSize: number;
 };
 
-export function TeamView({ editor }: { editor: EditorSettings }) {
+export function TeamView({
+  editor,
+  onOpenNote,
+  onToggleAction,
+}: {
+  editor: EditorSettings;
+  onOpenNote: (path: string) => void;
+  onToggleAction: (id: string, nextDone: boolean) => void;
+}) {
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -64,6 +76,8 @@ export function TeamView({ editor }: { editor: EditorSettings }) {
         member={member}
         editor={editor}
         onBack={() => setSelectedId(null)}
+        onOpenNote={onOpenNote}
+        onToggleAction={onToggleAction}
         onUpdated={(next) =>
           setMembers((prev) => prev.map((m) => (m.id === next.id ? next : m)))
         }
@@ -260,17 +274,28 @@ function TeamDetail({
   onBack,
   onUpdated,
   onDeleted,
+  onOpenNote,
+  onToggleAction,
 }: {
   member: TeamMember;
   editor: EditorSettings;
   onBack: () => void;
   onUpdated: (next: TeamMember) => void;
   onDeleted: () => void;
+  onOpenNote: (path: string) => void;
+  onToggleAction: (id: string, nextDone: boolean) => void;
 }) {
   const [body, setBody] = useState<string | null>(null);
   const pendingBody = useRef<string | null>(null);
   const saveTimer = useRef<number | null>(null);
   const profilePath = member.profile_md_path;
+  const [tab, setTab] = useState<"profile" | "tasks">("profile");
+
+  // Reset to Profile when switching to a different member so the user
+  // never lands on a stale Tasks tab from the previous selection.
+  useEffect(() => {
+    setTab("profile");
+  }, [member.id]);
 
   // Load profile.md whenever the targeted member changes.
   useEffect(() => {
@@ -437,7 +462,34 @@ function TeamDetail({
           />
         </div>
       </header>
-      <div className="team-detail-editor">
+      <div className="team-detail-tabs">
+        <div className="nh-segmented" role="tablist" aria-label="Section">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "profile"}
+            className={"nh-segmented-btn" + (tab === "profile" ? " active" : "")}
+            onClick={() => setTab("profile")}
+          >
+            Profile
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "tasks"}
+            className={"nh-segmented-btn" + (tab === "tasks" ? " active" : "")}
+            onClick={() => setTab("tasks")}
+          >
+            Tasks
+          </button>
+        </div>
+      </div>
+      {/* Profile body — hidden, not unmounted, so the editor's debounced
+          save and the EditableField drafts survive a Tasks-tab detour. */}
+      <div
+        className="team-detail-editor"
+        style={{ display: tab === "profile" ? undefined : "none" }}
+      >
         {body !== null && (
           <Editor
             value={body}
@@ -449,6 +501,13 @@ function TeamDetail({
           />
         )}
       </div>
+      {tab === "tasks" && (
+        <TasksTab
+          member={member}
+          onOpenNote={onOpenNote}
+          onToggleAction={onToggleAction}
+        />
+      )}
     </section>
   );
 }
@@ -519,5 +578,193 @@ function EditableField({
     >
       {display || placeholder || ""}
     </button>
+  );
+}
+
+// ---------- Tasks tab ----------------------------------------------------
+
+function TasksTab({
+  member,
+  onOpenNote,
+  onToggleAction,
+}: {
+  member: TeamMember;
+  onOpenNote: (path: string) => void;
+  onToggleAction: (id: string, nextDone: boolean) => void;
+}) {
+  const [actions, setActions] = useState<ActionListItem[] | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setActions(null);
+    void (async () => {
+      try {
+        const list = await listActions("all", member.id);
+        if (!cancelled) setActions(list);
+      } catch (err) {
+        console.error("listActions failed:", err);
+        if (!cancelled) setActions([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [member.id]);
+
+  // Optimistic toggle: flip the local copy immediately so the row
+  // updates without a refetch round-trip. The upstream onToggleAction
+  // writes to disk; on next reindex / re-render the source of truth
+  // matches.
+  const toggleLocal = useCallback(
+    (id: string, nextDone: boolean) => {
+      onToggleAction(id, nextDone);
+      setActions((prev) =>
+        prev === null
+          ? prev
+          : prev.map((a) => (a.id === id ? { ...a, done: nextDone } : a)),
+      );
+    },
+    [onToggleAction],
+  );
+
+  const stats = useMemo(() => {
+    if (!actions) return { open: 0, dueThisWeek: 0, overdue: 0 };
+    const now = Date.now();
+    let open = 0;
+    let dueThisWeek = 0;
+    let overdue = 0;
+    for (const a of actions) {
+      if (a.done) continue;
+      open += 1;
+      if (a.due_ms == null) continue;
+      const bucket = dueBucket(a.due_ms, now);
+      if (bucket === "overdue") {
+        overdue += 1;
+        dueThisWeek += 1;
+      } else if (bucket === "today" || bucket === "soon") {
+        dueThisWeek += 1;
+      }
+    }
+    return { open, dueThisWeek, overdue };
+  }, [actions]);
+
+  const grouped = useMemo(() => {
+    const empty: Record<string, ActionListItem[]> = {
+      overdue: [],
+      today: [],
+      soon: [],
+      later: [],
+    };
+    const undated: ActionListItem[] = [];
+    if (!actions) return { byBucket: empty, undated };
+    const now = Date.now();
+    for (const a of actions) {
+      if (a.done) continue;
+      if (a.due_ms == null) {
+        undated.push(a);
+        continue;
+      }
+      const bucket = dueBucket(a.due_ms, now);
+      empty[bucket].push(a);
+    }
+    return { byBucket: empty, undated };
+  }, [actions]);
+
+  if (actions === null) {
+    return <div className="team-tasks-loading" />;
+  }
+
+  const totalOpen = stats.open;
+  const completed = actions.filter((a) => a.done);
+
+  return (
+    <div className="team-tasks-tab">
+      <div className="team-tasks-counters">
+        <span className="team-tasks-counter">
+          <strong>{stats.open}</strong> open
+        </span>
+        <span className="team-tasks-counter">
+          <strong>{stats.dueThisWeek}</strong> due this week
+        </span>
+        <span
+          className={
+            "team-tasks-counter overdue" + (stats.overdue > 0 ? " active" : "")
+          }
+        >
+          <strong>{stats.overdue}</strong> overdue
+        </span>
+      </div>
+
+      {totalOpen === 0 && completed.length === 0 ? (
+        <p className="home-empty">
+          No tasks attributed to {member.display_name} yet. Action items resolve
+          here when they're written as <code>{member.display_name} — task</code>{" "}
+          in any meeting note.
+        </p>
+      ) : (
+        <>
+          {BUCKET_ORDER.map(({ key, label }) => {
+            const items = grouped.byBucket[key];
+            if (!items || items.length === 0) return null;
+            return (
+              <div key={key} className={`home-action-bucket bucket-${key}`}>
+                <div className="home-action-bucket-head">
+                  <span className="home-action-bucket-label">{label}</span>
+                  <span className="home-action-bucket-count">{items.length}</span>
+                </div>
+                <div className="home-actions">
+                  {items.map((it) => (
+                    <ActionRow
+                      key={it.id}
+                      it={it}
+                      onToggle={toggleLocal}
+                      onOpenNote={onOpenNote}
+                    />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          {grouped.undated.length > 0 && (
+            <div className="home-action-bucket bucket-undated">
+              <div className="home-action-bucket-head">
+                <span className="home-action-bucket-label">No due date</span>
+                <span className="home-action-bucket-count">
+                  {grouped.undated.length}
+                </span>
+              </div>
+              <div className="home-actions">
+                {grouped.undated.map((it) => (
+                  <ActionRow
+                    key={it.id}
+                    it={it}
+                    onToggle={toggleLocal}
+                    onOpenNote={onOpenNote}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+          {completed.length > 0 && (
+            <div className="home-action-bucket bucket-done">
+              <div className="home-action-bucket-head">
+                <span className="home-action-bucket-label">Completed</span>
+                <span className="home-action-bucket-count">{completed.length}</span>
+              </div>
+              <div className="home-actions">
+                {completed.map((it) => (
+                  <ActionRow
+                    key={it.id}
+                    it={it}
+                    onToggle={toggleLocal}
+                    onOpenNote={onOpenNote}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
   );
 }

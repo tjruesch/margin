@@ -224,7 +224,11 @@ export function Home({
         {UPCOMING_EVENTS.length > 0 && <UpcomingStrip events={UPCOMING_EVENTS} />}
 
         {nav === "team" ? (
-          <TeamView editor={editor} />
+          <TeamView
+            editor={editor}
+            onOpenNote={onOpen}
+            onToggleAction={onToggleAction}
+          />
         ) : nav === "actions" ? (
           <ActionsFeed
             actions={actions}
@@ -591,14 +595,14 @@ function ActionItemsTeaser({
 
 // Order in which due-buckets render. The string keys match the values
 // returned by `dueBucket` from dueLabel.ts; the labels are human copy.
-const BUCKET_ORDER = [
+export const BUCKET_ORDER = [
   { key: "overdue", label: "Overdue" },
   { key: "today", label: "Today" },
   { key: "soon", label: "This week" },
   { key: "later", label: "Later" },
 ] as const;
 
-function ActionRow({
+export function ActionRow({
   it,
   onToggle,
   onOpenNote,
