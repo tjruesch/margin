@@ -2797,3 +2797,224 @@ input.nh-title {
 .nh-tag-suggestion:hover {
   background: var(--nh-bg-chip);
 }
+
+/* ----- Team page ----- */
+
+.team-loading {
+  height: 80px;
+}
+
+.team-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding: 12px 14px;
+  border: 0.5px solid var(--home-line);
+  background: var(--home-card);
+  border-radius: 10px;
+}
+.team-composer-text {
+  width: 100%;
+  padding: 6px 0;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 14px;
+  outline: none;
+  caret-color: var(--accent);
+}
+.team-composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.team-list {
+  display: flex;
+  flex-direction: column;
+  margin-top: 14px;
+}
+.team-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 120ms ease;
+  border: none;
+  background: transparent;
+  text-align: left;
+  outline: none;
+}
+.team-row:hover,
+.team-row:focus-visible {
+  background: var(--home-card-hover);
+}
+.team-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: #fff;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  border: 1.5px solid var(--bg);
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+}
+.team-row-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.team-row-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.team-row-role {
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.team-self-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+/* ----- Team detail ----- */
+
+.team-detail {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding: 10px 32px 0;
+}
+.team-detail-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.team-detail-back,
+.team-detail-delete {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+.team-detail-back:hover {
+  color: var(--fg);
+  background: var(--home-card-hover);
+}
+.team-detail-delete {
+  color: #c44a1f;
+}
+.team-detail-delete:hover {
+  background: color-mix(in srgb, #c44a1f 10%, transparent);
+}
+
+.team-detail-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  padding-bottom: 16px;
+  border-bottom: 0.5px solid var(--home-line);
+}
+.team-detail-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* Click-to-edit fields. Display variant looks like text; hover hints at
+   editability without a chrome rail. Input variant inherits the same
+   typography so the swap is seamless. */
+.team-field-display,
+.team-field-input {
+  background: transparent;
+  border: none;
+  padding: 4px 6px;
+  margin-left: -6px;
+  border-radius: 6px;
+  font: inherit;
+  color: var(--fg);
+  text-align: left;
+  cursor: text;
+  outline: none;
+  width: 100%;
+  max-width: 480px;
+}
+.team-field-display {
+  cursor: pointer;
+}
+.team-field-display.placeholder {
+  color: var(--fg-muted);
+  font-style: italic;
+}
+.team-field-display:hover {
+  background: var(--home-card-hover);
+}
+.team-field-input:focus {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.team-detail-name,
+.team-detail-name.team-field-input {
+  font-family: "Fraunces", Georgia, serif;
+  font-size: 24px;
+  font-weight: 500;
+  font-variation-settings: "opsz" 144;
+  letter-spacing: -0.012em;
+}
+.team-detail-role,
+.team-detail-role.team-field-input {
+  font-size: 13.5px;
+  color: var(--fg-muted);
+}
+.team-detail-aliases,
+.team-detail-aliases.team-field-input {
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+.team-detail-editor {
+  flex: 1;
+  min-height: 0;
+  margin-top: 14px;
+  padding-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+}
+.team-detail-editor > * {
+  flex: 1;
+  min-height: 0;
+}

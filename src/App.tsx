@@ -1433,6 +1433,7 @@ export default function App() {
             actions={actions}
             onToggleAction={(id, next) => void onToggleAction(id, next)}
             onAddInboxTodo={onAddInboxTodo}
+            editor={{ tabSize, useTabs, softWrap, fontSize }}
           />
         )}
       </main>

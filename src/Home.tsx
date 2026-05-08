@@ -2,7 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { dueBucket, friendlyDueLabel } from "./dueLabel";
 import { type ActionListItem, type NoteListItem } from "./file";
+import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
+import { TeamView, type EditorSettings as TeamEditorSettings } from "./Team";
 import {
   IconArchive,
   IconBell,
@@ -18,6 +20,7 @@ import {
   IconSettings,
   IconSidebar,
   IconStar,
+  IconUser,
   IconUsers,
 } from "./icons";
 
@@ -53,9 +56,19 @@ type Props = {
    *  optional payload after `@` (e.g. `2026-05-15` or `2026-05-15 09:00`);
    *  Rust resolves any relative form during write_note. */
   onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
+  /** Editor preferences threaded through so the Team detail view can
+   *  hand them to the embedded markdown editor. */
+  editor: TeamEditorSettings;
 };
 
-type NavId = "home" | "actions" | "meetings" | "shared" | "favorites" | "archive";
+type NavId =
+  | "home"
+  | "actions"
+  | "meetings"
+  | "shared"
+  | "favorites"
+  | "archive"
+  | "team";
 type FilterId = "all" | "notes" | "meetings" | "shared";
 
 function DueChip({ dueMs }: { dueMs: number | null }) {
@@ -95,6 +108,7 @@ export function Home({
   actions,
   onToggleAction,
   onAddInboxTodo,
+  editor,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -185,7 +199,9 @@ export function Home({
 
         {UPCOMING_EVENTS.length > 0 && <UpcomingStrip events={UPCOMING_EVENTS} />}
 
-        {nav === "actions" ? (
+        {nav === "team" ? (
+          <TeamView editor={editor} />
+        ) : nav === "actions" ? (
           <ActionsFeed
             actions={actions}
             onToggle={onToggleAction}
@@ -283,6 +299,12 @@ function Sidebar({
           badge={meetingCount > 0 ? String(meetingCount) : null}
           active={active === "meetings"}
           onClick={() => onSelect("meetings")}
+        />
+        <NavItem
+          icon={<IconUser size={14} sw={1.7} />}
+          label="Team"
+          active={active === "team"}
+          onClick={() => onSelect("team")}
         />
         <NavItem
           icon={<IconUsers size={14} sw={1.7} />}
@@ -1249,13 +1271,6 @@ function inferDisplayName(): string | null {
   // No profile system yet — greet anonymously. When settings grows a
   // displayName field, return it here.
   return null;
-}
-
-function avatarColor(initials: string): string {
-  const palette = ["#C44A1F", "#3A5DA8", "#4F8A3F", "#6E4FA8", "#A88B3A"];
-  let hash = 0;
-  for (let i = 0; i < initials.length; i++) hash = (hash * 31 + initials.charCodeAt(i)) | 0;
-  return palette[Math.abs(hash) % palette.length];
 }
 
 function stub(label: string, issue: number) {

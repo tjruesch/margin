@@ -150,6 +150,12 @@ export const IconUsers = (p: Props) => (
     <path d="M21 20c0-2.5-2-4.5-4.5-5" />
   </Icon>
 );
+export const IconUser = (p: Props) => (
+  <Icon {...p}>
+    <circle cx="12" cy="8" r="3.6" />
+    <path d="M5 20c0-3.5 3.1-6 7-6s7 2.5 7 6" />
+  </Icon>
+);
 export const IconSearch = (p: Props) => (
   <Icon {...p}>
     <circle cx="11" cy="11" r="6" />
