@@ -27,6 +27,10 @@ pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }
 
+pub fn team_dir() -> PathBuf {
+    data_dir().join("team")
+}
+
 /// Idempotent — safe to call repeatedly. Creates ~/.margin and its subdirs.
 pub fn init() -> std::io::Result<()> {
     for p in [
@@ -35,6 +39,7 @@ pub fn init() -> std::io::Result<()> {
         meetings_dir(),
         notes_dir(),
         logs_dir(),
+        team_dir(),
     ] {
         fs::create_dir_all(&p)?;
     }

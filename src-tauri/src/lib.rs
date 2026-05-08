@@ -10,6 +10,7 @@ mod reconcile;
 mod reminders;
 mod sharing;
 mod sysaudio;
+mod team;
 mod transcribe;
 
 use notify::{RecommendedWatcher, RecursiveMode};
@@ -388,6 +389,9 @@ pub fn run() {
             if let Err(e) = index::reconcile(&mut conn, &paths::notes_dir()) {
                 eprintln!("index reconcile failed at boot: {e}");
             }
+            if let Err(e) = team::bootstrap_self_if_missing(&mut conn) {
+                eprintln!("team bootstrap failed at boot: {e}");
+            }
             app.manage(Mutex::new(conn));
 
             // Recursive watcher over `~/.margin/notes/`. Keeps the index
@@ -497,7 +501,15 @@ pub fn run() {
             notes::set_favorite,
             notes::list_actions,
             notes::set_action_done,
-            sharing::share_note
+            sharing::share_note,
+            team::list_team_members,
+            team::get_team_member,
+            team::create_team_member,
+            team::update_team_member,
+            team::delete_team_member,
+            team::set_meeting_attendees,
+            team::get_meeting_attendees,
+            team::set_action_assignee
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

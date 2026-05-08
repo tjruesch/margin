@@ -1,0 +1,420 @@
+//! Team-member CRUD, the `meeting_attendees` join, and `actions.assignee_id`
+//! writes.
+//!
+//! Profile bodies live on disk as `~/.margin/team/<member_id>/profile.md`,
+//! outside the notes index. The `team_members.profile_md_path` column
+//! stores the absolute path so the frontend can read/write the body via
+//! the generic `read_file` / `write_file` commands.
+//!
+//! Self bootstrap runs once at app start (see `lib.rs::setup`), inserting
+//! a single `is_self = 1` row if none exists. The partial unique index
+//! `idx_team_self` guarantees there can never be more than one Self.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+
+use crate::paths;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TeamMember {
+    pub id: String,
+    pub display_name: String,
+    pub role: String,
+    pub aliases: Vec<String>,
+    pub profile_md_path: String,
+    pub is_self: bool,
+    pub created_ms: i64,
+    pub updated_ms: i64,
+}
+
+fn aliases_to_json(v: &[String]) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "[]".into())
+}
+
+fn aliases_from_json(s: &str) -> Vec<String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+fn now_ms() -> i64 {
+    chrono::Local::now().timestamp_millis()
+}
+
+fn member_dir(id: &str) -> PathBuf {
+    paths::team_dir().join(id)
+}
+
+fn profile_path_for(id: &str) -> PathBuf {
+    member_dir(id).join("profile.md")
+}
+
+fn write_stub_profile(profile_path: &Path, display_name: &str) -> Result<(), String> {
+    if let Some(parent) = profile_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if !profile_path.exists() {
+        fs::write(profile_path, format!("# {}\n", display_name)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn row_to_member(
+    id: String,
+    display_name: String,
+    role: String,
+    aliases_json: String,
+    profile_md_path: String,
+    is_self: i64,
+    created_ms: i64,
+    updated_ms: i64,
+) -> TeamMember {
+    TeamMember {
+        id,
+        display_name,
+        role,
+        aliases: aliases_from_json(&aliases_json),
+        profile_md_path,
+        is_self: is_self != 0,
+        created_ms,
+        updated_ms,
+    }
+}
+
+const SELECT_MEMBER_COLS: &str = "id, display_name, role, aliases, profile_md_path, is_self, \
+                                  created_ms, updated_ms";
+
+fn fetch_one(conn: &Connection, id: &str) -> Result<TeamMember, String> {
+    let sql = format!(
+        "SELECT {SELECT_MEMBER_COLS} FROM team_members WHERE id = ?1"
+    );
+    conn.query_row(&sql, params![id], |r| {
+        Ok(row_to_member(
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+            r.get(7)?,
+        ))
+    })
+    .optional()
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("team member not found: {id}"))
+}
+
+fn default_self_display_name() -> String {
+    let real = whoami::realname();
+    if !real.trim().is_empty() {
+        return real;
+    }
+    if let Ok(user) = std::env::var("USER") {
+        if !user.trim().is_empty() {
+            return user;
+        }
+    }
+    "You".to_string()
+}
+
+/// Insert the Self row if it does not already exist. Idempotent — safe
+/// to call on every app start. Called from `lib.rs::setup` after
+/// migrations apply, before the connection is moved into Tauri state.
+pub fn bootstrap_self_if_missing(conn: &mut Connection) -> Result<(), String> {
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM team_members WHERE is_self = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if existing.is_some() {
+        return Ok(());
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let display_name = default_self_display_name();
+    let profile_md_path = profile_path_for(&id);
+    write_stub_profile(&profile_md_path, &display_name)?;
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO team_members(id, display_name, role, aliases, profile_md_path, is_self, \
+         created_ms, updated_ms) VALUES (?1, ?2, '', '[]', ?3, 1, ?4, ?4)",
+        params![id, display_name, profile_md_path.to_string_lossy().to_string(), now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_team_members(
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<TeamMember>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT {SELECT_MEMBER_COLS} FROM team_members \
+         ORDER BY is_self DESC, display_name COLLATE NOCASE ASC"
+    );
+    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(row_to_member(
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn get_team_member(
+    id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<TeamMember, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    fetch_one(&c, &id)
+}
+
+#[tauri::command]
+pub fn create_team_member(
+    display_name: String,
+    role: String,
+    aliases: Vec<String>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<TeamMember, String> {
+    let trimmed = display_name.trim();
+    if trimmed.is_empty() {
+        return Err("display_name is required".to_string());
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let profile_md_path = profile_path_for(&id);
+    write_stub_profile(&profile_md_path, trimmed)?;
+    let now = now_ms();
+    let aliases_json = aliases_to_json(&aliases);
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.execute(
+            "INSERT INTO team_members(id, display_name, role, aliases, profile_md_path, \
+             is_self, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?6)",
+            params![
+                id,
+                trimmed,
+                role,
+                aliases_json,
+                profile_md_path.to_string_lossy().to_string(),
+                now,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    fetch_one(&c, &id)
+}
+
+#[tauri::command]
+pub fn update_team_member(
+    id: String,
+    display_name: Option<String>,
+    role: Option<String>,
+    aliases: Option<Vec<String>>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<TeamMember, String> {
+    if display_name.is_none() && role.is_none() && aliases.is_none() {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        return fetch_one(&c, &id);
+    }
+    let now = now_ms();
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        if let Some(name) = display_name.as_deref() {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Err("display_name cannot be empty".to_string());
+            }
+            c.execute(
+                "UPDATE team_members SET display_name = ?1, updated_ms = ?2 WHERE id = ?3",
+                params![trimmed, now, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(role) = role.as_deref() {
+            c.execute(
+                "UPDATE team_members SET role = ?1, updated_ms = ?2 WHERE id = ?3",
+                params![role, now, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(aliases) = aliases.as_deref() {
+            c.execute(
+                "UPDATE team_members SET aliases = ?1, updated_ms = ?2 WHERE id = ?3",
+                params![aliases_to_json(aliases), now, id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    fetch_one(&c, &id)
+}
+
+#[tauri::command]
+pub fn delete_team_member(
+    id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        let is_self: Option<i64> = c
+            .query_row(
+                "SELECT is_self FROM team_members WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match is_self {
+            None => return Err(format!("team member not found: {id}")),
+            Some(1) => return Err("cannot delete the Self profile".to_string()),
+            _ => {}
+        }
+        c.execute("DELETE FROM team_members WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+    }
+    let dir = member_dir(&id);
+    if dir.exists() {
+        if let Err(e) = fs::remove_dir_all(&dir) {
+            // DB row is already gone; surface a soft error so the user
+            // knows the bundle leaked but the operation otherwise
+            // succeeded.
+            eprintln!("team: failed to remove {}: {e}", dir.display());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_meeting_attendees(
+    note_path: String,
+    member_ids: Vec<String>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM meeting_attendees WHERE note_path = ?1",
+        params![note_path],
+    )
+    .map_err(|e| e.to_string())?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO meeting_attendees(note_path, member_id) VALUES (?1, ?2) \
+                 ON CONFLICT(note_path, member_id) DO NOTHING",
+            )
+            .map_err(|e| e.to_string())?;
+        for member_id in &member_ids {
+            stmt.execute(params![note_path, member_id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_meeting_attendees(
+    note_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<TeamMember>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT {} FROM team_members t \
+         JOIN meeting_attendees a ON a.member_id = t.id \
+         WHERE a.note_path = ?1 \
+         ORDER BY t.is_self DESC, t.display_name COLLATE NOCASE ASC",
+        SELECT_MEMBER_COLS
+            .split(", ")
+            .map(|c| format!("t.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut stmt = c.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![note_path], |r| {
+            Ok(row_to_member(
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn set_action_assignee(
+    action_id: String,
+    member_id: Option<String>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let updated = c
+        .execute(
+            "UPDATE actions SET assignee_id = ?1 WHERE id = ?2",
+            params![member_id, action_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if updated == 0 {
+        return Err(format!("action not found: {action_id}"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aliases_round_trip_preserves_order() {
+        let v = vec!["TJ".to_string(), "Tom".to_string(), "Tom Ruesch".to_string()];
+        let json = aliases_to_json(&v);
+        let back = aliases_from_json(&json);
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn aliases_from_json_empty_or_garbage_returns_empty() {
+        assert!(aliases_from_json("").is_empty());
+        assert!(aliases_from_json("not json").is_empty());
+        assert!(aliases_from_json("{}").is_empty());
+        assert!(aliases_from_json("[]").is_empty());
+    }
+
+    #[test]
+    fn aliases_to_json_empty_is_empty_array() {
+        let v: Vec<String> = Vec::new();
+        assert_eq!(aliases_to_json(&v), "[]");
+    }
+}

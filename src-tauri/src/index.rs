@@ -34,7 +34,8 @@ const SCHEMA_V2: &str = include_str!("migrations/002_archived.sql");
 const SCHEMA_V3: &str = include_str!("migrations/003_favorite.sql");
 const SCHEMA_V4: &str = include_str!("migrations/004_actions.sql");
 const SCHEMA_V5: &str = include_str!("migrations/005_due_dates.sql");
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_V6: &str = include_str!("migrations/006_team_members.sql");
+const SCHEMA_VERSION: i64 = 6;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -96,6 +97,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         // due_ms for any pre-existing absolute `@YYYY-MM-DD` tokens.
         conn.execute_batch(SCHEMA_V5)?;
         version = 5;
+    }
+    if version == 5 {
+        conn.execute_batch(SCHEMA_V6)?;
+        version = 6;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.

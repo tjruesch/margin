@@ -192,6 +192,64 @@ export async function deleteNote(notePath: string): Promise<void> {
   await invoke<void>("delete_note", { notePath });
 }
 
+// --- Team members --------------------------------------------------------
+
+export type TeamMember = {
+  id: string;
+  display_name: string;
+  role: string;
+  aliases: string[];
+  profile_md_path: string;
+  is_self: boolean;
+  created_ms: number;
+  updated_ms: number;
+};
+
+export async function listTeamMembers(): Promise<TeamMember[]> {
+  return invoke<TeamMember[]>("list_team_members");
+}
+
+export async function getTeamMember(id: string): Promise<TeamMember> {
+  return invoke<TeamMember>("get_team_member", { id });
+}
+
+export async function createTeamMember(
+  displayName: string,
+  role: string,
+  aliases: string[],
+): Promise<TeamMember> {
+  return invoke<TeamMember>("create_team_member", { displayName, role, aliases });
+}
+
+export async function updateTeamMember(
+  id: string,
+  fields: { displayName?: string; role?: string; aliases?: string[] },
+): Promise<TeamMember> {
+  return invoke<TeamMember>("update_team_member", { id, ...fields });
+}
+
+export async function deleteTeamMember(id: string): Promise<void> {
+  await invoke<void>("delete_team_member", { id });
+}
+
+export async function setMeetingAttendees(
+  notePath: string,
+  memberIds: string[],
+): Promise<void> {
+  await invoke<void>("set_meeting_attendees", { notePath, memberIds });
+}
+
+export async function getMeetingAttendees(notePath: string): Promise<TeamMember[]> {
+  return invoke<TeamMember[]>("get_meeting_attendees", { notePath });
+}
+
+export async function setActionAssignee(
+  actionId: string,
+  memberId: string | null,
+): Promise<void> {
+  await invoke<void>("set_action_assignee", { actionId, memberId });
+}
+
 // --- Recording + transcription -------------------------------------------
 
 export type Segment = {

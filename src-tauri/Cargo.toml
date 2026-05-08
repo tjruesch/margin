@@ -44,6 +44,7 @@ screencapturekit = { version = "1.5", features = ["macos_14_0"] }
 sherpa-onnx = "1.13"
 window-vibrancy = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+whoami = "1"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSResponder",
