@@ -32,6 +32,7 @@ export function MoreMenu({
   onFavorite,
   favorited,
   onDuplicate,
+  onSummarize,
 }: {
   onClose: () => void;
   /** When omitted, the Delete item is hidden. */
@@ -46,10 +47,17 @@ export function MoreMenu({
   favorited?: boolean;
   /** When omitted, the Duplicate item stays a no-op stub. */
   onDuplicate?: () => void;
+  /** When omitted, the Summarize item is hidden. Only meetings with a
+   *  transcript should authorize it. */
+  onSummarize?: () => void;
 }) {
-  // Hide Delete when the parent hasn't authorized it, then drop any
-  // separator that would dangle as a result.
-  const visible = ITEMS.filter((it) => it.id !== "del" || onDelete);
+  // Hide Delete and Summarize when the parent hasn't authorized them,
+  // then drop any separator that would dangle as a result.
+  const visible = ITEMS.filter((it) => {
+    if (it.id === "del" && !onDelete) return false;
+    if (it.id === "ai" && !onSummarize) return false;
+    return true;
+  });
   const cleaned = visible.filter((it, i, arr) => {
     if (it.id !== "sep") return true;
     const next = arr[i + 1];
@@ -68,9 +76,11 @@ export function MoreMenu({
         const isArchive = it.id === "arc";
         const isFavorite = it.id === "fav";
         const isDuplicate = it.id === "dup";
+        const isSummarize = it.id === "ai";
         const archiveWired = isArchive && onArchive !== undefined;
         const favoriteWired = isFavorite && onFavorite !== undefined;
         const duplicateWired = isDuplicate && onDuplicate !== undefined;
+        const summarizeWired = isSummarize && onSummarize !== undefined;
         const label = isArchive && archived
           ? "Move to notes"
           : isFavorite && favorited
@@ -80,7 +90,8 @@ export function MoreMenu({
           (it.id === "del" && onDelete !== undefined) ||
           archiveWired ||
           favoriteWired ||
-          duplicateWired;
+          duplicateWired ||
+          summarizeWired;
         return (
           <button
             key={it.id}
@@ -105,6 +116,11 @@ export function MoreMenu({
               }
               if (duplicateWired) {
                 onDuplicate!();
+                onClose();
+                return;
+              }
+              if (summarizeWired) {
+                onSummarize!();
                 onClose();
                 return;
               }

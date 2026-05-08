@@ -121,6 +121,30 @@ export function Home({
       nav === "archive" ? "archived" : nav === "favorites" ? "favorites" : "active";
     if (next !== scope) onScopeChange(next);
   }, [nav, scope, onScopeChange]);
+
+  // External "open this nav" requests (e.g. the AttendeePicker's
+  // "+ Add team member" link) come in as `margin:nav` events so the
+  // sender doesn't have to lift state. Mirrors the dueDatePopover
+  // CustomEvent pattern.
+  useEffect(() => {
+    const VALID: NavId[] = [
+      "home",
+      "actions",
+      "meetings",
+      "shared",
+      "favorites",
+      "archive",
+      "team",
+    ];
+    const onNav = (e: Event) => {
+      const detail = (e as CustomEvent<unknown>).detail;
+      if (typeof detail === "string" && (VALID as string[]).includes(detail)) {
+        setNav(detail as NavId);
+      }
+    };
+    window.addEventListener("margin:nav", onNav);
+    return () => window.removeEventListener("margin:nav", onNav);
+  }, []);
   const [filter, setFilter] = useState<FilterId>("all");
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() => {

@@ -14,6 +14,7 @@ import { RecordingBanner, type NoteRecording } from "./RecordingBanner";
 import { RestrictedBanner } from "./RestrictedBanner";
 import { Settings } from "./Settings";
 import { TranscriptView } from "./Transcript";
+import { AttendeePicker } from "./AttendeePicker";
 import {
   convertExternal,
   createNote,
@@ -37,10 +38,13 @@ import {
   setArchived as setArchivedFile,
   setFavorite as setFavoriteFile,
   setActionDone,
+  setMeetingAttendees,
+  getMeetingAttendees,
   setNoteTags,
   shareNote,
   listActions,
   type ActionListItem,
+  type TeamMember,
   startMeetingRecording,
   stopMeetingRecording,
   transcribe,
@@ -149,6 +153,17 @@ export default function App() {
   const [notesDir, setNotesDir] = useState<string | null>(null);
   const [hasKey, setHasKey] = useState<boolean>(true);
   const [sysAvailable, setSysAvailable] = useState<boolean>(true);
+  // Attendee picker state lives here so the imperative `askForAttendees`
+  // pattern below can hand the modal a Promise resolver. Open ⇔ non-null.
+  const [pickerState, setPickerState] = useState<{
+    notePath: string;
+    resolve: (ids: string[] | null) => void;
+  } | null>(null);
+  // Attendees attached to the active note, surfaced as chips on the
+  // header. Empty array when the note has no saved attendees yet.
+  const [meetingAttendees, setMeetingAttendeesState] = useState<TeamMember[]>(
+    [],
+  );
   const [recording, setRecording] = useState<NoteRecording>({
     kind: "none",
     hasTranscript: false,
@@ -177,6 +192,29 @@ export default function App() {
     if (!path || !notesDir) return false;
     return path.startsWith(notesDir.endsWith("/") ? notesDir : notesDir + "/");
   }, [path, notesDir]);
+
+  // Load the attendee list whenever the active note path changes. The
+  // backend returns empty for non-meeting notes, which is fine — the
+  // header chip is hidden when the array is empty.
+  useEffect(() => {
+    if (!path || !isOwned) {
+      setMeetingAttendeesState([]);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await getMeetingAttendees(path);
+        if (!cancelled) setMeetingAttendeesState(list);
+      } catch (err) {
+        console.error("getMeetingAttendees failed:", err);
+        if (!cancelled) setMeetingAttendeesState([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [path, isOwned]);
 
   const recordingExclusive =
     recording.kind === "recording" ||
@@ -513,15 +551,45 @@ export default function App() {
     [],
   );
 
-  const onGenerate = useCallback(() => {
+  // Promise-based modal: resolves with the chosen member IDs, or null on
+  // cancel. The picker is rendered conditionally below; submit/cancel
+  // handlers fire `resolve` and clear pickerState.
+  const askForAttendees = useCallback(
+    (notePath: string) =>
+      new Promise<string[] | null>((resolve) => {
+        setPickerState({ notePath, resolve });
+      }),
+    [],
+  );
+
+  const requestTeamView = useCallback(() => {
+    setMode("home");
+    window.dispatchEvent(new CustomEvent("margin:nav", { detail: "team" }));
+  }, []);
+
+  const onGenerate = useCallback(async () => {
     const r = recordingRef.current;
     let tp: string | undefined;
     if (r.kind === "ready") tp = r.transcriptPath;
     else if (r.kind === "none" && r.hasTranscript) tp = r.transcriptPath;
     else if (r.kind === "error" && r.transcriptPath) tp = r.transcriptPath;
     if (!tp) return;
+    const np = pathRef.current;
+    if (!np) return;
+    const ids = await askForAttendees(np);
+    if (!ids) return; // user cancelled
+    try {
+      await setMeetingAttendees(np, ids);
+      // Refresh the chip cluster so the header reflects the new list
+      // immediately, before reconcile finishes.
+      const fresh = await getMeetingAttendees(np);
+      setMeetingAttendeesState(fresh);
+    } catch (err) {
+      console.error("setMeetingAttendees failed:", err);
+      return;
+    }
     void runReconcile(tp);
-  }, [runReconcile]);
+  }, [askForAttendees, runReconcile]);
 
   const onDismissError = useCallback(() => {
     void refreshRecordingState(pathRef.current);
@@ -1338,6 +1406,23 @@ export default function App() {
               ? () => void onShareNote()
               : undefined
           }
+          onSummarize={
+            isOwned &&
+            (recording.kind === "ready" ||
+              (recording.kind === "none" && !!recording.hasTranscript) ||
+              (recording.kind === "error" && !!recording.transcriptPath))
+              ? () => void onGenerate()
+              : undefined
+          }
+          attendees={meetingAttendees}
+          onEditAttendees={
+            isOwned &&
+            (recording.kind === "ready" ||
+              (recording.kind === "none" && !!recording.hasTranscript) ||
+              (recording.kind === "error" && !!recording.transcriptPath))
+              ? () => void onGenerate()
+              : undefined
+          }
         />
       )}
 
@@ -1448,6 +1533,27 @@ export default function App() {
       )}
 
       <DueDatePopover />
+      {pickerState && (
+        <AttendeePicker
+          notePath={pickerState.notePath}
+          onSubmit={(ids) => {
+            const r = pickerState.resolve;
+            setPickerState(null);
+            r(ids);
+          }}
+          onCancel={() => {
+            const r = pickerState.resolve;
+            setPickerState(null);
+            r(null);
+          }}
+          onAddTeamMember={() => {
+            const r = pickerState.resolve;
+            setPickerState(null);
+            r(null);
+            requestTeamView();
+          }}
+        />
+      )}
     </div>
   );
 }

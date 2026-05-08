@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { type TeamMember } from "./file";
 import {
   IconCalendar,
   IconChevLeft,
@@ -11,6 +12,7 @@ import {
   IconShare,
   IconStar,
 } from "./icons";
+import { avatarColor, initialsFromName } from "./initials";
 import { MoreMenu } from "./MoreMenu";
 
 export type ViewMode = "edit" | "preview" | "transcript";
@@ -56,6 +58,16 @@ type Props = {
   onDuplicate?: () => void;
   /** When omitted, the Share button is hidden. */
   onShare?: () => void;
+  /** When omitted, the Summarize-with-AI item is hidden from the More
+   *  menu. Only meetings with a transcript should authorize it. */
+  onSummarize?: () => void;
+  /** Attendees attached to this meeting (from #44/#46). Empty array when
+   *  none have been picked. */
+  attendees?: TeamMember[];
+  /** When omitted (or `attendees` is empty), the attendee chip is hidden.
+   *  When set, clicking the chip opens the picker so the user can edit
+   *  the list — same flow as `onSummarize`. */
+  onEditAttendees?: () => void;
 };
 
 export function NoteHeader({
@@ -81,6 +93,9 @@ export function NoteHeader({
   favorited,
   onDuplicate,
   onShare,
+  onSummarize,
+  attendees,
+  onEditAttendees,
 }: Props) {
   const [moreOpen, setMoreOpen] = useState(false);
 
@@ -136,6 +151,7 @@ export function NoteHeader({
               onFavorite={onFavorite}
               favorited={favorited}
               onDuplicate={onDuplicate}
+              onSummarize={onSummarize}
             />
           )}
         </div>
@@ -162,9 +178,55 @@ export function NoteHeader({
               onChange={onTagsChange}
             />
           )}
+          {attendees && attendees.length > 0 && (
+            <AttendeesChip
+              attendees={attendees}
+              onClick={onEditAttendees}
+            />
+          )}
         </div>
       </div>
     </header>
+  );
+}
+
+function AttendeesChip({
+  attendees,
+  onClick,
+}: {
+  attendees: TeamMember[];
+  onClick?: () => void;
+}) {
+  const max = 3;
+  const shown = attendees.slice(0, max);
+  const overflow = attendees.length - shown.length;
+  const tooltip = attendees.map((a) => a.display_name).join(", ");
+  const Tag = onClick ? "button" : "span";
+  return (
+    <Tag
+      className={"nh-chip nh-chip-attendees" + (onClick ? " clickable" : "")}
+      title={tooltip}
+      onClick={onClick}
+      type={onClick ? "button" : undefined}
+    >
+      <span className="nh-attendee-stack">
+        {shown.map((m) => (
+          <span
+            key={m.id}
+            className="nh-attendee-disc"
+            style={{ background: avatarColor(m.id) }}
+            aria-label={m.display_name}
+          >
+            {initialsFromName(m.display_name)}
+          </span>
+        ))}
+        {overflow > 0 && (
+          <span className="nh-attendee-disc nh-attendee-disc-more">
+            +{overflow}
+          </span>
+        )}
+      </span>
+    </Tag>
   );
 }
 
