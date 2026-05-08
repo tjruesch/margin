@@ -29,10 +29,12 @@ export function TeamView({
   editor,
   onOpenNote,
   onToggleAction,
+  onReassignAction,
 }: {
   editor: EditorSettings;
   onOpenNote: (path: string) => void;
   onToggleAction: (id: string, nextDone: boolean) => void;
+  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -41,6 +43,14 @@ export function TeamView({
   const reload = useCallback(async () => {
     const fresh = await listTeamMembers();
     setMembers(fresh);
+  }, []);
+
+  // Tell App.tsx (and anyone else holding a member-list copy) that the
+  // roster changed. Dispatched after any create / update / delete so
+  // the assignee-chip dropdown on action rows (#51) sees the new list
+  // without forcing a full app reload.
+  const announceTeamChanged = useCallback(() => {
+    window.dispatchEvent(new CustomEvent("margin:team-changed"));
   }, []);
 
   useEffect(() => {
@@ -74,16 +84,20 @@ export function TeamView({
     return (
       <TeamDetail
         member={member}
+        members={members}
         editor={editor}
         onBack={() => setSelectedId(null)}
         onOpenNote={onOpenNote}
         onToggleAction={onToggleAction}
-        onUpdated={(next) =>
-          setMembers((prev) => prev.map((m) => (m.id === next.id ? next : m)))
-        }
+        onReassignAction={onReassignAction}
+        onUpdated={(next) => {
+          setMembers((prev) => prev.map((m) => (m.id === next.id ? next : m)));
+          announceTeamChanged();
+        }}
         onDeleted={() => {
           setMembers((prev) => prev.filter((m) => m.id !== member.id));
           setSelectedId(null);
+          announceTeamChanged();
         }}
       />
     );
@@ -96,6 +110,7 @@ export function TeamView({
       onCreated={async (m) => {
         await reload();
         setSelectedId(m.id);
+        announceTeamChanged();
       }}
     />
   );
@@ -270,20 +285,24 @@ const PROFILE_SAVE_DEBOUNCE_MS = 600;
 
 function TeamDetail({
   member,
+  members,
   editor,
   onBack,
   onUpdated,
   onDeleted,
   onOpenNote,
   onToggleAction,
+  onReassignAction,
 }: {
   member: TeamMember;
+  members: TeamMember[];
   editor: EditorSettings;
   onBack: () => void;
   onUpdated: (next: TeamMember) => void;
   onDeleted: () => void;
   onOpenNote: (path: string) => void;
   onToggleAction: (id: string, nextDone: boolean) => void;
+  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
   const [body, setBody] = useState<string | null>(null);
   const pendingBody = useRef<string | null>(null);
@@ -504,8 +523,10 @@ function TeamDetail({
       {tab === "tasks" && (
         <TasksTab
           member={member}
+          members={members}
           onOpenNote={onOpenNote}
           onToggleAction={onToggleAction}
+          onReassignAction={onReassignAction}
         />
       )}
     </section>
@@ -585,12 +606,16 @@ function EditableField({
 
 function TasksTab({
   member,
+  members,
   onOpenNote,
   onToggleAction,
+  onReassignAction,
 }: {
   member: TeamMember;
+  members: TeamMember[];
   onOpenNote: (path: string) => void;
   onToggleAction: (id: string, nextDone: boolean) => void;
+  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
   const [actions, setActions] = useState<ActionListItem[] | null>(null);
 
@@ -625,6 +650,44 @@ function TasksTab({
       );
     },
     [onToggleAction],
+  );
+
+  // Reassign with optimistic chip update + post-write refetch.
+  // Reassigning may move the action OUT of this member's tab (if the
+  // user picks someone else), so we always refetch after the IPC.
+  const reassignLocal = useCallback(
+    async (actionId: string, memberId: string | null) => {
+      const newName =
+        memberId === null
+          ? null
+          : members.find((m) => m.id === memberId)?.display_name ?? null;
+      setActions((prev) =>
+        prev === null
+          ? prev
+          : prev.map((a) =>
+              a.id === actionId
+                ? {
+                    ...a,
+                    assignee_id: memberId,
+                    assignee_display_name: newName,
+                  }
+                : a,
+            ),
+      );
+      try {
+        await onReassignAction(actionId, memberId);
+        // Action ID changes when text changes; refetch to pick it up.
+        const fresh = await listActions("all", member.id);
+        setActions(fresh);
+      } catch (err) {
+        console.error("reassign failed:", err);
+        try {
+          const fresh = await listActions("all", member.id);
+          setActions(fresh);
+        } catch {}
+      }
+    },
+    [members, member.id, onReassignAction],
   );
 
   const stats = useMemo(() => {
@@ -719,6 +782,8 @@ function TasksTab({
                       it={it}
                       onToggle={toggleLocal}
                       onOpenNote={onOpenNote}
+                      members={members}
+                      onReassign={(id, memberId) => void reassignLocal(id, memberId)}
                     />
                   ))}
                 </div>
@@ -740,6 +805,8 @@ function TasksTab({
                     it={it}
                     onToggle={toggleLocal}
                     onOpenNote={onOpenNote}
+                    members={members}
+                    onReassign={(id, memberId) => void reassignLocal(id, memberId)}
                   />
                 ))}
               </div>
@@ -758,6 +825,8 @@ function TasksTab({
                     it={it}
                     onToggle={toggleLocal}
                     onOpenNote={onOpenNote}
+                    members={members}
+                    onReassign={(id, memberId) => void reassignLocal(id, memberId)}
                   />
                 ))}
               </div>

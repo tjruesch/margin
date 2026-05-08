@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { AssigneeChip, stripLeadingOwnerPrefix } from "./AssigneeChip";
 import { dueBucket, friendlyDueLabel } from "./dueLabel";
-import { type ActionListItem, type NoteListItem } from "./file";
+import { type ActionListItem, type NoteListItem, type TeamMember } from "./file";
 import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
 import { TeamView, type EditorSettings as TeamEditorSettings } from "./Team";
@@ -59,6 +60,12 @@ type Props = {
   /** Editor preferences threaded through so the Team detail view can
    *  hand them to the embedded markdown editor. */
   editor: TeamEditorSettings;
+  /** Team members for the assignee-chip dropdown on action rows (#51). */
+  members: TeamMember[];
+  /** Reassign an action to a different team member (or null to unassign).
+   *  Body-rewrites the source line; the upstream refetch picks up the
+   *  new assignee_id via the resolver. */
+  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 };
 
 type NavId =
@@ -109,6 +116,8 @@ export function Home({
   onToggleAction,
   onAddInboxTodo,
   editor,
+  members,
+  onReassignAction,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -228,6 +237,7 @@ export function Home({
             editor={editor}
             onOpenNote={onOpen}
             onToggleAction={onToggleAction}
+            onReassignAction={onReassignAction}
           />
         ) : nav === "actions" ? (
           <ActionsFeed
@@ -235,6 +245,8 @@ export function Home({
             onToggle={onToggleAction}
             onOpenNote={onOpen}
             onAddInboxTodo={onAddInboxTodo}
+            members={members}
+            onReassign={onReassignAction}
           />
         ) : (
           <>
@@ -244,6 +256,8 @@ export function Home({
                 onToggle={onToggleAction}
                 onOpenNote={onOpen}
                 onViewAll={() => setNav("actions")}
+                members={members}
+                onReassign={onReassignAction}
               />
             )}
             <NotesFeed
@@ -548,11 +562,15 @@ function ActionItemsTeaser({
   onToggle,
   onOpenNote,
   onViewAll,
+  members,
+  onReassign,
 }: {
   items: ActionListItem[];
   onToggle: (id: string, nextDone: boolean) => void;
   onOpenNote: (path: string) => void;
   onViewAll: () => void;
+  members: TeamMember[];
+  onReassign: (actionId: string, memberId: string | null) => void;
 }) {
   // Show what's currently in state — items are fetched in `open` scope,
   // so anything done here was just ticked off in this page session and
@@ -586,6 +604,8 @@ function ActionItemsTeaser({
             it={it}
             onToggle={onToggle}
             onOpenNote={onOpenNote}
+            members={members}
+            onReassign={onReassign}
           />
         ))}
       </div>
@@ -606,11 +626,22 @@ export function ActionRow({
   it,
   onToggle,
   onOpenNote,
+  members,
+  onReassign,
 }: {
   it: ActionListItem;
   onToggle: (id: string, nextDone: boolean) => void;
   onOpenNote: (path: string) => void;
+  members: TeamMember[];
+  onReassign: (actionId: string, memberId: string | null) => void;
 }) {
+  // When the action has a resolved assignee, hide the literal
+  // `Owner — ` prefix in the displayed text — the chip already
+  // communicates ownership. Unresolved/ambiguous prefixes stay visible
+  // so the user can see (and edit) the raw line content.
+  const displayText = it.assignee_id
+    ? stripLeadingOwnerPrefix(it.text)
+    : it.text;
   return (
     <div
       className="home-action-row"
@@ -638,9 +669,15 @@ export function ActionRow({
         {it.done && <IconCheck size={20} sw={3.6} />}
       </button>
       <div className="home-action-body">
-        <div className={"home-action-text" + (it.done ? " done" : "")}>{it.text}</div>
+        <div className={"home-action-text" + (it.done ? " done" : "")}>{displayText}</div>
       </div>
       <DueChip dueMs={it.due_ms} />
+      <AssigneeChip
+        assigneeId={it.assignee_id}
+        assigneeDisplayName={it.assignee_display_name}
+        members={members}
+        onPick={(memberId) => onReassign(it.id, memberId)}
+      />
     </div>
   );
 }
@@ -774,11 +811,15 @@ function ActionsFeed({
   onToggle,
   onOpenNote,
   onAddInboxTodo,
+  members,
+  onReassign,
 }: {
   actions: ActionListItem[];
   onToggle: (id: string, nextDone: boolean) => void;
   onOpenNote: (path: string) => void;
   onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
+  members: TeamMember[];
+  onReassign: (actionId: string, memberId: string | null) => void;
 }) {
   // Split dated vs. undated, then bucket the dated half by urgency.
   // Backend already orders dated rows by `due_ms ASC`, so each bucket is
@@ -849,6 +890,8 @@ function ActionsFeed({
                   it={it}
                   onToggle={onToggle}
                   onOpenNote={onOpenNote}
+                  members={members}
+                  onReassign={onReassign}
                 />
               ))}
             </div>
@@ -869,6 +912,8 @@ function ActionsFeed({
                 it={it}
                 onToggle={onToggle}
                 onOpenNote={onOpenNote}
+                members={members}
+                onReassign={onReassign}
               />
             ))}
           </div>

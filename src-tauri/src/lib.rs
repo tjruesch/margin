@@ -501,6 +501,7 @@ pub fn run() {
             notes::set_favorite,
             notes::list_actions,
             notes::set_action_done,
+            notes::set_action_assignee,
             sharing::share_note,
             team::list_team_members,
             team::get_team_member,
@@ -508,8 +509,7 @@ pub fn run() {
             team::update_team_member,
             team::delete_team_member,
             team::set_meeting_attendees,
-            team::get_meeting_attendees,
-            team::set_action_assignee
+            team::get_meeting_attendees
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

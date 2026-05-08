@@ -605,6 +605,100 @@ pub fn set_action_done(
     Ok(())
 }
 
+/// Reassign an action item to a different team member, or unassign
+/// (#51). Mirrors `set_action_done`'s "look up by id, locate the line
+/// by cached index + hash, rewrite, write back" pattern. The body's
+/// leading `Owner — ` prefix is replaced/prepended/stripped via
+/// `rewrite_action_owner`; `assignee_id` is re-resolved on the next
+/// reindex pass via the existing `upsert_in_tx` path. No-op when the
+/// new assignee already matches the current one.
+#[tauri::command]
+pub fn set_action_assignee(
+    action_id: String,
+    member_id: Option<String>,
+    guard: tauri::State<'_, crate::WriteGuard>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let (note_path, cached_line, want_text, current_assignee) = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT note_path, line, text, assignee_id FROM actions WHERE id = ?1",
+            rusqlite::params![action_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    if member_id == current_assignee {
+        return Ok(());
+    }
+
+    // Resolve the new member's canonical display name (if assigning).
+    // None member_id = unassign.
+    let new_owner_name: Option<String> = if let Some(id) = member_id.as_deref() {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        let members =
+            crate::team::list_team_members_raw(&c).map_err(|e| e)?;
+        match members.into_iter().find(|m| m.id == id) {
+            Some(m) => Some(m.display_name),
+            None => return Err(format!("team member not found: {id}")),
+        }
+    } else {
+        None
+    };
+
+    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
+    let want_hash = action_text_hash(&want_text);
+
+    // Locate the source line — cached index first, then hash scan.
+    let mut target_idx: Option<usize> = None;
+    if cached_line >= 1 && cached_line <= lines.len() {
+        if let Some((line_text, _, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
+            if action_text_hash(&line_text) == want_hash {
+                target_idx = Some(cached_line - 1);
+            }
+        }
+    }
+    if target_idx.is_none() {
+        for (i, line) in lines.iter().enumerate() {
+            if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
+                if action_text_hash(&line_text) == want_hash {
+                    target_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let idx = target_idx.ok_or_else(|| {
+        "Action not found in note (index may be stale; reload to refresh)".to_string()
+    })?;
+
+    let rewritten = rewrite_action_owner(&lines[idx], new_owner_name.as_deref())
+        .ok_or_else(|| "action line is not a recognizable checkbox".to_string())?;
+    if rewritten == lines[idx] {
+        // Nothing to write — the line was already in the desired form.
+        return Ok(());
+    }
+    lines[idx] = rewritten;
+    let new_body = lines.join("\n");
+
+    let map = yaml.map(parse_frontmatter).unwrap_or_default();
+    let merged = write_with_frontmatter(&map, &new_body);
+    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
+    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    touch_index(&conn, Path::new(&note_path), false);
+    Ok(())
+}
+
 /// Replace the character between `[` and `]` on the first checkbox the
 /// line contains. Preserves indentation, bullet character, and
 /// trailing text/whitespace. Always normalizes done to lowercase `x`.
@@ -725,6 +819,85 @@ pub(crate) fn extract_owner_candidate(text: &str) -> Option<String> {
         return None;
     }
     Some(owner.to_string())
+}
+
+/// Return `text` with the leading `{Owner} {sep} ` segment removed, or
+/// `text` unchanged when no recognized separator with a non-empty owner
+/// prefix is present (#51). Counterpart to `extract_owner_candidate`.
+pub(crate) fn strip_leading_owner_segment(text: &str) -> &str {
+    const SEPARATORS: &[&str] = &[" — ", " – ", " -- "];
+    // Pick the earliest separator that has a non-empty owner before it.
+    let mut best: Option<(usize, usize)> = None; // (start_of_sep, sep_len)
+    for sep in SEPARATORS {
+        if let Some(idx) = text.find(sep) {
+            if text[..idx].trim().is_empty() {
+                continue;
+            }
+            match best {
+                Some((cur, _)) if cur <= idx => {}
+                _ => best = Some((idx, sep.len())),
+            }
+        }
+    }
+    match best {
+        Some((idx, sep_len)) => &text[idx + sep_len..],
+        None => text,
+    }
+}
+
+/// Replace, prepend, or strip the leading `{Owner} — ` segment of an
+/// action line (#51). Preserves the indentation, bullet character,
+/// checkbox marker, and the rest of the line text (including any
+/// trailing `@<token>`). Returns `None` when `line` is not a recognized
+/// markdown checkbox.
+///
+/// - `Some(name)` → produce `{name} — {body without prior owner prefix}`.
+/// - `None`       → strip any prior owner prefix.
+///
+/// Always emits the canonical em-dash separator on output regardless of
+/// what was on input. Returns `Some(line.to_string())` unchanged when
+/// the rewrite would be a no-op.
+pub(crate) fn rewrite_action_owner(line: &str, new_owner: Option<&str>) -> Option<String> {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = &line[indent_len..];
+
+    // Strip the bullet (one of `- `, `* `, `+ `) so we know the bullet
+    // character; reattach with a single space separator below.
+    let (bullet_char, after_bullet) = if let Some(rest) = trimmed.strip_prefix("- ") {
+        ('-', rest)
+    } else if let Some(rest) = trimmed.strip_prefix("* ") {
+        ('*', rest)
+    } else if let Some(rest) = trimmed.strip_prefix("+ ") {
+        ('+', rest)
+    } else {
+        return None;
+    };
+
+    // Need `[X] x` (4 ASCII bytes plus the body).
+    let bytes = after_bullet.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'[' || bytes[2] != b']' || bytes[3] != b' ' {
+        return None;
+    }
+    let done_marker = &after_bullet[..4]; // "[ ] " or "[x] " or "[X] "
+    let body_with_at = &after_bullet[4..];
+
+    // Pure body manipulation: strip any prior owner prefix, then
+    // optionally prepend the new one with the canonical em-dash.
+    let stripped = strip_leading_owner_segment(body_with_at);
+    let new_body = match new_owner {
+        Some(name) => {
+            let trimmed_name = name.trim();
+            if trimmed_name.is_empty() {
+                stripped.to_string()
+            } else {
+                format!("{trimmed_name} — {stripped}")
+            }
+        }
+        None => stripped.to_string(),
+    };
+
+    Some(format!("{indent}{bullet_char} {done_marker}{new_body}"))
 }
 
 fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
@@ -1481,5 +1654,85 @@ mod tests {
         assert_eq!(got[0].text, "Tom — write spec");
         assert_eq!(got[1].owner_candidate, None);
         assert_eq!(got[1].text, "no owner here");
+    }
+
+    // ---------- #51 owner rewrite -------------------------------------
+
+    #[test]
+    fn rewrite_action_owner_replaces_existing_prefix() {
+        let got = rewrite_action_owner("- [ ] Heike — task", Some("Tom Ruesch"));
+        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
+    }
+
+    #[test]
+    fn rewrite_action_owner_prepends_when_absent() {
+        let got = rewrite_action_owner("- [ ] task", Some("Tom Ruesch"));
+        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
+    }
+
+    #[test]
+    fn rewrite_action_owner_strips_when_unassigning() {
+        let got = rewrite_action_owner("- [ ] Heike — task", None);
+        assert_eq!(got.as_deref(), Some("- [ ] task"));
+    }
+
+    #[test]
+    fn rewrite_action_owner_unassign_no_prefix_is_noop() {
+        let got = rewrite_action_owner("- [ ] task", None);
+        assert_eq!(got.as_deref(), Some("- [ ] task"));
+    }
+
+    #[test]
+    fn rewrite_action_owner_canonicalizes_separator() {
+        // En-dash + double-hyphen separators get rewritten as em-dash.
+        let got = rewrite_action_owner("- [ ] Heike – task", Some("Tom Ruesch"));
+        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
+        let got = rewrite_action_owner("- [ ] Heike -- task", Some("Tom Ruesch"));
+        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
+    }
+
+    #[test]
+    fn rewrite_action_owner_preserves_due_token() {
+        let got = rewrite_action_owner("- [ ] Heike — task @2026-05-15", Some("Tom"));
+        assert_eq!(got.as_deref(), Some("- [ ] Tom — task @2026-05-15"));
+    }
+
+    #[test]
+    fn rewrite_action_owner_preserves_done_marker_and_indent() {
+        let got = rewrite_action_owner("\t- [x] Heike — task", Some("Tom"));
+        assert_eq!(got.as_deref(), Some("\t- [x] Tom — task"));
+        let got = rewrite_action_owner("  * [X] Heike — task", Some("Tom"));
+        assert_eq!(got.as_deref(), Some("  * [X] Tom — task"));
+        let got = rewrite_action_owner("+ [ ] Heike — task", None);
+        assert_eq!(got.as_deref(), Some("+ [ ] task"));
+    }
+
+    #[test]
+    fn rewrite_action_owner_returns_none_for_non_checkbox() {
+        assert_eq!(rewrite_action_owner("plain text line", Some("Tom")), None);
+        assert_eq!(rewrite_action_owner("- not a checkbox", Some("Tom")), None);
+        assert_eq!(rewrite_action_owner("[x] bare bullet missing", Some("Tom")), None);
+    }
+
+    #[test]
+    fn strip_leading_owner_segment_handles_all_separators() {
+        assert_eq!(strip_leading_owner_segment("Tom — task"), "task");
+        assert_eq!(strip_leading_owner_segment("Tom – task"), "task");
+        assert_eq!(strip_leading_owner_segment("Tom -- task"), "task");
+    }
+
+    #[test]
+    fn strip_leading_owner_segment_leaves_compact_dashes_alone() {
+        assert_eq!(strip_leading_owner_segment("Tom—task"), "Tom—task");
+        assert_eq!(
+            strip_leading_owner_segment("Refactor self-driving cars"),
+            "Refactor self-driving cars"
+        );
+    }
+
+    #[test]
+    fn strip_leading_owner_segment_no_separator_unchanged() {
+        assert_eq!(strip_leading_owner_segment("write spec"), "write spec");
+        assert_eq!(strip_leading_owner_segment(""), "");
     }
 }

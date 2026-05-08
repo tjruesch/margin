@@ -37,12 +37,14 @@ import {
   reconcileNotes,
   setArchived as setArchivedFile,
   setFavorite as setFavoriteFile,
+  setActionAssignee,
   setActionDone,
   setMeetingAttendees,
   getMeetingAttendees,
   setNoteTags,
   shareNote,
   listActions,
+  listTeamMembers,
   type ActionListItem,
   type TeamMember,
   startMeetingRecording,
@@ -250,6 +252,11 @@ export default function App() {
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [notesLoading, setNotesLoading] = useState<boolean>(true);
   const [actions, setActions] = useState<ActionListItem[]>([]);
+  // Team members for the assignee-chip dropdown on action rows (#51).
+  // Loaded once at mount and refreshed on `margin:nav` events so adds /
+  // edits / deletes done on the Team page are reflected next time the
+  // user is back on Home or the Action items page.
+  const [members, setMembers] = useState<TeamMember[]>([]);
   const allTags = useMemo(() => {
     const set = new Set<string>();
     for (const n of notes) for (const t of n.tags) set.add(t);
@@ -1267,6 +1274,63 @@ export default function App() {
     }
   }, []);
 
+  // Refresh team-member list. Cheap; runs on mount and on every
+  // `margin:nav` event (fires when the user changes sidebar nav).
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const fresh = await listTeamMembers();
+        if (!cancelled) setMembers(fresh);
+      } catch (err) {
+        console.error("listTeamMembers failed:", err);
+      }
+    };
+    void refresh();
+    const onNav = () => void refresh();
+    const onTeamChanged = () => void refresh();
+    window.addEventListener("margin:nav", onNav);
+    window.addEventListener("margin:team-changed", onTeamChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("margin:nav", onNav);
+      window.removeEventListener("margin:team-changed", onTeamChanged);
+    };
+  }, []);
+
+  // Reassign an action item to a new team member (or unassign with
+  // null). Optimistic local update first; on success refetch the list
+  // because the action's id changes when the body line is rewritten.
+  // On error, refetch to restore authoritative state.
+  const onReassignAction = useCallback(
+    async (actionId: string, memberId: string | null) => {
+      const newName =
+        memberId === null
+          ? null
+          : members.find((m) => m.id === memberId)?.display_name ?? null;
+      setActions((curr) =>
+        curr.map((a) =>
+          a.id === actionId
+            ? { ...a, assignee_id: memberId, assignee_display_name: newName }
+            : a,
+        ),
+      );
+      try {
+        await setActionAssignee(actionId, memberId);
+        const fresh = await listActions("open");
+        setActions(fresh);
+      } catch (err) {
+        console.error("setActionAssignee failed:", err);
+        alert("Could not change the owner. See console for details.");
+        try {
+          const fresh = await listActions("open");
+          setActions(fresh);
+        } catch {}
+      }
+    },
+    [members],
+  );
+
   /** Open the macOS share sheet for the active note. The Rust side
    *  writes a renamed temp `<title>.md` (frontmatter stripped) and
    *  hands the file URL to NSSharingServicePicker. */
@@ -1519,6 +1583,8 @@ export default function App() {
             onToggleAction={(id, next) => void onToggleAction(id, next)}
             onAddInboxTodo={onAddInboxTodo}
             editor={{ tabSize, useTabs, softWrap, fontSize }}
+            members={members}
+            onReassignAction={onReassignAction}
           />
         )}
       </main>

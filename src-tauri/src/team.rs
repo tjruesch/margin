@@ -450,25 +450,6 @@ pub fn get_meeting_attendees(
     list_meeting_attendees(&c, &note_path)
 }
 
-#[tauri::command]
-pub fn set_action_assignee(
-    action_id: String,
-    member_id: Option<String>,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    let updated = c
-        .execute(
-            "UPDATE actions SET assignee_id = ?1 WHERE id = ?2",
-            params![member_id, action_id],
-        )
-        .map_err(|e| e.to_string())?;
-    if updated == 0 {
-        return Err(format!("action not found: {action_id}"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
