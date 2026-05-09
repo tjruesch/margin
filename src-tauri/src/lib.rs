@@ -668,7 +668,9 @@ pub fn run() {
             connectors::commands::delete_connector,
             connectors::commands::list_calendar_events,
             connectors::commands::get_event_details,
-            connectors::commands::open_or_create_event_note
+            connectors::commands::open_or_create_event_note,
+            connectors::commands::list_email_messages,
+            connectors::commands::get_email_body
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

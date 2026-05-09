@@ -321,6 +321,77 @@ fn format_event_note_body(event: &super::calendar::CalendarEvent) -> String {
     s
 }
 
+// ----- Email query commands (#69) ----------------------------------------
+
+#[tauri::command]
+pub fn list_email_messages(
+    thread_id: Option<String>,
+    sent_from_ms: Option<i64>,
+    sent_to_ms: Option<i64>,
+    connector_id: Option<String>,
+    limit: Option<u32>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Vec<super::email::EmailMessage>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    if let Some(tid) = thread_id {
+        return super::email::list_messages_by_thread(&c, &tid).map_err(|e| e.to_string());
+    }
+    let from = sent_from_ms.unwrap_or(0);
+    let to = sent_to_ms.unwrap_or_else(|| current_unix_ms() + 24 * 3600 * 1000);
+    let lim = limit.unwrap_or(100) as usize;
+    super::email::list_messages_in_range(&c, from, to, connector_id.as_deref(), lim)
+        .map_err(|e| e.to_string())
+}
+
+/// Lazy-fetch a message body. On first call we GET `body` from Graph,
+/// persist it, and return. Subsequent calls return the cached value.
+#[tauri::command]
+pub async fn get_email_body(
+    app: AppHandle,
+    message_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Option<String>, String> {
+    // Fast path: already cached.
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        match super::email::get_message_body_html(&c, &message_id) {
+            Ok(Some(body)) => return Ok(Some(body)),
+            Ok(None) => {} // exists but body not yet fetched
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+
+    // Look up origin (connector_id, external_id).
+    let origin = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        super::email::get_message_origin(&c, &message_id).map_err(|e| e.to_string())?
+    };
+    let (connector_id, external_id) = match origin {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    // Fetch via Graph.
+    let kind = connector_id
+        .split_once(':')
+        .map(|(k, _)| k.to_string())
+        .unwrap_or_else(|| "microsoft_graph".to_string());
+    let body = oauth::with_valid_token(&app, &connector_id, &kind, |access| async move {
+        super::microsoft_graph::fetch_message_body(&access, &external_id).await
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if let Some(ref html) = body {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = super::email::set_message_body_html(&c, &message_id, html) {
+            eprintln!("[connectors] persist email body failed for {message_id}: {e}");
+        }
+    }
+    Ok(body)
+}
+
 /// Minimal YAML string escape — sufficient for IDs / locations the
 /// connector hands us. If the value contains any special chars
 /// (colon, quotes, newline, leading/trailing whitespace) we wrap it

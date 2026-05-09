@@ -27,6 +27,7 @@ use serde::Serialize;
 
 pub mod calendar;
 pub mod commands;
+pub mod email;
 pub mod microsoft_graph;
 pub mod oauth;
 pub mod providers;
