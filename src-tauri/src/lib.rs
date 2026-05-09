@@ -1,3 +1,4 @@
+mod ask;
 mod audio;
 mod chunker;
 mod dates;
@@ -81,6 +82,23 @@ async fn start_meeting_recording(
     let path = r.note_path.to_string_lossy().into_owned();
     s.recording = Some(r);
     Ok(path)
+}
+
+/// Kick off an AI Q&A turn over the user's notes (#31 follow-up).
+/// Retrieves candidate notes via FTS, streams Anthropic's response back
+/// as `ai-stream` events keyed by `turn_id`. The frontend generates the
+/// `turn_id` so it can tag the in-flight assistant message *before*
+/// the first event lands — otherwise the listener races the invoke
+/// response and loses the `Sources` event.
+#[tauri::command]
+async fn ask_notes_start(
+    app: AppHandle,
+    turn_id: String,
+    query: String,
+    history: Vec<ask::ChatTurn>,
+    model: Option<String>,
+) -> Result<(), String> {
+    ask::start(app, turn_id, query, history, model).await
 }
 
 #[tauri::command]
@@ -482,6 +500,7 @@ pub fn run() {
             keychain::has_anthropic_api_key,
             start_meeting_recording,
             stop_meeting_recording,
+            ask_notes_start,
             transcribe::transcribe,
             reconcile::reconcile_notes,
             notes::notes_dir,

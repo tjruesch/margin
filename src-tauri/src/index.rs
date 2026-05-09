@@ -408,6 +408,349 @@ struct FtsRow {
     score: f64,
 }
 
+/// One entry in the "all non-archived notes" directory the AI ask
+/// command builds for citation. Lighter than `SearchHit` — just enough
+/// to render a chip and ground the model on what exists.
+#[derive(Serialize, Clone)]
+pub struct DirectoryEntry {
+    pub note_path: String,
+    pub bundle_id: String,
+    pub title: String,
+    pub modified_ms: i64,
+    pub preview: String,
+}
+
+/// All non-archived notes, newest-first, capped at `limit`. Used as the
+/// "Notes directory" section of the AI ask prompt — every entry gets a
+/// `[N]` label the model can cite even when its body wasn't deep-loaded
+/// into the retrieved set.
+pub fn list_directory(conn: &Connection, limit: usize) -> Result<Vec<DirectoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT note_path, bundle_id, title, modified_ms, preview \
+         FROM notes WHERE archived = 0 \
+         ORDER BY modified_ms DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |r| {
+        Ok(DirectoryEntry {
+            note_path: r.get(0)?,
+            bundle_id: r.get(1)?,
+            title: r.get(2)?,
+            modified_ms: r.get(3)?,
+            preview: r.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// AI-question retrieval: stopword-filtered OR query over title+body
+/// (and a per-token transcript scan to fill remaining slots). Used by
+/// the Ask palette where the input is a full natural-language question
+/// rather than a narrowing keyword filter — strict AND semantics from
+/// the lexical search would reject most candidates because question
+/// words like "what", "did", "is" rarely co-occur with topic terms in
+/// the same note.
+///
+/// Falls back to the most-recently-modified non-archived notes when no
+/// content tokens remain (e.g. user asked "what's new?") so the model
+/// always has something to reason over.
+pub fn retrieve_for_ask(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let cap = limit.min(50);
+    let tokens = content_tokens(query);
+
+    if tokens.is_empty() {
+        return recent_notes(conn, cap);
+    }
+
+    // OR'd FTS query — bm25 ranks docs with more matching terms higher
+    // automatically, so OR + bm25 ≈ best-effort topic recall.
+    let fts_query = tokens
+        .iter()
+        .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut seen_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    let fts_sql = "\
+        SELECT n.note_path, n.bundle_id, n.title, n.modified_ms, \
+               snippet(notes_fts, 2, ?2, ?3, '…', 16) AS body_snip, \
+               bm25(notes_fts) AS score \
+        FROM notes_fts \
+        JOIN notes n ON n.note_path = notes_fts.note_path \
+        WHERE notes_fts MATCH ?1 AND n.archived = 0 \
+        ORDER BY score ASC \
+        LIMIT ?4";
+    let mut stmt = conn.prepare(fts_sql)?;
+    let rows = stmt.query_map(
+        params![
+            &fts_query,
+            SEARCH_SNIPPET_OPEN,
+            SEARCH_SNIPPET_CLOSE,
+            cap as i64,
+        ],
+        |r| {
+            Ok(FtsRow {
+                note_path: r.get(0)?,
+                bundle_id: r.get(1)?,
+                title: r.get(2)?,
+                modified_ms: r.get(3)?,
+                body_snip: r.get(4)?,
+                score: r.get(5)?,
+            })
+        },
+    )?;
+    for row in rows {
+        let row = row?;
+        seen_paths.insert(row.note_path.clone());
+        let source = if tokens
+            .iter()
+            .any(|t| row.title.to_lowercase().contains(t.as_str()))
+        {
+            SearchSource::Title
+        } else {
+            SearchSource::Body
+        };
+        let snippet = if matches!(source, SearchSource::Title) {
+            row.title.clone()
+        } else {
+            row.body_snip.clone()
+        };
+        hits.push(SearchHit {
+            note_path: row.note_path,
+            bundle_id: row.bundle_id,
+            title: row.title,
+            modified_ms: row.modified_ms,
+            snippet,
+            source,
+            score: row.score,
+        });
+    }
+
+    // Transcript pass — for ask retrieval we want any note whose
+    // transcript contains *any* meaningful token, not just the full
+    // query string. Cheap pre-filter: lowercased substring match per
+    // token before JSON parse.
+    if hits.len() < cap {
+        let archived_paths: std::collections::HashSet<String> = {
+            let mut stmt = conn
+                .prepare("SELECT note_path FROM notes WHERE archived = 1")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut set = std::collections::HashSet::new();
+            for r in rows {
+                set.insert(r?);
+            }
+            set
+        };
+        let titles_by_path: HashMap<String, (String, String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT note_path, bundle_id, title, modified_ms FROM notes \
+                 WHERE archived = 0",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut map = HashMap::new();
+            for row in rows {
+                let (p, b, t, m) = row?;
+                map.insert(p, (b, t, m));
+            }
+            map
+        };
+
+        let remaining = cap - hits.len();
+        let transcript_hits = scan_transcripts_any_token(
+            &paths::notes_dir(),
+            &tokens,
+            &seen_paths,
+            &archived_paths,
+            &titles_by_path,
+            remaining,
+        );
+        hits.extend(transcript_hits);
+    }
+
+    // Last-resort fallback: if even OR retrieval found nothing, hand
+    // the model the most-recent notes so it can at least confirm
+    // there's nothing relevant rather than refusing on empty context.
+    if hits.is_empty() {
+        return recent_notes(conn, cap);
+    }
+
+    Ok(hits)
+}
+
+/// Tokenize input the way the FTS tokenizer does, then drop stopwords
+/// and very short tokens. Output is lowercased for consistent
+/// case-insensitive matching downstream.
+fn content_tokens(input: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in input.split(|c: char| !c.is_alphanumeric() && c != '\'' && c != '-') {
+        let lc = raw.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        if lc.chars().count() < 3 {
+            continue;
+        }
+        if STOPWORDS.contains(&lc.as_str()) {
+            continue;
+        }
+        if !out.iter().any(|t| t == &lc) {
+            out.push(lc);
+        }
+    }
+    out
+}
+
+/// English stopwords — common question words, auxiliaries, and
+/// determiners that almost never carry topical signal. Trimmed to
+/// avoid removing too much.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "are", "but", "not", "you", "all", "any", "can",
+    "had", "has", "have", "her", "his", "him", "she", "they", "this", "that",
+    "these", "those", "with", "from", "your", "yours", "ours", "their",
+    "theirs", "what", "when", "where", "who", "whom", "why", "how", "which",
+    "was", "were", "been", "being", "did", "does", "doing", "done", "would",
+    "could", "should", "shall", "will", "may", "might", "must", "into",
+    "about", "over", "under", "than", "then", "there", "here", "them",
+    "some", "such", "very", "just", "also", "only", "more", "most", "much",
+    "many", "few", "again", "still", "yet", "now", "before", "after",
+    "between", "during", "while", "because", "though", "although", "even",
+    "ever", "never", "always", "often", "sometimes", "really",
+];
+
+fn recent_notes(conn: &Connection, limit: usize) -> Result<Vec<SearchHit>> {
+    let mut stmt = conn.prepare(
+        "SELECT note_path, bundle_id, title, modified_ms, preview \
+         FROM notes WHERE archived = 0 \
+         ORDER BY modified_ms DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (note_path, bundle_id, title, modified_ms, preview) = row?;
+        out.push(SearchHit {
+            note_path,
+            bundle_id,
+            title,
+            modified_ms,
+            snippet: preview,
+            source: SearchSource::Body,
+            score: 999.0,
+        });
+    }
+    Ok(out)
+}
+
+fn scan_transcripts_any_token(
+    notes_dir: &Path,
+    tokens: &[String],
+    seen_paths: &std::collections::HashSet<String>,
+    archived_paths: &std::collections::HashSet<String>,
+    titles_by_path: &HashMap<String, (String, String, i64)>,
+    limit: usize,
+) -> Vec<SearchHit> {
+    if limit == 0 || tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<SearchHit> = Vec::new();
+    let read_dir = match fs::read_dir(notes_dir) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for entry in read_dir.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let bundle = entry.path();
+        if !bundle.is_dir() {
+            continue;
+        }
+        let note_path = bundle.join(NOTE_FILENAME);
+        let note_path_str = note_path.to_string_lossy().into_owned();
+        if seen_paths.contains(&note_path_str)
+            || archived_paths.contains(&note_path_str)
+        {
+            continue;
+        }
+        let transcript_path = bundle.join(TRANSCRIPT_FILENAME);
+        if !transcript_path.exists() {
+            continue;
+        }
+        let raw = match fs::read_to_string(&transcript_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let raw_lc = raw.to_lowercase();
+        // Match any token (OR). First-token-wins for the snippet.
+        let mut snippet: Option<String> = None;
+        for tok in tokens {
+            if raw_lc.contains(tok.as_str()) {
+                let parsed: serde_json::Value =
+                    match serde_json::from_str(&raw) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                let segments = match parsed.get("segments").and_then(|s| s.as_array()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                for seg in segments {
+                    let text = seg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    if let Some((start, end)) = find_ci(text, tok) {
+                        snippet = Some(transcript_snippet(text, start, end));
+                        break;
+                    }
+                }
+                if snippet.is_some() {
+                    break;
+                }
+            }
+        }
+        let snippet = match snippet {
+            Some(s) => s,
+            None => continue,
+        };
+        let (bundle_id, title, modified_ms) = match titles_by_path.get(&note_path_str) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        out.push(SearchHit {
+            note_path: note_path_str,
+            bundle_id,
+            title,
+            modified_ms,
+            snippet,
+            source: SearchSource::Transcript,
+            score: 1.0,
+        });
+    }
+    out
+}
+
 /// Translate user input into an FTS5 MATCH expression. Each
 /// whitespace-separated token becomes a quoted prefix term so the query
 /// never trips on FTS5 operators (`AND`, `NOT`, `*`, `:` etc) the user

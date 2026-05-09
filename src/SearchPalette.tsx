@@ -1,12 +1,25 @@
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  type AiStreamEvent,
+  type AskSource,
+  askNotesStart,
+  type MessagePart,
   searchNotes,
   SEARCH_HIGHLIGHT_CLOSE,
   SEARCH_HIGHLIGHT_OPEN,
   type SearchHit,
 } from "./file";
-import { IconFileText, IconMic, IconSearch } from "./icons";
+import { render as renderMarkdown } from "./markdown";
+import {
+  IconArrowRight,
+  IconCheck,
+  IconFileText,
+  IconMic,
+  IconSearch,
+  IconSparkle,
+} from "./icons";
 
 type Props = {
   open: boolean;
@@ -16,28 +29,69 @@ type Props = {
 
 const QUERY_DEBOUNCE_MS = 120;
 
-/// ⌘K command palette. Backed by `search_notes` (FTS over title+body
-/// plus per-bundle transcript scan). The palette stays mounted while
-/// `open` to preserve input/result state across rapid open/close
-/// cycles, but resets state on the open→close edge.
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  /** Ordered list of parts. User messages always have a single text
+   *  part (the user can't trigger tools directly). Assistant messages
+   *  interleave text deltas and tool-use markers in the order the
+   *  model emitted them. */
+  parts: MessagePart[];
+  /** Assistant-only — populated by the `sources` event before any
+   *  `delta` arrives so chips can render alongside the streaming text. */
+  sources?: AskSource[];
+  status: "streaming" | "done" | "error";
+  error?: string;
+  /** The turn_id returned by `ask_notes_start`; used to filter the
+   *  Tauri `ai-stream` channel to events for this message. Only set on
+   *  assistant messages. */
+  turnId?: string;
+};
+
+/// Concatenate all text parts of a message, ignoring tool parts. Used
+/// for citation parsing (regex over the whole prose) and for shipping
+/// history back to the backend (which only stores plain text content).
+function joinText(parts: MessagePart[]): string {
+  let out = "";
+  for (const p of parts) {
+    if (p.kind === "text") out += p.value;
+  }
+  return out;
+}
+
+/// Search palette + AI Q&A surface (#31).
+///
+/// Two modes share the same dialog:
+///   - "search": debounced lexical search via `search_notes`. Plain Enter
+///     opens the active row.
+///   - "chat":  conversation thread streamed from `ask_notes_start`.
+///     Plain Enter submits the next turn.
+///
+/// Cmd+Enter from search escalates to chat (sends the current input as
+/// the first user turn). Esc closes and resets everything.
 export function SearchPalette({ open, onClose, onOpenNote }: Props) {
+  const [mode, setMode] = useState<"search" | "chat">("search");
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+
   const inputRef = useRef<HTMLInputElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
-  const listRef = useRef<HTMLDivElement | null>(null);
-  // Generation counter so out-of-order search responses can't overwrite
-  // newer results when a slow query resolves after a faster one.
+  const resultsRef = useRef<HTMLDivElement | null>(null);
+  const conversationRef = useRef<HTMLDivElement | null>(null);
+  // Generation counter for the search debounce — out-of-order responses
+  // from a slower keystroke must not overwrite a newer one's results.
   const queryGen = useRef(0);
 
-  // Reset on close so the next open starts fresh. Focus the input on
-  // open so the user can type immediately.
+  // Reset everything on close. Focus the input on open.
   useEffect(() => {
     if (!open) {
+      setMode("search");
       setQuery("");
       setHits([]);
+      setMessages([]);
       setLoading(false);
       setActiveIdx(0);
       return;
@@ -45,9 +99,9 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
     inputRef.current?.focus();
   }, [open]);
 
-  // Debounced search. Empty query clears results without a round-trip.
+  // Lexical search debounce — only runs in search mode.
   useEffect(() => {
-    if (!open) return;
+    if (!open || mode !== "search") return;
     const trimmed = query.trim();
     if (trimmed.length === 0) {
       setHits([]);
@@ -72,11 +126,10 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
       }
     }, QUERY_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [open, query]);
+  }, [open, mode, query]);
 
-  // Outside-click + Escape dismissal. Stop propagation on the dialog
-  // itself so the global mousedown listener doesn't fire when the user
-  // clicks inside.
+  // Outside-click dismissal. Click *on* the dialog does not bubble here
+  // because the dialog stops propagation in its onMouseDown.
   useEffect(() => {
     if (!open) return;
     const onMouseDown = (e: MouseEvent) => {
@@ -88,16 +141,153 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
     return () => window.removeEventListener("mousedown", onMouseDown);
   }, [open, onClose]);
 
-  // Scroll the active row into view when navigating with arrow keys.
+  // Scroll the active search row into view when navigating with arrows.
   useEffect(() => {
-    if (!listRef.current) return;
-    const row = listRef.current.querySelector<HTMLElement>(
+    if (mode !== "search") return;
+    if (!resultsRef.current) return;
+    const row = resultsRef.current.querySelector<HTMLElement>(
       `[data-row-idx="${activeIdx}"]`,
     );
     row?.scrollIntoView({ block: "nearest" });
-  }, [activeIdx, hits]);
+  }, [activeIdx, hits, mode]);
+
+  // Auto-scroll the conversation as new tokens arrive.
+  useEffect(() => {
+    if (mode !== "chat") return;
+    if (!conversationRef.current) return;
+    conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
+  }, [mode, messages]);
+
+  // Tauri `ai-stream` subscription. Active only while open and in chat
+  // mode (search-only sessions don't need the listener). Cleanup
+  // unsubscribes; the listener filters on turn_id so events from a
+  // closed palette can't mutate state for a fresh open.
+  useEffect(() => {
+    if (!open || mode !== "chat") return;
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    (async () => {
+      const fn = await listen<AiStreamEvent>("ai-stream", (event) => {
+        const ev = event.payload;
+        setMessages((prev) =>
+          prev.map((m) => {
+            if (m.role !== "assistant" || m.turnId !== ev.turn_id) return m;
+            if (ev.kind === "sources") {
+              return { ...m, sources: ev.sources };
+            }
+            if (ev.kind === "delta") {
+              // Append to the trailing text part if there is one,
+              // otherwise push a new text part. Crucial for ordering:
+              // a tool pill in the middle of streaming text must not
+              // get its trailing text appended onto its `value`.
+              const last = m.parts[m.parts.length - 1];
+              if (last && last.kind === "text") {
+                const updated: MessagePart[] = [...m.parts];
+                updated[updated.length - 1] = {
+                  kind: "text",
+                  value: last.value + ev.text,
+                };
+                return { ...m, parts: updated };
+              }
+              return {
+                ...m,
+                parts: [...m.parts, { kind: "text", value: ev.text }],
+              };
+            }
+            if (ev.kind === "tool_use_start") {
+              return {
+                ...m,
+                parts: [
+                  ...m.parts,
+                  {
+                    kind: "tool",
+                    toolId: ev.tool_id,
+                    name: ev.name,
+                    targetN: ev.target_n,
+                    targetTitle: ev.target_title,
+                    status: "running",
+                  },
+                ],
+              };
+            }
+            if (ev.kind === "tool_use_done") {
+              const updated: MessagePart[] = m.parts.map((p) =>
+                p.kind === "tool" && p.toolId === ev.tool_id
+                  ? { ...p, status: ev.ok ? "ok" : "error" }
+                  : p,
+              );
+              return { ...m, parts: updated };
+            }
+            if (ev.kind === "done") {
+              return { ...m, status: "done" };
+            }
+            if (ev.kind === "error") {
+              return { ...m, status: "error", error: ev.message };
+            }
+            return m;
+          }),
+        );
+      });
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [open, mode]);
 
   if (!open) return null;
+
+  const isAnyStreaming = messages.some(
+    (m) => m.role === "assistant" && m.status === "streaming",
+  );
+
+  const submitChatTurn = async (text: string) => {
+    const trimmed = text.trim();
+    if (trimmed.length === 0 || isAnyStreaming) return;
+    const userMsg: ChatMessage = {
+      id: cryptoId(),
+      role: "user",
+      parts: [{ kind: "text", value: trimmed }],
+      status: "done",
+    };
+    // Generate turn_id up-front so it lands on the message before the
+    // backend's `Sources` event can arrive at the listener.
+    const turnId = cryptoId();
+    const assistantMsg: ChatMessage = {
+      id: cryptoId(),
+      role: "assistant",
+      parts: [],
+      status: "streaming",
+      turnId,
+    };
+    // History: every prior message at the moment of submit, in send
+    // order. Tool parts are dropped — the model only sees prose
+    // history. Backend stores history as plain {role, content} strings.
+    const history = messages.map((m) => ({
+      role: m.role,
+      content: joinText(m.parts),
+    }));
+    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+    setQuery("");
+    setMode("chat");
+    try {
+      await askNotesStart(turnId, trimmed, history);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === assistantMsg.id
+            ? { ...m, status: "error", error: message }
+            : m,
+        ),
+      );
+    }
+  };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
@@ -105,87 +295,385 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
       onClose();
       return;
     }
-    if (hits.length === 0) return;
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      setActiveIdx((i) => Math.min(i + 1, hits.length - 1));
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      setActiveIdx((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      const hit = hits[activeIdx];
-      if (hit) {
-        onOpenNote(hit.note_path);
-        onClose();
+    if (mode === "search") {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        // Escalate to AI ask.
+        e.preventDefault();
+        if (query.trim().length > 0) submitChatTurn(query);
+        return;
+      }
+      if (hits.length === 0) return;
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setActiveIdx((i) => Math.min(i + 1, hits.length - 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setActiveIdx((i) => Math.max(i - 1, 0));
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const hit = hits[activeIdx];
+        if (hit) {
+          onOpenNote(hit.note_path);
+          onClose();
+        }
+      }
+    } else {
+      // chat mode — Enter sends a follow-up turn.
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        if (query.trim().length > 0) submitChatTurn(query);
       }
     }
   };
+
+  const placeholder =
+    mode === "chat"
+      ? isAnyStreaming
+        ? "Waiting for answer…"
+        : "Ask a follow-up…"
+      : "Search notes — ⌘↵ to ask AI";
 
   return (
     <div
       className="palette-backdrop"
       role="presentation"
       onMouseDown={(e) => {
-        // Click on the backdrop dismisses; click on the dialog does
-        // not (the dialog stops propagation below).
         if (e.target === e.currentTarget) onClose();
       }}
     >
       <div
         ref={dialogRef}
-        className="palette-dialog"
+        className={"palette-dialog" + (mode === "chat" ? " mode-chat" : " mode-search")}
         role="dialog"
         aria-modal="true"
-        aria-label="Search notes"
+        aria-label={mode === "chat" ? "Ask AI about your notes" : "Search notes"}
         onKeyDown={onKeyDown}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="palette-input-row">
           <span className="palette-input-icon" aria-hidden="true">
-            <IconSearch size={14} sw={1.7} />
+            {mode === "chat" ? (
+              <IconSparkle size={14} sw={1.7} />
+            ) : (
+              <IconSearch size={14} sw={1.7} />
+            )}
           </span>
           <input
             ref={inputRef}
             type="text"
             className="palette-input"
-            placeholder="Search notes…"
+            placeholder={placeholder}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            disabled={mode === "chat" && isAnyStreaming}
             spellCheck={false}
             autoCorrect="off"
             autoCapitalize="off"
           />
-          <span className="palette-input-kbd">esc</span>
-        </div>
-        <div className="palette-results" ref={listRef} role="listbox">
-          {query.trim().length === 0 ? (
-            <div className="palette-empty">
-              Type to search across all your notes — titles, bodies, and
-              meeting transcripts.
-            </div>
-          ) : loading && hits.length === 0 ? (
-            <div className="palette-empty">Searching…</div>
-          ) : hits.length === 0 ? (
-            <div className="palette-empty">No matches.</div>
+          {mode === "chat" ? (
+            <button
+              type="button"
+              className="palette-send"
+              aria-label="Send message"
+              disabled={query.trim().length === 0 || isAnyStreaming}
+              onClick={() => submitChatTurn(query)}
+            >
+              <IconArrowRight size={13} sw={1.7} />
+            </button>
           ) : (
-            hits.map((hit, idx) => (
-              <ResultRow
-                key={hit.note_path + ":" + hit.source}
-                hit={hit}
-                active={idx === activeIdx}
-                idx={idx}
-                onMouseEnter={() => setActiveIdx(idx)}
-                onClick={() => {
-                  onOpenNote(hit.note_path);
-                  onClose();
-                }}
-              />
-            ))
+            <span className="palette-input-kbd">esc</span>
+          )}
+        </div>
+
+        {mode === "search" ? (
+          <SearchResults
+            ref={resultsRef}
+            query={query}
+            hits={hits}
+            loading={loading}
+            activeIdx={activeIdx}
+            onHover={setActiveIdx}
+            onPick={(path) => {
+              onOpenNote(path);
+              onClose();
+            }}
+          />
+        ) : (
+          <Conversation
+            ref={conversationRef}
+            messages={messages}
+            onOpenNote={(path) => {
+              onOpenNote(path);
+              onClose();
+            }}
+          />
+        )}
+
+        <div className="palette-footer">
+          {mode === "chat" ? (
+            <span>
+              <kbd>↵</kbd> send · <kbd>esc</kbd> close
+            </span>
+          ) : (
+            <span>
+              <kbd>↵</kbd> open · <kbd>⌘↵</kbd> ask AI · <kbd>esc</kbd> close
+            </span>
           )}
         </div>
       </div>
     </div>
+  );
+}
+
+function SearchResults({
+  ref,
+  query,
+  hits,
+  loading,
+  activeIdx,
+  onHover,
+  onPick,
+}: {
+  ref: React.RefObject<HTMLDivElement | null>;
+  query: string;
+  hits: SearchHit[];
+  loading: boolean;
+  activeIdx: number;
+  onHover: (idx: number) => void;
+  onPick: (path: string) => void;
+}) {
+  return (
+    <div className="palette-results" ref={ref} role="listbox">
+      {query.trim().length === 0 ? (
+        <div className="palette-empty">
+          Type to search across all your notes — titles, bodies, and meeting
+          transcripts. Press <kbd>⌘↵</kbd> to ask AI instead.
+        </div>
+      ) : loading && hits.length === 0 ? (
+        <div className="palette-empty">Searching…</div>
+      ) : hits.length === 0 ? (
+        <div className="palette-empty">No matches.</div>
+      ) : (
+        hits.map((hit, idx) => (
+          <ResultRow
+            key={hit.note_path + ":" + hit.source}
+            hit={hit}
+            active={idx === activeIdx}
+            idx={idx}
+            onMouseEnter={() => onHover(idx)}
+            onClick={() => onPick(hit.note_path)}
+          />
+        ))
+      )}
+    </div>
+  );
+}
+
+function Conversation({
+  ref,
+  messages,
+  onOpenNote,
+}: {
+  ref: React.RefObject<HTMLDivElement | null>;
+  messages: ChatMessage[];
+  onOpenNote: (path: string) => void;
+}) {
+  return (
+    <div className="palette-conversation" ref={ref}>
+      {messages.map((m) => (
+        <MessageBubble key={m.id} message={m} onOpenNote={onOpenNote} />
+      ))}
+    </div>
+  );
+}
+
+function MessageBubble({
+  message,
+  onOpenNote,
+}: {
+  message: ChatMessage;
+  onOpenNote: (path: string) => void;
+}) {
+  if (message.role === "user") {
+    return (
+      <div className="palette-msg palette-msg-user">
+        <div className="palette-msg-bubble">{joinText(message.parts)}</div>
+      </div>
+    );
+  }
+  // Assistant
+  if (message.status === "error") {
+    return (
+      <div className="palette-msg palette-msg-assistant">
+        <div className="palette-msg-bubble palette-msg-error">
+          {message.error || "Something went wrong."}
+        </div>
+      </div>
+    );
+  }
+  const sources = message.sources || [];
+  const fullText = joinText(message.parts);
+  // Render chips only for [N] markers the model actually cited across
+  // all text parts. The directory can be hundreds of entries — showing
+  // all of them would be a wall of chips.
+  const citedSources = useMemo(() => {
+    if (sources.length === 0) return [];
+    const cited = new Set<number>();
+    const re = /\[(\d{1,3})\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(fullText)) !== null) {
+      cited.add(Number(m[1]));
+    }
+    return sources.filter((s) => cited.has(s.index));
+  }, [sources, fullText]);
+
+  const isEmptyAndStreaming =
+    message.parts.length === 0 && message.status === "streaming";
+
+  return (
+    <div className="palette-msg palette-msg-assistant">
+      <div className="palette-msg-bubble">
+        {isEmptyAndStreaming ? (
+          <span className="palette-msg-typing">
+            <span></span>
+            <span></span>
+            <span></span>
+          </span>
+        ) : (
+          message.parts.map((part, i) =>
+            part.kind === "text" ? (
+              <CitedText
+                key={i}
+                text={part.value}
+                sources={sources}
+                onOpenNote={onOpenNote}
+              />
+            ) : (
+              <ToolPill
+                key={i}
+                part={part}
+                onOpen={() => {
+                  // Resolve the directory entry by [N] and open the
+                  // note. Lets the user follow the model's reasoning
+                  // trail.
+                  const src = sources.find((s) => s.index === part.targetN);
+                  if (src) onOpenNote(src.note_path);
+                }}
+              />
+            ),
+          )
+        )}
+      </div>
+      {citedSources.length > 0 && (
+        <div className="palette-sources">
+          <div className="palette-sources-label">Sources</div>
+          <div className="palette-sources-list">
+            {citedSources.map((s) => (
+              <button
+                key={s.note_path}
+                type="button"
+                className="palette-source-chip"
+                title={s.title}
+                onClick={() => onOpenNote(s.note_path)}
+              >
+                <span className="palette-source-num">{s.index}</span>
+                <span className="palette-source-title">{s.title}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ToolPill({
+  part,
+  onOpen,
+}: {
+  part: Extract<MessagePart, { kind: "tool" }>;
+  onOpen: () => void;
+}) {
+  const verb = part.name === "read_transcript" ? "Reading transcript" : "Reading";
+  const titleAttr = `${part.name}([${part.targetN}] ${part.targetTitle})`;
+  return (
+    <button
+      type="button"
+      className={`palette-tool-pill status-${part.status}`}
+      title={titleAttr}
+      onClick={onOpen}
+    >
+      <span className="palette-tool-icon" aria-hidden="true">
+        {part.status === "ok" ? (
+          <IconCheck size={11} sw={2} />
+        ) : part.status === "error" ? (
+          "✗"
+        ) : (
+          <IconSearch size={11} sw={1.7} />
+        )}
+      </span>
+      <span className="palette-tool-text">
+        {verb} <span className="palette-tool-target">[{part.targetN}]</span>
+        {part.targetTitle ? ` "${part.targetTitle}"` : ""}
+        {part.status === "running" ? "…" : ""}
+      </span>
+    </button>
+  );
+}
+
+/// Render assistant text as Markdown with `[N]` markers swapped for
+/// clickable chips that link to the corresponding source note.
+///
+/// Approach: replace each `[N]` in the source with a sentinel `<button>`
+/// element BEFORE markdown rendering, so markdown-it sees the inline
+/// HTML and passes it through untouched. The button carries the
+/// citation number in `data-cite-n`; click handling is delegated on the
+/// wrapping div so React doesn't have to mount one handler per chip.
+///
+/// Streaming partial markdown (incomplete `**bold` etc.) is fine —
+/// markdown-it just renders the partial state literally until the
+/// closing pair arrives in a later delta.
+function CitedText({
+  text,
+  sources,
+  onOpenNote,
+}: {
+  text: string;
+  sources: AskSource[];
+  onOpenNote: (path: string) => void;
+}) {
+  const sourceByIndex = useMemo(() => {
+    const m = new Map<number, AskSource>();
+    for (const s of sources) m.set(s.index, s);
+    return m;
+  }, [sources]);
+
+  const html = useMemo(() => {
+    const withCitations = text.replace(/\[(\d{1,3})\]/g, (full, n) => {
+      const num = Number(n);
+      // Hallucinated citation number — leave the marker as plain text
+      // rather than emitting a dead chip.
+      if (!sourceByIndex.has(num)) return full;
+      return `<button type="button" class="palette-cite" data-cite-n="${num}">${num}</button>`;
+    });
+    return renderMarkdown(withCitations);
+  }, [text, sourceByIndex]);
+
+  const onClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    const cite = target.closest<HTMLElement>(".palette-cite[data-cite-n]");
+    if (!cite) return;
+    const n = Number(cite.getAttribute("data-cite-n"));
+    const source = sourceByIndex.get(n);
+    if (source) onOpenNote(source.note_path);
+  };
+
+  return (
+    <div
+      className="palette-md"
+      onClick={onClick}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
   );
 }
 
@@ -226,9 +714,7 @@ function ResultRow({
           <Highlighted text={hit.snippet} />
         </span>
       </span>
-      <span className={"palette-row-tag tag-" + hit.source}>
-        {labelFor(hit.source)}
-      </span>
+      <span className={"palette-row-tag tag-" + hit.source}>{labelFor(hit.source)}</span>
     </div>
   );
 }
@@ -239,9 +725,6 @@ function labelFor(source: SearchHit["source"]): string {
   return "Transcript";
 }
 
-/// Render text containing the U+2068/U+2069 isolate marks the Rust side
-/// uses to delimit the matched span. Falls back to plain text if the
-/// marks are absent or unbalanced.
 function Highlighted({ text }: { text: string }) {
   const parts = useMemo(() => splitHighlights(text), [text]);
   return (
@@ -271,7 +754,6 @@ function splitHighlights(text: string): { text: string; match: boolean }[] {
     if (open > i) out.push({ text: text.slice(i, open), match: false });
     const close = text.indexOf(SEARCH_HIGHLIGHT_CLOSE, open + 1);
     if (close === -1) {
-      // Unbalanced — render remainder verbatim, marks included.
       out.push({ text: text.slice(open), match: false });
       break;
     }
@@ -279,4 +761,12 @@ function splitHighlights(text: string): { text: string; match: boolean }[] {
     i = close + 1;
   }
   return out;
+}
+
+function cryptoId(): string {
+  // crypto.randomUUID is available in modern browsers + Tauri webview.
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return Math.random().toString(36).slice(2);
 }
