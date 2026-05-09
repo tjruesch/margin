@@ -98,7 +98,10 @@ pub async fn run_authorization_flow(
     // Bind the loopback FIRST — we need the chosen port to build the
     // redirect_uri before opening the browser.
     let (listener, port) = bind_loopback().await?;
-    let redirect_uri = format!("http://127.0.0.1:{port}/oauth/callback");
+    // Match the redirect URI registered in the provider console
+    // (no path suffix — keeps Azure / Google registration as just
+    // `http://127.0.0.1:<port>`).
+    let redirect_uri = format!("http://127.0.0.1:{port}");
 
     let oauth_client = build_client(provider, client_id, &redirect_uri)?;
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
