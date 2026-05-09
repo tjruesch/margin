@@ -13,6 +13,7 @@ mod sharing;
 mod sysaudio;
 mod team;
 mod transcribe;
+mod voice;
 
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
@@ -29,6 +30,10 @@ use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
 
 struct AudioState {
     recording: Option<audio::Recording>,
+}
+
+struct VoiceState {
+    recording: Option<voice::VoiceRecording>,
 }
 
 /// Start recording into a Margin note bundle. The note_path must be an owned
@@ -109,6 +114,109 @@ fn stop_meeting_recording(state: State<'_, Mutex<AudioState>>) -> Result<String,
     };
     let path = r.stop()?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Voice query result reported back to the frontend after stop. The
+/// `status` discriminator drives the palette UI: "ok" populates the
+/// input with `text`, "silent" shows "Didn't catch that", "error"
+/// shows the error message and stays in voice mode.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "snake_case")]
+struct VoiceTranscript {
+    status: VoiceStatus,
+    text: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "snake_case")]
+enum VoiceStatus {
+    Ok,
+    Silent,
+    Error,
+}
+
+/// Peak amplitude floor below which we treat a recording as silence
+/// and skip the (~1-2s) Whisper inference. Tuned low because the cpal
+/// stream takes ~50-200ms to start delivering frames after `play()` —
+/// short voice queries can capture only a few hundred ms of real audio
+/// after that warm-up, so we err on the side of running Whisper rather
+/// than dropping a real attempt. Whisper's own silence handling
+/// catches the truly empty case.
+const VOICE_SILENCE_THRESHOLD: f32 = 0.01;
+
+/// Start mic capture for a one-shot voice query (#57). Errors out if a
+/// meeting recording is already running — sharing the input device
+/// across two recorders is technically possible but UX-confusing.
+#[tauri::command]
+fn start_voice_recording(
+    app: AppHandle,
+    voice_state: State<'_, Mutex<VoiceState>>,
+    audio_state: State<'_, Mutex<AudioState>>,
+) -> Result<(), String> {
+    {
+        let a = audio_state.lock().map_err(|e| e.to_string())?;
+        if a.recording.is_some() {
+            return Err("A meeting is recording — stop it first.".to_string());
+        }
+    }
+    let mut v = voice_state.lock().map_err(|e| e.to_string())?;
+    if v.recording.is_some() {
+        // Idempotent: already recording counts as success. Avoids races
+        // between the keyboard listener's autorepeat and the React
+        // state updater.
+        return Ok(());
+    }
+    let r = voice::start(app)?;
+    v.recording = Some(r);
+    Ok(())
+}
+
+/// Stop mic capture, finalize the temp WAV, run silence detection,
+/// transcribe via the existing Whisper helper if non-silent, and
+/// return the result. Always cleans up the temp WAV before returning.
+#[tauri::command]
+async fn stop_voice_recording(
+    app: AppHandle,
+    voice_state: State<'_, Mutex<VoiceState>>,
+    model: Option<String>,
+) -> Result<VoiceTranscript, String> {
+    let r = {
+        let mut v = voice_state.lock().map_err(|e| e.to_string())?;
+        v.recording.take().ok_or("not recording")?
+    };
+    let stop = r.stop()?;
+    let wav = stop.wav_path.clone();
+
+    if stop.max_amplitude < VOICE_SILENCE_THRESHOLD {
+        let _ = std::fs::remove_file(&wav);
+        return Ok(VoiceTranscript {
+            status: VoiceStatus::Silent,
+            text: String::new(),
+        });
+    }
+
+    let result = transcribe::transcribe_wav_to_transcript(
+        app,
+        wav.clone(),
+        model,
+        None,
+        None,
+    )
+    .await;
+
+    // Always clean up the temp WAV — voice queries are ephemeral.
+    let _ = std::fs::remove_file(&wav);
+
+    match result {
+        Ok(t) => Ok(VoiceTranscript {
+            status: VoiceStatus::Ok,
+            text: t.full_text.trim().to_string(),
+        }),
+        Err(e) => Ok(VoiceTranscript {
+            status: VoiceStatus::Error,
+            text: e,
+        }),
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -398,6 +506,7 @@ pub fn run() {
                 last_write: Mutex::new(None),
             });
             app.manage(Mutex::new(AudioState { recording: None }));
+            app.manage(Mutex::new(VoiceState { recording: None }));
 
             // Open the SQLite index, run migrations, and reconcile against
             // disk. Reconcile is fast on the happy path (a single
@@ -500,6 +609,8 @@ pub fn run() {
             keychain::has_anthropic_api_key,
             start_meeting_recording,
             stop_meeting_recording,
+            start_voice_recording,
+            stop_voice_recording,
             ask_notes_start,
             transcribe::transcribe,
             reconcile::reconcile_notes,

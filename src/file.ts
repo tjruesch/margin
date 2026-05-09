@@ -275,6 +275,24 @@ export async function askNotesStart(
   return invoke<void>("ask_notes_start", { turnId, query, history, model });
 }
 
+// --- Voice mode (#57) ----------------------------------------------------
+
+/** Result of a voice-query stop. `ok` carries the transcribed text;
+ *  `silent` means the recording was below the silence threshold (no
+ *  speech detected); `error` carries a user-facing message in `text`. */
+export type VoiceTranscript = {
+  status: "ok" | "silent" | "error";
+  text: string;
+};
+
+export async function startVoiceRecording(): Promise<void> {
+  return invoke<void>("start_voice_recording");
+}
+
+export async function stopVoiceRecording(model?: string): Promise<VoiceTranscript> {
+  return invoke<VoiceTranscript>("stop_voice_recording", { model });
+}
+
 export type NoteMeta = { modified_ms: number };
 
 export async function noteMeta(notePath: string): Promise<NoteMeta> {

@@ -10,7 +10,10 @@ import {
   SEARCH_HIGHLIGHT_CLOSE,
   SEARCH_HIGHLIGHT_OPEN,
   type SearchHit,
+  startVoiceRecording,
+  stopVoiceRecording,
 } from "./file";
+import { LevelMeter } from "./LevelMeter";
 import { render as renderMarkdown } from "./markdown";
 import {
   IconArrowRight,
@@ -69,6 +72,12 @@ function joinText(parts: MessagePart[]): string {
 ///
 /// Cmd+Enter from search escalates to chat (sends the current input as
 /// the first user turn). Esc closes and resets everything.
+type VoiceState =
+  | { kind: "off" }
+  | { kind: "recording" }
+  | { kind: "transcribing" }
+  | { kind: "didnt-catch"; message?: string };
+
 export function SearchPalette({ open, onClose, onOpenNote }: Props) {
   const [mode, setMode] = useState<"search" | "chat">("search");
   const [query, setQuery] = useState("");
@@ -76,6 +85,8 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
   const [loading, setLoading] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [voiceState, setVoiceState] = useState<VoiceState>({ kind: "off" });
+  const voiceModeActive = voiceState.kind !== "off";
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
@@ -94,6 +105,7 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
       setMessages([]);
       setLoading(false);
       setActiveIdx(0);
+      setVoiceState({ kind: "off" });
       return;
     }
     inputRef.current?.focus();
@@ -240,6 +252,90 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
     };
   }, [open, mode]);
 
+  // While voice is recording (from a button mousedown), watch for a
+  // window-level mouseup to end recording — the mic button itself
+  // unmounts as soon as state flips to "recording" (replaced by the
+  // VoiceComposer), so its own onMouseUp can't fire. The keyboard
+  // shortcut path emits margin:voice-stop directly so it doesn't need
+  // this listener.
+  useEffect(() => {
+    if (voiceState.kind !== "recording") return;
+    const onUp = () => void endVoice();
+    window.addEventListener("mouseup", onUp);
+    return () => window.removeEventListener("mouseup", onUp);
+    // endVoice closes over voiceState via React's state updater
+    // functions, so ESLint exhaustive-deps would flag it; safe to skip.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceState.kind]);
+
+  const beginVoice = async () => {
+    // Idempotent: already-armed presses are no-ops.
+    if (voiceState.kind === "recording" || voiceState.kind === "transcribing") {
+      return;
+    }
+    setVoiceState({ kind: "recording" });
+    try {
+      await startVoiceRecording();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setVoiceState({ kind: "didnt-catch", message });
+    }
+  };
+
+  const endVoice = async () => {
+    if (voiceState.kind !== "recording") return;
+    setVoiceState({ kind: "transcribing" });
+    try {
+      const r = await stopVoiceRecording();
+      if (r.status === "silent") {
+        setVoiceState({ kind: "didnt-catch" });
+        return;
+      }
+      if (r.status === "error") {
+        setVoiceState({ kind: "didnt-catch", message: r.text });
+        return;
+      }
+      // Append rather than replace so a user who started typing then
+      // voiced the rest gets composite input. Trim avoids double spaces
+      // when the existing query already ends with whitespace.
+      setQuery((prev) => {
+        const sep = prev.length > 0 && !prev.endsWith(" ") ? " " : "";
+        return prev + sep + r.text;
+      });
+      setVoiceState({ kind: "off" });
+      // Defer focus: the input is being re-enabled, the focus call has
+      // to land after React applies the disabled=false update.
+      setTimeout(() => inputRef.current?.focus(), 0);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setVoiceState({ kind: "didnt-catch", message });
+    }
+  };
+
+  // CustomEvent bridge for Home.tsx's space-hold listener. Must be
+  // registered on MOUNT (not gated on `open`) because Home.tsx
+  // dispatches the event synchronously inside the keydown handler that
+  // also calls setPaletteOpen — if registration were gated on open,
+  // the listener wouldn't exist yet when the event fires.
+  //
+  // Refs let the listener always invoke the latest closure of
+  // beginVoice/endVoice (which read voiceState etc. directly) without
+  // re-registering on every render.
+  const beginVoiceRef = useRef(beginVoice);
+  const endVoiceRef = useRef(endVoice);
+  beginVoiceRef.current = beginVoice;
+  endVoiceRef.current = endVoice;
+  useEffect(() => {
+    const onStart = () => void beginVoiceRef.current();
+    const onStop = () => void endVoiceRef.current();
+    window.addEventListener("margin:voice-start", onStart);
+    window.addEventListener("margin:voice-stop", onStop);
+    return () => {
+      window.removeEventListener("margin:voice-start", onStart);
+      window.removeEventListener("margin:voice-stop", onStop);
+    };
+  }, []);
+
   if (!open) return null;
 
   const isAnyStreaming = messages.some(
@@ -292,6 +388,19 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
       e.preventDefault();
+      // Esc in voice mode cancels back to the prior search/chat mode
+      // rather than closing the whole palette — gives the user a way
+      // to back out of a misfired ⇧⌘K.
+      if (voiceModeActive) {
+        if (voiceState.kind === "recording") {
+          // Best-effort: tell the backend to stop and discard the
+          // recording. We don't await — the UI returns to off
+          // immediately.
+          void stopVoiceRecording().catch(() => {});
+        }
+        setVoiceState({ kind: "off" });
+        return;
+      }
       onClose();
       return;
     }
@@ -350,42 +459,62 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
         onKeyDown={onKeyDown}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <div className="palette-input-row">
-          <span className="palette-input-icon" aria-hidden="true">
-            {mode === "chat" ? (
-              <IconSparkle size={14} sw={1.7} />
-            ) : (
-              <IconSearch size={14} sw={1.7} />
-            )}
-          </span>
-          <input
-            ref={inputRef}
-            type="text"
-            className="palette-input"
-            placeholder={placeholder}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            disabled={mode === "chat" && isAnyStreaming}
-            spellCheck={false}
-            autoCorrect="off"
-            autoCapitalize="off"
-          />
-          {mode === "chat" ? (
+        {voiceModeActive ? (
+          <VoiceComposer state={voiceState} />
+        ) : (
+          <div className="palette-input-row">
+            <span className="palette-input-icon" aria-hidden="true">
+              {mode === "chat" ? (
+                <IconSparkle size={14} sw={1.7} />
+              ) : (
+                <IconSearch size={14} sw={1.7} />
+              )}
+            </span>
+            <input
+              ref={inputRef}
+              type="text"
+              className="palette-input"
+              placeholder={placeholder}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              disabled={mode === "chat" && isAnyStreaming}
+              spellCheck={false}
+              autoCorrect="off"
+              autoCapitalize="off"
+            />
             <button
               type="button"
-              className="palette-send"
-              aria-label="Send message"
-              disabled={query.trim().length === 0 || isAnyStreaming}
-              onClick={() => submitChatTurn(query)}
+              className="palette-mic"
+              aria-label="Hold to record voice query"
+              title="Hold to record (or hold space)"
+              // Hold-to-record. mousedown/touchstart begin, the
+              // matching up/cancel events end. Pointer events would
+              // unify these but onMouseDown / onMouseUp work fine on
+              // both desktop platforms we ship to.
+              onMouseDown={(e) => {
+                e.preventDefault();
+                void beginVoice();
+              }}
             >
-              <IconArrowRight size={13} sw={1.7} />
+              <IconMic size={13} sw={1.7} />
             </button>
-          ) : (
-            <span className="palette-input-kbd">esc</span>
-          )}
-        </div>
+            {mode === "chat" ? (
+              <button
+                type="button"
+                className="palette-send"
+                aria-label="Send message"
+                disabled={query.trim().length === 0 || isAnyStreaming}
+                onClick={() => submitChatTurn(query)}
+              >
+                <IconArrowRight size={13} sw={1.7} />
+              </button>
+            ) : (
+              <span className="palette-input-kbd">esc</span>
+            )}
+          </div>
+        )}
 
-        {mode === "search" ? (
+        {voiceModeActive ? null : mode === "search" ? (
           <SearchResults
             ref={resultsRef}
             query={query}
@@ -421,6 +550,37 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function VoiceComposer({ state }: { state: VoiceState }) {
+  const status = state.kind;
+  return (
+    <div className={`palette-voice palette-voice-${status}`}>
+      {status === "recording" && (
+        <>
+          <LevelMeter eventName="voice-level" ariaLabel="Voice input level" />
+          <div className="palette-voice-status">
+            <span className="palette-voice-pulse" aria-hidden="true" />
+            Listening — release space to transcribe
+          </div>
+        </>
+      )}
+      {status === "transcribing" && (
+        <div className="palette-voice-status">
+          <span className="palette-voice-spinner" aria-hidden="true" />
+          Transcribing…
+        </div>
+      )}
+      {status === "didnt-catch" && (
+        <div className="palette-voice-didnt-catch">
+          <div>{state.message ?? "Didn't catch that."}</div>
+          <div className="palette-voice-hint">
+            Hold <kbd>space</kbd> to try again, or press <kbd>esc</kbd> to cancel.
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -119,13 +119,46 @@ async fn full_transcribe(
     glossary: Vec<String>,
     model: Option<String>,
 ) -> Result<Transcript, String> {
-    let path = PathBuf::from(audio_path);
+    let path = PathBuf::from(&audio_path);
+    let initial_prompt = build_initial_prompt(&glossary, None);
+    let transcript = transcribe_wav_to_transcript(
+        app,
+        path.clone(),
+        model,
+        initial_prompt,
+        Some("transcribe-progress"),
+    )
+    .await?;
+
+    // Sidecar JSON for re-summarization without re-transcribing.
+    let json_path = path.with_file_name(crate::notes::TRANSCRIPT_FILENAME);
+    std::fs::write(&json_path, serde_json::to_vec_pretty(&transcript).unwrap())
+        .map_err(|e| e.to_string())?;
+
+    Ok(transcript)
+}
+
+/// Run Whisper inference on a 16-bit PCM 16 kHz mono WAV (the format
+/// produced by `audio.rs` and `voice.rs`). Returns the full `Transcript`
+/// (segments, full_text, language, duration_ms). Does not write the
+/// sidecar JSON — caller decides whether to persist.
+///
+/// `progress_event`, when `Some`, names the Tauri event channel that
+/// receives 0-100 progress integers from whisper.cpp; pass `None` for
+/// silent inference (used by the voice-query path which doesn't want to
+/// pollute the meeting-transcribe progress UI).
+pub async fn transcribe_wav_to_transcript(
+    app: AppHandle,
+    audio_path: PathBuf,
+    model: Option<String>,
+    initial_prompt: Option<String>,
+    progress_event: Option<&'static str>,
+) -> Result<Transcript, String> {
     // Validate against the picker's allowlist; unknown values fall back to
     // the default rather than asking the OS to download an arbitrary URL.
     let model = resolve_model(model.as_deref());
     let model_path = ensure_model(&app, &model).await?;
     let app2 = app.clone();
-    let initial_prompt = build_initial_prompt(&glossary, None);
 
     tauri::async_runtime::spawn_blocking(move || -> Result<Transcript, String> {
         // Load Whisper model + state (Metal acceleration on Apple Silicon).
@@ -141,7 +174,7 @@ async fn full_transcribe(
         let mut state = ctx.create_state().map_err(|e| e.to_string())?;
 
         // Read 16-bit PCM 16 kHz mono WAV (per audio.rs spec).
-        let mut reader = hound::WavReader::open(&path).map_err(|e| e.to_string())?;
+        let mut reader = hound::WavReader::open(&audio_path).map_err(|e| e.to_string())?;
         let pcm_i16: Vec<i16> = reader.samples::<i16>().filter_map(|s| s.ok()).collect();
         let mut pcm_f32 = vec![0.0f32; pcm_i16.len()];
         whisper_rs::convert_integer_to_float_audio(&pcm_i16, &mut pcm_f32)
@@ -172,10 +205,12 @@ async fn full_transcribe(
             params.set_initial_prompt(p);
         }
 
-        let app3 = app2.clone();
-        params.set_progress_callback_safe(move |pct: i32| {
-            let _ = app3.emit("transcribe-progress", pct);
-        });
+        if let Some(event_name) = progress_event {
+            let app3 = app2.clone();
+            params.set_progress_callback_safe(move |pct: i32| {
+                let _ = app3.emit(event_name, pct);
+            });
+        }
 
         state.full(params, &pcm_f32).map_err(|e| e.to_string())?;
 
@@ -225,7 +260,7 @@ async fn full_transcribe(
         // stays compiled and reachable so #23 can re-enable it.
         let _ = (&mut segments, &app2);
 
-        let transcript = Transcript {
+        Ok(Transcript {
             segments,
             full_text,
             language,
@@ -233,14 +268,7 @@ async fn full_transcribe(
             num_speakers: None,
             reconciled_at: None,
             had_errors: false,
-        };
-
-        // Sidecar JSON for re-summarization without re-transcribing.
-        let json_path = path.with_file_name(crate::notes::TRANSCRIPT_FILENAME);
-        std::fs::write(&json_path, serde_json::to_vec_pretty(&transcript).unwrap())
-            .map_err(|e| e.to_string())?;
-
-        Ok(transcript)
+        })
     })
     .await
     .map_err(|e| e.to_string())?
