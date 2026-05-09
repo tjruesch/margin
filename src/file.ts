@@ -423,6 +423,67 @@ export async function openOrCreateEventNote(eventId: string): Promise<string> {
   return invoke<string>("open_or_create_event_note", { eventId });
 }
 
+// ----- Email (#69) ---------------------------------------------------------
+
+export type EmailRecipient = {
+  email: string;
+  display_name: string | null;
+  /** "to" | "cc" | "bcc" */
+  recipient_type: string;
+  team_member_id: string | null;
+};
+
+export type EmailMessage = {
+  id: string;
+  connector_id: string;
+  external_id: string;
+  thread_id: string;
+  subject: string;
+  from_email: string;
+  from_name: string | null;
+  sent_at_ms: number;
+  body_preview: string | null;
+  /** Full HTML body. Null until lazy-fetched via `getEmailBody`. */
+  body_html: string | null;
+  has_attachments: boolean;
+  is_read: boolean;
+  raw_etag: string | null;
+  modified_ms: number;
+  recipients: EmailRecipient[];
+};
+
+export type ListEmailMessagesParams = {
+  /** When set, returns the full thread (oldest-first) and ignores all
+   *  other filters. */
+  threadId?: string;
+  sentFromMs?: number;
+  sentToMs?: number;
+  connectorId?: string;
+  /** Default 100. Ignored when `threadId` is set. */
+  limit?: number;
+};
+
+/** List inbox messages most-recent-first. Pass `threadId` to fetch a
+ *  full conversation in chronological order. */
+export async function listEmailMessages(
+  params: ListEmailMessagesParams = {},
+): Promise<EmailMessage[]> {
+  return invoke<EmailMessage[]>("list_email_messages", {
+    threadId: params.threadId,
+    sentFromMs: params.sentFromMs,
+    sentToMs: params.sentToMs,
+    connectorId: params.connectorId,
+    limit: params.limit,
+  });
+}
+
+/** Lazy-fetch the full HTML body for a message. First call hits Graph
+ *  and caches the result locally; subsequent calls return the cached
+ *  body. Returns `null` if the message id is unknown. */
+export async function getEmailBody(messageId: string): Promise<string | null> {
+  return invoke<string | null>("get_email_body", { messageId });
+}
+
 export type NoteMeta = { modified_ms: number };
 
 export async function noteMeta(notePath: string): Promise<NoteMeta> {

@@ -42,10 +42,10 @@ pub const PROVIDERS: &[OAuthProvider] = &[
     },
     OAuthProvider {
         kind: "microsoft_graph",
-        display_name: "Microsoft Calendar",
+        display_name: "Microsoft",
         auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
         token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-        scopes: &["Calendars.Read", "User.Read", "offline_access"],
+        scopes: &["Calendars.Read", "Mail.Read", "User.Read", "offline_access"],
         client_id: option_env!("MARGIN_MICROSOFT_CLIENT_ID"),
     },
 ];

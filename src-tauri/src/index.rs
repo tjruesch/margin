@@ -41,7 +41,8 @@ const SCHEMA_V7: &str = include_str!("migrations/007_action_owners.sql");
 const SCHEMA_V8: &str = include_str!("migrations/008_connectors.sql");
 const SCHEMA_V9: &str = include_str!("migrations/009_calendar.sql");
 const SCHEMA_V10: &str = include_str!("migrations/010_event_note_link.sql");
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_V11: &str = include_str!("migrations/011_email.sql");
+const SCHEMA_VERSION: i64 = 11;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -123,6 +124,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 9 {
         conn.execute_batch(SCHEMA_V10)?;
         version = 10;
+    }
+    if version == 10 {
+        conn.execute_batch(SCHEMA_V11)?;
+        version = 11;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.

@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use super::calendar::{CalendarAttendee, CalendarEvent};
+use super::email::{EmailMessage, EmailRecipient};
 use super::oauth::with_valid_token;
 use super::registry::ConnectorRegistry;
 use super::{Connector, ConnectorError, ConnectorRow, SyncCtx, SyncReport};
@@ -28,6 +29,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
 const WINDOW_FORWARD_MS: i64 = 30 * 24 * 3600 * 1000;
 const PAGE_SIZE: u32 = 100;
+
+/// Mail ingestion: 200 most recent inbox messages per sync. 4 pages
+/// of 50 each — Graph caps `$top` at 1000 but smaller pages mean
+/// faster first-byte latency and tolerable memory at peak.
+const MAIL_PAGE_SIZE: u32 = 50;
+const MAIL_MAX_PAGES: usize = 4;
 
 const KIND: &str = "microsoft_graph";
 
@@ -73,14 +80,8 @@ impl Connector for MicrosoftGraphConnector {
         let window_start = now - WINDOW_BACK_MS;
         let window_end = now + WINDOW_FORWARD_MS;
 
-        // Fetch all events via /me/calendarView, paginated.
-        let raw_events = with_valid_token(ctx.app, &self.id, &self.kind, |access| async move {
-            fetch_calendar_view(&access, window_start, window_end).await
-        })
-        .await?;
-
-        // Snapshot team members for attendee resolution. Keep the
-        // lock window short — release before mapping.
+        // Snapshot team members once for both calendar and mail. Keep
+        // the lock window short — release before any network I/O.
         let team = {
             let conn = ctx
                 .conn
@@ -91,13 +92,18 @@ impl Connector for MicrosoftGraphConnector {
         let resolver = AttendeeResolver::new(&team);
         let self_email = self.self_email();
 
+        // ---- Calendar half ------------------------------------------------
+        let raw_events = with_valid_token(ctx.app, &self.id, &self.kind, |access| async move {
+            fetch_calendar_view(&access, window_start, window_end).await
+        })
+        .await?;
+
         let events: Vec<CalendarEvent> = raw_events
             .into_iter()
             .map(|raw| map_event(&self.id, raw, &resolver, self_email))
             .collect();
 
-        // Upsert in one transaction.
-        let report = {
+        let calendar_report = {
             let mut conn = ctx
                 .conn
                 .lock()
@@ -106,13 +112,88 @@ impl Connector for MicrosoftGraphConnector {
                 .map_err(|e| ConnectorError::Other(format!("upsert events: {e}")))?
         };
 
+        // ---- Mail half ----------------------------------------------------
+        // Calendar succeeded; if mail fails, log + skip rather than
+        // dropping the calendar half. This keeps the more visible
+        // "Coming up" UI healthy when, say, Mail.Read consent is
+        // outstanding but Calendars.Read still works.
+        let mail_report = match self.sync_mail(&ctx, &resolver).await {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("[microsoft_graph] mail sync failed: {e}");
+                super::email::UpsertReport::default()
+            }
+        };
+
         Ok(SyncReport {
-            added: report.added,
-            updated: report.updated,
-            removed: report.removed,
-            skipped: 0,
+            added: calendar_report.added + mail_report.added,
+            updated: calendar_report.updated + mail_report.updated,
+            removed: calendar_report.removed,
+            skipped: mail_report.skipped,
         })
     }
+}
+
+impl MicrosoftGraphConnector {
+    async fn sync_mail(
+        &self,
+        ctx: &SyncCtx<'_>,
+        resolver: &AttendeeResolver<'_>,
+    ) -> Result<super::email::UpsertReport, ConnectorError> {
+        let raw_messages =
+            with_valid_token(ctx.app, &self.id, &self.kind, |access| async move {
+                fetch_inbox_messages(&access).await
+            })
+            .await?;
+
+        let messages: Vec<EmailMessage> = raw_messages
+            .into_iter()
+            .filter_map(|raw| map_message(&self.id, raw, resolver))
+            .collect();
+
+        let report = {
+            let mut conn = ctx
+                .conn
+                .lock()
+                .map_err(|e| ConnectorError::Other(format!("conn lock: {e}")))?;
+            super::email::upsert_messages(&mut conn, &self.id, &messages)
+                .map_err(|e| ConnectorError::Other(format!("upsert messages: {e}")))?
+        };
+        Ok(report)
+    }
+}
+
+/// Lazy-fetch a single message body via Graph. Public so the
+/// `get_email_body` Tauri command can call it.
+pub async fn fetch_message_body(
+    access_token: &str,
+    external_id: &str,
+) -> Result<Option<String>, ConnectorError> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| ConnectorError::Network(format!("client init: {e}")))?;
+    // URL-encode the external id (Graph IDs contain `=`/`/`/`+`).
+    let encoded = percent_encode_path(external_id);
+    let url = format!(
+        "https://graph.microsoft.com/v1.0/me/messages/{encoded}?$select=body"
+    );
+    let resp = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| ConnectorError::Network(format!("graph GET body: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry_after = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(map_status(status, retry_after, body));
+    }
+    let parsed: RawMessageBody = resp
+        .json()
+        .await
+        .map_err(|e| ConnectorError::Other(format!("graph body parse: {e}")))?;
+    Ok(parsed.body.and_then(|b| b.content))
 }
 
 /// Plug the factory into the registry. Called once at app boot from
@@ -380,6 +461,214 @@ pub(crate) fn map_event(
     }
 }
 
+// ----- Mail: API client + JSON shape + mapping ----------------------------
+
+async fn fetch_inbox_messages(access_token: &str) -> Result<Vec<RawMessage>, ConnectorError> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| ConnectorError::Network(format!("client init: {e}")))?;
+
+    let mut url = format!(
+        "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages\
+         ?$top={MAIL_PAGE_SIZE}\
+         &$orderby=sentDateTime%20desc\
+         &$select=id,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,bodyPreview,sentDateTime,hasAttachments,isRead,lastModifiedDateTime"
+    );
+
+    let mut all: Vec<RawMessage> = Vec::new();
+    let mut pages = 0usize;
+
+    loop {
+        let resp = client
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| ConnectorError::Network(format!("graph GET inbox: {e}")))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_status(status, retry_after, body));
+        }
+
+        let page: GraphMessagePage = resp
+            .json()
+            .await
+            .map_err(|e| ConnectorError::Other(format!("graph mail parse: {e}")))?;
+        all.extend(page.value);
+
+        pages += 1;
+        if pages >= MAIL_MAX_PAGES {
+            break;
+        }
+        match page.next_link {
+            Some(next) if !next.is_empty() => url = next,
+            _ => break,
+        }
+    }
+
+    Ok(all)
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphMessagePage {
+    value: Vec<RawMessage>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawMessage {
+    pub(crate) id: String,
+    #[serde(rename = "conversationId", default)]
+    pub(crate) conversation_id: Option<String>,
+    #[serde(default)]
+    pub(crate) subject: Option<String>,
+    #[serde(default)]
+    pub(crate) from: Option<RawRecipientWrapper>,
+    #[serde(rename = "toRecipients", default)]
+    pub(crate) to_recipients: Vec<RawRecipientWrapper>,
+    #[serde(rename = "ccRecipients", default)]
+    pub(crate) cc_recipients: Vec<RawRecipientWrapper>,
+    #[serde(rename = "bccRecipients", default)]
+    pub(crate) bcc_recipients: Vec<RawRecipientWrapper>,
+    #[serde(rename = "bodyPreview", default)]
+    pub(crate) body_preview: Option<String>,
+    #[serde(rename = "sentDateTime", default)]
+    pub(crate) sent_date_time: Option<String>,
+    #[serde(rename = "hasAttachments", default)]
+    pub(crate) has_attachments: bool,
+    #[serde(rename = "isRead", default)]
+    pub(crate) is_read: bool,
+    #[serde(rename = "lastModifiedDateTime", default)]
+    pub(crate) last_modified: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawRecipientWrapper {
+    #[serde(rename = "emailAddress", default)]
+    pub(crate) email_address: Option<RawEmailAddress>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMessageBody {
+    body: Option<RawBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawBody {
+    content: Option<String>,
+}
+
+/// Map a Graph message into the provider-agnostic `EmailMessage`.
+/// Returns `None` for messages we can't represent (no `from`, no
+/// sentDateTime — system-generated noise we'd otherwise persist with
+/// blank fields and a 1970 timestamp).
+pub(crate) fn map_message(
+    connector_id: &str,
+    raw: RawMessage,
+    resolver: &AttendeeResolver<'_>,
+) -> Option<EmailMessage> {
+    let from_addr = raw
+        .from
+        .as_ref()
+        .and_then(|w| w.email_address.as_ref())
+        .and_then(|a| a.address.as_deref())
+        .filter(|s| !s.is_empty())?;
+    let from_email = from_addr.to_lowercase();
+    let from_name = raw
+        .from
+        .as_ref()
+        .and_then(|w| w.email_address.as_ref())
+        .and_then(|a| a.name.clone());
+
+    let subject = match raw.subject {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => "(no subject)".to_string(),
+    };
+
+    let sent_at_ms = raw
+        .sent_date_time
+        .as_deref()
+        .and_then(iso_to_ms)
+        .unwrap_or(0);
+    let modified_ms = raw
+        .last_modified
+        .as_deref()
+        .and_then(iso_to_ms)
+        .unwrap_or(sent_at_ms);
+
+    let thread_id = raw.conversation_id.unwrap_or_else(|| raw.id.clone());
+
+    let mut recipients: Vec<EmailRecipient> = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
+    for (kind, list) in [
+        ("to", raw.to_recipients),
+        ("cc", raw.cc_recipients),
+        ("bcc", raw.bcc_recipients),
+    ] {
+        for r in list {
+            let addr = match r.email_address {
+                Some(a) => a,
+                None => continue,
+            };
+            let email = match addr.address {
+                Some(e) if !e.is_empty() => e.to_lowercase(),
+                _ => continue,
+            };
+            if !seen.insert((email.clone(), kind.to_string())) {
+                continue;
+            }
+            recipients.push(EmailRecipient {
+                team_member_id: resolver.resolve(&email, addr.name.as_deref()),
+                email,
+                display_name: addr.name,
+                recipient_type: kind.to_string(),
+            });
+        }
+    }
+
+    Some(EmailMessage {
+        id: format!("{connector_id}::{}", raw.id),
+        connector_id: connector_id.to_string(),
+        external_id: raw.id,
+        thread_id,
+        subject,
+        from_email,
+        from_name,
+        sent_at_ms,
+        body_preview: raw.body_preview.filter(|s| !s.is_empty()),
+        body_html: None,
+        has_attachments: raw.has_attachments,
+        is_read: raw.is_read,
+        raw_etag: None,
+        modified_ms,
+        recipients,
+    })
+}
+
+/// Percent-encode characters in a Microsoft Graph message ID for use
+/// as a URL path segment. Graph IDs use URL-safe Base64-ish strings
+/// that may include `=`, `/`, and `+`, none of which are valid
+/// unescaped in a path segment.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{:02X}", b));
+            }
+        }
+    }
+    out
+}
+
 // ----- Attendee resolver -------------------------------------------------
 
 /// Resolve an attendee's `email` (and optional display name) to a
@@ -631,5 +920,142 @@ mod tests {
     fn attendee_resolver_no_match_returns_none() {
         let r = AttendeeResolver::new(&[]);
         assert!(r.resolve("nobody@nope.com", Some("Nobody")).is_none());
+    }
+
+    fn mk_recip(email: &str, name: Option<&str>) -> RawRecipientWrapper {
+        RawRecipientWrapper {
+            email_address: Some(RawEmailAddress {
+                address: Some(email.to_string()),
+                name: name.map(|s| s.to_string()),
+            }),
+        }
+    }
+
+    #[test]
+    fn map_message_basic() {
+        let raw = RawMessage {
+            id: "MSG1".into(),
+            conversation_id: Some("THREAD1".into()),
+            subject: Some("Roadmap review".into()),
+            from: Some(mk_recip("alice@Example.com", Some("Alice"))),
+            to_recipients: vec![mk_recip("tj@example.com", Some("TJ"))],
+            cc_recipients: vec![mk_recip("bob@example.com", Some("Bob"))],
+            bcc_recipients: vec![],
+            body_preview: Some("Let's align on…".into()),
+            sent_date_time: Some("2026-05-09T12:34:56Z".into()),
+            has_attachments: true,
+            is_read: false,
+            last_modified: Some("2026-05-09T12:35:00Z".into()),
+        };
+        let resolver = AttendeeResolver::new(&[]);
+        let m = map_message("microsoft_graph:tj@example.com", raw, &resolver).unwrap();
+
+        assert_eq!(m.id, "microsoft_graph:tj@example.com::MSG1");
+        assert_eq!(m.thread_id, "THREAD1");
+        assert_eq!(m.subject, "Roadmap review");
+        assert_eq!(m.from_email, "alice@example.com");
+        assert_eq!(m.from_name.as_deref(), Some("Alice"));
+        assert!(m.has_attachments);
+        assert!(!m.is_read);
+        assert_eq!(m.recipients.len(), 2);
+        assert_eq!(m.recipients[0].email, "tj@example.com");
+        assert_eq!(m.recipients[0].recipient_type, "to");
+        assert_eq!(m.recipients[1].email, "bob@example.com");
+        assert_eq!(m.recipients[1].recipient_type, "cc");
+    }
+
+    #[test]
+    fn map_message_no_recipients() {
+        let raw = RawMessage {
+            id: "MSG2".into(),
+            conversation_id: Some("THREAD2".into()),
+            subject: Some("Release notes".into()),
+            from: Some(mk_recip("notifications@github.com", None)),
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            body_preview: None,
+            sent_date_time: Some("2026-05-09T12:00:00Z".into()),
+            has_attachments: false,
+            is_read: true,
+            last_modified: None,
+        };
+        let resolver = AttendeeResolver::new(&[]);
+        let m = map_message("mg:tj", raw, &resolver).unwrap();
+        assert_eq!(m.recipients.len(), 0);
+        assert!(m.is_read);
+    }
+
+    #[test]
+    fn map_message_default_subject_when_missing() {
+        let raw = RawMessage {
+            id: "MSG3".into(),
+            conversation_id: None,
+            subject: Some("   ".into()),
+            from: Some(mk_recip("a@b.com", None)),
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            body_preview: None,
+            sent_date_time: None,
+            has_attachments: false,
+            is_read: false,
+            last_modified: None,
+        };
+        let resolver = AttendeeResolver::new(&[]);
+        let m = map_message("mg:x", raw, &resolver).unwrap();
+        assert_eq!(m.subject, "(no subject)");
+        // Falls back to message id when conversation_id missing.
+        assert_eq!(m.thread_id, "MSG3");
+    }
+
+    #[test]
+    fn map_message_returns_none_when_from_missing() {
+        let raw = RawMessage {
+            id: "MSG4".into(),
+            conversation_id: None,
+            subject: Some("???".into()),
+            from: None,
+            to_recipients: vec![],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            body_preview: None,
+            sent_date_time: None,
+            has_attachments: false,
+            is_read: false,
+            last_modified: None,
+        };
+        let resolver = AttendeeResolver::new(&[]);
+        assert!(map_message("mg:x", raw, &resolver).is_none());
+    }
+
+    #[test]
+    fn map_message_resolves_recipients_via_team() {
+        let members = [mk_member("hk1", "Heike Müller", &["heike@contoso.com"])];
+        let resolver = AttendeeResolver::new(&members);
+        let raw = RawMessage {
+            id: "MSG5".into(),
+            conversation_id: Some("THREAD5".into()),
+            subject: Some("Hi".into()),
+            from: Some(mk_recip("alice@e.com", None)),
+            to_recipients: vec![mk_recip("Heike@CONTOSO.com", Some("Heike"))],
+            cc_recipients: vec![],
+            bcc_recipients: vec![],
+            body_preview: None,
+            sent_date_time: Some("2026-05-09T12:00:00Z".into()),
+            has_attachments: false,
+            is_read: false,
+            last_modified: None,
+        };
+        let m = map_message("mg:tj", raw, &resolver).unwrap();
+        assert_eq!(m.recipients.len(), 1);
+        assert_eq!(m.recipients[0].email, "heike@contoso.com");
+        assert_eq!(m.recipients[0].team_member_id.as_deref(), Some("hk1"));
+    }
+
+    #[test]
+    fn percent_encode_path_handles_graph_id_chars() {
+        let encoded = percent_encode_path("AAMkA+/=foo");
+        assert_eq!(encoded, "AAMkA%2B%2F%3Dfoo");
     }
 }
