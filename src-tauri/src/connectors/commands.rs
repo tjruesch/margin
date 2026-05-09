@@ -192,3 +192,26 @@ fn current_unix_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+// ----- Calendar query commands (#63) -------------------------------------
+
+#[tauri::command]
+pub fn list_calendar_events(
+    start_ms: i64,
+    end_ms: i64,
+    connector_id: Option<String>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Vec<super::calendar::CalendarEvent>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    super::calendar::list_events_in_range(&c, start_ms, end_ms, connector_id.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_event_details(
+    event_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Option<super::calendar::CalendarEvent>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    super::calendar::get_event_details(&c, &event_id).map_err(|e| e.to_string())
+}
