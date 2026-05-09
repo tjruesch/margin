@@ -3808,3 +3808,342 @@ input.nh-title {
   border-radius: 2px;
   padding: 0 1px;
 }
+
+/* AI chat mode (#31 follow-up) */
+
+.palette-dialog.mode-chat {
+  max-height: min(640px, calc(100vh - 22vh));
+}
+
+.palette-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--bg);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: opacity 100ms ease;
+}
+.palette-send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.palette-send:not(:disabled):hover {
+  filter: brightness(1.05);
+}
+
+.palette-conversation {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.palette-msg {
+  display: flex;
+  flex-direction: column;
+}
+.palette-msg-user {
+  align-items: flex-end;
+}
+.palette-msg-assistant {
+  align-items: flex-start;
+}
+
+.palette-msg-bubble {
+  max-width: 90%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.45;
+  word-wrap: break-word;
+}
+
+/* Markdown rendered inside the assistant bubble. Tightens margins so
+   prose feels chat-like rather than document-like. */
+.palette-md > :first-child { margin-top: 0; }
+.palette-md > :last-child { margin-bottom: 0; }
+.palette-md p {
+  margin: 0 0 8px 0;
+}
+.palette-md p:last-child { margin-bottom: 0; }
+.palette-md strong {
+  font-weight: 600;
+}
+.palette-md em {
+  font-style: italic;
+}
+.palette-md ul,
+.palette-md ol {
+  margin: 4px 0 8px 0;
+  padding-left: 22px;
+}
+.palette-md li {
+  margin: 2px 0;
+}
+.palette-md li > p {
+  margin: 0;
+}
+.palette-md code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--home-chip);
+  color: var(--fg);
+}
+.palette-md pre {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--home-chip);
+  overflow-x: auto;
+  font-size: 11.5px;
+}
+.palette-md pre code {
+  padding: 0;
+  background: none;
+  font-size: inherit;
+}
+.palette-md h1,
+.palette-md h2,
+.palette-md h3,
+.palette-md h4 {
+  margin: 8px 0 4px 0;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.palette-md h1 { font-size: 15px; }
+.palette-md h2 { font-size: 14px; }
+.palette-md h3 { font-size: 13.5px; }
+.palette-md h4 { font-size: 13px; }
+.palette-md a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 0.5px;
+  text-underline-offset: 2px;
+}
+.palette-md blockquote {
+  margin: 6px 0;
+  padding: 0 0 0 10px;
+  border-left: 2px solid var(--home-line-strong);
+  color: var(--fg-muted);
+}
+.palette-md hr {
+  margin: 10px 0;
+  border: none;
+  border-top: 0.5px solid var(--home-line);
+}
+
+.palette-msg-user .palette-msg-bubble {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--fg);
+  border: 0.5px solid color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.palette-msg-assistant .palette-msg-bubble {
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--fg);
+  border: 0.5px solid var(--home-line);
+}
+
+.palette-msg-error {
+  background: color-mix(in srgb, #c44a1f 12%, transparent) !important;
+  border-color: color-mix(in srgb, #c44a1f 30%, transparent) !important;
+  color: #c44a1f;
+}
+
+.palette-msg-typing {
+  display: inline-flex;
+  gap: 4px;
+  padding: 2px 0;
+}
+.palette-msg-typing span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--fg-muted);
+  animation: palette-typing 1s infinite ease-in-out;
+}
+.palette-msg-typing span:nth-child(2) {
+  animation-delay: 0.16s;
+}
+.palette-msg-typing span:nth-child(3) {
+  animation-delay: 0.32s;
+}
+@keyframes palette-typing {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
+}
+
+.palette-cite {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 16px;
+  padding: 0 4px;
+  margin: 0 2px;
+  border: 0.5px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  line-height: 1;
+  cursor: pointer;
+  vertical-align: baseline;
+  transition: background 80ms ease;
+}
+.palette-cite:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.palette-sources {
+  margin-top: 8px;
+  width: 100%;
+}
+.palette-sources-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  margin-bottom: 6px;
+}
+.palette-sources-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.palette-source-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 4px 8px 4px 4px;
+  border: 0.5px solid var(--home-line);
+  border-radius: 14px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: background 80ms ease, border-color 80ms ease;
+}
+.palette-source-chip:hover {
+  background: var(--home-card-hover);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+.palette-source-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 10.5px;
+  flex-shrink: 0;
+}
+.palette-source-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.palette-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 6px 14px;
+  border-top: 0.5px solid var(--home-line);
+  font-size: 10.5px;
+  color: var(--fg-muted);
+}
+.palette-footer kbd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--home-chip);
+  color: var(--fg-muted);
+}
+
+/* Tool-use pills inline in assistant message bubble. The model
+   emits these mid-stream when invoking read_note / read_transcript;
+   each pill is clickable to jump to the underlying note. */
+.palette-tool-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 4px 0;
+  padding: 3px 8px 3px 6px;
+  border: 0.5px solid var(--home-line);
+  border-radius: 12px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  font-style: italic;
+  font-family: inherit;
+  cursor: pointer;
+  vertical-align: baseline;
+  transition: background 80ms ease, border-color 80ms ease;
+}
+.palette-tool-pill:hover {
+  background: var(--home-card-hover);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.palette-tool-pill.status-running {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.palette-tool-pill.status-running .palette-tool-icon {
+  animation: palette-tool-spin 1.4s linear infinite;
+}
+.palette-tool-pill.status-ok {
+  color: var(--fg-muted);
+}
+.palette-tool-pill.status-ok .palette-tool-icon {
+  color: #1a8a3a;
+}
+.palette-tool-pill.status-error {
+  color: #c44a1f;
+  border-color: color-mix(in srgb, #c44a1f 24%, transparent);
+  background: color-mix(in srgb, #c44a1f 6%, transparent);
+}
+
+.palette-tool-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.palette-tool-target {
+  font-style: normal;
+  font-weight: 600;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+@keyframes palette-tool-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
