@@ -1,6 +1,7 @@
 mod ask;
 mod audio;
 mod chunker;
+mod connectors;
 mod dates;
 mod diarize;
 mod index;
@@ -519,6 +520,20 @@ pub fn run() {
             if let Err(e) = team::bootstrap_self_if_missing(&mut conn) {
                 eprintln!("team bootstrap failed at boot: {e}");
             }
+
+            // Connector registry: holds kind-factory mappings + live
+            // connector instances. Real factories register themselves
+            // in their own module's setup hook in future PRs (#61, #63).
+            // For #59 the registry boots empty — `rebuild_instances`
+            // is still called so any previously-persisted rows are
+            // observed (and skipped with a warning if their kind has
+            // no factory yet).
+            let registry = std::sync::Arc::new(connectors::ConnectorRegistry::new());
+            if let Err(e) = registry.rebuild_instances(app.handle(), &conn) {
+                eprintln!("connector registry rebuild failed at boot: {e}");
+            }
+            app.manage(registry);
+
             app.manage(Mutex::new(conn));
 
             // Recursive watcher over `~/.margin/notes/`. Keeps the index
@@ -594,6 +609,11 @@ pub fn run() {
             // task lives until the app exits.
             reminders::start(app.handle().clone());
 
+            // Connector sync runner (#59): ticks every 15s, syncs any
+            // due connectors, emits `connector-status` events per pass.
+            // Idle until a real connector is configured (#60+).
+            connectors::runner::start(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -640,7 +660,11 @@ pub fn run() {
             team::update_team_member,
             team::delete_team_member,
             team::set_meeting_attendees,
-            team::get_meeting_attendees
+            team::get_meeting_attendees,
+            connectors::commands::list_connectors,
+            connectors::commands::list_oauth_providers,
+            connectors::commands::start_oauth_connector,
+            connectors::commands::delete_connector
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
