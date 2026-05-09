@@ -1,14 +1,19 @@
 import { useEffect, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  type ConnectorInfo,
+  type ConnectorStatusEvent,
   deleteAnthropicApiKey,
   hasAnthropicApiKey,
+  listConnectors,
   setAnthropicApiKey,
 } from "./file";
 import {
   IconChevLeft,
   IconEdit,
   IconHome,
+  IconLink,
   IconSettings,
   IconSparkle,
 } from "./icons";
@@ -22,7 +27,7 @@ import type {
 import { loadGlossary } from "./settingsStore";
 import { THEMES, darkThemes, getTheme, lightThemes, type Theme } from "./themes";
 
-type Section = "appearance" | "ai" | "editor" | "shortcuts";
+type Section = "appearance" | "ai" | "connectors" | "editor" | "shortcuts";
 
 export type EditorPrefs = {
   tabSize: number;
@@ -50,6 +55,7 @@ const SECTIONS: {
 }[] = [
   { id: "appearance", label: "Appearance", icon: <IconSettings size={14} sw={1.7} /> },
   { id: "ai", label: "AI", icon: <IconSparkle size={14} sw={1.7} /> },
+  { id: "connectors", label: "Connectors", icon: <IconLink size={14} sw={1.7} /> },
   { id: "editor", label: "Editor", icon: <IconEdit size={14} sw={1.7} /> },
   { id: "shortcuts", label: "Shortcuts", icon: <IconHome size={14} sw={1.7} /> },
 ];
@@ -57,6 +63,7 @@ const SECTIONS: {
 const SECTION_TITLE: Record<Section, string> = {
   appearance: "Appearance",
   ai: "AI",
+  connectors: "Connectors",
   editor: "Editor",
   shortcuts: "Shortcuts",
 };
@@ -240,6 +247,8 @@ export function Settings({
           </section>
         )}
 
+        {active === "connectors" && <ConnectorsSection />}
+
         {active === "shortcuts" && (
           <section className="settings-section">
             <h2>Shortcuts</h2>
@@ -248,6 +257,100 @@ export function Settings({
         )}
         </div>
       </main>
+    </div>
+  );
+}
+
+/// Settings → Connectors. v1 ships the listing surface only — the
+/// add/remove flow lands with #60 (OAuth). The backend `SyncRunner`
+/// emits `connector-status` whenever any registered connector syncs;
+/// we refetch on each event so the per-row status (last sync time,
+/// errors) stays live without polling.
+function ConnectorsSection() {
+  const [connectors, setConnectors] = useState<ConnectorInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = async () => {
+    try {
+      const list = await listConnectors();
+      setConnectors(list);
+    } catch (e) {
+      console.error("[settings] listConnectors failed:", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+    let unlisten: UnlistenFn | null = null;
+    let cancelled = false;
+    (async () => {
+      const fn = await listen<ConnectorStatusEvent>("connector-status", () => {
+        void refresh();
+      });
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  return (
+    <section className="settings-section">
+      <h2>Connectors</h2>
+      <p className="settings-section-intro">
+        Pull signals from external systems — calendar, email, chat — into your
+        notes context. Adding connectors arrives in the next release.
+      </p>
+      {loading ? (
+        <p className="settings-placeholder">Loading…</p>
+      ) : connectors.length === 0 ? (
+        <div className="settings-empty">
+          <div className="settings-empty-title">No connectors configured</div>
+          <div className="settings-empty-body">
+            Calendar (Google &amp; Microsoft) lands in the next release. Future
+            connectors plug into the same surface.
+          </div>
+        </div>
+      ) : (
+        <div className="connector-list">
+          {connectors.map((c) => (
+            <ConnectorRow key={c.id} info={c} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ConnectorRow({ info }: { info: ConnectorInfo }) {
+  const status = info.last_error
+    ? "error"
+    : info.last_success_ms
+    ? "ok"
+    : "pending";
+  const lastLabel = info.last_sync_ms
+    ? new Date(info.last_sync_ms).toLocaleString()
+    : "never";
+  return (
+    <div className={`connector-row connector-row-${status}`}>
+      <div className="connector-row-body">
+        <div className="connector-row-title">{info.display_name}</div>
+        <div className="connector-row-sub">
+          <span className="connector-row-kind">{info.kind}</span>
+          <span className="connector-row-sep">·</span>
+          <span className="connector-row-last">last sync: {lastLabel}</span>
+        </div>
+        {info.last_error && (
+          <div className="connector-row-error">{info.last_error}</div>
+        )}
+      </div>
     </div>
   );
 }

@@ -293,6 +293,34 @@ export async function stopVoiceRecording(model?: string): Promise<VoiceTranscrip
   return invoke<VoiceTranscript>("stop_voice_recording", { model });
 }
 
+// --- Connectors (#59) ----------------------------------------------------
+
+/** One connector + its current sync state. Returned by `list_connectors`,
+ *  joined from the `connectors` and `sync_status` tables. */
+export type ConnectorInfo = {
+  id: string;
+  kind: string;
+  display_name: string;
+  enabled: boolean;
+  last_sync_ms: number | null;
+  last_success_ms: number | null;
+  last_error: string | null;
+  next_due_ms: number;
+};
+
+export async function listConnectors(): Promise<ConnectorInfo[]> {
+  return invoke<ConnectorInfo[]>("list_connectors");
+}
+
+/** Pushed by the Rust side on the `connector-status` Tauri event channel
+ *  whenever a connector starts/finishes/errors a sync. Consumers refetch
+ *  via `listConnectors()` on each event to pick up the new state. */
+export type ConnectorStatusEvent = {
+  connector_id: string;
+  state: "syncing" | "synced" | "errored" | "skipped";
+  message?: string;
+};
+
 export type NoteMeta = { modified_ms: number };
 
 export async function noteMeta(notePath: string): Promise<NoteMeta> {

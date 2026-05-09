@@ -2370,6 +2370,7 @@ dependencies = [
 name = "margin"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "cpal",
  "crossbeam-channel",

@@ -46,6 +46,7 @@ window-vibrancy = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
 whoami = "1"
 unicode-normalization = "0.1"
+async-trait = "0.1"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSResponder",
