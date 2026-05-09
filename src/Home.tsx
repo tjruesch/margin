@@ -1,8 +1,17 @@
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AssigneeChip, stripLeadingOwnerPrefix } from "./AssigneeChip";
 import { dueBucket, friendlyDueLabel } from "./dueLabel";
-import { type ActionListItem, type NoteListItem, type TeamMember } from "./file";
+import {
+  type ActionListItem,
+  type CalendarEvent,
+  type ConnectorStatusEvent,
+  listCalendarEvents,
+  type NoteListItem,
+  openOrCreateEventNote,
+  type TeamMember,
+} from "./file";
 import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
 import { type NotificationRecord, unreadCount } from "./notifications";
@@ -101,10 +110,158 @@ function DueChip({ dueMs }: { dueMs: number | null }) {
   );
 }
 
-// Stub data for sections whose backends don't exist yet (#27 calendar).
-// Returns empty so the section hides gracefully; swap in live data when
-// the backend lands.
-const UPCOMING_EVENTS: UpcomingEvent[] = [];
+/// Live calendar data hook (#62). Returns mapped `UpcomingEvent`s for
+/// the next 24 hours plus a 30-minute look-back window so an
+/// in-progress meeting still appears with a "Now" indicator. Refetches
+/// on every `connector-status` Tauri event so a freshly-synced
+/// connector lights up immediately. Ticks once per minute so relative
+/// labels ("in 12 min" → "in 11 min") update without manual refresh.
+function useUpcomingEvents(): {
+  upcoming: UpcomingEvent[];
+  raw: CalendarEvent[];
+  nowMs: number;
+} {
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [tickMs, setTickMs] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const now = Date.now();
+      try {
+        const list = await listCalendarEvents(
+          now - 30 * 60_000,
+          now + 24 * 3600_000,
+        );
+        if (!cancelled) setEvents(list);
+      } catch (e) {
+        if (!cancelled) console.error("[home] listCalendarEvents failed:", e);
+      }
+    };
+    void load();
+    let unlisten: UnlistenFn | null = null;
+    (async () => {
+      const fn = await listen<ConnectorStatusEvent>("connector-status", () => {
+        void load();
+      });
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    const id = window.setInterval(() => setTickMs(Date.now()), 60_000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const upcoming = useMemo(
+    () =>
+      events
+        .filter(
+          (e) =>
+            // Defensive against any event whose start_ms didn't parse —
+            // would render with a misleading "Now" label.
+            e.start_ms > tickMs - 24 * 3600_000 && e.status !== "cancelled",
+        )
+        .map((e) => mapToUpcoming(e, tickMs)),
+    [events, tickMs],
+  );
+
+  return { upcoming, raw: events, nowMs: tickMs };
+}
+
+function mapToUpcoming(e: CalendarEvent, nowMs: number): UpcomingEvent {
+  const live = e.start_ms <= nowMs && nowMs < e.end_ms;
+  return {
+    id: e.id,
+    when: live ? "now" : formatRelative(e.start_ms, nowMs),
+    tStart: formatHm(e.start_ms),
+    tEnd: formatHm(e.end_ms),
+    title: e.title,
+    attendees: e.attendees
+      .filter((a) => !a.is_self)
+      .slice(0, 8)
+      .map((a) => initialsOf(a.display_name ?? a.email)),
+    tags: [],
+    color: connectorColor(e.connector_id),
+    live,
+  };
+}
+
+function formatHm(ms: number): string {
+  return new Intl.DateTimeFormat([], {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(ms));
+}
+
+function formatRelative(startMs: number, nowMs: number): string {
+  const delta = startMs - nowMs;
+  if (delta < 60_000) return "now";
+  const min = Math.floor(delta / 60_000);
+  if (min < 60) return `in ${min} min`;
+
+  const startDay = startOfDay(startMs);
+  const todayDay = startOfDay(nowMs);
+  if (startDay === todayDay) {
+    const h = Math.floor(min / 60);
+    const m = min % 60;
+    return m > 0 ? `in ${h}h ${m}m` : `in ${h}h`;
+  }
+  if (startDay === todayDay + 24 * 3600_000) {
+    return `tomorrow at ${formatHm(startMs)}`;
+  }
+  const weekday = new Intl.DateTimeFormat([], { weekday: "short" }).format(
+    new Date(startMs),
+  );
+  return `${weekday} at ${formatHm(startMs)}`;
+}
+
+function startOfDay(ms: number): number {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+/// Two-character initials extracted from a display name or email. For
+/// emails we use the local part. AttendeeStack already calls
+/// `avatarColor()` per initials string so different attendees get
+/// different chip colors.
+function initialsOf(s: string): string {
+  const trimmed = s.trim();
+  if (trimmed.length === 0) return "?";
+  // Email: take the first letter of the local part.
+  if (trimmed.includes("@")) {
+    const local = trimmed.split("@")[0];
+    return (local.slice(0, 2) || "?").toUpperCase();
+  }
+  // Name: first letter of first two whitespace-separated tokens.
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
+/// Map connector_id to a stable accent color. Provider-aware lookup —
+/// Microsoft = MS blue, Google = Google blue, others = neutral. v1
+/// keeps this static; per-account variation can be a v2 nicety.
+function connectorColor(connectorId: string): string {
+  const kind = connectorId.split(":")[0];
+  switch (kind) {
+    case "microsoft_graph":
+      return "#0078d4";
+    case "google_calendar":
+      return "#1a73e8";
+    default:
+      return "#888";
+  }
+}
 
 export function Home({
   notes,
@@ -266,6 +423,39 @@ export function Home({
 
   const openActionCount = actions.filter((a) => !a.done).length;
 
+  const { upcoming, raw: rawEvents, nowMs: eventsNowMs } = useUpcomingEvents();
+
+  // Today-bound count for the greeting subline. Counts events whose
+  // start falls between today's midnight and tomorrow's, ignoring
+  // cancelled events.
+  const todayCount = useMemo(() => {
+    const dayStart = startOfDay(eventsNowMs);
+    const dayEnd = dayStart + 24 * 3600_000;
+    return rawEvents.filter(
+      (e) =>
+        e.status !== "cancelled" &&
+        e.start_ms >= dayStart &&
+        e.start_ms < dayEnd,
+    ).length;
+  }, [rawEvents, eventsNowMs]);
+
+  // The next future event drives the greeting accent ("1 starts in
+  // Xm"). Skip in-progress events here — those already get a Now
+  // pulse on their card.
+  const nextEvent = useMemo(
+    () => upcoming.find((e) => !e.live) ?? null,
+    [upcoming],
+  );
+
+  const openEventNote = async (eventId: string) => {
+    try {
+      const path = await openOrCreateEventNote(eventId);
+      onOpen(path);
+    } catch (e) {
+      console.error("[home] openOrCreateEventNote failed:", e);
+    }
+  };
+
   return (
     <div className={"home" + (sidebarOpen ? "" : " home-collapsed")}>
       <SearchPalette
@@ -281,7 +471,7 @@ export function Home({
           active={nav}
           onSelect={setNav}
           actionCount={openActionCount}
-          meetingCount={UPCOMING_EVENTS.length}
+          meetingCount={upcoming.length}
           tags={allTags}
           activeTag={tagFilter}
           onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
@@ -329,13 +519,13 @@ export function Home({
         </div>
 
         <Greeting
-          upcomingCount={UPCOMING_EVENTS.length}
-          nextEvent={UPCOMING_EVENTS[0] ?? null}
+          upcomingCount={todayCount}
+          nextEvent={nextEvent}
           onNewNote={onNewNote}
           onNewMeeting={onNewMeeting}
         />
 
-        {UPCOMING_EVENTS.length > 0 && <UpcomingStrip events={UPCOMING_EVENTS} />}
+        {upcoming.length > 0 && <UpcomingStrip events={upcoming} onOpen={openEventNote} />}
 
         {nav === "team" ? (
           <TeamView
@@ -616,13 +806,24 @@ type UpcomingEvent = {
   live?: boolean;
 };
 
-function UpcomingStrip({ events }: { events: UpcomingEvent[] }) {
+function UpcomingStrip({
+  events,
+  onOpen,
+}: {
+  events: UpcomingEvent[];
+  onOpen: (eventId: string) => void;
+}) {
   return (
     <section className="home-section">
-      <SectionTitle eyebrow="Upcoming" title="Coming up" actionLabel="View calendar" actionIssue={27} />
+      <SectionTitle eyebrow="Upcoming" title="Coming up" />
       <div className="home-upcoming">
         {events.map((ev) => (
-          <button key={ev.id} type="button" className="home-upcoming-card">
+          <button
+            key={ev.id}
+            type="button"
+            className="home-upcoming-card"
+            onClick={() => onOpen(ev.id)}
+          >
             <span className="home-upcoming-strip" style={{ background: ev.color }} />
             <div className="home-upcoming-row">
               <span className={"home-upcoming-when" + (ev.live ? " live" : "")}>

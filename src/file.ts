@@ -371,6 +371,10 @@ export type CalendarEvent = {
   status: string | null;
   raw_etag: string | null;
   modified_ms: number;
+  /** Path to the note bundle the user linked to this event (set on
+   *  first click of the event card). Null until linked. Survives
+   *  re-syncs of the same event. */
+  linked_note_path: string | null;
   attendees: CalendarAttendee[];
 };
 
@@ -392,6 +396,16 @@ export async function listCalendarEvents(
 
 export async function getEventDetails(eventId: string): Promise<CalendarEvent | null> {
   return invoke<CalendarEvent | null>("get_event_details", { eventId });
+}
+
+/** Returns a path to the note bundle for this calendar event. If the
+ *  event was already linked, returns the existing path. Otherwise
+ *  creates a fresh bundle with calendar metadata in the frontmatter,
+ *  records meeting attendees in the team module, and persists the
+ *  link on the event row. Used by the "Coming up" strip click
+ *  handler (#62). */
+export async function openOrCreateEventNote(eventId: string): Promise<string> {
+  return invoke<string>("open_or_create_event_note", { eventId });
 }
 
 export type NoteMeta = { modified_ms: number };
