@@ -25,7 +25,9 @@ use std::time::Duration;
 use rusqlite::Connection;
 use serde::Serialize;
 
+pub mod calendar;
 pub mod commands;
+pub mod microsoft_graph;
 pub mod oauth;
 pub mod providers;
 pub mod registry;

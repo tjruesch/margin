@@ -522,13 +522,14 @@ pub fn run() {
             }
 
             // Connector registry: holds kind-factory mappings + live
-            // connector instances. Real factories register themselves
-            // in their own module's setup hook in future PRs (#61, #63).
-            // For #59 the registry boots empty — `rebuild_instances`
-            // is still called so any previously-persisted rows are
-            // observed (and skipped with a warning if their kind has
-            // no factory yet).
+            // connector instances. Real connector modules register
+            // their factories at boot (Microsoft Graph in #63;
+            // Google Calendar in a future #61). `rebuild_instances`
+            // then hydrates `Arc<dyn Connector>` instances from the
+            // persisted `connectors` table — kinds without registered
+            // factories are skipped with a warning.
             let registry = std::sync::Arc::new(connectors::ConnectorRegistry::new());
+            connectors::microsoft_graph::register(&registry);
             if let Err(e) = registry.rebuild_instances(app.handle(), &conn) {
                 eprintln!("connector registry rebuild failed at boot: {e}");
             }
@@ -664,7 +665,9 @@ pub fn run() {
             connectors::commands::list_connectors,
             connectors::commands::list_oauth_providers,
             connectors::commands::start_oauth_connector,
-            connectors::commands::delete_connector
+            connectors::commands::delete_connector,
+            connectors::commands::list_calendar_events,
+            connectors::commands::get_event_details
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

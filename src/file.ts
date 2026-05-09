@@ -346,6 +346,54 @@ export async function deleteConnector(connectorId: string): Promise<void> {
   return invoke<void>("delete_connector", { connectorId });
 }
 
+// --- Calendar events (#63) -----------------------------------------------
+
+export type CalendarAttendee = {
+  email: string;
+  display_name: string | null;
+  response_status: string | null;
+  is_self: boolean;
+  is_organizer: boolean;
+  team_member_id: string | null;
+};
+
+export type CalendarEvent = {
+  id: string;
+  connector_id: string;
+  external_id: string;
+  title: string;
+  start_ms: number;
+  end_ms: number;
+  all_day: boolean;
+  location: string | null;
+  description: string | null;
+  source_calendar: string | null;
+  status: string | null;
+  raw_etag: string | null;
+  modified_ms: number;
+  attendees: CalendarAttendee[];
+};
+
+/** Read calendar events whose start time falls in [startMs, endMs].
+ *  Optional `connectorId` to scope to a single source. The backend
+ *  joins attendees in a single query; results are ordered by start
+ *  time ascending. */
+export async function listCalendarEvents(
+  startMs: number,
+  endMs: number,
+  connectorId?: string,
+): Promise<CalendarEvent[]> {
+  return invoke<CalendarEvent[]>("list_calendar_events", {
+    startMs,
+    endMs,
+    connectorId,
+  });
+}
+
+export async function getEventDetails(eventId: string): Promise<CalendarEvent | null> {
+  return invoke<CalendarEvent | null>("get_event_details", { eventId });
+}
+
 export type NoteMeta = { modified_ms: number };
 
 export async function noteMeta(notePath: string): Promise<NoteMeta> {
