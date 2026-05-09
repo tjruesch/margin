@@ -136,19 +136,70 @@ export function Home({
   const [paletteOpen, setPaletteOpen] = useState(false);
   const unreadBadge = useMemo(() => unreadCount(notifications), [notifications]);
 
-  // Global ⌘K / Ctrl+K to open the search palette. Capture phase so the
-  // editor's Cmd+K (link insert, etc.) doesn't swallow it first.
+  // Global keyboard shortcuts for the search palette:
+  //   ⌘K          — open palette in lexical search mode
+  //   Space hold  — open palette in voice mode; release to transcribe.
+  //                 Only fires when no editable element is focused, so
+  //                 typing in inputs / note editor still gets a space.
+  // Capture phase so the editor's Cmd+K (link insert, etc.) doesn't
+  // swallow it first.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
+    let voiceArmed = false;
+
+    // True when the active element is something the user is likely
+    // typing into. Skips the space-hold trigger so normal typing isn't
+    // hijacked. CodeMirror's content area is contenteditable=true so
+    // it gets caught by the isContentEditable check.
+    const isEditable = (el: Element | null) => {
+      if (!el) return false;
+      const tag = el.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+      return (el as HTMLElement).isContentEditable === true;
+    };
+
+    const onDown = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
+      // ⌘K — existing palette open in search mode.
       if (mod && (e.key === "k" || e.key === "K")) {
         e.preventDefault();
         e.stopPropagation();
         setPaletteOpen(true);
+        return;
+      }
+      // Space hold — voice mode. Skip if any modifier is held (so
+      // ⌘+Space, ⌃+Space etc. continue to work for OS shortcuts) or
+      // if the user is currently typing.
+      if (
+        e.code === "Space" &&
+        !e.metaKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.shiftKey
+      ) {
+        if (isEditable(document.activeElement)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (voiceArmed || e.repeat) return; // ignore autorepeat
+        voiceArmed = true;
+        setPaletteOpen(true);
+        window.dispatchEvent(new CustomEvent("margin:voice-start"));
       }
     };
-    window.addEventListener("keydown", onKey, { capture: true });
-    return () => window.removeEventListener("keydown", onKey, { capture: true } as EventListenerOptions);
+
+    const onUp = (e: KeyboardEvent) => {
+      if (!voiceArmed) return;
+      if (e.code === "Space") {
+        voiceArmed = false;
+        window.dispatchEvent(new CustomEvent("margin:voice-stop"));
+      }
+    };
+
+    window.addEventListener("keydown", onDown, { capture: true });
+    window.addEventListener("keyup", onUp, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", onDown, { capture: true } as EventListenerOptions);
+      window.removeEventListener("keyup", onUp, { capture: true } as EventListenerOptions);
+    };
   }, []);
 
   // Map sidebar nav → backend scope. Only home, archive, and favorites

@@ -235,7 +235,10 @@ fn run_mic_thread(
     Ok(())
 }
 
-fn build_stream(
+/// Reusable across `audio.rs` (meeting capture) and `voice.rs` (voice
+/// query capture). Exposed at crate scope so a sibling module doesn't
+/// have to duplicate the four sample-format match arms.
+pub(crate) fn build_stream(
     device: &cpal::Device,
     cfg: &cpal::StreamConfig,
     fmt: cpal::SampleFormat,
@@ -291,7 +294,7 @@ fn build_stream(
     }
 }
 
-fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
+pub(crate) fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
     if channels == 1 {
         interleaved.to_vec()
     } else {
@@ -303,14 +306,14 @@ fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
 }
 
 /// Buffers mono samples at the source rate and emits 16 kHz mono chunks.
-struct MonoResampler {
+pub(crate) struct MonoResampler {
     resampler: Option<FastFixedIn<f32>>,
     chunk: usize,
     leftover: Vec<f32>,
 }
 
 impl MonoResampler {
-    fn new(src_rate: u32, _channels: usize) -> Result<Self, String> {
+    pub(crate) fn new(src_rate: u32, _channels: usize) -> Result<Self, String> {
         let resampler = if src_rate == TARGET_SAMPLE_RATE {
             None
         } else {
@@ -332,7 +335,7 @@ impl MonoResampler {
         })
     }
 
-    fn process(&mut self, mono: Vec<f32>) -> Result<Vec<Vec<f32>>, String> {
+    pub(crate) fn process(&mut self, mono: Vec<f32>) -> Result<Vec<Vec<f32>>, String> {
         self.leftover.extend_from_slice(&mono);
         let mut out_chunks = Vec::new();
         while self.leftover.len() >= self.chunk {
