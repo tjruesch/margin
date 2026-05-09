@@ -661,7 +661,10 @@ pub fn run() {
             team::delete_team_member,
             team::set_meeting_attendees,
             team::get_meeting_attendees,
-            connectors::commands::list_connectors
+            connectors::commands::list_connectors,
+            connectors::commands::list_oauth_providers,
+            connectors::commands::start_oauth_connector,
+            connectors::commands::delete_connector
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -26,6 +26,8 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 pub mod commands;
+pub mod oauth;
+pub mod providers;
 pub mod registry;
 pub mod runner;
 

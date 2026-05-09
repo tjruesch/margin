@@ -313,13 +313,38 @@ export async function listConnectors(): Promise<ConnectorInfo[]> {
 }
 
 /** Pushed by the Rust side on the `connector-status` Tauri event channel
- *  whenever a connector starts/finishes/errors a sync. Consumers refetch
- *  via `listConnectors()` on each event to pick up the new state. */
+ *  whenever a connector starts/finishes/errors a sync, or is added /
+ *  removed. Consumers refetch via `listConnectors()` on each event to
+ *  pick up the new state. */
 export type ConnectorStatusEvent = {
   connector_id: string;
-  state: "syncing" | "synced" | "errored" | "skipped";
+  state: "syncing" | "synced" | "errored" | "skipped" | "added" | "removed";
   message?: string;
 };
+
+/** A configured OAuth provider that the user can pick from in the
+ *  "Add connector" modal. Only providers whose client ID is set at
+ *  build time appear in this list. */
+export type OAuthProviderInfo = {
+  kind: string;
+  display_name: string;
+};
+
+export async function listOAuthProviders(): Promise<OAuthProviderInfo[]> {
+  return invoke<OAuthProviderInfo[]>("list_oauth_providers");
+}
+
+/** Run the OAuth flow for `kind`. Opens the system browser; returns
+ *  the new (or updated) connector id when the user completes the
+ *  grant. Rejects with the provider/connector error message if the
+ *  user denies, the flow times out, or the network fails. */
+export async function startOAuthConnector(kind: string): Promise<string> {
+  return invoke<string>("start_oauth_connector", { kind });
+}
+
+export async function deleteConnector(connectorId: string): Promise<void> {
+  return invoke<void>("delete_connector", { connectorId });
+}
 
 export type NoteMeta = { modified_ms: number };
 

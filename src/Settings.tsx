@@ -5,9 +5,13 @@ import {
   type ConnectorInfo,
   type ConnectorStatusEvent,
   deleteAnthropicApiKey,
+  deleteConnector,
   hasAnthropicApiKey,
   listConnectors,
+  listOAuthProviders,
+  type OAuthProviderInfo,
   setAnthropicApiKey,
+  startOAuthConnector,
 } from "./file";
 import {
   IconChevLeft,
@@ -261,19 +265,21 @@ export function Settings({
   );
 }
 
-/// Settings → Connectors. v1 ships the listing surface only — the
-/// add/remove flow lands with #60 (OAuth). The backend `SyncRunner`
-/// emits `connector-status` whenever any registered connector syncs;
-/// we refetch on each event so the per-row status (last sync time,
-/// errors) stays live without polling.
+/// Settings → Connectors. The backend `SyncRunner` emits
+/// `connector-status` whenever any registered connector syncs (or is
+/// added / removed via OAuth flow); we refetch on each event so the
+/// per-row status stays live without polling.
 function ConnectorsSection() {
   const [connectors, setConnectors] = useState<ConnectorInfo[]>([]);
+  const [providers, setProviders] = useState<OAuthProviderInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   const refresh = async () => {
     try {
-      const list = await listConnectors();
+      const [list, provs] = await Promise.all([listConnectors(), listOAuthProviders()]);
       setConnectors(list);
+      setProviders(provs);
     } catch (e) {
       console.error("[settings] listConnectors failed:", e);
     } finally {
@@ -301,12 +307,51 @@ function ConnectorsSection() {
     };
   }, []);
 
+  const onRemove = async (connectorId: string, displayName: string) => {
+    const confirmed = await ask(
+      `Remove ${displayName}? Margin's local copy of its data will be cleared. The connection in your account stays granted until you revoke it on the provider's side.`,
+      { title: "Remove connector", kind: "warning" },
+    );
+    if (!confirmed) return;
+    try {
+      await deleteConnector(connectorId);
+    } catch (e) {
+      console.error("[settings] deleteConnector failed:", e);
+    }
+  };
+
+  const onReconnect = async (kind: string) => {
+    try {
+      await startOAuthConnector(kind);
+    } catch (e) {
+      console.error("[settings] reconnect failed:", e);
+    }
+  };
+
+  const noProviders = providers.length === 0;
+
   return (
     <section className="settings-section">
-      <h2>Connectors</h2>
+      <div className="settings-section-header">
+        <h2>Connectors</h2>
+        <button
+          type="button"
+          className="settings-add-btn"
+          onClick={() => setPickerOpen(true)}
+          disabled={noProviders}
+          title={
+            noProviders
+              ? "No OAuth client IDs configured at build time"
+              : "Connect an external account"
+          }
+        >
+          + Add connector
+        </button>
+      </div>
       <p className="settings-section-intro">
         Pull signals from external systems — calendar, email, chat — into your
-        notes context. Adding connectors arrives in the next release.
+        notes context. Connectors authenticate via OAuth and Margin only
+        stores tokens locally in your keychain.
       </p>
       {loading ? (
         <p className="settings-placeholder">Loading…</p>
@@ -314,22 +359,42 @@ function ConnectorsSection() {
         <div className="settings-empty">
           <div className="settings-empty-title">No connectors configured</div>
           <div className="settings-empty-body">
-            Calendar (Google &amp; Microsoft) lands in the next release. Future
-            connectors plug into the same surface.
+            {noProviders
+              ? "No OAuth providers built into this binary. See the README for setup."
+              : "Click + Add connector to authenticate one of the supported providers."}
           </div>
         </div>
       ) : (
         <div className="connector-list">
           {connectors.map((c) => (
-            <ConnectorRow key={c.id} info={c} />
+            <ConnectorRow
+              key={c.id}
+              info={c}
+              onRemove={() => onRemove(c.id, c.display_name)}
+              onReconnect={() => onReconnect(c.kind)}
+            />
           ))}
         </div>
+      )}
+      {pickerOpen && (
+        <ConnectorPickerModal
+          providers={providers}
+          onClose={() => setPickerOpen(false)}
+        />
       )}
     </section>
   );
 }
 
-function ConnectorRow({ info }: { info: ConnectorInfo }) {
+function ConnectorRow({
+  info,
+  onRemove,
+  onReconnect,
+}: {
+  info: ConnectorInfo;
+  onRemove: () => void;
+  onReconnect: () => void;
+}) {
   const status = info.last_error
     ? "error"
     : info.last_success_ms
@@ -338,6 +403,7 @@ function ConnectorRow({ info }: { info: ConnectorInfo }) {
   const lastLabel = info.last_sync_ms
     ? new Date(info.last_sync_ms).toLocaleString()
     : "never";
+  const reauthNeeded = info.last_error?.startsWith("reauth_needed:");
   return (
     <div className={`connector-row connector-row-${status}`}>
       <div className="connector-row-body">
@@ -350,6 +416,92 @@ function ConnectorRow({ info }: { info: ConnectorInfo }) {
         {info.last_error && (
           <div className="connector-row-error">{info.last_error}</div>
         )}
+      </div>
+      <div className="connector-row-actions">
+        {reauthNeeded && (
+          <button
+            type="button"
+            className="connector-row-reconnect"
+            onClick={onReconnect}
+          >
+            Reconnect
+          </button>
+        )}
+        <button
+          type="button"
+          className="connector-row-remove"
+          onClick={onRemove}
+        >
+          Remove
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ConnectorPickerModal({
+  providers,
+  onClose,
+}: {
+  providers: OAuthProviderInfo[];
+  onClose: () => void;
+}) {
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const onPick = async (kind: string) => {
+    setPending(kind);
+    setError(null);
+    try {
+      await startOAuthConnector(kind);
+      onClose();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+    } finally {
+      setPending(null);
+    }
+  };
+
+  return (
+    <div className="connector-modal-backdrop" onClick={onClose}>
+      <div
+        className="connector-modal"
+        role="dialog"
+        aria-modal="true"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="connector-modal-title">Add connector</h3>
+        <p className="connector-modal-sub">
+          Pick a provider. Margin will open your browser to authenticate.
+        </p>
+        <div className="connector-modal-list">
+          {providers.map((p) => (
+            <button
+              key={p.kind}
+              type="button"
+              className="connector-modal-row"
+              onClick={() => onPick(p.kind)}
+              disabled={pending !== null}
+            >
+              <span className="connector-modal-row-name">{p.display_name}</span>
+              {pending === p.kind && (
+                <span className="connector-modal-row-status">Waiting for browser…</span>
+              )}
+            </button>
+          ))}
+        </div>
+        {error && <div className="connector-modal-error">{error}</div>}
+        <div className="connector-modal-actions">
+          <button
+            type="button"
+            className="connector-modal-cancel"
+            onClick={onClose}
+            disabled={pending !== null}
+          >
+            Close
+          </button>
+        </div>
       </div>
     </div>
   );
