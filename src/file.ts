@@ -211,6 +211,70 @@ export async function searchNotes(query: string, limit = 20): Promise<SearchHit[
   return invoke<SearchHit[]>("search_notes", { query, limit });
 }
 
+// --- AI Q&A (#31 follow-up) ---------------------------------------------
+
+export type AskSource = {
+  /** 1-based label the model is told to cite as `[N]`. */
+  index: number;
+  note_path: string;
+  bundle_id: string;
+  title: string;
+  modified_ms: number;
+};
+
+export type ChatTurn = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+/** Discriminated union pushed by the Rust side on the `ai-stream` Tauri
+ *  event channel. Order: `sources` (once), then any number of `delta` /
+ *  `tool_use_start` / `tool_use_done` interleaved (in the order the
+ *  model emits text vs tool calls), then a terminal `done` or `error`.
+ *  Filter by `turn_id` to ignore stale turns. */
+export type AiStreamEvent =
+  | { kind: "sources"; turn_id: string; sources: AskSource[] }
+  | { kind: "delta"; turn_id: string; text: string }
+  | {
+      kind: "tool_use_start";
+      turn_id: string;
+      tool_id: string;
+      name: string;
+      target_n: number;
+      target_title: string;
+    }
+  | { kind: "tool_use_done"; turn_id: string; tool_id: string; ok: boolean }
+  | { kind: "done"; turn_id: string }
+  | { kind: "error"; turn_id: string; message: string };
+
+/** One ordered piece of an assistant message. The Rust side only emits
+ *  text deltas + tool-use markers; the UI builds this list in arrival
+ *  order so tool pills land at their position in the prose. */
+export type MessagePart =
+  | { kind: "text"; value: string }
+  | {
+      kind: "tool";
+      toolId: string;
+      name: string;
+      targetN: number;
+      targetTitle: string;
+      status: "running" | "ok" | "error";
+    };
+
+/** Caller generates `turnId` (UUID) so the in-flight assistant message
+ *  can be tagged with it before the first `ai-stream` event arrives —
+ *  the backend's `Sources` emit can fire before invoke's promise
+ *  resolves, and the listener needs the tag to associate the event
+ *  with the right message. */
+export async function askNotesStart(
+  turnId: string,
+  query: string,
+  history: ChatTurn[] = [],
+  model?: string,
+): Promise<void> {
+  return invoke<void>("ask_notes_start", { turnId, query, history, model });
+}
+
 export type NoteMeta = { modified_ms: number };
 
 export async function noteMeta(notePath: string): Promise<NoteMeta> {
