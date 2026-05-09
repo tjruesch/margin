@@ -131,7 +131,7 @@ function useUpcomingEvents(): {
       try {
         const list = await listCalendarEvents(
           now - 30 * 60_000,
-          now + 24 * 3600_000,
+          now + 48 * 3600_000,
         );
         if (!cancelled) setEvents(list);
       } catch (e) {
@@ -170,6 +170,10 @@ function useUpcomingEvents(): {
             // would render with a misleading "Now" label.
             e.start_ms > tickMs - 24 * 3600_000 && e.status !== "cancelled",
         )
+        // Cap at 5 cards. Events arrive sorted by start_ms, so this
+        // keeps the soonest 5 — anything further out is past what the
+        // strip is meant to surface.
+        .slice(0, 5)
         .map((e) => mapToUpcoming(e, tickMs)),
     [events, tickMs],
   );

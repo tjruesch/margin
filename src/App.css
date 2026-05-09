@@ -4261,6 +4261,25 @@ input.nh-title {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
 }
 
+/* Event citation chips ([E*]) get a calendar-domain accent so the
+   reader can tell at a glance which domain the model is citing. */
+.palette-cite.is-event {
+  border-color: color-mix(in srgb, #c44a1f 30%, transparent);
+  background: color-mix(in srgb, #c44a1f 12%, transparent);
+  color: #c44a1f;
+}
+.palette-cite.is-event:hover {
+  background: color-mix(in srgb, #c44a1f 22%, transparent);
+}
+
+.palette-source-chip.is-event .palette-source-num {
+  background: color-mix(in srgb, #c44a1f 14%, transparent);
+  color: #c44a1f;
+}
+.palette-source-chip.is-event:hover {
+  border-color: color-mix(in srgb, #c44a1f 30%, transparent);
+}
+
 .palette-sources {
   margin-top: 8px;
   width: 100%;

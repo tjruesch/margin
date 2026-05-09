@@ -6,6 +6,7 @@ import {
   type AskSource,
   askNotesStart,
   type MessagePart,
+  openOrCreateEventNote,
   searchNotes,
   SEARCH_HIGHLIGHT_CLOSE,
   SEARCH_HIGHLIGHT_OPEN,
@@ -217,6 +218,8 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
                     name: ev.name,
                     targetN: ev.target_n,
                     targetTitle: ev.target_title,
+                    targetLabel: ev.target_label,
+                    targetKind: ev.target_kind,
                     status: "running",
                   },
                 ],
@@ -673,18 +676,19 @@ function MessageBubble({
   }
   const sources = message.sources || [];
   const fullText = joinText(message.parts);
-  // Render chips only for [N] markers the model actually cited across
-  // all text parts. The directory can be hundreds of entries — showing
-  // all of them would be a wall of chips.
+  // Render chips only for labels the model actually cited across all
+  // text parts. The full directory + schedule can be hundreds of
+  // entries — showing all of them would be a wall of chips. Both `[N]`
+  // (notes) and `[E<N>]` (events) match.
   const citedSources = useMemo(() => {
     if (sources.length === 0) return [];
-    const cited = new Set<number>();
-    const re = /\[(\d{1,3})\]/g;
+    const cited = new Set<string>();
+    const re = /\[(E?\d{1,3})\]/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(fullText)) !== null) {
-      cited.add(Number(m[1]));
+      cited.add(m[1]);
     }
-    return sources.filter((s) => cited.has(s.index));
+    return sources.filter((s) => cited.has(s.label));
   }, [sources, fullText]);
 
   const isEmptyAndStreaming =
@@ -713,11 +717,13 @@ function MessageBubble({
                 key={i}
                 part={part}
                 onOpen={() => {
-                  // Resolve the directory entry by [N] and open the
-                  // note. Lets the user follow the model's reasoning
-                  // trail.
-                  const src = sources.find((s) => s.index === part.targetN);
-                  if (src) onOpenNote(src.note_path);
+                  // Resolve the source by label and open the right
+                  // surface — note path for [N], or the linked event
+                  // bundle for [E<N>] (creating one if needed via
+                  // openOrCreateEventNote from #62).
+                  const src = sources.find((s) => s.label === part.targetLabel);
+                  if (!src) return;
+                  void openSource(src, onOpenNote);
                 }}
               />
             ),
@@ -730,13 +736,15 @@ function MessageBubble({
           <div className="palette-sources-list">
             {citedSources.map((s) => (
               <button
-                key={s.note_path}
+                key={s.label}
                 type="button"
-                className="palette-source-chip"
+                className={`palette-source-chip ${
+                  s.kind === "event" ? "is-event" : "is-note"
+                }`}
                 title={s.title}
-                onClick={() => onOpenNote(s.note_path)}
+                onClick={() => void openSource(s, onOpenNote)}
               >
-                <span className="palette-source-num">{s.index}</span>
+                <span className="palette-source-num">{s.label}</span>
                 <span className="palette-source-title">{s.title}</span>
               </button>
             ))}
@@ -754,8 +762,16 @@ function ToolPill({
   part: Extract<MessagePart, { kind: "tool" }>;
   onOpen: () => void;
 }) {
-  const verb = part.name === "read_transcript" ? "Reading transcript" : "Reading";
-  const titleAttr = `${part.name}([${part.targetN}] ${part.targetTitle})`;
+  const verb =
+    part.name === "read_event_details"
+      ? "Reading event"
+      : part.name === "read_transcript"
+      ? "Reading transcript"
+      : "Reading";
+  // targetLabel is the new field; fall back to targetN for older
+  // events that might still be in flight from a stale runner.
+  const label = part.targetLabel || `${part.targetN}`;
+  const titleAttr = `${part.name}([${label}] ${part.targetTitle})`;
   return (
     <button
       type="button"
@@ -773,12 +789,33 @@ function ToolPill({
         )}
       </span>
       <span className="palette-tool-text">
-        {verb} <span className="palette-tool-target">[{part.targetN}]</span>
+        {verb} <span className="palette-tool-target">[{label}]</span>
         {part.targetTitle ? ` "${part.targetTitle}"` : ""}
         {part.status === "running" ? "…" : ""}
       </span>
     </button>
   );
+}
+
+/// Open the surface a source points at. Notes go through `onOpenNote`
+/// directly. Events route through `openOrCreateEventNote` (#62) which
+/// creates the linked bundle on first click.
+async function openSource(
+  source: AskSource,
+  onOpenNote: (path: string) => void,
+): Promise<void> {
+  if (source.kind === "note" && source.note_path) {
+    onOpenNote(source.note_path);
+    return;
+  }
+  if (source.kind === "event" && source.event_id) {
+    try {
+      const path = await openOrCreateEventNote(source.event_id);
+      onOpenNote(path);
+    } catch (e) {
+      console.error("[ask] open event note failed:", e);
+    }
+  }
 }
 
 /// Render assistant text as Markdown with `[N]` markers swapped for
@@ -802,30 +839,32 @@ function CitedText({
   sources: AskSource[];
   onOpenNote: (path: string) => void;
 }) {
-  const sourceByIndex = useMemo(() => {
-    const m = new Map<number, AskSource>();
-    for (const s of sources) m.set(s.index, s);
+  const sourceByLabel = useMemo(() => {
+    const m = new Map<string, AskSource>();
+    for (const s of sources) m.set(s.label, s);
     return m;
   }, [sources]);
 
   const html = useMemo(() => {
-    const withCitations = text.replace(/\[(\d{1,3})\]/g, (full, n) => {
-      const num = Number(n);
-      // Hallucinated citation number — leave the marker as plain text
+    const withCitations = text.replace(/\[(E?\d{1,3})\]/g, (full, label) => {
+      const src = sourceByLabel.get(label);
+      // Hallucinated citation label — leave the marker as plain text
       // rather than emitting a dead chip.
-      if (!sourceByIndex.has(num)) return full;
-      return `<button type="button" class="palette-cite" data-cite-n="${num}">${num}</button>`;
+      if (!src) return full;
+      const variant = src.kind === "event" ? "is-event" : "is-note";
+      return `<button type="button" class="palette-cite ${variant}" data-cite-label="${label}">${label}</button>`;
     });
     return renderMarkdown(withCitations);
-  }, [text, sourceByIndex]);
+  }, [text, sourceByLabel]);
 
   const onClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement;
-    const cite = target.closest<HTMLElement>(".palette-cite[data-cite-n]");
+    const cite = target.closest<HTMLElement>(".palette-cite[data-cite-label]");
     if (!cite) return;
-    const n = Number(cite.getAttribute("data-cite-n"));
-    const source = sourceByIndex.get(n);
-    if (source) onOpenNote(source.note_path);
+    const label = cite.getAttribute("data-cite-label");
+    if (!label) return;
+    const source = sourceByLabel.get(label);
+    if (source) void openSource(source, onOpenNote);
   };
 
   return (

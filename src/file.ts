@@ -213,13 +213,24 @@ export async function searchNotes(query: string, limit = 20): Promise<SearchHit[
 
 // --- AI Q&A (#31 follow-up) ---------------------------------------------
 
+export type AskSourceKind = "note" | "event";
+
+/** A single citation source the model can reference. Notes use `[N]`
+ *  labels (e.g. `"3"`), events use `[E<N>]` labels (e.g. `"E2"`).
+ *  Frontend picks chip styling and click destination from `kind`. */
 export type AskSource = {
-  /** 1-based label the model is told to cite as `[N]`. */
-  index: number;
-  note_path: string;
-  bundle_id: string;
+  kind: AskSourceKind;
+  /** Citation label as it appears between the brackets in the model's
+   *  output. Notes: `"3"` / `"12"`. Events: `"E1"` / `"E14"`. */
+  label: string;
   title: string;
   modified_ms: number;
+  /** Set when `kind === "note"`. Click handler opens this path. */
+  note_path?: string;
+  bundle_id?: string;
+  /** Set when `kind === "event"`. Click handler invokes
+   *  `openOrCreateEventNote(event_id)` (#62). */
+  event_id?: string;
 };
 
 export type ChatTurn = {
@@ -242,6 +253,8 @@ export type AiStreamEvent =
       name: string;
       target_n: number;
       target_title: string;
+      target_label: string;
+      target_kind: AskSourceKind;
     }
   | { kind: "tool_use_done"; turn_id: string; tool_id: string; ok: boolean }
   | { kind: "done"; turn_id: string }
@@ -258,6 +271,8 @@ export type MessagePart =
       name: string;
       targetN: number;
       targetTitle: string;
+      targetLabel: string;
+      targetKind: AskSourceKind;
       status: "running" | "ok" | "error";
     };
 

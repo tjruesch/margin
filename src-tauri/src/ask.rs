@@ -52,6 +52,17 @@ const TRANSCRIPT_CHARS_CAP: usize = 3000;
 /// Max tool-use round-trips per turn before we force the model to
 /// answer with what it has. Guards against runaway tool loops.
 const MAX_TOOL_ITERATIONS: u32 = 6;
+/// Window for events surfaced in the Schedule section (#64). Past
+/// events give context for "what did we last talk about with X";
+/// future events for "what's coming up with Y".
+const SCHEDULE_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
+const SCHEDULE_FORWARD_MS: i64 = 14 * 24 * 3600 * 1000;
+/// Hard cap on events embedded in the prompt. Recency-prioritized;
+/// older events still loadable via `read_event_details` if the model
+/// spots a relevant title.
+const SCHEDULE_CAP: usize = 50;
+/// Per-event description cap when fetched via `read_event_details`.
+const EVENT_DESCRIPTION_CAP: usize = 1500;
 
 /// Emitted on the unified `ai-stream` channel. The frontend filters by
 /// `turn_id` so a stale stream that arrives after the user navigates
@@ -72,13 +83,22 @@ enum StreamEvent {
         text: String,
     },
     /// The model has issued a tool call. Carries enough info for the UI
-    /// to render an inline pill ("Reading [3] 'All-hands April'…").
+    /// to render an inline pill ("Reading [3] 'All-hands April'…" or
+    /// "Reading event [E2] 'Standup'…").
     ToolUseStart {
         turn_id: String,
         tool_id: String,
         name: String,
+        /// 1-based n the tool was called with — preserved for backward
+        /// compatibility with frontend code that hasn't migrated to
+        /// `target_label` yet. Carries the same value as the integer
+        /// portion of `target_label`.
         target_n: u32,
         target_title: String,
+        /// Citation label format the UI renders inside `[…]`. Notes:
+        /// `"3"` / `"12"`. Events: `"E1"` / `"E14"`.
+        target_label: String,
+        target_kind: AskSourceKind,
     },
     /// The tool call resolved. `ok=false` on out-of-range / I/O errors;
     /// the model still gets the error text and can recover next turn.
@@ -96,19 +116,40 @@ enum StreamEvent {
     },
 }
 
-/// One source the model can cite as `[N]`. Indexes the full notes
-/// directory (not just the retrieved set) so the model's allowed
-/// citation surface matches what's actually in its prompt. The UI
-/// renders chips only for `[N]`s the model actually emits in its
-/// answer — passing the whole directory keeps the mapping consistent
-/// without flooding the chip strip.
+/// Discriminator for citation sources. Notes use `[N]` labels (e.g.
+/// `[3]`); events use `[E<N>]` labels (e.g. `[E2]`). The frontend
+/// picks chip styling and click destination based on this.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AskSourceKind {
+    Note,
+    Event,
+}
+
+/// One source the model can cite. The full directory of notes plus
+/// the schedule of events is sent up-front; the UI renders chips only
+/// for labels the model actually emits, but the entire surface is
+/// consistent so out-of-frame citations resolve correctly.
 #[derive(Serialize, Clone)]
 pub struct AskSource {
-    pub index: u32,
-    pub note_path: String,
-    pub bundle_id: String,
+    pub kind: AskSourceKind,
+    /// Citation label as it appears in `[label]`. Notes carry the
+    /// 1-based directory index (e.g. `"3"`); events carry the
+    /// E-prefixed index (e.g. `"E2"`).
+    pub label: String,
     pub title: String,
+    /// For notes: file mtime; for events: start_ms. Lets the frontend
+    /// sort the source strip in a sensible order if it needs to.
     pub modified_ms: i64,
+    /// Set when `kind == Note`. Frontend opens this path on chip click.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bundle_id: Option<String>,
+    /// Set when `kind == Event`. Frontend invokes
+    /// `openOrCreateEventNote(event_id)` on chip click (#62).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
 }
 
 /// One past turn in the conversation, threaded back to the model.
@@ -121,9 +162,9 @@ pub struct ChatTurn {
 }
 
 const SYSTEM_PROMPT: &str = "You are answering questions about the user's personal notes (meeting \
-notes, hand-typed notes, transcripts) and their team profiles.
+notes, hand-typed notes, transcripts), their team profiles, and their calendar.
 
-The user's message contains three sections:
+The user's message contains four sections:
 
 1. **Notes directory** — every non-archived note, labeled `[1]`, `[2]`, etc., with title, date, and \
 a short preview. This is the master index; you may cite *any* `[N]` from this directory.
@@ -135,26 +176,34 @@ that came from a body, cite the directory `[N]`.
 3. **Team profiles** — short bios for each colleague: display name, aliases, role, profile text. \
 Use these to interpret references to people in the notes (e.g. \"Heike\" maps to a known team \
 member). You may cite directly attributable claims from a profile by the person's name in prose; \
-profiles aren't `[N]`-citable — only notes are.
+profiles aren't `[N]`-citable — only notes and events are.
 
-You also have two tools for digging deeper into the directory:
+4. **Schedule** — calendar events from connected Microsoft / Google accounts, labeled `[E1]`, \
+`[E2]`, etc., covering the last 14 days and the next 14 days. Each entry: title, time range, \
+attendees, location. Cite events with their `[E<N>]` label inline, same shape as note `[N]`s.
+
+You have three tools for digging deeper:
 - **`read_note(n)`** — returns the full markdown body of directory entry `[n]`. Use when a preview \
 hints at relevance but you need the body to answer.
 - **`read_transcript(n)`** — returns the meeting transcript text for `[n]`, if it has audio. Use \
 when the question is likely about something said in a meeting but not captured in the typed body.
+- **`read_event_details(n)`** — returns the full attendee list, description, location, and exact \
+times for event `[E<n>]`. Use when answering questions about meeting participants or content. \
+Pass the integer after the `E` as `n` (e.g. for `[E3]` call `read_event_details(3)`).
 
-Use tools sparingly — most questions can be answered from the directory + top candidates already in \
-context. Don't speculate; call a tool if you genuinely need the content. Up to 6 tool calls per \
-question; after that you must answer with what you have.
+Use tools sparingly — most questions can be answered from the directory + top candidates + schedule \
+already in context. Don't speculate; call a tool if you genuinely need the content. Up to 6 tool \
+calls per question; after that you must answer with what you have.
 
 Rules:
 - Answer in natural prose. Be specific and concise — 1-4 short paragraphs unless the question asks \
 for a list.
-- Cite sources inline with `[N]` immediately after each claim that came from a note. Multiple \
-citations: `[1][3]`. Never make up citation numbers — only use directory labels you actually \
-received.
+- Cite sources inline with `[N]` (notes) or `[E<N>]` (events) immediately after each claim that \
+came from one. Multiple citations: `[1][3]` or `[E1][E2]` or mixed `[3][E2]`. Never make up \
+citation labels — only use ones you actually received.
 - For \"when did we first…\" questions, identify the *earliest* dated note that matches and cite it.
-- If neither the notes nor the profiles contain the answer, say so clearly. Don't speculate.
+- If neither the notes nor the profiles nor the schedule contain the answer, say so clearly. \
+Don't speculate.
 - Don't pad with caveats or restate the question. Open with the answer.
 - Don't echo note titles back as a heading; cite them inline.";
 
@@ -174,10 +223,12 @@ pub async fn start(
         "Anthropic API key not configured — open Settings → AI to add one".to_string()
     })?;
 
-    // Pull the all-notes directory + retrieval set + team roster in
-    // one lock. Profile.md content is read off-lock below.
+    // Pull the all-notes directory + retrieval set + team roster +
+    // schedule window in one lock. Profile.md content is read off-lock
+    // below.
     let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
-    let (directory, retrieved_paths, team) = {
+    let now_ms = current_unix_ms();
+    let (directory, retrieved_paths, team, schedule) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         let directory = crate::index::list_directory(&c, DIRECTORY_CAP)
             .map_err(|e| e.to_string())?;
@@ -186,19 +237,41 @@ pub async fn start(
         let retrieved_paths: std::collections::HashSet<String> =
             hits.iter().map(|h| h.note_path.clone()).collect();
         let team = crate::team::list_team_members_raw(&c).unwrap_or_default();
-        (directory, retrieved_paths, team)
+        let mut schedule = crate::connectors::calendar::list_events_in_range(
+            &c,
+            now_ms - SCHEDULE_BACK_MS,
+            now_ms + SCHEDULE_FORWARD_MS,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        schedule.truncate(SCHEDULE_CAP);
+        (directory, retrieved_paths, team, schedule)
     };
 
     // Build the citation surface: every directory entry gets a 1-based
-    // [N] label.
-    let mut sources: Vec<AskSource> = Vec::with_capacity(directory.len());
+    // [N] label, every schedule entry gets an [E<N>] label.
+    let mut sources: Vec<AskSource> =
+        Vec::with_capacity(directory.len() + schedule.len());
     for (i, e) in directory.iter().enumerate() {
         sources.push(AskSource {
-            index: (i + 1) as u32,
-            note_path: e.note_path.clone(),
-            bundle_id: e.bundle_id.clone(),
+            kind: AskSourceKind::Note,
+            label: (i + 1).to_string(),
+            note_path: Some(e.note_path.clone()),
+            bundle_id: Some(e.bundle_id.clone()),
+            event_id: None,
             title: e.title.clone(),
             modified_ms: e.modified_ms,
+        });
+    }
+    for (i, e) in schedule.iter().enumerate() {
+        sources.push(AskSource {
+            kind: AskSourceKind::Event,
+            label: format!("E{}", i + 1),
+            note_path: e.linked_note_path.clone(),
+            bundle_id: None,
+            event_id: Some(e.id.clone()),
+            title: e.title.clone(),
+            modified_ms: e.start_ms,
         });
     }
 
@@ -256,6 +329,7 @@ pub async fn start(
         &directory,
         &retrieved_paths,
         &profile_excerpts,
+        &schedule,
     );
 
     // Compose `messages[]`: prior history first, then this turn's user
@@ -292,6 +366,7 @@ pub async fn start(
             &model,
             messages,
             &directory,
+            &schedule,
         )
         .await
         {
@@ -377,6 +452,7 @@ async fn run_loop(
     model: &str,
     mut messages: Vec<ApiMessage>,
     directory: &[DirectoryEntry],
+    schedule: &[crate::connectors::calendar::CalendarEvent],
 ) -> Result<(), String> {
     let tools = tool_definitions();
 
@@ -422,10 +498,19 @@ async fn run_loop(
                 .get("n")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
-            let target_title = directory
-                .get(target_n.saturating_sub(1) as usize)
-                .map(|e| e.title.clone())
-                .unwrap_or_default();
+            let idx = target_n.saturating_sub(1) as usize;
+            let (target_title, target_label, target_kind) = match tc.name.as_str() {
+                "read_event_details" => (
+                    schedule.get(idx).map(|e| e.title.clone()).unwrap_or_default(),
+                    format!("E{}", target_n),
+                    AskSourceKind::Event,
+                ),
+                _ => (
+                    directory.get(idx).map(|e| e.title.clone()).unwrap_or_default(),
+                    target_n.to_string(),
+                    AskSourceKind::Note,
+                ),
+            };
 
             let _ = app.emit(
                 "ai-stream",
@@ -435,10 +520,12 @@ async fn run_loop(
                     name: tc.name.clone(),
                     target_n,
                     target_title: target_title.clone(),
+                    target_label,
+                    target_kind,
                 },
             );
 
-            let result = dispatch_tool(&tc.name, &tc.input, directory);
+            let result = dispatch_tool(&tc.name, &tc.input, directory, schedule);
 
             let _ = app.emit(
                 "ai-stream",
@@ -515,6 +602,21 @@ fn tool_definitions() -> serde_json::Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "The 1-based [N] label from the Notes directory section."
+                    }
+                },
+                "required": ["n"]
+            }
+        },
+        {
+            "name": "read_event_details",
+            "description": "Read the full details of a calendar event by its schedule label [E<N>]. Returns the title, exact start/end times, location, description, and the full attendee list (with response statuses and resolved team_member IDs where Margin knows the person). Use when an event preview hints at relevance but you need attendees or the body. NOTE: the `n` argument is the integer after the `E` (e.g. for `[E3]` pass `n: 3`).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "The 1-based [E<N>] label from the Schedule section."
                     }
                 },
                 "required": ["n"]
@@ -793,16 +895,25 @@ fn dispatch_tool(
     name: &str,
     input: &serde_json::Value,
     directory: &[DirectoryEntry],
+    schedule: &[crate::connectors::calendar::CalendarEvent],
 ) -> ToolResult {
     let n = match input.get("n").and_then(|v| v.as_u64()) {
         Some(v) if v >= 1 => v as usize,
         _ => {
             return ToolResult {
-                content: "Tool input missing or invalid required field 'n' (must be a 1-based directory index).".to_string(),
+                content: "Tool input missing or invalid required field 'n' (must be a 1-based index).".to_string(),
                 is_error: true,
             };
         }
     };
+
+    // read_event_details indexes the schedule, not the notes directory.
+    // Handled before the notes-directory bounds check so an out-of-range
+    // event call gives the model a useful error.
+    if name == "read_event_details" {
+        return dispatch_read_event_details(n, schedule);
+    }
+
     if n > directory.len() {
         return ToolResult {
             content: format!(
@@ -899,9 +1010,97 @@ fn dispatch_tool(
             }
         }
         _ => ToolResult {
-            content: format!("Unknown tool: {name}. Available tools: read_note, read_transcript."),
+            content: format!("Unknown tool: {name}. Available tools: read_note, read_transcript, read_event_details."),
             is_error: true,
         },
+    }
+}
+
+/// Format a single calendar event into a structured text block the
+/// model can quote from. Includes attendees with response statuses,
+/// the linked-note pointer (if any), and a truncated description.
+fn dispatch_read_event_details(
+    n: usize,
+    schedule: &[crate::connectors::calendar::CalendarEvent],
+) -> ToolResult {
+    if n > schedule.len() {
+        return ToolResult {
+            content: format!(
+                "[E{n}] is out of range. Schedule has {len} entries — valid range is [E1]..[E{len}].",
+                n = n,
+                len = schedule.len()
+            ),
+            is_error: true,
+        };
+    }
+    let event = &schedule[n - 1];
+    let label = format!("E{n}");
+    let mut s = String::new();
+    s.push_str(&format!(
+        "# [{label}] {title}\n",
+        label = label,
+        title = event.title.trim(),
+    ));
+    s.push_str(&format!(
+        "When: {}\n",
+        format_dt_range(event.start_ms, event.end_ms, event.all_day)
+    ));
+    if let Some(loc) = event.location.as_deref().filter(|l| !l.is_empty()) {
+        s.push_str(&format!("Location: {loc}\n"));
+    }
+    s.push_str(&format!("Source: {}\n", event.connector_id));
+    if let Some(status) = event.status.as_deref().filter(|x| !x.is_empty()) {
+        s.push_str(&format!("Status: {status}\n"));
+    }
+    s.push_str(&format!(
+        "Linked note: {}\n",
+        event
+            .linked_note_path
+            .as_deref()
+            .unwrap_or("(none yet)")
+    ));
+
+    s.push_str("\nAttendees:\n");
+    if event.attendees.is_empty() {
+        s.push_str("- _(none)_\n");
+    } else {
+        for a in &event.attendees {
+            let name = a
+                .display_name
+                .as_deref()
+                .filter(|x| !x.is_empty())
+                .unwrap_or(&a.email);
+            let mut tags: Vec<String> = Vec::new();
+            if a.is_organizer {
+                tags.push("organizer".to_string());
+            }
+            if a.is_self {
+                tags.push("self".to_string());
+            }
+            if let Some(rs) = a.response_status.as_deref().filter(|x| !x.is_empty()) {
+                tags.push(rs.to_string());
+            }
+            if let Some(tm) = a.team_member_id.as_deref() {
+                tags.push(format!("team_member: {tm}"));
+            }
+            let tag_str = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", tags.join(", "))
+            };
+            s.push_str(&format!("- {name} <{email}>{tag_str}\n", email = a.email));
+        }
+    }
+
+    if let Some(desc) = event.description.as_deref().filter(|x| !x.trim().is_empty()) {
+        s.push_str("\nDescription (excerpt):\n");
+        s.push_str(&truncate_chars(desc.trim(), EVENT_DESCRIPTION_CAP));
+        s.push('\n');
+    }
+
+    ToolResult {
+        content: s,
+        is_error: false,
     }
 }
 
@@ -933,6 +1132,7 @@ fn format_user_message(
     directory: &[DirectoryEntry],
     retrieved_paths: &std::collections::HashSet<String>,
     profiles: &[(crate::team::TeamMember, String)],
+    schedule: &[crate::connectors::calendar::CalendarEvent],
 ) -> String {
     let mut s = String::new();
 
@@ -1012,9 +1212,100 @@ fn format_user_message(
         }
     }
 
+    s.push_str(&format_schedule_section(schedule));
+
     s.push_str("# Question\n\n");
     s.push_str(query.trim());
     s
+}
+
+/// Render the upcoming/recent meeting list as a labeled prompt
+/// section. Each event becomes one line with `[E<N>]` label, title,
+/// time range, attendees (max 5 + overflow), and location.
+fn format_schedule_section(events: &[crate::connectors::calendar::CalendarEvent]) -> String {
+    let mut s = String::new();
+    s.push_str("# Schedule (last 14 days, next 14 days)\n\n");
+    if events.is_empty() {
+        s.push_str("_(no scheduled meetings in this window)_\n\n");
+        return s;
+    }
+    for (i, e) in events.iter().enumerate() {
+        let label = format!("E{}", i + 1);
+        let when = format_dt_range(e.start_ms, e.end_ms, e.all_day);
+        let attendees = format_attendee_summary(&e.attendees);
+        let attendee_suffix = if attendees.is_empty() {
+            String::new()
+        } else {
+            format!(" — {attendees}")
+        };
+        let location_suffix = match e.location.as_deref() {
+            Some(loc) if !loc.trim().is_empty() => format!(" — {loc}"),
+            _ => String::new(),
+        };
+        s.push_str(&format!(
+            "[{label}] {} ({when}){attendee_suffix}{location_suffix}\n",
+            e.title.trim()
+        ));
+    }
+    s.push('\n');
+    s
+}
+
+/// Concise attendee list for the Schedule section. Skips `is_self`,
+/// caps at 5 visible names, suffixes "+N more" if more remain.
+fn format_attendee_summary(
+    attendees: &[crate::connectors::calendar::CalendarAttendee],
+) -> String {
+    let visible: Vec<&str> = attendees
+        .iter()
+        .filter(|a| !a.is_self)
+        .filter_map(|a| {
+            a.display_name
+                .as_deref()
+                .filter(|x| !x.is_empty())
+                .or(Some(a.email.as_str()))
+        })
+        .take(5)
+        .collect();
+    let total_others = attendees.iter().filter(|a| !a.is_self).count();
+    let mut out = visible.join(", ");
+    if total_others > visible.len() {
+        let extra = total_others - visible.len();
+        if !out.is_empty() {
+            out.push_str(&format!(", +{extra} more"));
+        } else {
+            out = format!("+{extra} attendees");
+        }
+    }
+    out
+}
+
+/// "YYYY-MM-DD HH:MM → HH:MM" if same UTC day, "YYYY-MM-DD HH:MM →
+/// YYYY-MM-DD HH:MM" if cross-day, "YYYY-MM-DD (all day)" for all-day
+/// events. UTC throughout — Microsoft Graph requests UTC via the
+/// `Prefer` header, and we'd rather not introduce locale-dependent
+/// formatting in the prompt.
+fn format_dt_range(start_ms: i64, end_ms: i64, all_day: bool) -> String {
+    use chrono::{DateTime, Utc};
+    let start = DateTime::<Utc>::from_timestamp(start_ms / 1000, 0);
+    let end = DateTime::<Utc>::from_timestamp(end_ms / 1000, 0);
+    match (start, end) {
+        (Some(s), Some(e)) => {
+            if all_day {
+                return format!("{} (all day)", s.format("%Y-%m-%d"));
+            }
+            let s_date = s.format("%Y-%m-%d").to_string();
+            let e_date = e.format("%Y-%m-%d").to_string();
+            let s_time = s.format("%H:%M").to_string();
+            let e_time = e.format("%H:%M").to_string();
+            if s_date == e_date {
+                format!("{s_date} {s_time} → {e_time}")
+            } else {
+                format!("{s_date} {s_time} → {e_date} {e_time}")
+            }
+        }
+        _ => "(invalid timestamp)".to_string(),
+    }
 }
 
 fn preview_one_line(preview: &str) -> String {
@@ -1023,6 +1314,14 @@ fn preview_one_line(preview: &str) -> String {
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect();
     truncate_chars(collapsed.trim(), PER_PREVIEW_CAP)
+}
+
+fn current_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn format_date(modified_ms: i64) -> String {
