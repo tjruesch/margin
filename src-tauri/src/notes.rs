@@ -253,6 +253,21 @@ pub fn list_notes(
     crate::index::list_all(&c, scope.unwrap_or_default()).map_err(|e| e.to_string())
 }
 
+/// Search across all non-archived owned notes (titles + bodies via the
+/// FTS5 index, plus per-bundle transcript.json segments). Returns a
+/// ranked list of `SearchHit`s. `limit` defaults to 20 and is clamped
+/// to 50 by the index layer.
+#[tauri::command]
+pub fn search_notes(
+    query: String,
+    limit: Option<usize>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<crate::index::SearchHit>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    crate::index::search_notes(&c, &query, limit.unwrap_or(20))
+        .map_err(|e| e.to_string())
+}
+
 /// Return action items across all non-archived owned notes, scoped to
 /// open / done / all. Default `Open`. Joins on the notes table for the
 /// source note's title. When `assignee_id` is set, the result is

@@ -7,6 +7,7 @@ import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
 import { type NotificationRecord, unreadCount } from "./notifications";
 import { NotificationsPanel } from "./NotificationsPanel";
+import { SearchPalette } from "./SearchPalette";
 import { TeamView, type EditorSettings as TeamEditorSettings } from "./Team";
 import {
   IconArchive,
@@ -132,7 +133,23 @@ export function Home({
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
   );
   const [panelOpen, setPanelOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const unreadBadge = useMemo(() => unreadCount(notifications), [notifications]);
+
+  // Global ⌘K / Ctrl+K to open the search palette. Capture phase so the
+  // editor's Cmd+K (link insert, etc.) doesn't swallow it first.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        e.stopPropagation();
+        setPaletteOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey, { capture: true });
+    return () => window.removeEventListener("keydown", onKey, { capture: true } as EventListenerOptions);
+  }, []);
 
   // Map sidebar nav → backend scope. Only home, archive, and favorites
   // currently map to scopes; the other nav items are placeholders.
@@ -200,6 +217,14 @@ export function Home({
 
   return (
     <div className={"home" + (sidebarOpen ? "" : " home-collapsed")}>
+      <SearchPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        onOpenNote={(p) => {
+          setPaletteOpen(false);
+          onOpen(p);
+        }}
+      />
       {sidebarOpen && (
         <Sidebar
           active={nav}
@@ -210,6 +235,7 @@ export function Home({
           activeTag={tagFilter}
           onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
           onOpenSettings={onOpenSettings}
+          onOpenPalette={() => setPaletteOpen(true)}
         />
       )}
       <div className="home-main">
@@ -323,6 +349,7 @@ function Sidebar({
   activeTag,
   onTagSelect,
   onOpenSettings,
+  onOpenPalette,
 }: {
   active: NavId;
   onSelect: (id: NavId) => void;
@@ -332,21 +359,24 @@ function Sidebar({
   activeTag: string | null;
   onTagSelect: (tag: string) => void;
   onOpenSettings: () => void;
+  onOpenPalette: () => void;
 }) {
   return (
     <aside className="home-sidebar">
       <div className="home-titlebar" data-tauri-drag-region />
       <div className="home-search-wrap">
-        <div
+        <button
+          type="button"
           className="home-search"
           data-tauri-drag-region="false"
-          title="Search — coming soon (issue #31)"
-          onClick={() => stub("Search", 31)}
+          title="Search notes (⌘K)"
+          aria-label="Search notes"
+          onClick={onOpenPalette}
         >
           <IconSearch size={13} sw={1.8} />
           <span className="home-search-placeholder">Search notes…</span>
           <span className="home-search-kbd">⌘K</span>
-        </div>
+        </button>
       </div>
 
       <nav className="home-nav">

@@ -187,6 +187,30 @@ export async function listNotes(scope: NoteScope = "active"): Promise<NoteListIt
   return invoke<NoteListItem[]>("list_notes", { scope });
 }
 
+// --- Search (#31) --------------------------------------------------------
+
+export type SearchSource = "title" | "body" | "transcript";
+
+/** One ranked result from `search_notes`. The Rust side wraps the matched
+ *  span in U+2068 / U+2069 (FSI/PDI) inside `snippet` so the UI can split
+ *  on those marks to render the highlight without HTML round-tripping. */
+export type SearchHit = {
+  note_path: string;
+  bundle_id: string;
+  title: string;
+  modified_ms: number;
+  snippet: string;
+  source: SearchSource;
+  score: number;
+};
+
+export const SEARCH_HIGHLIGHT_OPEN = "\u{2068}";
+export const SEARCH_HIGHLIGHT_CLOSE = "\u{2069}";
+
+export async function searchNotes(query: string, limit = 20): Promise<SearchHit[]> {
+  return invoke<SearchHit[]>("search_notes", { query, limit });
+}
+
 export type NoteMeta = { modified_ms: number };
 
 export async function noteMeta(notePath: string): Promise<NoteMeta> {

@@ -491,6 +491,7 @@ pub fn run() {
             notes::duplicate_note,
             notes::is_owned_note,
             notes::list_notes,
+            notes::search_notes,
             notes::note_meta,
             notes::discard_recording,
             notes::delete_note,
