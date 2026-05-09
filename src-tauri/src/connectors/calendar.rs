@@ -28,6 +28,11 @@ pub struct CalendarEvent {
     pub status: Option<String>,
     pub raw_etag: Option<String>,
     pub modified_ms: i64,
+    /// Path to the note bundle the user linked to this event (via the
+    /// "Coming up" strip click handler). Set lazily on first click;
+    /// preserved across re-syncs (#62). Null until the user opens the
+    /// event for the first time.
+    pub linked_note_path: Option<String>,
     pub attendees: Vec<CalendarAttendee>,
 }
 
@@ -112,11 +117,15 @@ pub fn upsert_window(
 }
 
 fn upsert_event(tx: &rusqlite::Transaction<'_>, e: &CalendarEvent) -> rusqlite::Result<()> {
+    // ON CONFLICT preserves `linked_note_path` — it's owned by the
+    // user (set on first click of the event), not by the connector.
+    // Re-syncing the event must not clobber it.
     tx.execute(
         "INSERT INTO calendar_events(\
             id, connector_id, external_id, title, start_ms, end_ms, all_day, \
-            location, description, source_calendar, status, raw_etag, modified_ms\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+            location, description, source_calendar, status, raw_etag, modified_ms, \
+            linked_note_path\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
          ON CONFLICT(id) DO UPDATE SET \
             title = excluded.title, \
             start_ms = excluded.start_ms, \
@@ -142,6 +151,7 @@ fn upsert_event(tx: &rusqlite::Transaction<'_>, e: &CalendarEvent) -> rusqlite::
             e.status,
             e.raw_etag,
             e.modified_ms,
+            e.linked_note_path,
         ],
     )?;
 
@@ -181,14 +191,16 @@ pub fn list_events_in_range(
     let sql = match connector_id {
         Some(_) => {
             "SELECT id, connector_id, external_id, title, start_ms, end_ms, all_day, \
-                    location, description, source_calendar, status, raw_etag, modified_ms \
+                    location, description, source_calendar, status, raw_etag, modified_ms, \
+                    linked_note_path \
              FROM calendar_events \
              WHERE start_ms BETWEEN ?1 AND ?2 AND connector_id = ?3 \
              ORDER BY start_ms ASC"
         }
         None => {
             "SELECT id, connector_id, external_id, title, start_ms, end_ms, all_day, \
-                    location, description, source_calendar, status, raw_etag, modified_ms \
+                    location, description, source_calendar, status, raw_etag, modified_ms, \
+                    linked_note_path \
              FROM calendar_events \
              WHERE start_ms BETWEEN ?1 AND ?2 \
              ORDER BY start_ms ASC"
@@ -211,6 +223,7 @@ pub fn list_events_in_range(
             status: r.get(10)?,
             raw_etag: r.get(11)?,
             modified_ms: r.get(12)?,
+            linked_note_path: r.get(13)?,
             attendees: Vec::new(),
         })
     };
@@ -238,13 +251,29 @@ pub fn list_events_in_range(
     Ok(events)
 }
 
+/// Update an event's `linked_note_path`. Called after the user clicks
+/// an event card in the "Coming up" strip and we've created (or
+/// rediscovered) the linked note bundle.
+pub fn set_linked_note_path(
+    conn: &Connection,
+    event_id: &str,
+    note_path: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE calendar_events SET linked_note_path = ?1 WHERE id = ?2",
+        params![note_path, event_id],
+    )?;
+    Ok(())
+}
+
 pub fn get_event_details(
     conn: &Connection,
     event_id: &str,
 ) -> rusqlite::Result<Option<CalendarEvent>> {
     let mut stmt = conn.prepare(
         "SELECT id, connector_id, external_id, title, start_ms, end_ms, all_day, \
-                location, description, source_calendar, status, raw_etag, modified_ms \
+                location, description, source_calendar, status, raw_etag, modified_ms, \
+                linked_note_path \
          FROM calendar_events WHERE id = ?1",
     )?;
     let mut event: Option<CalendarEvent> = stmt
@@ -263,6 +292,7 @@ pub fn get_event_details(
                 status: r.get(10)?,
                 raw_etag: r.get(11)?,
                 modified_ms: r.get(12)?,
+                linked_note_path: r.get(13)?,
                 attendees: Vec::new(),
             })
         })
@@ -340,6 +370,8 @@ mod tests {
         .unwrap();
         conn.execute_batch(include_str!("../migrations/009_calendar.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../migrations/010_event_note_link.sql"))
+            .unwrap();
         conn
     }
 
@@ -358,6 +390,7 @@ mod tests {
             status: Some("confirmed".to_string()),
             raw_etag: None,
             modified_ms: start_ms,
+            linked_note_path: None,
             attendees: attendee_emails
                 .iter()
                 .map(|e| CalendarAttendee {
@@ -465,5 +498,34 @@ mod tests {
         let conn = open_test_db();
         let result = get_event_details(&conn, "nope").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn set_linked_note_path_round_trips_and_survives_resync() {
+        let mut conn = open_test_db();
+        let event = make_event("a", 5_000, &[]);
+        upsert_window(&mut conn, "mg:test", &[event.clone()], 0, 100_000).unwrap();
+
+        // User clicks the event → set linked path.
+        set_linked_note_path(&conn, &event.id, "/tmp/notes/x/note.md").unwrap();
+        let after_link = get_event_details(&conn, &event.id).unwrap().unwrap();
+        assert_eq!(after_link.linked_note_path.as_deref(), Some("/tmp/notes/x/note.md"));
+
+        // Now re-sync the same event with `linked_note_path: None`
+        // (the connector doesn't know about the link).
+        let mut resynced = event.clone();
+        resynced.title = "Renamed in calendar".to_string();
+        resynced.linked_note_path = None;
+        upsert_window(&mut conn, "mg:test", &[resynced], 0, 100_000).unwrap();
+
+        // Title updated, link preserved (the COALESCE skip on
+        // ON CONFLICT keeps the user-set value).
+        let after_resync = get_event_details(&conn, &event.id).unwrap().unwrap();
+        assert_eq!(after_resync.title, "Renamed in calendar");
+        assert_eq!(
+            after_resync.linked_note_path.as_deref(),
+            Some("/tmp/notes/x/note.md"),
+            "linked_note_path must survive a re-sync that doesn't carry it"
+        );
     }
 }
