@@ -12,8 +12,9 @@
 //!
 //! See `src/migrations/001_init.sql` for the schema.
 //!
-//! Out of scope here: `notes_fts` is populated but no search command
-//! exists yet; that lands with #31.
+//! Search (#31) is exposed via `search_notes`: FTS5 over title+body
+//! against `notes_fts` plus a per-bundle `transcript.json` substring scan
+//! merged into the same ranked result list.
 
 use std::collections::HashMap;
 use std::fs;
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
+use serde::Serialize;
 
 use crate::notes::{
     action_id, bundle_dir_for_in, extract_preview, parse_actions, parse_frontmatter,
@@ -237,6 +239,368 @@ pub fn list_actions(
         out.push(row?);
     }
     Ok(out)
+}
+
+/// One ranked hit from `search_notes`. `source` carries which surface
+/// the match came from so the UI can label rows ("Title", "Body",
+/// "Transcript"). `snippet` is a short window around the match — already
+/// truncated, ready to render.
+#[derive(Serialize, Clone)]
+pub struct SearchHit {
+    pub note_path: String,
+    pub bundle_id: String,
+    pub title: String,
+    pub modified_ms: i64,
+    pub snippet: String,
+    pub source: SearchSource,
+    /// Lower is better (mirrors SQLite's bm25). Transcript hits get a
+    /// synthetic score so they slot in alongside FTS rows.
+    pub score: f64,
+}
+
+#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchSource {
+    Title,
+    Body,
+    Transcript,
+}
+
+const SEARCH_SNIPPET_OPEN: &str = "\u{2068}";
+const SEARCH_SNIPPET_CLOSE: &str = "\u{2069}";
+const SEARCH_TRANSCRIPT_WINDOW: usize = 80;
+
+/// Combined FTS + transcript search. Excludes archived notes (mirrors the
+/// `Active` scope in `list_all`). Caller picks the per-source caps via
+/// `limit`; total results = `limit` (FTS hits favored, transcript hits
+/// fill the remainder).
+pub fn search_notes(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let cap = limit.min(50);
+
+    let fts_query = match build_fts_query(trimmed) {
+        Some(q) => q,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut seen_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    // FTS pass — pull bm25() and a body snippet in one go. JOIN on
+    // `notes` to drop archived rows and to fetch the canonical title /
+    // mtime / bundle_id (the FTS row's `title` is duplicated for ranking
+    // purposes; `notes.title` is the source-of-truth).
+    let fts_sql = "\
+        SELECT n.note_path, n.bundle_id, n.title, n.modified_ms, \
+               snippet(notes_fts, 2, ?2, ?3, '…', 12) AS body_snip, \
+               bm25(notes_fts) AS score \
+        FROM notes_fts \
+        JOIN notes n ON n.note_path = notes_fts.note_path \
+        WHERE notes_fts MATCH ?1 AND n.archived = 0 \
+        ORDER BY score ASC \
+        LIMIT ?4";
+    let mut stmt = conn.prepare(fts_sql)?;
+    let rows = stmt.query_map(
+        params![
+            &fts_query,
+            SEARCH_SNIPPET_OPEN,
+            SEARCH_SNIPPET_CLOSE,
+            cap as i64,
+        ],
+        |r| {
+            Ok(FtsRow {
+                note_path: r.get(0)?,
+                bundle_id: r.get(1)?,
+                title: r.get(2)?,
+                modified_ms: r.get(3)?,
+                body_snip: r.get(4)?,
+                score: r.get(5)?,
+            })
+        },
+    )?;
+
+    let needle_lc = trimmed.to_lowercase();
+    for row in rows {
+        let row = row?;
+        let title_lc = row.title.to_lowercase();
+        let (source, snippet) = if title_lc.contains(&needle_lc) {
+            (SearchSource::Title, row.title.clone())
+        } else {
+            (SearchSource::Body, row.body_snip.clone())
+        };
+        seen_paths.insert(row.note_path.clone());
+        hits.push(SearchHit {
+            note_path: row.note_path,
+            bundle_id: row.bundle_id,
+            title: row.title,
+            modified_ms: row.modified_ms,
+            snippet,
+            source,
+            score: row.score,
+        });
+    }
+
+    // Transcript pass — we need the user's notes dir, but `index.rs`
+    // doesn't take it as a parameter elsewhere. Use `paths::notes_dir()`
+    // for symmetry with `upsert`. Walk every non-archived bundle whose
+    // path we haven't already surfaced and substring-scan the segments.
+    if hits.len() < cap {
+        let archived_paths: std::collections::HashSet<String> = {
+            let mut stmt = conn
+                .prepare("SELECT note_path FROM notes WHERE archived = 1")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mut set = std::collections::HashSet::new();
+            for r in rows {
+                set.insert(r?);
+            }
+            set
+        };
+        let titles_by_path: HashMap<String, (String, String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT note_path, bundle_id, title, modified_ms FROM notes \
+                 WHERE archived = 0",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })?;
+            let mut map = HashMap::new();
+            for row in rows {
+                let (p, b, t, m) = row?;
+                map.insert(p, (b, t, m));
+            }
+            map
+        };
+
+        let remaining = cap - hits.len();
+        let transcript_hits = scan_transcripts(
+            &paths::notes_dir(),
+            trimmed,
+            &seen_paths,
+            &archived_paths,
+            &titles_by_path,
+            remaining,
+        );
+        hits.extend(transcript_hits);
+    }
+
+    Ok(hits)
+}
+
+struct FtsRow {
+    note_path: String,
+    bundle_id: String,
+    title: String,
+    modified_ms: i64,
+    body_snip: String,
+    score: f64,
+}
+
+/// Translate user input into an FTS5 MATCH expression. Each
+/// whitespace-separated token becomes a quoted prefix term so the query
+/// never trips on FTS5 operators (`AND`, `NOT`, `*`, `:` etc) the user
+/// happened to type. Returns `None` when the input has no usable tokens
+/// (e.g. punctuation-only input).
+fn build_fts_query(input: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for raw in input.split_whitespace() {
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '\'' || *c == '-' || *c == '_')
+            .collect();
+        if cleaned.is_empty() {
+            continue;
+        }
+        let escaped = cleaned.replace('"', "\"\"");
+        parts.push(format!("\"{escaped}\"*"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
+fn scan_transcripts(
+    notes_dir: &Path,
+    needle: &str,
+    seen_paths: &std::collections::HashSet<String>,
+    archived_paths: &std::collections::HashSet<String>,
+    titles_by_path: &HashMap<String, (String, String, i64)>,
+    limit: usize,
+) -> Vec<SearchHit> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let needle_lc = needle.to_lowercase();
+    let mut out: Vec<SearchHit> = Vec::new();
+
+    let read_dir = match fs::read_dir(notes_dir) {
+        Ok(r) => r,
+        Err(_) => return out,
+    };
+    for entry in read_dir.flatten() {
+        if out.len() >= limit {
+            break;
+        }
+        let bundle = entry.path();
+        if !bundle.is_dir() {
+            continue;
+        }
+        let note_path = bundle.join(NOTE_FILENAME);
+        let note_path_str = note_path.to_string_lossy().into_owned();
+        if seen_paths.contains(&note_path_str)
+            || archived_paths.contains(&note_path_str)
+        {
+            continue;
+        }
+        let transcript_path = bundle.join(TRANSCRIPT_FILENAME);
+        if !transcript_path.exists() {
+            continue;
+        }
+        let raw = match fs::read_to_string(&transcript_path) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Cheap filter before parsing JSON — most transcripts won't
+        // contain the needle at all.
+        if !raw.to_lowercase().contains(&needle_lc) {
+            continue;
+        }
+        let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let segments = match parsed.get("segments").and_then(|s| s.as_array()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let mut snippet: Option<String> = None;
+        for seg in segments {
+            let text = seg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if let Some((start, end)) = find_ci(text, &needle_lc) {
+                snippet = Some(transcript_snippet(text, start, end));
+                break;
+            }
+        }
+        let snippet = match snippet {
+            Some(s) => s,
+            None => continue,
+        };
+        let (bundle_id, title, modified_ms) = match titles_by_path.get(&note_path_str) {
+            Some(v) => v.clone(),
+            None => continue,
+        };
+        out.push(SearchHit {
+            note_path: note_path_str,
+            bundle_id,
+            title,
+            modified_ms,
+            snippet,
+            source: SearchSource::Transcript,
+            // Transcript hits rank below FTS rows. bm25 returns negative
+            // scores for stronger matches — pick a positive value to
+            // place transcripts at the end deterministically.
+            score: 1.0,
+        });
+    }
+    out
+}
+
+/// Case-insensitive substring search returning a `(start, end)` byte
+/// range in `haystack` aligned to char boundaries. `needle_lc` must
+/// already be lowercase. Returns `None` if no match.
+fn find_ci(haystack: &str, needle_lc: &str) -> Option<(usize, usize)> {
+    let needle_chars: Vec<char> = needle_lc.chars().collect();
+    if needle_chars.is_empty() {
+        return None;
+    }
+    let hay: Vec<(usize, char)> = haystack.char_indices().collect();
+    if hay.len() < needle_chars.len() {
+        return None;
+    }
+    'outer: for i in 0..=hay.len() - needle_chars.len() {
+        for (k, n) in needle_chars.iter().enumerate() {
+            // Compare via single-char lowercase folding. This matches
+            // ASCII and most Latin scripts; specialty cases like ß→SS
+            // (which lowercases to two chars) won't align, and we
+            // accept the false negative for v1.
+            let lc = hay[i + k].1.to_lowercase().next().unwrap_or(hay[i + k].1);
+            if lc != *n {
+                continue 'outer;
+            }
+        }
+        let start = hay[i].0;
+        let end_idx = i + needle_chars.len();
+        let end = if end_idx < hay.len() {
+            hay[end_idx].0
+        } else {
+            haystack.len()
+        };
+        return Some((start, end));
+    }
+    None
+}
+
+/// Build a `…pre[needle]post…` snippet with bidirectional isolate marks
+/// around the match. `start`/`end` are byte offsets into `text`; both
+/// must be on char boundaries.
+fn transcript_snippet(text: &str, start: usize, end: usize) -> String {
+    let half = SEARCH_TRANSCRIPT_WINDOW / 2;
+
+    let pre_byte = char_offset_back(&text[..start], half);
+    let post_byte_rel = char_offset_forward(&text[end..], half);
+    let post_byte = end + post_byte_rel;
+
+    let mut snip = String::new();
+    if pre_byte > 0 {
+        snip.push('…');
+    }
+    snip.push_str(text[pre_byte..start].trim_start());
+    snip.push_str(SEARCH_SNIPPET_OPEN);
+    snip.push_str(&text[start..end]);
+    snip.push_str(SEARCH_SNIPPET_CLOSE);
+    snip.push_str(text[end..post_byte].trim_end());
+    if post_byte < text.len() {
+        snip.push('…');
+    }
+    snip
+}
+
+/// Byte index `n_chars` chars before the end of `prefix`, or 0 if
+/// `prefix` is shorter than that.
+fn char_offset_back(prefix: &str, n_chars: usize) -> usize {
+    let total = prefix.chars().count();
+    if total <= n_chars {
+        return 0;
+    }
+    prefix
+        .char_indices()
+        .nth(total - n_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+/// Byte index `n_chars` chars into `suffix`, or `suffix.len()` if
+/// `suffix` is shorter than that.
+fn char_offset_forward(suffix: &str, n_chars: usize) -> usize {
+    suffix
+        .char_indices()
+        .nth(n_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(suffix.len())
 }
 
 #[derive(Default)]
