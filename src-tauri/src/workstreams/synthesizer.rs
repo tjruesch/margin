@@ -73,6 +73,14 @@ Summaries: 1-3 sentences. State what's happening and what's next, not what it is
 Action items: extract concrete TODOs the user owes (or owns) per workstream. Each must reference \
 a source by its label. Skip items that are already done.
 
+Hierarchy: the \"Existing workstreams (active)\" section may show parents at the top level with \
+children indented underneath (rendered with a \"↳\" marker). When a NEW workstream cleanly extends \
+an umbrella effort already in the list (e.g. \"ELAN AI Bridge\" with sub-threads like \"Talgo demo\" \
+or \"CompTIA setup\"), set \"parent_id\" to the umbrella's id. Otherwise leave \"parent_id\" null. \
+The hierarchy is flat — max 2 levels — so do NOT set \"parent_id\" to a workstream that's already \
+indented under another. \"parent_id\" only takes effect on newly-spawned workstreams; it is ignored \
+for existing ids (the user owns parent assignment for established workstreams).
+
 Output: a strict JSON array. No prose. No markdown fences. No keys other than the schema below.
 
 Schema:
@@ -80,6 +88,7 @@ Schema:
   {
     \"id\": \"<existing workstream id or null>\",
     \"status\": \"active\" | null,
+    \"parent_id\": \"<existing parent workstream id or null>\",
     \"title\": \"...\",
     \"summary\": \"...\",
     \"members\": { \"emails\": [\"M1\", \"M2\"], \"events\": [\"E3\"], \"notes\": [\"N1\"] },
@@ -465,44 +474,26 @@ fn build_user_message(
     if existing_active.is_empty() {
         s.push_str("(none)\n");
     } else {
+        // Render parents and standalones at the top level in the order
+        // the list builder returned (last_activity DESC). Each parent
+        // is followed by its children indented with `↳` so Claude sees
+        // the umbrella structure when proposing parent_id (#89).
+        let mut children_by_parent: std::collections::HashMap<&str, Vec<&Workstream>> =
+            std::collections::HashMap::new();
         for w in existing_active {
-            s.push_str(&format!(
-                "[{}] {} — {} (active)\n",
-                w.id,
-                w.title,
-                summarize_one_line(&w.summary)
-            ));
-            if let Some(owner_id) = w.owner_member_id.as_deref() {
-                if let Some(name) = team_by_id.get(owner_id) {
-                    s.push_str(&format!("   Owner: {name}\n"));
-                }
+            if let Some(p) = w.parent_workstream_id.as_deref() {
+                children_by_parent.entry(p).or_default().push(w);
             }
-            if !w.members.is_empty() {
-                let names: Vec<&str> = w
-                    .members
-                    .iter()
-                    .filter_map(|id| team_by_id.get(id).map(String::as_str))
-                    .take(8)
-                    .collect();
-                if !names.is_empty() {
-                    let suffix = if w.members.len() > names.len() {
-                        format!(" (+{} more)", w.members.len() - names.len())
-                    } else {
-                        String::new()
-                    };
-                    s.push_str(&format!(
-                        "   Members: {names}{suffix}\n",
-                        names = names.join(", "),
-                        suffix = suffix
-                    ));
-                }
+        }
+        for w in existing_active {
+            if w.parent_workstream_id.is_some() {
+                continue;
             }
-            if let Some(notes) = w.user_notes.as_deref().filter(|s| !s.trim().is_empty()) {
-                let collapsed = collapse_ws(notes);
-                let truncated = truncate_chars(&collapsed, USER_NOTES_PROMPT_CAP);
-                s.push_str(&format!(
-                    "   Notes (user-authored, ground truth): {truncated}\n"
-                ));
+            format_existing_workstream_entry(&mut s, w, team_by_id, false);
+            if let Some(children) = children_by_parent.get(w.id.as_str()) {
+                for child in children {
+                    format_existing_workstream_entry(&mut s, child, team_by_id, true);
+                }
             }
         }
     }
@@ -592,6 +583,59 @@ fn collapse_ws(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Render one existing-workstream entry in the cluster-pass prompt.
+/// Top-level workstreams render flush left; children render indented
+/// with a "↳" marker so Claude sees the parent → child structure (#89).
+/// The same per-row continuation lines (Owner / Members / Notes) are
+/// emitted for both, just under a deeper indent for children.
+fn format_existing_workstream_entry(
+    s: &mut String,
+    w: &Workstream,
+    team_by_id: &std::collections::HashMap<String, String>,
+    is_child: bool,
+) {
+    let head_prefix = if is_child { "   ↳ " } else { "" };
+    let cont_prefix = if is_child { "      " } else { "   " };
+    s.push_str(&format!(
+        "{head_prefix}[{id}] {title} — {summary} (active)\n",
+        id = w.id,
+        title = w.title,
+        summary = summarize_one_line(&w.summary)
+    ));
+    if let Some(owner_id) = w.owner_member_id.as_deref() {
+        if let Some(name) = team_by_id.get(owner_id) {
+            s.push_str(&format!("{cont_prefix}Owner: {name}\n"));
+        }
+    }
+    if !w.members.is_empty() {
+        let names: Vec<&str> = w
+            .members
+            .iter()
+            .filter_map(|id| team_by_id.get(id).map(String::as_str))
+            .take(8)
+            .collect();
+        if !names.is_empty() {
+            let suffix = if w.members.len() > names.len() {
+                format!(" (+{} more)", w.members.len() - names.len())
+            } else {
+                String::new()
+            };
+            s.push_str(&format!(
+                "{cont_prefix}Members: {names}{suffix}\n",
+                names = names.join(", "),
+                suffix = suffix
+            ));
+        }
+    }
+    if let Some(notes) = w.user_notes.as_deref().filter(|s| !s.trim().is_empty()) {
+        let collapsed = collapse_ws(notes);
+        let truncated = truncate_chars(&collapsed, USER_NOTES_PROMPT_CAP);
+        s.push_str(&format!(
+            "{cont_prefix}Notes (user-authored, ground truth): {truncated}\n"
+        ));
+    }
+}
+
 fn summarize_one_line(s: &str) -> String {
     let collapsed = collapse_ws(s);
     if collapsed.chars().count() <= 200 {
@@ -636,6 +680,12 @@ struct RawWorkstream {
     members: Option<RawMembers>,
     #[serde(default)]
     actions: Option<Vec<RawAction>>,
+    /// Optional parent workstream id (#89). Synthesizer's write path
+    /// validates against the 2-level cap before persisting; invalid
+    /// values are dropped to NULL. Only honored on insert — existing
+    /// workstreams' parent is user-only authority.
+    #[serde(default)]
+    parent_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,6 +758,13 @@ fn parse_synthesizer_response(
             .filter(|s| !s.is_empty() && *s != "null")
             .map(|s| s.to_string());
 
+        let parent_id = raw
+            .parent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(|s| s.to_string());
+
         let members = raw.members.unwrap_or(RawMembers {
             emails: Vec::new(),
             events: Vec::new(),
@@ -757,6 +814,7 @@ fn parse_synthesizer_response(
             member_notes,
             actions,
             status,
+            parent_id,
         });
     }
     out

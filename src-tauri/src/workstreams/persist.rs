@@ -36,6 +36,11 @@ pub struct SynthesizedWorkstream {
     /// runs `resurrect_if_archived`. Other values are ignored — archive
     /// flow is user-driven only.
     pub status: Option<String>,
+    /// Optional parent workstream id from Claude (#89). When set, the
+    /// synthesizer's write path validates against the 2-level cap +
+    /// self-parent / unknown-id rules; invalid values are silently
+    /// dropped to NULL with a log line.
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +83,8 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0) AS evc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0) AS nc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) AS ac, \
-                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) AS lc \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) AS lc, \
+                w.parent_workstream_id \
          FROM workstreams w \
          WHERE w.status = 'active' \
          ORDER BY w.last_activity_ms DESC",
@@ -102,6 +108,7 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
             note_count: r.get::<_, i64>(13)? as u32,
             open_action_count: r.get::<_, i64>(14)? as u32,
             link_count: r.get::<_, i64>(15)? as u32,
+            parent_workstream_id: r.get(16)?,
             external_participants: Vec::new(),
         })
     })?;
@@ -126,7 +133,8 @@ pub fn list_workstreams_archived(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
+                w.parent_workstream_id \
          FROM workstreams w \
          WHERE w.status = 'archived' \
          ORDER BY w.archived_at_ms DESC NULLS LAST",
@@ -150,6 +158,7 @@ pub fn list_workstreams_archived(
             note_count: r.get::<_, i64>(13)? as u32,
             open_action_count: r.get::<_, i64>(14)? as u32,
             link_count: r.get::<_, i64>(15)? as u32,
+            parent_workstream_id: r.get(16)?,
             external_participants: Vec::new(),
         })
     })?;
@@ -179,7 +188,8 @@ pub fn list_workstreams_for_synthesis(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
+                w.parent_workstream_id \
          FROM workstreams w \
          WHERE w.status IN ('active', 'archived') \
          ORDER BY \
@@ -208,6 +218,7 @@ pub fn list_workstreams_for_synthesis(
                 note_count: r.get::<_, i64>(13)? as u32,
                 open_action_count: r.get::<_, i64>(14)? as u32,
                 link_count: r.get::<_, i64>(15)? as u32,
+                parent_workstream_id: r.get(16)?,
                 external_participants: Vec::new(),
             },
             is_archived,
@@ -272,6 +283,7 @@ pub fn get_workstream_detail(
 
     let actions = list_actions_for(conn, id)?;
     let links = list_workstream_links(conn, id)?;
+    let children = list_children_of(conn, id)?;
 
     Ok(Some(WorkstreamDetail {
         workstream,
@@ -280,7 +292,60 @@ pub fn get_workstream_detail(
         notes,
         actions,
         links,
+        children,
     }))
+}
+
+/// All direct children of `parent_id`, ordered by recency (#89).
+/// Reuses the same column shape as the list builders so `attach_members`
+/// applies. Empty for leaves and standalones.
+pub fn list_children_of(
+    conn: &Connection,
+    parent_id: &str,
+) -> rusqlite::Result<Vec<Workstream>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
+                w.parent_workstream_id \
+         FROM workstreams w \
+         WHERE w.parent_workstream_id = ?1 \
+         ORDER BY w.last_activity_ms DESC",
+    )?;
+    let rows = stmt.query_map(params![parent_id], |r| {
+        Ok(Workstream {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            summary: r.get(2)?,
+            status: r.get(3)?,
+            last_activity_ms: r.get(4)?,
+            created_ms: r.get(5)?,
+            updated_ms: r.get(6)?,
+            user_notes: r.get(7)?,
+            archived_at_ms: r.get(8)?,
+            reopened_at_ms: r.get(9)?,
+            owner_member_id: r.get(10)?,
+            members: Vec::new(),
+            email_count: r.get::<_, i64>(11)? as u32,
+            event_count: r.get::<_, i64>(12)? as u32,
+            note_count: r.get::<_, i64>(13)? as u32,
+            open_action_count: r.get::<_, i64>(14)? as u32,
+            link_count: r.get::<_, i64>(15)? as u32,
+            parent_workstream_id: r.get(16)?,
+            external_participants: Vec::new(),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    attach_members(conn, &mut out)?;
+    attach_external_participants(conn, &mut out)?;
+    Ok(out)
 }
 
 // ----- User-curated links (#88) -------------------------------------------
@@ -381,7 +446,8 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
+                w.parent_workstream_id \
          FROM workstreams w WHERE w.id = ?1",
     )?;
     let mut ws = stmt
@@ -404,6 +470,7 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 note_count: r.get::<_, i64>(13)? as u32,
                 open_action_count: r.get::<_, i64>(14)? as u32,
                 link_count: r.get::<_, i64>(15)? as u32,
+                parent_workstream_id: r.get(16)?,
                 external_participants: Vec::new(),
             })
         })
@@ -640,6 +707,32 @@ pub fn write_workstream(
             params![id, record.title, record.summary, last_activity, now_ms],
         )?;
         counts.workstream_added = true;
+
+        // Synthesizer-proposed parent (#89) only applies on insert. For
+        // updates we preserve user-set parent — same authority pattern
+        // as `owner_member_id` and `user_notes`. Validation drops bad
+        // values (would-be-grandparent, self-parent, unknown id) with a
+        // log line; the new row stays standalone in those cases.
+        if let Some(parent_id) = record
+            .parent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null")
+        {
+            match validate_proposed_parent(tx, &id, parent_id)? {
+                Ok(()) => {
+                    tx.execute(
+                        "UPDATE workstreams SET parent_workstream_id = ?2 WHERE id = ?1",
+                        params![id, parent_id],
+                    )?;
+                }
+                Err(reason) => {
+                    eprintln!(
+                        "[workstreams] dropping parent_id {parent_id} for new workstream {id}: {reason}"
+                    );
+                }
+            }
+        }
     } else {
         tx.execute(
             "UPDATE workstreams SET title = ?2, summary = ?3, last_activity_ms = ?4, updated_ms = ?5 \
@@ -860,6 +953,79 @@ pub fn set_owner(
     Ok(())
 }
 
+/// Validate a proposed `(child, parent)` edge for #89's flat 2-level
+/// hierarchy. Returns `Ok(())` when the edge is allowed, `Err(reason)`
+/// otherwise. Cheap — at most three single-row lookups.
+///
+/// Rules:
+///   1. `parent_id == child_id` is forbidden (self-parent).
+///   2. `parent_id` must resolve to an existing workstream.
+///   3. The resolved parent must itself have `parent_workstream_id IS NULL`
+///      (otherwise the chain is 3 levels).
+///   4. `child_id` must not already have children (would push them to a
+///      grandchild slot).
+pub fn validate_proposed_parent(
+    conn: &Connection,
+    child_id: &str,
+    parent_id: &str,
+) -> rusqlite::Result<Result<(), String>> {
+    if parent_id == child_id {
+        return Ok(Err("a workstream can't be its own parent".to_string()));
+    }
+    let parent_grandparent: Option<Option<String>> = conn
+        .query_row(
+            "SELECT parent_workstream_id FROM workstreams WHERE id = ?1",
+            params![parent_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    let Some(parent_grandparent) = parent_grandparent else {
+        return Ok(Err(format!("parent {parent_id} not found")));
+    };
+    if parent_grandparent.is_some() {
+        return Ok(Err(
+            "the proposed parent is itself a child — hierarchy is capped at 2 levels".to_string(),
+        ));
+    }
+    let child_has_children: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workstreams WHERE parent_workstream_id = ?1",
+        params![child_id],
+        |r| r.get(0),
+    )?;
+    if child_has_children > 0 {
+        return Ok(Err(
+            "this workstream already has children — unparent them before assigning a parent here"
+                .to_string(),
+        ));
+    }
+    Ok(Ok(()))
+}
+
+/// Set or clear a workstream's parent (#89). Pass `None` to make it a
+/// top-level standalone. Validates via `validate_proposed_parent` when
+/// `parent_id` is `Some`; rejects with a user-facing error string the
+/// UI surfaces directly.
+pub fn set_workstream_parent(
+    conn: &Connection,
+    child_id: &str,
+    parent_id: Option<&str>,
+) -> rusqlite::Result<Result<(), String>> {
+    if let Some(p) = parent_id {
+        match validate_proposed_parent(conn, child_id, p)? {
+            Ok(()) => {}
+            Err(e) => return Ok(Err(e)),
+        }
+    }
+    let n = conn.execute(
+        "UPDATE workstreams SET parent_workstream_id = ?2, updated_ms = ?3 WHERE id = ?1",
+        params![child_id, parent_id, now_ms()],
+    )?;
+    if n == 0 {
+        return Ok(Err(format!("workstream {child_id} not found")));
+    }
+    Ok(Ok(()))
+}
+
 /// Drop signal pivot rows that point at items no longer present in
 /// their domain table (#85). Soft FKs mean the cascade-on-delete the
 /// old per-source pivots had via `ON DELETE CASCADE` is gone — this
@@ -1003,6 +1169,8 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("../migrations/018_workstream_links.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../migrations/019_workstream_parent.sql"))
+            .unwrap();
         conn
     }
 
@@ -1045,6 +1213,7 @@ mod tests {
             member_notes: notes.iter().map(|s| s.to_string()).collect(),
             actions,
             status: None,
+            parent_id: None,
         }
     }
 
@@ -2013,5 +2182,194 @@ mod tests {
             .map(|p| (p.email.as_str(), p.count))
             .collect();
         assert_eq!(pairs, vec![("alice@x.io", 3), ("bob@x.io", 1)]);
+    }
+
+    // ----- Hierarchy (#89) -------------------------------------------------
+
+    #[test]
+    fn set_workstream_parent_happy_path_then_clear() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_parent");
+        seed_workstream(&mut conn, "ws_child");
+
+        let r = set_workstream_parent(&conn, "ws_child", Some("ws_parent")).unwrap();
+        assert!(r.is_ok(), "happy path: {:?}", r);
+
+        let detail = get_workstream_detail(&conn, "ws_child").unwrap().unwrap();
+        assert_eq!(detail.workstream.parent_workstream_id.as_deref(), Some("ws_parent"));
+        let parent = get_workstream_detail(&conn, "ws_parent").unwrap().unwrap();
+        assert_eq!(parent.children.len(), 1);
+        assert_eq!(parent.children[0].id, "ws_child");
+
+        // Clear → standalone again.
+        let r = set_workstream_parent(&conn, "ws_child", None).unwrap();
+        assert!(r.is_ok());
+        let detail = get_workstream_detail(&conn, "ws_child").unwrap().unwrap();
+        assert!(detail.workstream.parent_workstream_id.is_none());
+    }
+
+    #[test]
+    fn set_workstream_parent_rejects_self_parent() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_self");
+        let r = set_workstream_parent(&conn, "ws_self", Some("ws_self")).unwrap();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("its own parent"));
+    }
+
+    #[test]
+    fn set_workstream_parent_rejects_grandparent_chain() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_a");
+        seed_workstream(&mut conn, "ws_b");
+        seed_workstream(&mut conn, "ws_c");
+        // A has parent B (so A is mid-level). Now trying to point C
+        // at A would make a 3-level chain.
+        set_workstream_parent(&conn, "ws_a", Some("ws_b"))
+            .unwrap()
+            .unwrap();
+        let r = set_workstream_parent(&conn, "ws_c", Some("ws_a")).unwrap();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("2 levels"));
+    }
+
+    #[test]
+    fn set_workstream_parent_rejects_when_self_has_children() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_p");
+        seed_workstream(&mut conn, "ws_c");
+        seed_workstream(&mut conn, "ws_x");
+        // ws_p already has a child (ws_c). Trying to set ws_p's parent
+        // would push ws_c to a third level.
+        set_workstream_parent(&conn, "ws_c", Some("ws_p"))
+            .unwrap()
+            .unwrap();
+        let r = set_workstream_parent(&conn, "ws_p", Some("ws_x")).unwrap();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("already has children"));
+    }
+
+    #[test]
+    fn set_workstream_parent_rejects_unknown_parent_id() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_a");
+        let r = set_workstream_parent(&conn, "ws_a", Some("ws_missing")).unwrap();
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn get_workstream_detail_returns_empty_children_for_leaves_and_standalones() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_solo");
+        let d = get_workstream_detail(&conn, "ws_solo").unwrap().unwrap();
+        assert!(d.children.is_empty());
+    }
+
+    #[test]
+    fn get_workstream_detail_orders_children_by_recency() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_p");
+        seed_workstream(&mut conn, "ws_old");
+        seed_workstream(&mut conn, "ws_new");
+        // Stamp last_activity directly so the ordering is deterministic.
+        conn.execute(
+            "UPDATE workstreams SET last_activity_ms = 1000 WHERE id = 'ws_old'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE workstreams SET last_activity_ms = 2000 WHERE id = 'ws_new'",
+            [],
+        )
+        .unwrap();
+        set_workstream_parent(&conn, "ws_old", Some("ws_p"))
+            .unwrap()
+            .unwrap();
+        set_workstream_parent(&conn, "ws_new", Some("ws_p"))
+            .unwrap()
+            .unwrap();
+        let d = get_workstream_detail(&conn, "ws_p").unwrap().unwrap();
+        let ids: Vec<&str> = d.children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["ws_new", "ws_old"]);
+    }
+
+    #[test]
+    fn delete_workstream_sets_children_parent_to_null() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_p");
+        seed_workstream(&mut conn, "ws_c");
+        set_workstream_parent(&conn, "ws_c", Some("ws_p"))
+            .unwrap()
+            .unwrap();
+
+        conn.execute("DELETE FROM workstreams WHERE id = 'ws_p'", [])
+            .unwrap();
+
+        let d = get_workstream_detail(&conn, "ws_c").unwrap().unwrap();
+        assert!(
+            d.workstream.parent_workstream_id.is_none(),
+            "FK ON DELETE SET NULL keeps the child but clears its parent"
+        );
+    }
+
+    #[test]
+    fn write_workstream_drops_invalid_parent_id_for_new_workstream() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_a");
+        seed_workstream(&mut conn, "ws_b");
+        // Make ws_a a child first; using it as a parent on a new write
+        // should be rejected (would-be-grandparent).
+        set_workstream_parent(&conn, "ws_a", Some("ws_b"))
+            .unwrap()
+            .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        let mut record = make_ws(Some("ws_new"), "Spawn", &[], &[], &[], vec![]);
+        record.parent_id = Some("ws_a".to_string());
+        write_workstream(&tx, &record, 9_000).unwrap();
+        tx.commit().unwrap();
+
+        let d = get_workstream_detail(&conn, "ws_new").unwrap().unwrap();
+        assert!(
+            d.workstream.parent_workstream_id.is_none(),
+            "invalid parent_id (would-be-grandparent) silently dropped"
+        );
+    }
+
+    #[test]
+    fn write_workstream_does_not_clobber_user_set_parent_on_resync() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_p");
+        seed_workstream(&mut conn, "ws_c");
+        set_workstream_parent(&conn, "ws_c", Some("ws_p"))
+            .unwrap()
+            .unwrap();
+
+        // Resync the existing workstream; even with no parent_id in the
+        // record, the user's parent assignment must survive.
+        let tx = conn.transaction().unwrap();
+        let record = make_ws(Some("ws_c"), "Renamed child", &[], &[], &[], vec![]);
+        write_workstream(&tx, &record, 9_000).unwrap();
+        tx.commit().unwrap();
+
+        let d = get_workstream_detail(&conn, "ws_c").unwrap().unwrap();
+        assert_eq!(d.workstream.parent_workstream_id.as_deref(), Some("ws_p"));
+    }
+
+    #[test]
+    fn list_workstreams_active_populates_parent_workstream_id() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_p");
+        seed_workstream(&mut conn, "ws_c");
+        set_workstream_parent(&conn, "ws_c", Some("ws_p"))
+            .unwrap()
+            .unwrap();
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let parent = listed.iter().find(|w| w.id == "ws_p").unwrap();
+        let child = listed.iter().find(|w| w.id == "ws_c").unwrap();
+        assert!(parent.parent_workstream_id.is_none());
+        assert_eq!(child.parent_workstream_id.as_deref(), Some("ws_p"));
     }
 }

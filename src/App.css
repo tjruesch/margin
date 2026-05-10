@@ -4840,6 +4840,7 @@ input.nh-title {
   gap: 10px;
 }
 .workstream-card {
+  position: relative;
   display: block;
   width: 100%;
   text-align: left;
@@ -4900,6 +4901,89 @@ input.nh-title {
   letter-spacing: 0.04em;
   text-transform: uppercase;
   vertical-align: middle;
+}
+
+/* Nested children cards under a parent (#89). Indent + slightly
+   muted background so the hierarchy reads at a glance, without
+   collapsing them behind a click. */
+.workstream-card.nested {
+  margin-left: 28px;
+  background: color-mix(in srgb, var(--bg-soft, rgba(0, 0, 0, 0.03)) 50%, transparent);
+}
+.workstream-card.nested::before {
+  content: "↳";
+  position: absolute;
+  left: -20px;
+  top: 14px;
+  color: var(--fg-muted);
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+/* Detail-view breadcrumb (#89). Only renders when the workstream
+   has a parent. Shows "[Parent] › [This]" — the parent text is the
+   click target. */
+.workstream-detail-breadcrumb {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  padding: 4px 0;
+  margin-bottom: 4px;
+  align-self: flex-start;
+}
+.workstream-detail-breadcrumb:hover {
+  color: var(--accent, #4a90e2);
+}
+.workstream-detail-breadcrumb-sep {
+  opacity: 0.5;
+}
+.workstream-detail-breadcrumb-self {
+  color: var(--fg);
+  font-weight: 500;
+}
+
+/* Parent picker (#89). Same chrome as the existing status pill so
+   the three pickers (status / owner / parent) align in the header. */
+.workstream-parent-select {
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  background: var(--bg, #fff);
+  border: 1px solid var(--home-line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.workstream-parent-select:hover:not(:disabled) {
+  color: var(--fg);
+  border-color: var(--border-strong, rgba(0, 0, 0, 0.25));
+}
+.workstream-parent-select:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Children section on a parent's detail view (#89). Same layout
+   as the list view's grid; the section title sits above the cards. */
+.workstream-children-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+.workstream-section-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  text-transform: uppercase;
 }
 
 /* Link-count badge on a list card (#88) — small chip next to the

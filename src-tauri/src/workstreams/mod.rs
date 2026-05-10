@@ -60,6 +60,12 @@ pub struct Workstream {
     /// team_member id; `None` when unassigned. Synthesizer never sets
     /// this — same authority pattern as user_notes.
     pub owner_member_id: Option<String>,
+    /// Parent workstream id (#89). `None` for top-level workstreams.
+    /// Hierarchy is flat 2-level; the synthesizer's `write_workstream`
+    /// + the manual `set_workstream_parent` command both validate
+    /// against would-be-grandparent / self-parent / has-children
+    /// before persisting.
+    pub parent_workstream_id: Option<String>,
     /// Derived list of team_member ids involved in the workstream
     /// (#81). Computed on read by joining the workstream's pivot
     /// emails / events against `email_recipients` / `calendar_attendees`
@@ -157,6 +163,11 @@ pub struct WorkstreamDetail {
     pub notes: Vec<NoteRef>,
     pub actions: Vec<WorkstreamAction>,
     pub links: Vec<WorkstreamLink>,
+    /// Direct children when this workstream is a parent (#89). Lean
+    /// `Workstream` shape — counts + members already populated, no
+    /// emails/events/notes/actions hydration. Empty for leaves and
+    /// standalones. Ordered by `last_activity_ms` desc.
+    pub children: Vec<Workstream>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

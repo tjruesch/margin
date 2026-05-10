@@ -531,6 +531,10 @@ export type Workstream = {
    *  capped per workstream backend-side. Drives the External chip strip
    *  on the detail view and the "+N external" pill on the list card. */
   external_participants: ExternalParticipant[];
+  /** Optional parent workstream id (#89). `null` for top-level workstreams.
+   *  The hierarchy is flat 2-level — backend rejects writes that would
+   *  create a 3-level chain. */
+  parent_workstream_id: string | null;
 };
 
 export type ExternalParticipant = {
@@ -587,6 +591,10 @@ export type WorkstreamDetail = Workstream & {
   notes: WorkstreamNoteRef[];
   actions: WorkstreamAction[];
   links: WorkstreamLink[];
+  /** Direct children when this workstream is a parent (#89). Empty for
+   *  leaves and standalones. Lean `Workstream` shape — counts and
+   *  members already populated. Ordered by last_activity_ms desc. */
+  children: Workstream[];
 };
 
 export type ClusterReport = {
@@ -665,6 +673,18 @@ export async function setWorkstreamOwner(
   ownerMemberId: string | null,
 ): Promise<void> {
   await invoke<void>("set_workstream_owner", { id, ownerMemberId });
+}
+
+/** Set or clear a workstream's parent (#89). Pass `null` to make it a
+ *  top-level standalone. Backend enforces the 2-level cap and surfaces
+ *  validation failures (self-parent, would-be-grandparent, current
+ *  workstream already has children, parent doesn't exist) as a thrown
+ *  Error string the caller should display. */
+export async function setWorkstreamParent(
+  id: string,
+  parentId: string | null,
+): Promise<void> {
+  await invoke<void>("set_workstream_parent", { id, parentId });
 }
 
 // --- Workstream links (#88) ----------------------------------------------
