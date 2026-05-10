@@ -9,7 +9,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use super::{NoteRef, WorkstreamDetail, Workstream, WorkstreamAction, WriteCounts};
+use super::{NoteRef, WorkstreamDetail, Workstream, WorkstreamAction, WorkstreamLink, WriteCounts};
 use crate::connectors::calendar;
 use crate::connectors::email;
 
@@ -74,7 +74,8 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0) AS ec, \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0) AS evc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0) AS nc, \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) AS ac \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) AS ac, \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) AS lc \
          FROM workstreams w \
          WHERE w.status = 'active' \
          ORDER BY w.last_activity_ms DESC",
@@ -97,6 +98,7 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
             event_count: r.get::<_, i64>(12)? as u32,
             note_count: r.get::<_, i64>(13)? as u32,
             open_action_count: r.get::<_, i64>(14)? as u32,
+            link_count: r.get::<_, i64>(15)? as u32,
         })
     })?;
     let mut out = Vec::new();
@@ -118,7 +120,8 @@ pub fn list_workstreams_archived(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) \
          FROM workstreams w \
          WHERE w.status = 'archived' \
          ORDER BY w.archived_at_ms DESC NULLS LAST",
@@ -141,6 +144,7 @@ pub fn list_workstreams_archived(
             event_count: r.get::<_, i64>(12)? as u32,
             note_count: r.get::<_, i64>(13)? as u32,
             open_action_count: r.get::<_, i64>(14)? as u32,
+            link_count: r.get::<_, i64>(15)? as u32,
         })
     })?;
     let mut out = Vec::new();
@@ -167,7 +171,8 @@ pub fn list_workstreams_for_synthesis(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) \
          FROM workstreams w \
          WHERE w.status IN ('active', 'archived') \
          ORDER BY \
@@ -195,6 +200,7 @@ pub fn list_workstreams_for_synthesis(
                 event_count: r.get::<_, i64>(12)? as u32,
                 note_count: r.get::<_, i64>(13)? as u32,
                 open_action_count: r.get::<_, i64>(14)? as u32,
+                link_count: r.get::<_, i64>(15)? as u32,
             },
             is_archived,
         ))
@@ -254,6 +260,7 @@ pub fn get_workstream_detail(
     }
 
     let actions = list_actions_for(conn, id)?;
+    let links = list_workstream_links(conn, id)?;
 
     Ok(Some(WorkstreamDetail {
         workstream,
@@ -261,7 +268,98 @@ pub fn get_workstream_detail(
         events,
         notes,
         actions,
+        links,
     }))
+}
+
+// ----- User-curated links (#88) -------------------------------------------
+
+/// All links for a workstream, ordered by `(position, created_ms)` so
+/// insertion order is preserved when `position` is left at the default.
+pub fn list_workstream_links(
+    conn: &Connection,
+    workstream_id: &str,
+) -> rusqlite::Result<Vec<WorkstreamLink>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, workstream_id, label, url, kind, position, created_ms \
+         FROM workstream_links \
+         WHERE workstream_id = ?1 \
+         ORDER BY position ASC, created_ms ASC",
+    )?;
+    let rows = stmt.query_map(params![workstream_id], |r| {
+        Ok(WorkstreamLink {
+            id: r.get(0)?,
+            workstream_id: r.get(1)?,
+            label: r.get(2)?,
+            url: r.get(3)?,
+            kind: r.get(4)?,
+            position: r.get(5)?,
+            created_ms: r.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Insert a new link at the end of the list. `position` is set to
+/// `MAX(position) + 1` for the workstream so insertion order survives
+/// even when the caller skips it. Trims label / url / kind; rejects
+/// empty label or url.
+pub fn add_workstream_link(
+    conn: &Connection,
+    workstream_id: &str,
+    label: &str,
+    url: &str,
+    kind: Option<&str>,
+    now_ms: i64,
+) -> rusqlite::Result<WorkstreamLink> {
+    let label = label.trim();
+    let url = url.trim();
+    if label.is_empty() || url.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "label and url are required".to_string(),
+        ));
+    }
+    let kind_owned = kind
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let next_position: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM workstream_links \
+             WHERE workstream_id = ?1",
+            params![workstream_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let id = format!("wsl_{}", uuid::Uuid::new_v4());
+    conn.execute(
+        "INSERT INTO workstream_links(id, workstream_id, label, url, kind, position, created_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, workstream_id, label, url, kind_owned, next_position, now_ms],
+    )?;
+    Ok(WorkstreamLink {
+        id,
+        workstream_id: workstream_id.to_string(),
+        label: label.to_string(),
+        url: url.to_string(),
+        kind: kind_owned,
+        position: next_position,
+        created_ms: now_ms,
+    })
+}
+
+/// Delete a single link by id. Returns whether a row was actually
+/// removed; callers that pass a stale id can choose how to surface that.
+pub fn remove_workstream_link(conn: &Connection, link_id: &str) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM workstream_links WHERE id = ?1",
+        params![link_id],
+    )?;
+    Ok(n > 0)
 }
 
 fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Workstream>> {
@@ -271,7 +369,8 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) \
          FROM workstreams w WHERE w.id = ?1",
     )?;
     let mut ws = stmt
@@ -293,6 +392,7 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 event_count: r.get::<_, i64>(12)? as u32,
                 note_count: r.get::<_, i64>(13)? as u32,
                 open_action_count: r.get::<_, i64>(14)? as u32,
+                link_count: r.get::<_, i64>(15)? as u32,
             })
         })
         .optional()?;
@@ -747,7 +847,10 @@ mod tests {
             "PRAGMA foreign_keys = ON;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta(key, value) VALUES ('schema_version', '11');
-             CREATE TABLE team_members (id TEXT PRIMARY KEY);
+             CREATE TABLE team_members (
+                 id      TEXT PRIMARY KEY,
+                 aliases TEXT NOT NULL DEFAULT '[]'
+             );
              CREATE TABLE connectors (id TEXT PRIMARY KEY);
              INSERT INTO connectors(id) VALUES ('mg:test');
              CREATE TABLE notes (
@@ -777,6 +880,14 @@ mod tests {
         // the migration backfills from the now-deleted pivots so it
         // must run before any test seeds workstreams.
         conn.execute_batch(include_str!("../migrations/016_workstream_signals.sql"))
+            .unwrap();
+        // 017 reshapes team_member_aliases — independent of workstreams
+        // but the persist layer's count subqueries (#88) reference
+        // tables created in 018 below, so we keep the migration order
+        // intact.
+        conn.execute_batch(include_str!("../migrations/017_typed_aliases.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/018_workstream_links.sql"))
             .unwrap();
         conn
     }
@@ -1466,5 +1577,87 @@ mod tests {
         tx.commit().unwrap();
 
         assert!(list_workstreams_active(&conn).unwrap()[0].members.is_empty());
+    }
+
+    // ----- User-curated links (#88) ----------------------------------------
+    //
+    // These tests reuse the `seed_workstream` helper above so the FK on
+    // `workstream_links` resolves through a real `write_workstream` call.
+
+    #[test]
+    fn add_workstream_link_assigns_monotonic_position() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+
+        let a = add_workstream_link(&conn, "ws_l", "Repo", "https://x/y", Some("github"), 100).unwrap();
+        let b = add_workstream_link(&conn, "ws_l", "Linear", "https://lin/p", Some("linear"), 110).unwrap();
+        let c = add_workstream_link(&conn, "ws_l", "Notes", "https://n/d", None, 120).unwrap();
+        assert_eq!(a.position, 0);
+        assert_eq!(b.position, 1);
+        assert_eq!(c.position, 2);
+        assert_eq!(c.kind, None, "kind=None survives round-trip");
+    }
+
+    #[test]
+    fn list_workstream_links_orders_by_position_then_created_ms() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        let _ = add_workstream_link(&conn, "ws_l", "A", "https://a", None, 100).unwrap();
+        let _ = add_workstream_link(&conn, "ws_l", "B", "https://b", None, 110).unwrap();
+        let _ = add_workstream_link(&conn, "ws_l", "C", "https://c", None, 120).unwrap();
+
+        let listed = list_workstream_links(&conn, "ws_l").unwrap();
+        let labels: Vec<&str> = listed.iter().map(|l| l.label.as_str()).collect();
+        assert_eq!(labels, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn add_workstream_link_rejects_empty_label_or_url() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        assert!(add_workstream_link(&conn, "ws_l", "  ", "https://x", None, 100).is_err());
+        assert!(add_workstream_link(&conn, "ws_l", "Ok", "  ", None, 100).is_err());
+    }
+
+    #[test]
+    fn remove_workstream_link_targets_only_the_named_id() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        let a = add_workstream_link(&conn, "ws_l", "A", "https://a", None, 100).unwrap();
+        let b = add_workstream_link(&conn, "ws_l", "B", "https://b", None, 110).unwrap();
+
+        let removed = remove_workstream_link(&conn, &a.id).unwrap();
+        assert!(removed);
+        let listed = list_workstream_links(&conn, "ws_l").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
+
+        // Re-removing the same id is a no-op (returns false).
+        let removed_again = remove_workstream_link(&conn, &a.id).unwrap();
+        assert!(!removed_again);
+    }
+
+    #[test]
+    fn delete_workstream_cascades_links() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        let _ = add_workstream_link(&conn, "ws_l", "A", "https://a", None, 100).unwrap();
+        let _ = add_workstream_link(&conn, "ws_l", "B", "https://b", None, 110).unwrap();
+        assert_eq!(list_workstream_links(&conn, "ws_l").unwrap().len(), 2);
+
+        conn.execute("DELETE FROM workstreams WHERE id = 'ws_l'", []).unwrap();
+        assert!(list_workstream_links(&conn, "ws_l").unwrap().is_empty());
+    }
+
+    #[test]
+    fn workstream_link_count_reflects_pivot_rows() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        let _ = add_workstream_link(&conn, "ws_l", "A", "https://a", None, 100).unwrap();
+        let _ = add_workstream_link(&conn, "ws_l", "B", "https://b", None, 110).unwrap();
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_l").expect("present");
+        assert_eq!(row.link_count, 2);
     }
 }

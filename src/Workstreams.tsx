@@ -8,26 +8,32 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { openUrl } from "@tauri-apps/plugin-opener";
+
 import {
   type EmailMessage,
+  LinkKind,
   type TeamMember,
   type Workstream,
   type WorkstreamAction,
   type WorkstreamDetail,
+  type WorkstreamLink,
   type WorkstreamStatus,
+  addWorkstreamLink,
   getEmailBody,
   getWorkstreamDetails,
   listArchivedWorkstreams,
   listTeamMembers,
   markWorkstreamSeen,
   openOrCreateEventNote,
+  removeWorkstreamLink,
   setWorkstreamActionDone,
   setWorkstreamOwner,
   setWorkstreamStatus,
   setWorkstreamUserNotes,
 } from "./file";
 import { DueChip } from "./Home";
-import { IconCheck, IconChevLeft } from "./icons";
+import { IconCheck, IconChevLeft, IconLink, IconPlus, IconTrash } from "./icons";
 import { avatarColor, initialsFromName } from "./initials";
 
 // ----- List view -----------------------------------------------------------
@@ -286,6 +292,16 @@ function WorkstreamCard({
           {isReopened ? (
             <span className="workstream-card-reopened" aria-label="Reopened">
               Reopened
+            </span>
+          ) : null}
+          {w.link_count > 0 ? (
+            <span
+              className="workstream-card-links-badge"
+              aria-label={`${w.link_count} linked URL${w.link_count === 1 ? "" : "s"}`}
+              title={`${w.link_count} linked URL${w.link_count === 1 ? "" : "s"}`}
+            >
+              <IconLink size={11} sw={1.8} />
+              {w.link_count}
             </span>
           ) : null}
         </span>
@@ -624,6 +640,16 @@ function WorkstreamDetailView({
         }
       />
 
+      <LinksSection
+        workstreamId={detail.id}
+        links={detail.links}
+        onLinksChanged={(next) =>
+          setDetail((d) =>
+            d ? { ...d, links: next, link_count: next.length } : d,
+          )
+        }
+      />
+
       <ActionsSection
         actions={detail.actions}
         onToggle={onToggleAction}
@@ -898,6 +924,210 @@ function MembersStrip({
         );
       })}
     </section>
+  );
+}
+
+// ----- User-curated links (#88) -------------------------------------------
+
+const LINK_KIND_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: LinkKind.GitHub, label: "GitHub" },
+  { value: LinkKind.Linear, label: "Linear" },
+  { value: LinkKind.Notion, label: "Notion" },
+  { value: LinkKind.Figma, label: "Figma" },
+  { value: LinkKind.Other, label: "Other" },
+];
+
+function LinksSection({
+  workstreamId,
+  links,
+  onLinksChanged,
+}: {
+  workstreamId: string;
+  links: WorkstreamLink[];
+  onLinksChanged: (next: WorkstreamLink[]) => void;
+}) {
+  const [composerOpen, setComposerOpen] = useState(false);
+
+  const handleOpen = async (url: string) => {
+    try {
+      await openUrl(url);
+    } catch (err) {
+      console.error("[workstreams] openUrl failed", err);
+    }
+  };
+
+  const handleRemove = async (linkId: string) => {
+    // Optimistic remove; revert on error so a transient backend hiccup
+    // doesn't drop the user's curated URL silently.
+    const prev = links;
+    onLinksChanged(links.filter((l) => l.id !== linkId));
+    try {
+      await removeWorkstreamLink(linkId);
+    } catch (err) {
+      console.error("[workstreams] removeWorkstreamLink failed", err);
+      onLinksChanged(prev);
+    }
+  };
+
+  const handleAdd = async (label: string, url: string, kind: string | null) => {
+    try {
+      const created = await addWorkstreamLink(workstreamId, label, url, kind);
+      onLinksChanged([...links, created]);
+      setComposerOpen(false);
+    } catch (err) {
+      console.error("[workstreams] addWorkstreamLink failed", err);
+    }
+  };
+
+  return (
+    <section className="workstream-links">
+      <div className="workstream-links-head">
+        <h3 className="workstream-links-title">Links</h3>
+        {!composerOpen && (
+          <button
+            type="button"
+            className="workstream-links-add"
+            onClick={() => setComposerOpen(true)}
+          >
+            <IconPlus size={12} sw={1.8} />
+            Add link
+          </button>
+        )}
+      </div>
+      {links.length === 0 && !composerOpen ? (
+        <p className="workstream-links-empty">
+          No external links yet — attach the repo, design doc, or tracking
+          ticket so they're one click away.
+        </p>
+      ) : null}
+      {links.length > 0 ? (
+        <div className="workstream-links-chips">
+          {links.map((link) => (
+            <div className="workstream-link-chip" key={link.id}>
+              <button
+                type="button"
+                className="workstream-link-chip-open"
+                onClick={() => void handleOpen(link.url)}
+                title={link.url}
+              >
+                <IconLink size={12} sw={1.8} />
+                <span className="workstream-link-chip-label">
+                  {link.label}
+                </span>
+                {link.kind ? (
+                  <span className="workstream-link-chip-kind">
+                    {link.kind}
+                  </span>
+                ) : null}
+              </button>
+              <button
+                type="button"
+                className="workstream-link-chip-remove"
+                onClick={() => void handleRemove(link.id)}
+                aria-label={`Remove ${link.label}`}
+                title="Remove"
+              >
+                <IconTrash size={11} sw={1.8} />
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {composerOpen ? (
+        <LinkComposer
+          onCancel={() => setComposerOpen(false)}
+          onSubmit={(label, url, kind) => void handleAdd(label, url, kind)}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+function LinkComposer({
+  onCancel,
+  onSubmit,
+}: {
+  onCancel: () => void;
+  onSubmit: (label: string, url: string, kind: string | null) => void;
+}) {
+  const [label, setLabel] = useState("");
+  const [url, setUrl] = useState("");
+  const [kind, setKind] = useState<string>(LinkKind.Other);
+  const labelRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    labelRef.current?.focus();
+  }, []);
+
+  const canSubmit = label.trim() !== "" && url.trim() !== "";
+
+  const submit = () => {
+    if (!canSubmit) return;
+    onSubmit(label.trim(), url.trim(), kind || null);
+  };
+
+  return (
+    <div className="workstream-link-composer">
+      <input
+        ref={labelRef}
+        type="text"
+        className="workstream-link-composer-input"
+        placeholder="Label (e.g. Repo)"
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            submit();
+          } else if (e.key === "Escape") {
+            onCancel();
+          }
+        }}
+      />
+      <input
+        type="url"
+        className="workstream-link-composer-input"
+        placeholder="https://…"
+        value={url}
+        onChange={(e) => setUrl(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            submit();
+          } else if (e.key === "Escape") {
+            onCancel();
+          }
+        }}
+      />
+      <select
+        className="workstream-link-composer-kind"
+        value={kind}
+        onChange={(e) => setKind(e.target.value)}
+      >
+        {LINK_KIND_OPTIONS.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+      <div className="workstream-link-composer-actions">
+        <button
+          type="button"
+          className="workstream-link-composer-cancel"
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="workstream-link-composer-save"
+          disabled={!canSubmit}
+          onClick={submit}
+        >
+          Add
+        </button>
+      </div>
+    </div>
   );
 }
 

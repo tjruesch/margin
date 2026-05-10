@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use tauri::AppHandle;
 
-use super::{persist, synthesizer, ClusterReport, Workstream, WorkstreamDetail};
+use super::{persist, synthesizer, ClusterReport, Workstream, WorkstreamDetail, WorkstreamLink};
 
 #[tauri::command]
 pub async fn synthesize_workstreams(
@@ -102,4 +102,40 @@ pub fn set_workstream_owner(
 ) -> Result<(), String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
     persist::set_owner(&c, &id, owner_member_id.as_deref()).map_err(|e| e.to_string())
+}
+
+// ----- User-curated links (#88) ------------------------------------------
+
+#[tauri::command]
+pub fn list_workstream_links(
+    workstream_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Vec<WorkstreamLink>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::list_workstream_links(&c, &workstream_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn add_workstream_link(
+    workstream_id: String,
+    label: String,
+    url: String,
+    kind: Option<String>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<WorkstreamLink, String> {
+    let now_ms = chrono::Local::now().timestamp_millis();
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::add_workstream_link(&c, &workstream_id, &label, &url, kind.as_deref(), now_ms)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn remove_workstream_link(
+    link_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::remove_workstream_link(&c, &link_id)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }

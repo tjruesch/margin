@@ -695,7 +695,10 @@ pub fn run() {
             workstreams::commands::set_workstream_user_notes,
             workstreams::commands::list_archived_workstreams,
             workstreams::commands::mark_workstream_seen,
-            workstreams::commands::set_workstream_owner
+            workstreams::commands::set_workstream_owner,
+            workstreams::commands::list_workstream_links,
+            workstreams::commands::add_workstream_link,
+            workstreams::commands::remove_workstream_link
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

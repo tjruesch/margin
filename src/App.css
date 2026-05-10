@@ -4902,6 +4902,23 @@ input.nh-title {
   vertical-align: middle;
 }
 
+/* Link-count badge on a list card (#88) — small chip next to the
+   reopened badge that hints "this workstream has external URLs
+   attached". The full chip set lives on the detail view. */
+.workstream-card-links-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 8px;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fg-muted) 12%, transparent);
+  color: var(--fg-muted);
+  font-size: 10.5px;
+  font-weight: 600;
+  vertical-align: middle;
+}
+
 /* Archived workstreams collapsed accordion at the bottom of the list
    view (#78). Default closed; click the toggle to expand. */
 .workstream-archived-section {
@@ -5105,6 +5122,179 @@ input.nh-title {
   line-height: 1.5;
   color: var(--fg);
   margin: 0;
+}
+
+/* ----- User-curated links (#88) ----- */
+.workstream-links {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.workstream-links-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.workstream-links-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+}
+.workstream-links-add {
+  background: transparent;
+  border: 1px solid var(--home-line);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.workstream-links-add:hover {
+  background: var(--bg-soft, rgba(0, 0, 0, 0.04));
+  color: var(--fg);
+}
+.workstream-links-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.workstream-links-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.workstream-link-chip {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--home-line);
+  border-radius: 999px;
+  background: var(--bg, #fff);
+  overflow: hidden;
+  transition: border-color 0.15s, background 0.15s;
+}
+.workstream-link-chip:hover {
+  border-color: var(--accent, #4a90e2);
+}
+.workstream-link-chip-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--fg);
+  max-width: 280px;
+}
+.workstream-link-chip-open:hover {
+  color: var(--accent, #4a90e2);
+}
+.workstream-link-chip-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.workstream-link-chip-kind {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.workstream-link-chip-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--home-line);
+  cursor: pointer;
+  color: var(--fg-muted);
+}
+.workstream-link-chip-remove:hover {
+  background: var(--bg-soft, rgba(0, 0, 0, 0.04));
+  color: var(--danger, #b00020);
+}
+.workstream-link-composer {
+  display: grid;
+  grid-template-columns: 1fr 1fr 130px;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--home-line);
+  border-radius: 8px;
+  background: var(--bg, #fff);
+}
+.workstream-link-composer-input,
+.workstream-link-composer-kind {
+  box-sizing: border-box;
+  height: 30px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 10px;
+  border: 1px solid var(--home-line);
+  border-radius: 6px;
+  background: var(--bg, #fff);
+  color: var(--fg);
+}
+.workstream-link-composer-kind {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 26px;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M3 4.5l3 3 3-3' fill='none' stroke='%23808080' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 10px 10px;
+}
+.workstream-link-composer-input:focus,
+.workstream-link-composer-kind:focus {
+  outline: none;
+  border-color: var(--accent, #4a90e2);
+}
+.workstream-link-composer-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.workstream-link-composer-cancel,
+.workstream-link-composer-save {
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--home-line);
+  background: var(--bg, #fff);
+  color: var(--fg);
+  cursor: pointer;
+}
+.workstream-link-composer-cancel:hover {
+  background: var(--bg-soft, rgba(0, 0, 0, 0.04));
+}
+.workstream-link-composer-save {
+  background: var(--accent, #4a90e2);
+  border-color: var(--accent, #4a90e2);
+  color: #fff;
+}
+.workstream-link-composer-save:hover {
+  filter: brightness(0.95);
+}
+.workstream-link-composer-save:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 /* ----- User notes (#77) ----- */
