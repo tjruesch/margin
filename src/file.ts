@@ -526,6 +526,21 @@ export type Workstream = {
   /** User-curated external link count (#88). Drives the small link-icon
    *  badge on the list card; the actual links land on WorkstreamDetail. */
   link_count: number;
+  /** Email addresses participating in the workstream's emails / events
+   *  that don't resolve to a team_member. Sorted by signal count desc;
+   *  capped per workstream backend-side. Drives the External chip strip
+   *  on the detail view and the "+N external" pill on the list card. */
+  external_participants: ExternalParticipant[];
+};
+
+export type ExternalParticipant = {
+  /** Lowercased canonical email. */
+  email: string;
+  /** First non-null display name encountered. `null` when only the
+   *  bare address is known. */
+  display_name: string | null;
+  /** Number of signals (emails + events) involving this address. */
+  count: number;
 };
 
 export type WorkstreamAction = {
