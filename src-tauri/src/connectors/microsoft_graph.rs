@@ -113,14 +113,20 @@ impl Connector for MicrosoftGraphConnector {
         };
 
         // ---- Mail half ----------------------------------------------------
-        // Calendar succeeded; if mail fails, log + skip rather than
-        // dropping the calendar half. This keeps the more visible
-        // "Coming up" UI healthy when, say, Mail.Read consent is
-        // outstanding but Calendars.Read still works.
+        // Calendar succeeded and rows are committed; the mail half is
+        // best-effort for transient errors (network, rate limit). But
+        // a `ReauthNeeded` (typically: existing token lacks `Mail.Read`)
+        // MUST surface as the connector's overall last_error so the
+        // Settings UI prompts a Reconnect — otherwise mail would
+        // silently never sync and the user has no signal.
         let mail_report = match self.sync_mail(&ctx, &resolver).await {
             Ok(report) => report,
+            Err(ConnectorError::ReauthNeeded(msg)) => {
+                eprintln!("[microsoft_graph] mail sync needs reauth: {msg}");
+                return Err(ConnectorError::ReauthNeeded(msg));
+            }
             Err(e) => {
-                eprintln!("[microsoft_graph] mail sync failed: {e}");
+                eprintln!("[microsoft_graph] mail sync failed (non-fatal): {e}");
                 super::email::UpsertReport::default()
             }
         };
@@ -273,6 +279,11 @@ fn map_status(
 ) -> ConnectorError {
     match status.as_u16() {
         401 => ConnectorError::ReauthNeeded(format!("graph 401: {body}")),
+        // 403 typically means the token's grant doesn't cover the
+        // requested resource (e.g. existing token without Mail.Read
+        // calling /me/messages). Reconnecting re-prompts consent for
+        // the new scope set, which is the right user action.
+        403 => ConnectorError::ReauthNeeded(format!("graph 403: {body}")),
         429 => ConnectorError::RateLimited {
             retry_after_ms: retry_after_ms.unwrap_or(60_000),
         },
@@ -1057,5 +1068,21 @@ mod tests {
     fn percent_encode_path_handles_graph_id_chars() {
         let encoded = percent_encode_path("AAMkA+/=foo");
         assert_eq!(encoded, "AAMkA%2B%2F%3Dfoo");
+    }
+
+    #[test]
+    fn map_status_treats_403_as_reauth_needed() {
+        let err = map_status(
+            reqwest::StatusCode::FORBIDDEN,
+            None,
+            "ErrorAccessDenied".into(),
+        );
+        match err {
+            ConnectorError::ReauthNeeded(msg) => {
+                assert!(msg.contains("403"));
+                assert!(msg.contains("ErrorAccessDenied"));
+            }
+            other => panic!("expected ReauthNeeded, got {other:?}"),
+        }
     }
 }
