@@ -485,6 +485,19 @@ export function Home({
           setPaletteOpen(false);
           onOpen(p);
         }}
+        onOpenWorkstream={(id) => {
+          setPaletteOpen(false);
+          setNav("workstreams");
+          // setNav is synchronous setState; the WorkstreamsView mounts
+          // on the next render. Defer the detail-open dispatch to the
+          // following microtask so the View's listener is wired up by
+          // the time the event fires.
+          queueMicrotask(() => {
+            window.dispatchEvent(
+              new CustomEvent("margin:open-workstream", { detail: id }),
+            );
+          });
+        }}
       />
       {sidebarOpen && (
         <Sidebar

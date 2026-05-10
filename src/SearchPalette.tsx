@@ -29,6 +29,10 @@ type Props = {
   open: boolean;
   onClose: () => void;
   onOpenNote: (path: string) => void;
+  /** Click-through for `[W*]` chips — switches the sidebar nav to
+   *  Workstreams and opens the specified workstream's detail view.
+   *  Provided by Home.tsx so it can flip its nav state directly. */
+  onOpenWorkstream: (workstreamId: string) => void;
 };
 
 const QUERY_DEBOUNCE_MS = 120;
@@ -79,7 +83,7 @@ type VoiceState =
   | { kind: "transcribing" }
   | { kind: "didnt-catch"; message?: string };
 
-export function SearchPalette({ open, onClose, onOpenNote }: Props) {
+export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: Props) {
   const [mode, setMode] = useState<"search" | "chat">("search");
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -538,6 +542,10 @@ export function SearchPalette({ open, onClose, onOpenNote }: Props) {
               onOpenNote(path);
               onClose();
             }}
+            onOpenWorkstream={(id) => {
+              onOpenWorkstream(id);
+              onClose();
+            }}
           />
         )}
 
@@ -636,15 +644,22 @@ function Conversation({
   ref,
   messages,
   onOpenNote,
+  onOpenWorkstream,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
   messages: ChatMessage[];
   onOpenNote: (path: string) => void;
+  onOpenWorkstream: (workstreamId: string) => void;
 }) {
   return (
     <div className="palette-conversation" ref={ref}>
       {messages.map((m) => (
-        <MessageBubble key={m.id} message={m} onOpenNote={onOpenNote} />
+        <MessageBubble
+          key={m.id}
+          message={m}
+          onOpenNote={onOpenNote}
+          onOpenWorkstream={onOpenWorkstream}
+        />
       ))}
     </div>
   );
@@ -653,9 +668,11 @@ function Conversation({
 function MessageBubble({
   message,
   onOpenNote,
+  onOpenWorkstream,
 }: {
   message: ChatMessage;
   onOpenNote: (path: string) => void;
+  onOpenWorkstream: (workstreamId: string) => void;
 }) {
   if (message.role === "user") {
     return (
@@ -677,13 +694,14 @@ function MessageBubble({
   const sources = message.sources || [];
   const fullText = joinText(message.parts);
   // Render chips only for labels the model actually cited across all
-  // text parts. The full directory + schedule can be hundreds of
-  // entries — showing all of them would be a wall of chips. Both `[N]`
-  // (notes) and `[E<N>]` (events) match.
+  // text parts. The full directory + schedule + workstreams can be
+  // hundreds of entries — showing all of them would be a wall of
+  // chips. `[N]` (notes), `[E<N>]` (events), and `[W<N>]`
+  // (workstreams) all match.
   const citedSources = useMemo(() => {
     if (sources.length === 0) return [];
     const cited = new Set<string>();
-    const re = /\[(E?\d{1,3})\]/g;
+    const re = /\[([WE]?\d{1,3})\]/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(fullText)) !== null) {
       cited.add(m[1]);
@@ -711,6 +729,7 @@ function MessageBubble({
                 text={part.value}
                 sources={sources}
                 onOpenNote={onOpenNote}
+                onOpenWorkstream={onOpenWorkstream}
               />
             ) : (
               <ToolPill
@@ -718,12 +737,14 @@ function MessageBubble({
                 part={part}
                 onOpen={() => {
                   // Resolve the source by label and open the right
-                  // surface — note path for [N], or the linked event
-                  // bundle for [E<N>] (creating one if needed via
-                  // openOrCreateEventNote from #62).
+                  // surface — note path for [N], the linked event
+                  // bundle for [E<N>] (created on demand via
+                  // openOrCreateEventNote from #62), or the
+                  // Workstreams detail view for [W<N>] via the custom
+                  // event in onOpenWorkstream.
                   const src = sources.find((s) => s.label === part.targetLabel);
                   if (!src) return;
-                  void openSource(src, onOpenNote);
+                  void openSource(src, onOpenNote, onOpenWorkstream);
                 }}
               />
             ),
@@ -738,11 +759,9 @@ function MessageBubble({
               <button
                 key={s.label}
                 type="button"
-                className={`palette-source-chip ${
-                  s.kind === "event" ? "is-event" : "is-note"
-                }`}
+                className={`palette-source-chip ${chipVariant(s.kind)}`}
                 title={s.title}
-                onClick={() => void openSource(s, onOpenNote)}
+                onClick={() => void openSource(s, onOpenNote, onOpenWorkstream)}
               >
                 <span className="palette-source-num">{s.label}</span>
                 <span className="palette-source-title">{s.title}</span>
@@ -765,6 +784,8 @@ function ToolPill({
   const verb =
     part.name === "read_event_details"
       ? "Reading event"
+      : part.name === "read_workstream"
+      ? "Reading workstream"
       : part.name === "read_transcript"
       ? "Reading transcript"
       : "Reading";
@@ -797,12 +818,30 @@ function ToolPill({
   );
 }
 
+/// CSS variant class for a chip / inline citation, keyed off the
+/// source kind. Centralized so the inline `[N]` markers and the bottom
+/// "Sources" strip stay consistent.
+function chipVariant(kind: AskSource["kind"]): string {
+  switch (kind) {
+    case "event":
+      return "is-event";
+    case "workstream":
+      return "is-workstream";
+    case "note":
+    default:
+      return "is-note";
+  }
+}
+
 /// Open the surface a source points at. Notes go through `onOpenNote`
 /// directly. Events route through `openOrCreateEventNote` (#62) which
-/// creates the linked bundle on first click.
+/// creates the linked bundle on first click. Workstreams hand the id
+/// to `onOpenWorkstream`, which switches the sidebar nav and dispatches
+/// `margin:open-workstream` so the detail view selects this one (#72).
 async function openSource(
   source: AskSource,
   onOpenNote: (path: string) => void,
+  onOpenWorkstream: (workstreamId: string) => void,
 ): Promise<void> {
   if (source.kind === "note" && source.note_path) {
     onOpenNote(source.note_path);
@@ -815,6 +854,10 @@ async function openSource(
     } catch (e) {
       console.error("[ask] open event note failed:", e);
     }
+    return;
+  }
+  if (source.kind === "workstream" && source.workstream_id) {
+    onOpenWorkstream(source.workstream_id);
   }
 }
 
@@ -834,10 +877,12 @@ function CitedText({
   text,
   sources,
   onOpenNote,
+  onOpenWorkstream,
 }: {
   text: string;
   sources: AskSource[];
   onOpenNote: (path: string) => void;
+  onOpenWorkstream: (workstreamId: string) => void;
 }) {
   const sourceByLabel = useMemo(() => {
     const m = new Map<string, AskSource>();
@@ -846,13 +891,12 @@ function CitedText({
   }, [sources]);
 
   const html = useMemo(() => {
-    const withCitations = text.replace(/\[(E?\d{1,3})\]/g, (full, label) => {
+    const withCitations = text.replace(/\[([WE]?\d{1,3})\]/g, (full, label) => {
       const src = sourceByLabel.get(label);
       // Hallucinated citation label — leave the marker as plain text
       // rather than emitting a dead chip.
       if (!src) return full;
-      const variant = src.kind === "event" ? "is-event" : "is-note";
-      return `<button type="button" class="palette-cite ${variant}" data-cite-label="${label}">${label}</button>`;
+      return `<button type="button" class="palette-cite ${chipVariant(src.kind)}" data-cite-label="${label}">${label}</button>`;
     });
     return renderMarkdown(withCitations);
   }, [text, sourceByLabel]);
@@ -864,7 +908,7 @@ function CitedText({
     const label = cite.getAttribute("data-cite-label");
     if (!label) return;
     const source = sourceByLabel.get(label);
-    if (source) void openSource(source, onOpenNote);
+    if (source) void openSource(source, onOpenNote, onOpenWorkstream);
   };
 
   return (
