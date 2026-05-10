@@ -6,10 +6,11 @@
 //! pipeline added in #70 and listens for `workstream-status` to
 //! refetch.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   type EmailMessage,
+  type TeamMember,
   type Workstream,
   type WorkstreamAction,
   type WorkstreamDetail,
@@ -17,13 +18,16 @@ import {
   getEmailBody,
   getWorkstreamDetails,
   listArchivedWorkstreams,
+  listTeamMembers,
   markWorkstreamSeen,
   openOrCreateEventNote,
   setWorkstreamActionDone,
+  setWorkstreamOwner,
   setWorkstreamStatus,
   setWorkstreamUserNotes,
 } from "./file";
 import { IconChevLeft } from "./icons";
+import { avatarColor, initialsFromName } from "./initials";
 
 // ----- List view -----------------------------------------------------------
 
@@ -43,6 +47,37 @@ export function WorkstreamsView({
   onOpenNote: (path: string) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Team-member cache for owner / member chips (#81). Loaded once and
+  // refreshed on `margin:team-changed` events.
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  // Filter-by-member dropdown (#81). null = no filter (default).
+  const [memberFilter, setMemberFilter] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const members = await listTeamMembers();
+        if (!cancelled) setTeamMembers(members);
+      } catch (e) {
+        console.error("[workstreams] listTeamMembers failed", e);
+      }
+    })();
+    const onChanged = () => {
+      void listTeamMembers().then((m) => setTeamMembers(m)).catch(() => {});
+    };
+    window.addEventListener("margin:team-changed", onChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("margin:team-changed", onChanged);
+    };
+  }, []);
+
+  const teamById = useMemo(() => {
+    const m = new Map<string, TeamMember>();
+    for (const t of teamMembers) m.set(t.id, t);
+    return m;
+  }, [teamMembers]);
 
   // External open: the AI ask palette dispatches `margin:open-workstream`
   // when a `[W*]` citation chip is clicked (#72). This view is only
@@ -60,15 +95,24 @@ export function WorkstreamsView({
     return () => window.removeEventListener("margin:open-workstream", onOpen);
   }, []);
 
+  // Filter dropdown options: every team member referenced as owner or
+  // member on at least one active workstream. Computed via useMemo —
+  // must run before any early return to satisfy the Rules of Hooks.
+  const filterCandidates = useFilterCandidates(workstreams, teamById);
+
   if (selectedId) {
     return (
       <WorkstreamDetailView
         id={selectedId}
         onBack={() => setSelectedId(null)}
         onOpenNote={onOpenNote}
+        teamMembers={teamMembers}
+        teamById={teamById}
       />
     );
   }
+
+  const filteredActive = applyMemberFilter(workstreams, memberFilter);
 
   const nowMs = Date.now();
 
@@ -104,6 +148,24 @@ export function WorkstreamsView({
         </div>
       ) : null}
 
+      {!loading && filterCandidates.length > 0 ? (
+        <div className="workstream-filter">
+          <label htmlFor="workstream-member-filter">Filter by member</label>
+          <select
+            id="workstream-member-filter"
+            value={memberFilter ?? ""}
+            onChange={(e) => setMemberFilter(e.target.value || null)}
+          >
+            <option value="">All</option>
+            {filterCandidates.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.display_name}
+              </option>
+            ))}
+          </select>
+        </div>
+      ) : null}
+
       {loading ? (
         <p className="home-empty">Loading…</p>
       ) : workstreams.length === 0 ? (
@@ -114,14 +176,19 @@ export function WorkstreamsView({
             then click Refresh to synthesize.
           </p>
         </div>
+      ) : filteredActive.length === 0 ? (
+        <p className="home-empty">
+          No active workstreams match this filter.
+        </p>
       ) : (
         <div className="workstream-list">
-          {workstreams.map((w) => (
+          {filteredActive.map((w) => (
             <WorkstreamCard
               key={w.id}
               workstream={w}
               nowMs={nowMs}
               onClick={() => setSelectedId(w.id)}
+              teamById={teamById}
             />
           ))}
         </div>
@@ -132,22 +199,84 @@ export function WorkstreamsView({
           onSelect={(id) => setSelectedId(id)}
           nowMs={nowMs}
           synthInFlight={synthInFlight}
+          teamById={teamById}
+          memberFilter={memberFilter}
         />
       )}
     </div>
   );
 }
 
+function useFilterCandidates(
+  workstreams: Workstream[],
+  teamById: Map<string, TeamMember>,
+): TeamMember[] {
+  return useMemo(() => {
+    const ids = new Set<string>();
+    for (const w of workstreams) {
+      if (w.owner_member_id) ids.add(w.owner_member_id);
+      for (const m of w.members) ids.add(m);
+    }
+    const out: TeamMember[] = [];
+    for (const id of ids) {
+      const m = teamById.get(id);
+      if (m) out.push(m);
+    }
+    out.sort((a, b) => a.display_name.localeCompare(b.display_name));
+    return out;
+  }, [workstreams, teamById]);
+}
+
+function applyMemberFilter<T extends Workstream>(
+  workstreams: T[],
+  memberId: string | null,
+): T[] {
+  if (!memberId) return workstreams;
+  return workstreams.filter(
+    (w) => w.owner_member_id === memberId || w.members.includes(memberId),
+  );
+}
+
+/// Max member chips rendered on the card before overflow collapses
+/// into a `+N` pill. Owner always shows when present; the cap covers
+/// owner + non-owner members combined.
+const CARD_CHIP_CAP = 4;
+
 function WorkstreamCard({
   workstream: w,
   nowMs,
   onClick,
+  teamById,
 }: {
   workstream: Workstream;
   nowMs: number;
   onClick: () => void;
+  teamById: Map<string, TeamMember>;
 }) {
   const isReopened = w.reopened_at_ms != null && w.status === "active";
+
+  // Build the ordered list: owner first (if resolvable), then other
+  // members (deduped), in the order persist returned them.
+  const ordered: TeamMember[] = [];
+  const seen = new Set<string>();
+  if (w.owner_member_id) {
+    const m = teamById.get(w.owner_member_id);
+    if (m) {
+      ordered.push(m);
+      seen.add(m.id);
+    }
+  }
+  for (const id of w.members) {
+    if (seen.has(id)) continue;
+    const m = teamById.get(id);
+    if (m) {
+      ordered.push(m);
+      seen.add(m.id);
+    }
+  }
+  const visible = ordered.slice(0, CARD_CHIP_CAP);
+  const overflow = ordered.length - visible.length;
+
   return (
     <button type="button" className="workstream-card" onClick={onClick}>
       <div className="workstream-card-head">
@@ -163,10 +292,62 @@ function WorkstreamCard({
           {formatPast(w.last_activity_ms, nowMs)}
         </span>
       </div>
+      {ordered.length > 0 ? (
+        <div className="workstream-card-people">
+          {visible.map((m) => {
+            const isOwner = m.id === w.owner_member_id;
+            if (isOwner) {
+              return (
+                <span
+                  key={m.id}
+                  className="workstream-card-owner-chip"
+                  title={`${m.display_name} (owner)`}
+                >
+                  <span aria-hidden className="workstream-card-owner-mark">
+                    ★
+                  </span>
+                  {firstName(m.display_name)}
+                </span>
+              );
+            }
+            return (
+              <span
+                key={m.id}
+                className="workstream-card-chip"
+                title={m.display_name}
+              >
+                <span
+                  className="workstream-card-chip-avatar"
+                  style={{ background: avatarColor(m.display_name) }}
+                >
+                  {initialsFromName(m.display_name)}
+                </span>
+                <span className="workstream-card-chip-name">
+                  {firstName(m.display_name)}
+                </span>
+              </span>
+            );
+          })}
+          {overflow > 0 ? (
+            <span
+              className="workstream-card-overflow"
+              title={`${overflow} more member${overflow === 1 ? "" : "s"}`}
+            >
+              +{overflow}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       <p className="workstream-card-summary">{w.summary}</p>
       <div className="workstream-card-counts">{countLine(w)}</div>
     </button>
   );
+}
+
+function firstName(displayName: string): string {
+  const trimmed = displayName.trim();
+  const space = trimmed.indexOf(" ");
+  return space === -1 ? trimmed : trimmed.slice(0, space);
 }
 
 /// Collapsed accordion at the bottom of the Workstreams list. Loads
@@ -179,10 +360,14 @@ function ArchivedSection({
   onSelect,
   nowMs,
   synthInFlight,
+  teamById,
+  memberFilter,
 }: {
   onSelect: (id: string) => void;
   nowMs: number;
   synthInFlight: boolean;
+  teamById: Map<string, TeamMember>;
+  memberFilter: string | null;
 }) {
   const [archived, setArchived] = useState<Workstream[]>([]);
   const [expanded, setExpanded] = useState(false);
@@ -207,6 +392,8 @@ function ArchivedSection({
     }
   }, [synthInFlight, reload]);
 
+  const filtered = applyMemberFilter(archived, memberFilter);
+
   if (archived.length === 0) return null;
   return (
     <section className="workstream-archived-section">
@@ -217,19 +404,24 @@ function ArchivedSection({
         aria-expanded={expanded}
       >
         <span>{expanded ? "▾" : "▸"}</span>
-        Archived ({archived.length})
+        Archived ({memberFilter ? `${filtered.length}/${archived.length}` : archived.length})
       </button>
       {expanded ? (
-        <div className="workstream-archived-list">
-          {archived.map((w) => (
-            <WorkstreamCard
-              key={w.id}
-              workstream={w}
-              nowMs={nowMs}
-              onClick={() => onSelect(w.id)}
-            />
-          ))}
-        </div>
+        filtered.length === 0 ? (
+          <p className="home-empty">No archived workstreams match this filter.</p>
+        ) : (
+          <div className="workstream-archived-list">
+            {filtered.map((w) => (
+              <WorkstreamCard
+                key={w.id}
+                workstream={w}
+                nowMs={nowMs}
+                onClick={() => onSelect(w.id)}
+                teamById={teamById}
+              />
+            ))}
+          </div>
+        )
       ) : null}
     </section>
   );
@@ -256,10 +448,14 @@ function WorkstreamDetailView({
   id,
   onBack,
   onOpenNote,
+  teamMembers,
+  teamById,
 }: {
   id: string;
   onBack: () => void;
   onOpenNote: (path: string) => void;
+  teamMembers: TeamMember[];
+  teamById: Map<string, TeamMember>;
 }) {
   const [detail, setDetail] = useState<WorkstreamDetail | null>(null);
   const [loading, setLoading] = useState(true);
@@ -395,8 +591,29 @@ function WorkstreamDetailView({
         onBack={onBack}
         status={detail.status}
         onChangeStatus={onChangeStatus}
+        ownerId={detail.owner_member_id}
+        teamMembers={teamMembers}
+        onChangeOwner={async (ownerId) => {
+          // Optimistic local update; revert on error.
+          const prev = detail.owner_member_id;
+          setDetail((d) => (d ? { ...d, owner_member_id: ownerId } : d));
+          try {
+            await setWorkstreamOwner(detail.id, ownerId);
+          } catch (e) {
+            console.error("[workstreams] setWorkstreamOwner failed", e);
+            setDetail((d) => (d ? { ...d, owner_member_id: prev } : d));
+          }
+        }}
       />
       <p className="workstream-detail-summary">{detail.summary}</p>
+
+      {detail.members.length > 0 ? (
+        <MembersStrip
+          memberIds={detail.members}
+          ownerId={detail.owner_member_id}
+          teamById={teamById}
+        />
+      ) : null}
 
       <WorkstreamUserNotes
         workstreamId={detail.id}
@@ -552,11 +769,17 @@ function DetailHeader({
   onBack,
   status,
   onChangeStatus,
+  ownerId,
+  teamMembers,
+  onChangeOwner,
 }: {
   title: string;
   onBack: () => void;
   status: WorkstreamStatus | null;
   onChangeStatus: (s: WorkstreamStatus) => void | Promise<void>;
+  ownerId?: string | null;
+  teamMembers?: TeamMember[];
+  onChangeOwner?: (ownerId: string | null) => void | Promise<void>;
 }) {
   return (
     <header className="workstream-header workstream-detail-header">
@@ -570,6 +793,21 @@ function DetailHeader({
         Back
       </button>
       <h1 className="workstream-title">{title}</h1>
+      {teamMembers && onChangeOwner ? (
+        <select
+          className="workstream-owner-select"
+          value={ownerId ?? ""}
+          onChange={(e) => onChangeOwner(e.target.value || null)}
+          aria-label="Workstream owner"
+        >
+          <option value="">Unassigned</option>
+          {teamMembers.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.display_name}
+            </option>
+          ))}
+        </select>
+      ) : null}
       {status ? (
         <select
           className="workstream-status"
@@ -583,6 +821,72 @@ function DetailHeader({
         </select>
       ) : null}
     </header>
+  );
+}
+
+function MembersStrip({
+  memberIds,
+  ownerId,
+  teamById,
+}: {
+  memberIds: string[];
+  ownerId: string | null;
+  teamById: Map<string, TeamMember>;
+}) {
+  // Owner first (bigger chip), then everyone else.
+  const ordered: TeamMember[] = [];
+  const seen = new Set<string>();
+  if (ownerId) {
+    const m = teamById.get(ownerId);
+    if (m) {
+      ordered.push(m);
+      seen.add(m.id);
+    }
+  }
+  for (const id of memberIds) {
+    if (seen.has(id)) continue;
+    const m = teamById.get(id);
+    if (m) {
+      ordered.push(m);
+      seen.add(m.id);
+    }
+  }
+  if (ordered.length === 0) return null;
+  return (
+    <section className="workstream-members-strip">
+      {ordered.map((m) => {
+        const isOwner = m.id === ownerId;
+        if (isOwner) {
+          return (
+            <span
+              key={m.id}
+              className="workstream-member-owner-chip"
+              title={`${m.display_name} (owner)`}
+            >
+              <span aria-hidden className="workstream-member-owner-mark">
+                ★
+              </span>
+              {m.display_name}
+            </span>
+          );
+        }
+        return (
+          <span
+            key={m.id}
+            className="workstream-member-chip"
+            title={m.display_name}
+          >
+            <span
+              className="workstream-member-avatar"
+              style={{ background: avatarColor(m.display_name) }}
+            >
+              {initialsFromName(m.display_name)}
+            </span>
+            <span className="workstream-member-name">{m.display_name}</span>
+          </span>
+        );
+      })}
+    </section>
   );
 }
 

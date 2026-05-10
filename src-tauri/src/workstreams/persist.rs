@@ -70,7 +70,7 @@ pub fn set_last_clustered_ms(conn: &Connection, ms: i64) -> rusqlite::Result<()>
 pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workstream>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
-                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0) AS ec, \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0) AS evc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0) AS nc, \
@@ -91,16 +91,19 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
             user_notes: r.get(7)?,
             archived_at_ms: r.get(8)?,
             reopened_at_ms: r.get(9)?,
-            email_count: r.get::<_, i64>(10)? as u32,
-            event_count: r.get::<_, i64>(11)? as u32,
-            note_count: r.get::<_, i64>(12)? as u32,
-            open_action_count: r.get::<_, i64>(13)? as u32,
+            owner_member_id: r.get(10)?,
+            members: Vec::new(),
+            email_count: r.get::<_, i64>(11)? as u32,
+            event_count: r.get::<_, i64>(12)? as u32,
+            note_count: r.get::<_, i64>(13)? as u32,
+            open_action_count: r.get::<_, i64>(14)? as u32,
         })
     })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
+    attach_members(conn, &mut out)?;
     Ok(out)
 }
 
@@ -111,7 +114,7 @@ pub fn list_workstreams_archived(
 ) -> rusqlite::Result<Vec<Workstream>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
-                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
@@ -132,16 +135,19 @@ pub fn list_workstreams_archived(
             user_notes: r.get(7)?,
             archived_at_ms: r.get(8)?,
             reopened_at_ms: r.get(9)?,
-            email_count: r.get::<_, i64>(10)? as u32,
-            event_count: r.get::<_, i64>(11)? as u32,
-            note_count: r.get::<_, i64>(12)? as u32,
-            open_action_count: r.get::<_, i64>(13)? as u32,
+            owner_member_id: r.get(10)?,
+            members: Vec::new(),
+            email_count: r.get::<_, i64>(11)? as u32,
+            event_count: r.get::<_, i64>(12)? as u32,
+            note_count: r.get::<_, i64>(13)? as u32,
+            open_action_count: r.get::<_, i64>(14)? as u32,
         })
     })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
+    attach_members(conn, &mut out)?;
     Ok(out)
 }
 
@@ -157,7 +163,7 @@ pub fn list_workstreams_for_synthesis(
 ) -> rusqlite::Result<Vec<(Workstream, bool)>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
-                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
@@ -183,10 +189,12 @@ pub fn list_workstreams_for_synthesis(
                 user_notes: r.get(7)?,
                 archived_at_ms: r.get(8)?,
                 reopened_at_ms: r.get(9)?,
-                email_count: r.get::<_, i64>(10)? as u32,
-                event_count: r.get::<_, i64>(11)? as u32,
-                note_count: r.get::<_, i64>(12)? as u32,
-                open_action_count: r.get::<_, i64>(13)? as u32,
+                owner_member_id: r.get(10)?,
+                members: Vec::new(),
+                email_count: r.get::<_, i64>(11)? as u32,
+                event_count: r.get::<_, i64>(12)? as u32,
+                note_count: r.get::<_, i64>(13)? as u32,
+                open_action_count: r.get::<_, i64>(14)? as u32,
             },
             is_archived,
         ))
@@ -194,6 +202,13 @@ pub fn list_workstreams_for_synthesis(
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
+    }
+    // Attach members to the workstreams (mutating in place via a
+    // throwaway view onto just the Workstream side of the tuple).
+    let mut just_ws: Vec<Workstream> = out.iter().map(|(w, _)| w.clone()).collect();
+    attach_members(conn, &mut just_ws)?;
+    for (i, (w, _)) in out.iter_mut().enumerate() {
+        w.members = std::mem::take(&mut just_ws[i].members);
     }
     Ok(out)
 }
@@ -278,32 +293,99 @@ pub fn get_workstream_detail(
 fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Workstream>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
-                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
          FROM workstreams w WHERE w.id = ?1",
     )?;
-    stmt.query_row(params![id], |r| {
-        Ok(Workstream {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            summary: r.get(2)?,
-            status: r.get(3)?,
-            last_activity_ms: r.get(4)?,
-            created_ms: r.get(5)?,
-            updated_ms: r.get(6)?,
-            user_notes: r.get(7)?,
-            archived_at_ms: r.get(8)?,
-            reopened_at_ms: r.get(9)?,
-            email_count: r.get::<_, i64>(10)? as u32,
-            event_count: r.get::<_, i64>(11)? as u32,
-            note_count: r.get::<_, i64>(12)? as u32,
-            open_action_count: r.get::<_, i64>(13)? as u32,
+    let mut ws = stmt
+        .query_row(params![id], |r| {
+            Ok(Workstream {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                summary: r.get(2)?,
+                status: r.get(3)?,
+                last_activity_ms: r.get(4)?,
+                created_ms: r.get(5)?,
+                updated_ms: r.get(6)?,
+                user_notes: r.get(7)?,
+                archived_at_ms: r.get(8)?,
+                reopened_at_ms: r.get(9)?,
+                owner_member_id: r.get(10)?,
+                members: Vec::new(),
+                email_count: r.get::<_, i64>(11)? as u32,
+                event_count: r.get::<_, i64>(12)? as u32,
+                note_count: r.get::<_, i64>(13)? as u32,
+                open_action_count: r.get::<_, i64>(14)? as u32,
+            })
         })
-    })
-    .optional()
+        .optional()?;
+    if let Some(ref mut w) = ws {
+        let mut single = vec![std::mem::take(w)];
+        attach_members(conn, &mut single)?;
+        *w = single.pop().unwrap();
+    }
+    Ok(ws)
+}
+
+/// Bulk-derive members for a slice of workstreams (#81). Members are
+/// the team_member ids that resolve from the workstream's email
+/// recipients and event attendees. One UNION query covers all rows in
+/// the slice — far cheaper than per-workstream fetches in the list
+/// view. No-op when the slice is empty.
+fn attach_members(
+    conn: &Connection,
+    workstreams: &mut [Workstream],
+) -> rusqlite::Result<()> {
+    if workstreams.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(workstreams.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Two halves UNION'd then DISTINCT'd at the (workstream, member) level.
+    // Each member appears once per workstream regardless of how many
+    // emails / events they're on.
+    let sql = format!(
+        "SELECT DISTINCT workstream_id, member_id FROM ( \
+            SELECT we.workstream_id, er.team_member_id AS member_id \
+            FROM workstream_emails we \
+            JOIN email_recipients er ON er.message_id = we.message_id \
+            WHERE we.workstream_id IN ({placeholders}) AND er.team_member_id IS NOT NULL \
+            UNION \
+            SELECT wev.workstream_id, ca.team_member_id AS member_id \
+            FROM workstream_events wev \
+            JOIN calendar_attendees ca ON ca.event_id = wev.event_id \
+            WHERE wev.workstream_id IN ({placeholders}) AND ca.team_member_id IS NOT NULL \
+         ) ORDER BY workstream_id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // The IN list appears twice in the UNION; bind both.
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(workstreams.len() * 2);
+    for w in workstreams.iter() {
+        params_vec.push(&w.id as &dyn rusqlite::ToSql);
+    }
+    for w in workstreams.iter() {
+        params_vec.push(&w.id as &dyn rusqlite::ToSql);
+    }
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut by_id: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (ws_id, member_id) = row?;
+        by_id.entry(ws_id).or_default().push(member_id);
+    }
+    for w in workstreams.iter_mut() {
+        if let Some(members) = by_id.remove(&w.id) {
+            w.members = members;
+        }
+    }
+    Ok(())
 }
 
 fn list_actions_for(
@@ -592,6 +674,22 @@ pub fn set_status(conn: &Connection, id: &str, status: &str) -> rusqlite::Result
     Ok(())
 }
 
+/// Set or clear a workstream's owner (#81). Pass `None` to unassign.
+/// `write_workstream` deliberately doesn't touch this column, so
+/// owner survives re-clusters — same pattern as `user_notes` and
+/// `linked_note_path`.
+pub fn set_owner(
+    conn: &Connection,
+    id: &str,
+    owner_member_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE workstreams SET owner_member_id = ?2, updated_ms = ?3 WHERE id = ?1",
+        params![id, owner_member_id, now_ms()],
+    )?;
+    Ok(())
+}
+
 /// Synthesizer-driven resurrect: flip an archived workstream back to
 /// active, stamp `reopened_at_ms = now`, leave `archived_at_ms` as
 /// historical record. No-op if the workstream isn't currently
@@ -692,6 +790,10 @@ mod tests {
         conn.execute_batch(include_str!("../migrations/013_workstream_user_notes.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../migrations/014_workstream_archive_resurface.sql"))
+            .unwrap();
+        // 015 references team_members; the test setup already has the
+        // table created above, so the FK reference resolves at migrate time.
+        conn.execute_batch(include_str!("../migrations/015_workstream_owner.sql"))
             .unwrap();
         conn
     }
@@ -1218,5 +1320,125 @@ mod tests {
         let res = lookup_pre_status(&tx, "ws_x").unwrap();
         tx.commit().unwrap();
         assert_eq!(res.as_deref(), Some("archived"));
+    }
+
+    // ----- owner + members (#81) -------------------------------------------
+
+    #[test]
+    fn set_owner_round_trips() {
+        let mut conn = open_test_db();
+        conn.execute("INSERT INTO team_members(id) VALUES ('tm:tj')", [])
+            .unwrap();
+        seed_workstream(&mut conn, "ws_o");
+        // Default: no owner.
+        assert_eq!(
+            list_workstreams_active(&conn).unwrap()[0].owner_member_id,
+            None
+        );
+
+        set_owner(&conn, "ws_o", Some("tm:tj")).unwrap();
+        assert_eq!(
+            list_workstreams_active(&conn).unwrap()[0].owner_member_id.as_deref(),
+            Some("tm:tj")
+        );
+
+        set_owner(&conn, "ws_o", None).unwrap();
+        assert_eq!(
+            list_workstreams_active(&conn).unwrap()[0].owner_member_id,
+            None
+        );
+    }
+
+    #[test]
+    fn write_workstream_does_not_overwrite_owner_on_resync() {
+        let mut conn = open_test_db();
+        conn.execute("INSERT INTO team_members(id) VALUES ('tm:tj')", [])
+            .unwrap();
+        seed_workstream(&mut conn, "ws_oo");
+        set_owner(&conn, "ws_oo", Some("tm:tj")).unwrap();
+
+        // Re-cluster pass refreshes title/summary; owner must survive.
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_oo"), "Renamed", &[], &[], &[], vec![]),
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            list_workstreams_active(&conn).unwrap()[0].owner_member_id.as_deref(),
+            Some("tm:tj")
+        );
+    }
+
+    #[test]
+    fn members_derived_from_email_recipients_and_event_attendees() {
+        let mut conn = open_test_db();
+        // Seed two team members.
+        conn.execute("INSERT INTO team_members(id) VALUES ('tm:heike'), ('tm:tj')", [])
+            .unwrap();
+
+        // An email + event referencing both. seed_email/seed_event from
+        // the calendar tests above set up the rows; recipients/attendees
+        // we add manually.
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_event(&conn, "mg:test::e1", 2_000);
+        conn.execute(
+            "INSERT INTO email_recipients(message_id, email, recipient_type, team_member_id) \
+             VALUES ('mg:test::m1', 'heike@e.com', 'to', 'tm:heike')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_attendees(event_id, email, team_member_id) \
+             VALUES ('mg:test::e1', 'tj@e.com', 'tm:tj')",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws_p"),
+                "WS",
+                &["mg:test::m1"],
+                &["mg:test::e1"],
+                &[],
+                vec![],
+            ),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let ws = &list_workstreams_active(&conn).unwrap()[0];
+        let mut members = ws.members.clone();
+        members.sort();
+        assert_eq!(members, vec!["tm:heike".to_string(), "tm:tj".to_string()]);
+    }
+
+    #[test]
+    fn members_excludes_unresolved_email_recipients() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        // Recipient with no team_member_id (NULL) — must not show up.
+        conn.execute(
+            "INSERT INTO email_recipients(message_id, email, recipient_type, team_member_id) \
+             VALUES ('mg:test::m1', 'unknown@e.com', 'to', NULL)",
+            [],
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_q"), "WS", &["mg:test::m1"], &[], &[], vec![]),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        assert!(list_workstreams_active(&conn).unwrap()[0].members.is_empty());
     }
 }

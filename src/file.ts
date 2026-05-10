@@ -512,6 +512,13 @@ export type Workstream = {
    *  markWorkstreamSeen. The "Reopened" badge shows when this is set
    *  and status === "active". */
   reopened_at_ms: number | null;
+  /** User-set internal owner of the workstream (#81). Single team_member
+   *  id; null when unassigned. */
+  owner_member_id: string | null;
+  /** Derived list of team_member ids involved in the workstream (#81)
+   *  via email recipients and event attendees. UI maps ids to display
+   *  names through the existing team-member cache. */
+  members: string[];
   email_count: number;
   event_count: number;
   note_count: number;
@@ -610,6 +617,15 @@ export async function listArchivedWorkstreams(): Promise<Workstream[]> {
  *  isn't set. */
 export async function markWorkstreamSeen(id: string): Promise<void> {
   await invoke<void>("mark_workstream_seen", { id });
+}
+
+/** Set or clear a workstream's owner (#81). Pass `null` to unassign.
+ *  User-only authority — the synthesizer never sets this. */
+export async function setWorkstreamOwner(
+  id: string,
+  ownerMemberId: string | null,
+): Promise<void> {
+  await invoke<void>("set_workstream_owner", { id, ownerMemberId });
 }
 
 export type NoteMeta = { modified_ms: number };
