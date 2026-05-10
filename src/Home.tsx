@@ -546,7 +546,9 @@ export function Home({
           onNewMeeting={onNewMeeting}
         />
 
-        {upcoming.length > 0 && <UpcomingStrip events={upcoming} onOpen={openEventNote} />}
+        {nav !== "workstreams" && upcoming.length > 0 && (
+          <UpcomingStrip events={upcoming} onOpen={openEventNote} />
+        )}
 
         {nav === "team" ? (
           <TeamView
