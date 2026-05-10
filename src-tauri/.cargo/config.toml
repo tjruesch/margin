@@ -1,9 +1,17 @@
-# Ad-hoc codesign the dev binary with a stable identifier (com.margin.app)
-# so macOS Keychain treats every `cargo run` as the same app and we don't
-# get an "Allow Access" prompt on every rebuild. Without this, Keychain's
-# ACL binds to the unsigned binary's hash, which changes every build.
+# Codesign the dev binary so macOS Keychain treats every `cargo run` as
+# the same app and "Always Allow" sticks across rebuilds.
+#
+# `--sign -` (ad-hoc) is the fallback. It produces a fresh code-designated-
+# requirement hash per build, which Keychain treats as a new principal —
+# so each launch re-prompts. To get sticky "Always Allow", create a
+# persistent self-signed code-signing certificate (Keychain Access →
+# Certificate Assistant → Create a Certificate, type Code Signing) and
+# put either the certificate name or its SHA1 in `MARGIN_DEV_SIGNING_IDENTITY`
+# (e.g. in `.env`). `security find-identity -v -p codesigning` will show
+# the SHA1 once the cert exists. cargo run then signs with that identity
+# every time, producing the same signature, and Keychain's ACL holds.
 [target.'cfg(target_os = "macos")']
-runner = ["sh", "-c", "codesign --force --sign - --identifier com.margin.app \"$0\" 2>/dev/null; exec \"$0\" \"$@\""]
+runner = ["sh", "-c", "codesign --force --sign \"${MARGIN_DEV_SIGNING_IDENTITY:--}\" --identifier com.margin.app \"$0\" 2>/dev/null; exec \"$0\" \"$@\""]
 
 # whisper-rs links against whisper.cpp's C++ object files; macOS needs libc++
 # and the Accelerate framework explicitly so the linker resolves
