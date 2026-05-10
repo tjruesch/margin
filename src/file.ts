@@ -523,6 +523,9 @@ export type Workstream = {
   event_count: number;
   note_count: number;
   open_action_count: number;
+  /** User-curated external link count (#88). Drives the small link-icon
+   *  badge on the list card; the actual links land on WorkstreamDetail. */
+  link_count: number;
 };
 
 export type WorkstreamAction = {
@@ -543,11 +546,32 @@ export type WorkstreamNoteRef = {
   modified_ms: number;
 };
 
+export type WorkstreamLink = {
+  id: string;
+  workstream_id: string;
+  label: string;
+  url: string;
+  /** Soft enum; canonical values exposed via `LinkKind` below. `null`
+   *  renders with a generic link glyph. */
+  kind: string | null;
+  position: number;
+  created_ms: number;
+};
+
+export const LinkKind = {
+  GitHub: "github",
+  Linear: "linear",
+  Notion: "notion",
+  Figma: "figma",
+  Other: "other",
+} as const;
+
 export type WorkstreamDetail = Workstream & {
   emails: EmailMessage[];
   events: CalendarEvent[];
   notes: WorkstreamNoteRef[];
   actions: WorkstreamAction[];
+  links: WorkstreamLink[];
 };
 
 export type ClusterReport = {
@@ -626,6 +650,32 @@ export async function setWorkstreamOwner(
   ownerMemberId: string | null,
 ): Promise<void> {
   await invoke<void>("set_workstream_owner", { id, ownerMemberId });
+}
+
+// --- Workstream links (#88) ----------------------------------------------
+
+export async function listWorkstreamLinks(
+  workstreamId: string,
+): Promise<WorkstreamLink[]> {
+  return invoke<WorkstreamLink[]>("list_workstream_links", { workstreamId });
+}
+
+export async function addWorkstreamLink(
+  workstreamId: string,
+  label: string,
+  url: string,
+  kind?: string | null,
+): Promise<WorkstreamLink> {
+  return invoke<WorkstreamLink>("add_workstream_link", {
+    workstreamId,
+    label,
+    url,
+    kind: kind ?? null,
+  });
+}
+
+export async function removeWorkstreamLink(linkId: string): Promise<void> {
+  await invoke<void>("remove_workstream_link", { linkId });
 }
 
 export type NoteMeta = { modified_ms: number };

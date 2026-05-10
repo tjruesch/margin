@@ -70,6 +70,10 @@ pub struct Workstream {
     pub event_count: u32,
     pub note_count: u32,
     pub open_action_count: u32,
+    /// Count of user-curated external links (#88). Drives the small
+    /// link-icon badge on the list card; the actual links land in
+    /// `WorkstreamDetail.links` on detail-view fetch.
+    pub link_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +96,34 @@ pub struct NoteRef {
     pub modified_ms: i64,
 }
 
+/// User-curated external URL on a workstream (#88). Pure user
+/// curation — synthesizer never touches this. Rendered as clickable
+/// chips on the detail view and folded into `read_workstream` for AI
+/// ask context.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkstreamLink {
+    pub id: String,
+    pub workstream_id: String,
+    pub label: String,
+    pub url: String,
+    /// Soft enum — `kinds` module below holds the canonical strings.
+    /// `None` is allowed and renders with a generic link glyph.
+    pub kind: Option<String>,
+    pub position: i64,
+    pub created_ms: i64,
+}
+
+/// Canonical string values for `WorkstreamLink.kind`. Soft enum so
+/// adding a new kind is non-breaking — just extend the icon mapping
+/// client-side.
+pub mod link_kinds {
+    pub const GITHUB: &str = "github";
+    pub const LINEAR: &str = "linear";
+    pub const NOTION: &str = "notion";
+    pub const FIGMA: &str = "figma";
+    pub const OTHER: &str = "other";
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkstreamDetail {
     #[serde(flatten)]
@@ -100,6 +132,7 @@ pub struct WorkstreamDetail {
     pub events: Vec<crate::connectors::calendar::CalendarEvent>,
     pub notes: Vec<NoteRef>,
     pub actions: Vec<WorkstreamAction>,
+    pub links: Vec<WorkstreamLink>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]

@@ -1206,6 +1206,26 @@ fn format_workstream_detail(
         s.push('\n');
     }
 
+    // User-curated external links (#88). Markdown link syntax so Claude
+    // can cite them naturally ("the repo for X is at github.com/…").
+    // The optional kind tag is a hint, not a constraint, so it goes in
+    // parens after the link.
+    if !detail.links.is_empty() {
+        s.push_str("\n## Links\n\n");
+        for link in &detail.links {
+            let label = link.label.trim();
+            let url = link.url.trim();
+            match link.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+                Some(kind) => {
+                    s.push_str(&format!("- [{label}]({url}) ({kind})\n"));
+                }
+                None => {
+                    s.push_str(&format!("- [{label}]({url})\n"));
+                }
+            }
+        }
+    }
+
     // Actions: open first, then recently done.
     if !detail.actions.is_empty() {
         let open: Vec<&crate::workstreams::WorkstreamAction> =
@@ -1769,6 +1789,7 @@ mod tests {
             event_count: 0,
             note_count: 0,
             open_action_count: 0,
+            link_count: 0,
         }
     }
 
@@ -1860,6 +1881,7 @@ mod tests {
                 event_count: 0,
                 note_count: 1,
                 open_action_count: 1,
+                link_count: 0,
             },
             emails: vec![
                 make_email("m1", "Re: invoice", 1000),
@@ -1872,6 +1894,7 @@ mod tests {
                 modified_ms: 800,
             }],
             actions: vec![make_action("Reply to invoice", false), make_action("Send quote", true)],
+            links: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W1", &detail, &team_map);
@@ -1914,11 +1937,13 @@ mod tests {
                 event_count: 0,
                 note_count: 0,
                 open_action_count: 0,
+            link_count: 0,
             },
             emails,
             events: vec![],
             notes: vec![],
             actions: vec![],
+            links: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W2", &detail, &team_map);
@@ -1969,11 +1994,13 @@ mod tests {
                 event_count: 0,
                 note_count: 0,
                 open_action_count: 0,
+            link_count: 0,
             },
             emails: vec![],
             events: vec![],
             notes: vec![],
             actions: vec![],
+            links: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W1", &detail, &team_map);
@@ -2005,14 +2032,114 @@ mod tests {
                 event_count: 0,
                 note_count: 0,
                 open_action_count: 0,
+            link_count: 0,
             },
             emails: vec![],
             events: vec![],
             notes: vec![],
             actions: vec![],
+            links: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W3", &detail, &team_map);
         assert_eq!(out, "# [W3] Bare\n");
+    }
+
+    #[test]
+    fn format_workstream_detail_renders_links_between_user_notes_and_actions() {
+        let detail = WorkstreamDetail {
+            workstream: Workstream {
+                id: "ws_links".into(),
+                title: "Hyundai POC".into(),
+                summary: "".into(),
+                status: "active".into(),
+                last_activity_ms: 0,
+                created_ms: 0,
+                updated_ms: 0,
+                user_notes: Some("Stay aligned with finance.".into()),
+                archived_at_ms: None,
+                reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
+                email_count: 0,
+                event_count: 0,
+                note_count: 0,
+                open_action_count: 1,
+                link_count: 2,
+            },
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![make_action("Reply to invoice", false)],
+            links: vec![
+                crate::workstreams::WorkstreamLink {
+                    id: "wsl_1".into(),
+                    workstream_id: "ws_links".into(),
+                    label: "Repo".into(),
+                    url: "https://github.com/x/y".into(),
+                    kind: Some("github".into()),
+                    position: 0,
+                    created_ms: 0,
+                },
+                crate::workstreams::WorkstreamLink {
+                    id: "wsl_2".into(),
+                    workstream_id: "ws_links".into(),
+                    label: "Design doc".into(),
+                    url: "https://www.notion.so/d".into(),
+                    kind: None,
+                    position: 1,
+                    created_ms: 0,
+                },
+            ],
+        };
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W4", &detail, &team_map);
+
+        assert!(out.contains("## Links"));
+        assert!(out.contains("- [Repo](https://github.com/x/y) (github)"));
+        assert!(
+            out.contains("- [Design doc](https://www.notion.so/d)\n"),
+            "no kind suffix when kind is None"
+        );
+
+        // Section ordering: User notes → Links → Actions.
+        let notes_idx = out.find("User notes (ground truth)").expect("user notes");
+        let links_idx = out.find("## Links").expect("links section");
+        let actions_idx = out.find("Actions (").expect("actions");
+        assert!(notes_idx < links_idx);
+        assert!(links_idx < actions_idx);
+    }
+
+    #[test]
+    fn format_workstream_detail_skips_links_section_when_empty() {
+        let detail = WorkstreamDetail {
+            workstream: Workstream {
+                id: "ws_no_links".into(),
+                title: "Empty".into(),
+                summary: "".into(),
+                status: "active".into(),
+                last_activity_ms: 0,
+                created_ms: 0,
+                updated_ms: 0,
+                user_notes: None,
+                archived_at_ms: None,
+                reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
+                email_count: 0,
+                event_count: 0,
+                note_count: 0,
+                open_action_count: 0,
+                link_count: 0,
+            },
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![],
+            links: Vec::new(),
+        };
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W5", &detail, &team_map);
+        assert!(!out.contains("## Links"));
     }
 }
