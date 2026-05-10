@@ -484,6 +484,90 @@ export async function getEmailBody(messageId: string): Promise<string | null> {
   return invoke<string | null>("get_email_body", { messageId });
 }
 
+// ----- Workstreams (#70) ---------------------------------------------------
+
+export type WorkstreamStatus = "active" | "archived" | "snoozed";
+
+export type Workstream = {
+  id: string;
+  title: string;
+  summary: string;
+  status: WorkstreamStatus;
+  last_activity_ms: number;
+  created_ms: number;
+  updated_ms: number;
+  email_count: number;
+  event_count: number;
+  note_count: number;
+  open_action_count: number;
+};
+
+export type WorkstreamAction = {
+  id: string;
+  workstream_id: string;
+  text: string;
+  due_ms: number | null;
+  /** "email" | "event" | "note" */
+  source_kind: "email" | "event" | "note";
+  source_id: string;
+  done: boolean;
+  created_ms: number;
+};
+
+export type WorkstreamNoteRef = {
+  note_path: string;
+  title: string;
+  modified_ms: number;
+};
+
+export type WorkstreamDetail = Workstream & {
+  emails: EmailMessage[];
+  events: CalendarEvent[];
+  notes: WorkstreamNoteRef[];
+  actions: WorkstreamAction[];
+};
+
+export type ClusterReport = {
+  workstreams_added: number;
+  workstreams_updated: number;
+  actions_added: number;
+  actions_updated: number;
+  items_clustered: number;
+  model: string;
+  last_clustered_ms: number;
+  /** "synced" | "skipped" | "errored" | "clustering" */
+  state: string;
+};
+
+/** Trigger a synthesis pass. Honors a 6h stale window unless `force` is
+ *  true. Returns a no-op `ClusterReport { state: "skipped" }` when the
+ *  pass is suppressed by the stale check or by an in-flight call. */
+export async function synthesizeWorkstreams(force: boolean): Promise<ClusterReport> {
+  return invoke<ClusterReport>("synthesize_workstreams", { force });
+}
+
+export async function listWorkstreams(): Promise<Workstream[]> {
+  return invoke<Workstream[]>("list_workstreams");
+}
+
+export async function getWorkstreamDetails(id: string): Promise<WorkstreamDetail | null> {
+  return invoke<WorkstreamDetail | null>("get_workstream_details", { id });
+}
+
+export async function setWorkstreamActionDone(
+  actionId: string,
+  done: boolean,
+): Promise<void> {
+  await invoke<void>("set_workstream_action_done", { actionId, done });
+}
+
+export async function setWorkstreamStatus(
+  id: string,
+  status: WorkstreamStatus,
+): Promise<void> {
+  await invoke<void>("set_workstream_status", { id, status });
+}
+
 export type NoteMeta = { modified_ms: number };
 
 export async function noteMeta(notePath: string): Promise<NoteMeta> {

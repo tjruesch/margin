@@ -1,0 +1,798 @@
+//! Storage layer for workstreams + their pivots and actions.
+//!
+//! Mirrors the per-domain pattern from `connectors/calendar.rs` /
+//! `connectors/email.rs`: small, transparent functions that take a
+//! `Connection` (or a `Transaction` on the write side), no hidden
+//! state, no caching. The synthesizer composes these into the
+//! end-to-end cluster pass.
+
+use rusqlite::{params, Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
+
+use super::{NoteRef, WorkstreamDetail, Workstream, WorkstreamAction, WriteCounts};
+use crate::connectors::calendar;
+use crate::connectors::email;
+
+const META_LAST_CLUSTERED: &str = "last_clustered_ms";
+
+// ----- Synthesizer input shape (parsed from Claude's JSON) -----------------
+
+#[derive(Debug, Clone)]
+pub struct SynthesizedWorkstream {
+    /// `Some(id)` to update an existing workstream; `None` to insert
+    /// a fresh one (we generate the id).
+    pub id: Option<String>,
+    pub title: String,
+    pub summary: String,
+    pub member_emails: Vec<String>,
+    pub member_events: Vec<String>,
+    pub member_notes: Vec<String>,
+    pub actions: Vec<SynthesizedAction>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SynthesizedAction {
+    pub text: String,
+    pub due_ms: Option<i64>,
+    pub source_kind: String,
+    pub source_id: String,
+}
+
+// ----- meta key/value ------------------------------------------------------
+
+pub fn last_clustered_ms(conn: &Connection) -> rusqlite::Result<i64> {
+    let s: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![META_LAST_CLUSTERED],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(s.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0))
+}
+
+pub fn set_last_clustered_ms(conn: &Connection, ms: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_LAST_CLUSTERED, ms.to_string()],
+    )?;
+    Ok(())
+}
+
+// ----- Read helpers --------------------------------------------------------
+
+pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workstream>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
+                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0) AS ec, \
+                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0) AS evc, \
+                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0) AS nc, \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) AS ac \
+         FROM workstreams w \
+         WHERE w.status = 'active' \
+         ORDER BY w.last_activity_ms DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Workstream {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            summary: r.get(2)?,
+            status: r.get(3)?,
+            last_activity_ms: r.get(4)?,
+            created_ms: r.get(5)?,
+            updated_ms: r.get(6)?,
+            email_count: r.get::<_, i64>(7)? as u32,
+            event_count: r.get::<_, i64>(8)? as u32,
+            note_count: r.get::<_, i64>(9)? as u32,
+            open_action_count: r.get::<_, i64>(10)? as u32,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn get_workstream_detail(
+    conn: &Connection,
+    id: &str,
+) -> rusqlite::Result<Option<WorkstreamDetail>> {
+    let workstream = match get_workstream_one(conn, id)? {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+
+    // Emails: join through pivot, hydrate via `email::get_message_details`.
+    let mut stmt = conn.prepare(
+        "SELECT message_id FROM workstream_emails WHERE workstream_id = ?1",
+    )?;
+    let mut emails = Vec::new();
+    let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        if let Some(m) = email::get_message_details(conn, &row?)? {
+            emails.push(m);
+        }
+    }
+    // Sort by sent_at_ms desc.
+    emails.sort_by(|a, b| b.sent_at_ms.cmp(&a.sent_at_ms));
+
+    // Events: ditto via calendar::get_event_details.
+    let mut stmt = conn.prepare(
+        "SELECT event_id FROM workstream_events WHERE workstream_id = ?1",
+    )?;
+    let mut events = Vec::new();
+    let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        if let Some(e) = calendar::get_event_details(conn, &row?)? {
+            events.push(e);
+        }
+    }
+    events.sort_by(|a, b| b.start_ms.cmp(&a.start_ms));
+
+    // Notes: join workstream_notes against notes table for title.
+    let mut stmt = conn.prepare(
+        "SELECT wn.note_path, COALESCE(n.title, ''), COALESCE(n.modified_ms, 0) \
+         FROM workstream_notes wn \
+         LEFT JOIN notes n ON n.note_path = wn.note_path \
+         WHERE wn.workstream_id = ?1 \
+         ORDER BY n.modified_ms DESC",
+    )?;
+    let note_rows = stmt.query_map(params![id], |r| {
+        Ok(NoteRef {
+            note_path: r.get(0)?,
+            title: r.get(1)?,
+            modified_ms: r.get(2)?,
+        })
+    })?;
+    let notes = note_rows.collect::<Result<Vec<_>, _>>()?;
+
+    let actions = list_actions_for(conn, id)?;
+
+    Ok(Some(WorkstreamDetail {
+        workstream,
+        emails,
+        events,
+        notes,
+        actions,
+    }))
+}
+
+fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Workstream>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
+                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
+         FROM workstreams w WHERE w.id = ?1",
+    )?;
+    stmt.query_row(params![id], |r| {
+        Ok(Workstream {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            summary: r.get(2)?,
+            status: r.get(3)?,
+            last_activity_ms: r.get(4)?,
+            created_ms: r.get(5)?,
+            updated_ms: r.get(6)?,
+            email_count: r.get::<_, i64>(7)? as u32,
+            event_count: r.get::<_, i64>(8)? as u32,
+            note_count: r.get::<_, i64>(9)? as u32,
+            open_action_count: r.get::<_, i64>(10)? as u32,
+        })
+    })
+    .optional()
+}
+
+fn list_actions_for(
+    conn: &Connection,
+    workstream_id: &str,
+) -> rusqlite::Result<Vec<WorkstreamAction>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms \
+         FROM workstream_actions WHERE workstream_id = ?1 \
+         ORDER BY done ASC, created_ms DESC",
+    )?;
+    let rows = stmt.query_map(params![workstream_id], |r| {
+        Ok(WorkstreamAction {
+            id: r.get(0)?,
+            workstream_id: r.get(1)?,
+            text: r.get(2)?,
+            due_ms: r.get(3)?,
+            source_kind: r.get(4)?,
+            source_id: r.get(5)?,
+            done: r.get::<_, i64>(6)? != 0,
+            created_ms: r.get(7)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+}
+
+// ----- Write helpers -------------------------------------------------------
+
+/// Upsert a workstream + replace its pivot sets + upsert actions in a
+/// single transaction. Returns the per-workstream contribution to the
+/// outer ClusterReport.
+///
+/// `record.id` is the existing workstream id when the synthesizer
+/// recognized this thread as a continuation; otherwise we generate a
+/// fresh `ws_<uuid>`. Action ids are content-hash so re-runs preserve
+/// the user's `done` flag.
+pub fn write_workstream(
+    tx: &rusqlite::Transaction<'_>,
+    record: &SynthesizedWorkstream,
+    now_ms: i64,
+) -> rusqlite::Result<WriteCounts> {
+    let mut counts = WriteCounts::default();
+
+    let id = match &record.id {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => format!("ws_{}", uuid::Uuid::new_v4()),
+    };
+    let pre_existed: i64 = tx
+        .query_row(
+            "SELECT 1 FROM workstreams WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+
+    // Last activity = max modified across joined items, fallback now.
+    let last_activity = compute_last_activity(tx, record)?.unwrap_or(now_ms);
+
+    if pre_existed == 0 {
+        tx.execute(
+            "INSERT INTO workstreams(id, title, summary, status, last_activity_ms, created_ms, updated_ms) \
+             VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?5)",
+            params![id, record.title, record.summary, last_activity, now_ms],
+        )?;
+        counts.workstream_added = true;
+    } else {
+        tx.execute(
+            "UPDATE workstreams SET title = ?2, summary = ?3, last_activity_ms = ?4, updated_ms = ?5 \
+             WHERE id = ?1",
+            params![id, record.title, record.summary, last_activity, now_ms],
+        )?;
+    }
+
+    // Replace pivots wholesale. Smaller than diffing for the typical
+    // dozens-of-items per workstream.
+    tx.execute(
+        "DELETE FROM workstream_emails WHERE workstream_id = ?1",
+        params![id],
+    )?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO workstream_emails(workstream_id, message_id) VALUES (?1, ?2)",
+        )?;
+        for mid in &record.member_emails {
+            stmt.execute(params![id, mid])?;
+        }
+    }
+
+    tx.execute(
+        "DELETE FROM workstream_events WHERE workstream_id = ?1",
+        params![id],
+    )?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO workstream_events(workstream_id, event_id) VALUES (?1, ?2)",
+        )?;
+        for eid in &record.member_events {
+            stmt.execute(params![id, eid])?;
+        }
+    }
+
+    tx.execute(
+        "DELETE FROM workstream_notes WHERE workstream_id = ?1",
+        params![id],
+    )?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT OR IGNORE INTO workstream_notes(workstream_id, note_path) VALUES (?1, ?2)",
+        )?;
+        for np in &record.member_notes {
+            stmt.execute(params![id, np])?;
+        }
+    }
+
+    // Actions: upsert by hashed id. ON CONFLICT preserves `done` and
+    // `created_ms` (the user's state); refreshes everything else.
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO workstream_actions(\
+                id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7) \
+             ON CONFLICT(id) DO UPDATE SET \
+                text = excluded.text, \
+                due_ms = excluded.due_ms, \
+                source_kind = excluded.source_kind, \
+                source_id = excluded.source_id",
+        )?;
+        for a in &record.actions {
+            let aid = action_id(&id, &a.text);
+            let pre_existed_action: i64 = tx
+                .query_row(
+                    "SELECT 1 FROM workstream_actions WHERE id = ?1",
+                    params![aid],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            stmt.execute(params![
+                aid,
+                id,
+                a.text,
+                a.due_ms,
+                a.source_kind,
+                a.source_id,
+                now_ms,
+            ])?;
+            if pre_existed_action == 0 {
+                counts.actions_added += 1;
+            } else {
+                counts.actions_updated += 1;
+            }
+        }
+    }
+
+    Ok(counts)
+}
+
+fn compute_last_activity(
+    tx: &rusqlite::Transaction<'_>,
+    record: &SynthesizedWorkstream,
+) -> rusqlite::Result<Option<i64>> {
+    let mut max_ms: Option<i64> = None;
+
+    if !record.member_emails.is_empty() {
+        let placeholders = std::iter::repeat("?")
+            .take(record.member_emails.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT MAX(sent_at_ms) FROM email_messages WHERE id IN ({placeholders})"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let p: Vec<&dyn rusqlite::ToSql> = record
+            .member_emails
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let v: Option<i64> = stmt
+            .query_row(rusqlite::params_from_iter(p), |r| r.get(0))
+            .optional()?
+            .flatten();
+        max_ms = max_opt(max_ms, v);
+    }
+
+    if !record.member_events.is_empty() {
+        let placeholders = std::iter::repeat("?")
+            .take(record.member_events.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT MAX(start_ms) FROM calendar_events WHERE id IN ({placeholders})"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let p: Vec<&dyn rusqlite::ToSql> = record
+            .member_events
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let v: Option<i64> = stmt
+            .query_row(rusqlite::params_from_iter(p), |r| r.get(0))
+            .optional()?
+            .flatten();
+        max_ms = max_opt(max_ms, v);
+    }
+
+    if !record.member_notes.is_empty() {
+        let placeholders = std::iter::repeat("?")
+            .take(record.member_notes.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT MAX(modified_ms) FROM notes WHERE note_path IN ({placeholders})"
+        );
+        let mut stmt = tx.prepare(&sql)?;
+        let p: Vec<&dyn rusqlite::ToSql> = record
+            .member_notes
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let v: Option<i64> = stmt
+            .query_row(rusqlite::params_from_iter(p), |r| r.get(0))
+            .optional()?
+            .flatten();
+        max_ms = max_opt(max_ms, v);
+    }
+
+    Ok(max_ms)
+}
+
+fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+pub fn set_action_done(
+    conn: &Connection,
+    action_id: &str,
+    done: bool,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE workstream_actions SET done = ?2 WHERE id = ?1",
+        params![action_id, done as i64],
+    )?;
+    Ok(())
+}
+
+pub fn set_status(conn: &Connection, id: &str, status: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE workstreams SET status = ?2, updated_ms = ?3 WHERE id = ?1",
+        params![id, status, now_ms()],
+    )?;
+    Ok(())
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Stable id for a workstream action: sha256 of `workstream_id\ntrim(text)`.
+/// Re-runs that produce the same workstream + same action text generate
+/// the same id, so the upsert preserves any user-set `done`.
+pub fn action_id(workstream_id: &str, text: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(workstream_id.as_bytes());
+    h.update(b"\n");
+    h.update(text.trim().as_bytes());
+    format!("wsa_{:x}", h.finalize())
+}
+
+// ----- Tests ---------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal schema replica needed for the workstreams tests.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta(key, value) VALUES ('schema_version', '11');
+             CREATE TABLE team_members (id TEXT PRIMARY KEY);
+             CREATE TABLE connectors (id TEXT PRIMARY KEY);
+             INSERT INTO connectors(id) VALUES ('mg:test');
+             CREATE TABLE notes (
+                 note_path  TEXT PRIMARY KEY,
+                 title      TEXT NOT NULL,
+                 modified_ms INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("../migrations/009_calendar.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/010_event_note_link.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/011_email.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/012_workstreams.sql"))
+            .unwrap();
+        conn
+    }
+
+    fn seed_email(conn: &Connection, id: &str, sent_at: i64) {
+        conn.execute(
+            "INSERT INTO email_messages(\
+                id, connector_id, external_id, thread_id, subject, from_email, from_name, \
+                sent_at_ms, body_preview, body_html, has_attachments, is_read, raw_etag, modified_ms\
+             ) VALUES (?1, 'mg:test', ?1, 't1', 'Sub', 'a@e', NULL, ?2, NULL, NULL, 0, 0, NULL, ?2)",
+            params![id, sent_at],
+        )
+        .unwrap();
+    }
+
+    fn seed_event(conn: &Connection, id: &str, start: i64) {
+        conn.execute(
+            "INSERT INTO calendar_events(\
+                id, connector_id, external_id, title, start_ms, end_ms, all_day, modified_ms\
+             ) VALUES (?1, 'mg:test', ?1, 'Ev', ?2, ?2, 0, ?2)",
+            params![id, start],
+        )
+        .unwrap();
+    }
+
+    fn seed_note(conn: &Connection, path: &str, modified: i64) {
+        conn.execute(
+            "INSERT INTO notes(note_path, title, modified_ms) VALUES (?1, ?2, ?3)",
+            params![path, "Note", modified],
+        )
+        .unwrap();
+    }
+
+    fn make_ws(id: Option<&str>, title: &str, emails: &[&str], events: &[&str], notes: &[&str], actions: Vec<SynthesizedAction>) -> SynthesizedWorkstream {
+        SynthesizedWorkstream {
+            id: id.map(|s| s.to_string()),
+            title: title.to_string(),
+            summary: format!("Summary of {title}"),
+            member_emails: emails.iter().map(|s| s.to_string()).collect(),
+            member_events: events.iter().map(|s| s.to_string()).collect(),
+            member_notes: notes.iter().map(|s| s.to_string()).collect(),
+            actions,
+        }
+    }
+
+    fn make_action(text: &str, source_kind: &str, source_id: &str) -> SynthesizedAction {
+        SynthesizedAction {
+            text: text.to_string(),
+            due_ms: None,
+            source_kind: source_kind.to_string(),
+            source_id: source_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn last_clustered_ms_default_is_zero_then_round_trips() {
+        let conn = open_test_db();
+        assert_eq!(last_clustered_ms(&conn).unwrap(), 0);
+        set_last_clustered_ms(&conn, 1_700_000_000_000).unwrap();
+        assert_eq!(last_clustered_ms(&conn).unwrap(), 1_700_000_000_000);
+    }
+
+    #[test]
+    fn write_workstream_inserts_new_record() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_event(&conn, "mg:test::e1", 2_000);
+        seed_note(&conn, "/n/a.md", 3_000);
+
+        let tx = conn.transaction().unwrap();
+        let ws = make_ws(
+            None,
+            "Hyundai POC",
+            &["mg:test::m1"],
+            &["mg:test::e1"],
+            &["/n/a.md"],
+            vec![make_action("Send invoice", "email", "mg:test::m1")],
+        );
+        let counts = write_workstream(&tx, &ws, 5_000).unwrap();
+        tx.commit().unwrap();
+
+        assert!(counts.workstream_added);
+        assert_eq!(counts.actions_added, 1);
+
+        let active = list_workstreams_active(&conn).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].title, "Hyundai POC");
+        assert_eq!(active[0].email_count, 1);
+        assert_eq!(active[0].event_count, 1);
+        assert_eq!(active[0].note_count, 1);
+        assert_eq!(active[0].open_action_count, 1);
+        // last_activity = max(1000, 2000, 3000) = 3000
+        assert_eq!(active[0].last_activity_ms, 3_000);
+    }
+
+    #[test]
+    fn write_workstream_updates_existing_and_replaces_pivots() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_email(&conn, "mg:test::m2", 4_000);
+        seed_event(&conn, "mg:test::e1", 2_000);
+
+        let tx = conn.transaction().unwrap();
+        let ws = make_ws(
+            Some("ws_existing"),
+            "Workstream A",
+            &["mg:test::m1"],
+            &["mg:test::e1"],
+            &[],
+            vec![],
+        );
+        write_workstream(&tx, &ws, 1_000).unwrap();
+        tx.commit().unwrap();
+
+        // Re-sync: replace m1 with m2, drop the event entirely, change title.
+        let tx = conn.transaction().unwrap();
+        let ws2 = make_ws(
+            Some("ws_existing"),
+            "Workstream A (renamed)",
+            &["mg:test::m2"],
+            &[],
+            &[],
+            vec![],
+        );
+        let counts = write_workstream(&tx, &ws2, 2_000).unwrap();
+        tx.commit().unwrap();
+        assert!(!counts.workstream_added);
+
+        let detail = get_workstream_detail(&conn, "ws_existing").unwrap().unwrap();
+        assert_eq!(detail.workstream.title, "Workstream A (renamed)");
+        assert_eq!(detail.emails.len(), 1);
+        assert_eq!(detail.emails[0].id, "mg:test::m2");
+        assert_eq!(detail.events.len(), 0);
+    }
+
+    #[test]
+    fn write_workstream_preserves_action_done_on_resync() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws1"),
+                "WS",
+                &["mg:test::m1"],
+                &[],
+                &[],
+                vec![make_action("Reply to invoice", "email", "mg:test::m1")],
+            ),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // User checks the action.
+        let aid = action_id("ws1", "Reply to invoice");
+        set_action_done(&conn, &aid, true).unwrap();
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        assert_eq!(detail.actions.len(), 1);
+        assert!(detail.actions[0].done);
+
+        // Re-sync emits the same action text.
+        let tx = conn.transaction().unwrap();
+        let counts = write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws1"),
+                "WS",
+                &["mg:test::m1"],
+                &[],
+                &[],
+                vec![make_action("Reply to invoice", "email", "mg:test::m1")],
+            ),
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(counts.actions_added, 0);
+        assert_eq!(counts.actions_updated, 1);
+
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        assert!(
+            detail.actions[0].done,
+            "done flag must survive a re-sync of the same action text"
+        );
+    }
+
+    #[test]
+    fn list_workstreams_active_excludes_archived() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_a"), "Active", &[], &[], &[], vec![]),
+            1_000,
+        )
+        .unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_b"), "Archived", &[], &[], &[], vec![]),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        set_status(&conn, "ws_b", "archived").unwrap();
+
+        let active = list_workstreams_active(&conn).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "ws_a");
+    }
+
+    #[test]
+    fn set_action_done_round_trips() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws1"),
+                "WS",
+                &["mg:test::m1"],
+                &[],
+                &[],
+                vec![make_action("Do thing", "email", "mg:test::m1")],
+            ),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let aid = action_id("ws1", "Do thing");
+        set_action_done(&conn, &aid, true).unwrap();
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        assert!(detail.actions[0].done);
+        set_action_done(&conn, &aid, false).unwrap();
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        assert!(!detail.actions[0].done);
+    }
+
+    #[test]
+    fn get_workstream_detail_returns_joined_emails_events_notes_and_actions() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_email(&conn, "mg:test::m2", 5_000);
+        seed_event(&conn, "mg:test::e1", 2_000);
+        seed_note(&conn, "/n/a.md", 3_000);
+
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws_x"),
+                "X",
+                &["mg:test::m1", "mg:test::m2"],
+                &["mg:test::e1"],
+                &["/n/a.md"],
+                vec![
+                    make_action("a1", "email", "mg:test::m1"),
+                    make_action("a2", "note", "/n/a.md"),
+                ],
+            ),
+            10_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let d = get_workstream_detail(&conn, "ws_x").unwrap().unwrap();
+        assert_eq!(d.emails.len(), 2);
+        // Sorted desc by sent_at_ms: m2 (5000), m1 (1000).
+        assert_eq!(d.emails[0].id, "mg:test::m2");
+        assert_eq!(d.emails[1].id, "mg:test::m1");
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.notes.len(), 1);
+        assert_eq!(d.notes[0].note_path, "/n/a.md");
+        assert_eq!(d.actions.len(), 2);
+    }
+
+    #[test]
+    fn action_id_is_stable_for_same_inputs() {
+        let id1 = action_id("ws1", "Do thing");
+        let id2 = action_id("ws1", "Do thing");
+        assert_eq!(id1, id2);
+
+        let id3 = action_id("ws2", "Do thing");
+        assert_ne!(id1, id3);
+        let id4 = action_id("ws1", "Do other thing");
+        assert_ne!(id1, id4);
+    }
+
+    #[test]
+    fn action_id_is_trim_normalized() {
+        // Trimming the text means whitespace drift in Claude output
+        // doesn't fragment action history.
+        let id1 = action_id("ws1", "Do thing");
+        let id2 = action_id("ws1", "  Do thing  ");
+        assert_eq!(id1, id2);
+        // But internal whitespace still matters (different action).
+        let id3 = action_id("ws1", "Do  thing");
+        assert_ne!(id1, id3);
+    }
+}

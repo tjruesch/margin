@@ -1,3 +1,4 @@
+mod anthropic;
 mod ask;
 mod audio;
 mod chunker;
@@ -15,6 +16,7 @@ mod sysaudio;
 mod team;
 mod transcribe;
 mod voice;
+mod workstreams;
 
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
@@ -615,6 +617,19 @@ pub fn run() {
             // Idle until a real connector is configured (#60+).
             connectors::runner::start(app.handle().clone());
 
+            // Workstream synthesizer boot tick (#70). Stale-checks
+            // last_clustered_ms inside; no-op if a fresh pass landed
+            // within the last 6h.
+            let app_for_cluster = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if let Err(e) =
+                    workstreams::synthesizer::maybe_cluster(&app_for_cluster, false).await
+                {
+                    eprintln!("[workstreams] boot cluster failed: {e}");
+                }
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -670,7 +685,12 @@ pub fn run() {
             connectors::commands::get_event_details,
             connectors::commands::open_or_create_event_note,
             connectors::commands::list_email_messages,
-            connectors::commands::get_email_body
+            connectors::commands::get_email_body,
+            workstreams::commands::synthesize_workstreams,
+            workstreams::commands::list_workstreams,
+            workstreams::commands::get_workstream_details,
+            workstreams::commands::set_workstream_action_done,
+            workstreams::commands::set_workstream_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
