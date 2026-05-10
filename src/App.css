@@ -4997,44 +4997,19 @@ input.nh-title {
   color: var(--fg-muted);
 }
 
-/* Actions */
-.workstream-actions {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.workstream-action-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 6px 8px;
-  border-radius: 6px;
-}
-.workstream-action-row:hover {
-  background: var(--home-chip);
-}
-.workstream-action-row.is-done .workstream-action-check span {
-  text-decoration: line-through;
-  color: var(--fg-muted);
-}
-.workstream-action-check {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  cursor: pointer;
-  font-size: 13.5px;
-  color: var(--fg);
-  flex: 1 1 auto;
-}
-.workstream-action-source {
-  font-size: 11px;
-  color: var(--fg-muted);
-  text-transform: uppercase;
+/* Actions — reuse home-action-row layout for visual parity with the
+   Home action items page (#81 follow-up). The only workstream-specific
+   touch is the small "from <kind>" source chip on the right, slotted
+   in the same column the home page uses for its AssigneeChip. */
+.workstream-action-source-chip {
+  font-size: 10.5px;
+  font-weight: 600;
   letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--home-chip);
   white-space: nowrap;
 }
 
