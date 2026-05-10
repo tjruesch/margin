@@ -150,6 +150,18 @@ async fn run_cluster_pass(
     conn_state: &std::sync::Mutex<rusqlite::Connection>,
     now_ms: i64,
 ) -> Result<ClusterReport, String> {
+    // ---- 0. Orphan-signals cleanup (#85) --------------------------------
+    // The signals pivot uses soft FKs to email_messages / calendar_events.
+    // When upstream items get deleted (calendar window-roll, message
+    // expiry, etc.) we keep the pivot tidy here once per cluster pass.
+    // Non-fatal — orphans only degrade hydrate behavior, not safety.
+    {
+        let c = conn_state.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = persist::cleanup_orphan_signals(&c) {
+            eprintln!("[workstreams] orphan signals cleanup failed: {e}");
+        }
+    }
+
     // ---- 1. Snapshot inputs in a single lock window ---------------------
     let (existing_active, existing_archived, mut emails, events, notes, team) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;

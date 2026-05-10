@@ -71,9 +71,9 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0) AS ec, \
-                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0) AS evc, \
-                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0) AS nc, \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0) AS ec, \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0) AS evc, \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0) AS nc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) AS ac \
          FROM workstreams w \
          WHERE w.status = 'active' \
@@ -115,9 +115,9 @@ pub fn list_workstreams_archived(
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
          FROM workstreams w \
          WHERE w.status = 'archived' \
@@ -164,9 +164,9 @@ pub fn list_workstreams_for_synthesis(
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
          FROM workstreams w \
          WHERE w.status IN ('active', 'archived') \
@@ -235,49 +235,23 @@ pub fn get_workstream_detail(
         None => return Ok(None),
     };
 
-    // Emails: join through pivot, hydrate via `email::get_message_details`.
-    let mut stmt = conn.prepare(
-        "SELECT message_id FROM workstream_emails WHERE workstream_id = ?1",
-    )?;
-    let mut emails = Vec::new();
-    let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
-    for row in rows {
-        if let Some(m) = email::get_message_details(conn, &row?)? {
-            emails.push(m);
+    // Hydrate per-kind through the Signal registry (#85). Each
+    // registered hydrator returns recency-desc; the registry routes
+    // unknown kinds to an empty result so a stale signal pivot row
+    // doesn't crash the detail view.
+    let mut emails: Vec<email::EmailMessage> = Vec::new();
+    let mut events: Vec<calendar::CalendarEvent> = Vec::new();
+    let mut notes: Vec<NoteRef> = Vec::new();
+    let by_kind = super::signals::load_and_hydrate_for_workstream(conn, id)?;
+    for (_kind, hydrated) in by_kind {
+        for h in hydrated {
+            match h {
+                super::signals::HydratedSignal::Email(m) => emails.push(m),
+                super::signals::HydratedSignal::Event(e) => events.push(e),
+                super::signals::HydratedSignal::Note(n) => notes.push(n),
+            }
         }
     }
-    // Sort by sent_at_ms desc.
-    emails.sort_by(|a, b| b.sent_at_ms.cmp(&a.sent_at_ms));
-
-    // Events: ditto via calendar::get_event_details.
-    let mut stmt = conn.prepare(
-        "SELECT event_id FROM workstream_events WHERE workstream_id = ?1",
-    )?;
-    let mut events = Vec::new();
-    let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
-    for row in rows {
-        if let Some(e) = calendar::get_event_details(conn, &row?)? {
-            events.push(e);
-        }
-    }
-    events.sort_by(|a, b| b.start_ms.cmp(&a.start_ms));
-
-    // Notes: join workstream_notes against notes table for title.
-    let mut stmt = conn.prepare(
-        "SELECT wn.note_path, COALESCE(n.title, ''), COALESCE(n.modified_ms, 0) \
-         FROM workstream_notes wn \
-         LEFT JOIN notes n ON n.note_path = wn.note_path \
-         WHERE wn.workstream_id = ?1 \
-         ORDER BY n.modified_ms DESC",
-    )?;
-    let note_rows = stmt.query_map(params![id], |r| {
-        Ok(NoteRef {
-            note_path: r.get(0)?,
-            title: r.get(1)?,
-            modified_ms: r.get(2)?,
-        })
-    })?;
-    let notes = note_rows.collect::<Result<Vec<_>, _>>()?;
 
     let actions = list_actions_for(conn, id)?;
 
@@ -294,9 +268,9 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
          FROM workstreams w WHERE w.id = ?1",
     )?;
@@ -351,15 +325,15 @@ fn attach_members(
     // emails / events they're on.
     let sql = format!(
         "SELECT DISTINCT workstream_id, member_id FROM ( \
-            SELECT we.workstream_id, er.team_member_id AS member_id \
-            FROM workstream_emails we \
-            JOIN email_recipients er ON er.message_id = we.message_id \
-            WHERE we.workstream_id IN ({placeholders}) AND er.team_member_id IS NOT NULL \
+            SELECT ws.workstream_id, er.team_member_id AS member_id \
+            FROM workstream_signals ws \
+            JOIN email_recipients er ON er.message_id = ws.item_id \
+            WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) AND er.team_member_id IS NOT NULL \
             UNION \
-            SELECT wev.workstream_id, ca.team_member_id AS member_id \
-            FROM workstream_events wev \
-            JOIN calendar_attendees ca ON ca.event_id = wev.event_id \
-            WHERE wev.workstream_id IN ({placeholders}) AND ca.team_member_id IS NOT NULL \
+            SELECT ws.workstream_id, ca.team_member_id AS member_id \
+            FROM workstream_signals ws \
+            JOIN calendar_attendees ca ON ca.event_id = ws.item_id \
+            WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) AND ca.team_member_id IS NOT NULL \
          ) ORDER BY workstream_id"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -460,44 +434,26 @@ pub fn write_workstream(
         )?;
     }
 
-    // Replace pivots wholesale. Smaller than diffing for the typical
+    // Replace signals wholesale (#85). One DELETE + one INSERT loop
+    // covers every kind. Smaller than diffing for the typical
     // dozens-of-items per workstream.
     tx.execute(
-        "DELETE FROM workstream_emails WHERE workstream_id = ?1",
+        "DELETE FROM workstream_signals WHERE workstream_id = ?1",
         params![id],
     )?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT OR IGNORE INTO workstream_emails(workstream_id, message_id) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO workstream_signals(workstream_id, kind, item_id, added_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
         )?;
         for mid in &record.member_emails {
-            stmt.execute(params![id, mid])?;
+            stmt.execute(params![id, "email", mid, now_ms])?;
         }
-    }
-
-    tx.execute(
-        "DELETE FROM workstream_events WHERE workstream_id = ?1",
-        params![id],
-    )?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT OR IGNORE INTO workstream_events(workstream_id, event_id) VALUES (?1, ?2)",
-        )?;
         for eid in &record.member_events {
-            stmt.execute(params![id, eid])?;
+            stmt.execute(params![id, "event", eid, now_ms])?;
         }
-    }
-
-    tx.execute(
-        "DELETE FROM workstream_notes WHERE workstream_id = ?1",
-        params![id],
-    )?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT OR IGNORE INTO workstream_notes(workstream_id, note_path) VALUES (?1, ?2)",
-        )?;
         for np in &record.member_notes {
-            stmt.execute(params![id, np])?;
+            stmt.execute(params![id, "note", np, now_ms])?;
         }
     }
 
@@ -690,6 +646,28 @@ pub fn set_owner(
     Ok(())
 }
 
+/// Drop signal pivot rows that point at items no longer present in
+/// their domain table (#85). Soft FKs mean the cascade-on-delete the
+/// old per-source pivots had via `ON DELETE CASCADE` is gone — this
+/// runs once per cluster pass to keep the pivot tidy.
+///
+/// Cheap thanks to the `idx_signals_kind_item` index. Safe to run
+/// concurrently with anything else inside the same Mutex<Connection>;
+/// the synthesizer always serializes through that lock anyway.
+pub fn cleanup_orphan_signals(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM workstream_signals \
+         WHERE kind = 'email' AND item_id NOT IN (SELECT id FROM email_messages)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM workstream_signals \
+         WHERE kind = 'event' AND item_id NOT IN (SELECT id FROM calendar_events)",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Synthesizer-driven resurrect: flip an archived workstream back to
 /// active, stamp `reopened_at_ms = now`, leave `archived_at_ms` as
 /// historical record. No-op if the workstream isn't currently
@@ -794,6 +772,11 @@ mod tests {
         // 015 references team_members; the test setup already has the
         // table created above, so the FK reference resolves at migrate time.
         conn.execute_batch(include_str!("../migrations/015_workstream_owner.sql"))
+            .unwrap();
+        // 016 collapses the per-source pivots into workstream_signals;
+        // the migration backfills from the now-deleted pivots so it
+        // must run before any test seeds workstreams.
+        conn.execute_batch(include_str!("../migrations/016_workstream_signals.sql"))
             .unwrap();
         conn
     }
@@ -1417,6 +1400,49 @@ mod tests {
         let mut members = ws.members.clone();
         members.sort();
         assert_eq!(members, vec!["tm:heike".to_string(), "tm:tj".to_string()]);
+    }
+
+    #[test]
+    fn cleanup_orphan_signals_removes_dangling_emails_and_events() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_event(&conn, "mg:test::e1", 2_000);
+        seed_workstream(&mut conn, "ws_orph");
+
+        // Attach two real + two orphan signals.
+        for (kind, item) in [
+            ("email", "mg:test::m1"),
+            ("email", "mg:test::missing"),
+            ("event", "mg:test::e1"),
+            ("event", "mg:test::also_missing"),
+        ] {
+            conn.execute(
+                "INSERT INTO workstream_signals(workstream_id, kind, item_id, added_ms) \
+                 VALUES ('ws_orph', ?1, ?2, 0)",
+                params![kind, item],
+            )
+            .unwrap();
+        }
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workstream_signals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 4);
+
+        cleanup_orphan_signals(&conn).unwrap();
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workstream_signals", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 2, "orphans deleted, real ones kept");
+        let orphan_left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workstream_signals \
+                 WHERE item_id IN ('mg:test::missing', 'mg:test::also_missing')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_left, 0);
     }
 
     #[test]
