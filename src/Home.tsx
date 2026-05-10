@@ -36,7 +36,6 @@ import {
   IconSidebar,
   IconStar,
   IconUser,
-  IconUsers,
 } from "./icons";
 
 type Props = {
@@ -99,13 +98,12 @@ type NavId =
   | "actions"
   | "meetings"
   | "workstreams"
-  | "shared"
   | "favorites"
   | "archive"
   | "team";
-type FilterId = "all" | "notes" | "meetings" | "shared";
+type FilterId = "all" | "notes" | "meetings";
 
-function DueChip({ dueMs }: { dueMs: number | null }) {
+export function DueChip({ dueMs }: { dueMs: number | null }) {
   if (dueMs == null) return null;
   // Recompute on each render so label flips at midnight when the user
   // returns to the page. Cheap; the home feed already re-renders often.
@@ -183,7 +181,7 @@ function useUpcomingEvents(): {
         // Cap at 5 cards. Events arrive sorted by start_ms, so this
         // keeps the soonest 5 — anything further out is past what the
         // strip is meant to surface.
-        .slice(0, 5)
+        .slice(0, 3)
         .map((e) => mapToUpcoming(e, tickMs)),
     [events, tickMs],
   );
@@ -396,7 +394,6 @@ export function Home({
       "actions",
       "meetings",
       "workstreams",
-      "shared",
       "favorites",
       "archive",
       "team",
@@ -432,8 +429,6 @@ export function Home({
         return list.filter((n) => n.duration_ms === null);
       case "meetings":
         return list.filter((n) => n.duration_ms !== null);
-      case "shared":
-        return [];
       default:
         return list;
     }
@@ -559,7 +554,7 @@ export function Home({
           onNewMeeting={onNewMeeting}
         />
 
-        {nav !== "workstreams" && upcoming.length > 0 && (
+        {(nav === "home" || nav === "meetings") && upcoming.length > 0 && (
           <UpcomingStrip events={upcoming} onOpen={openEventNote} />
         )}
 
@@ -700,12 +695,6 @@ function Sidebar({
           label="Team"
           active={active === "team"}
           onClick={() => onSelect("team")}
-        />
-        <NavItem
-          icon={<IconUsers size={14} sw={1.7} />}
-          label="Shared with me"
-          active={active === "shared"}
-          onClick={() => onSelect("shared")}
         />
         <NavItem
           icon={<IconStar size={14} sw={1.7} />}
@@ -1324,7 +1313,6 @@ function NotesFeed({
     { id: "all", label: "All" },
     { id: "notes", label: "Notes" },
     { id: "meetings", label: "Meetings" },
-    { id: "shared", label: "Shared" },
   ];
 
   return (
@@ -1380,11 +1368,7 @@ function NotesFeed({
               )}
         </p>
       ) : grouped.size === 0 ? (
-        <p className="home-empty">
-          {filter === "shared"
-            ? "Sharing is coming soon — see issue #15 / #32."
-            : "Nothing matches this filter."}
-        </p>
+        <p className="home-empty">Nothing matches this filter.</p>
       ) : (
         [...grouped.entries()].map(([dayKey, items]) => (
           <div key={dayKey} className="home-day-group">

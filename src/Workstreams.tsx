@@ -26,7 +26,8 @@ import {
   setWorkstreamStatus,
   setWorkstreamUserNotes,
 } from "./file";
-import { IconChevLeft } from "./icons";
+import { DueChip } from "./Home";
+import { IconCheck, IconChevLeft } from "./icons";
 import { avatarColor, initialsFromName } from "./initials";
 
 // ----- List view -----------------------------------------------------------
@@ -607,7 +608,7 @@ function WorkstreamDetailView({
       />
       <p className="workstream-detail-summary">{detail.summary}</p>
 
-      {detail.members.length > 0 ? (
+      {detail.members.length > 0 || detail.owner_member_id ? (
         <MembersStrip
           memberIds={detail.members}
           ownerId={detail.owner_member_id}
@@ -623,7 +624,17 @@ function WorkstreamDetailView({
         }
       />
 
-      <ActionsSection actions={detail.actions} onToggle={onToggleAction} />
+      <ActionsSection
+        actions={detail.actions}
+        onToggle={onToggleAction}
+        onOpenSource={async (kind, sourceId) => {
+          if (kind === "note") {
+            onOpenNote(sourceId);
+          } else if (kind === "event") {
+            await onOpenEvent(sourceId);
+          }
+        }}
+      />
 
       <EmailsSection emails={detail.emails} />
 
@@ -895,34 +906,69 @@ function MembersStrip({
 function ActionsSection({
   actions,
   onToggle,
+  onOpenSource,
 }: {
   actions: WorkstreamAction[];
   onToggle: (actionId: string, nextDone: boolean) => void | Promise<void>;
+  onOpenSource: (sourceKind: string, sourceId: string) => void | Promise<void>;
 }) {
   if (actions.length === 0) return null;
   return (
     <section className="workstream-section">
       <h2 className="workstream-section-title">Actions ({actions.length})</h2>
-      <ul className="workstream-actions">
-        {actions.map((a) => (
-          <li
-            key={a.id}
-            className={`workstream-action-row ${a.done ? "is-done" : ""}`}
-          >
-            <label className="workstream-action-check">
-              <input
-                type="checkbox"
-                checked={a.done}
-                onChange={(e) => onToggle(a.id, e.target.checked)}
-              />
-              <span>{a.text}</span>
-            </label>
-            <span className="workstream-action-source">
-              from {a.source_kind}
-            </span>
-          </li>
-        ))}
-      </ul>
+      <div className="home-actions">
+        {actions.map((a) => {
+          const openable = a.source_kind === "note" || a.source_kind === "event";
+          return (
+            <div
+              key={a.id}
+              className="home-action-row"
+              role={openable ? "button" : undefined}
+              tabIndex={openable ? 0 : undefined}
+              onClick={
+                openable
+                  ? () => void onOpenSource(a.source_kind, a.source_id)
+                  : undefined
+              }
+              onKeyDown={
+                openable
+                  ? (e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        void onOpenSource(a.source_kind, a.source_id);
+                      }
+                    }
+                  : undefined
+              }
+              title={openable ? `Open ${a.source_kind} source` : undefined}
+            >
+              <button
+                type="button"
+                className={"home-checkbox" + (a.done ? " done" : "")}
+                aria-label={a.done ? "Mark as open" : "Mark as done"}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void onToggle(a.id, !a.done);
+                }}
+              >
+                {a.done && <IconCheck size={20} sw={3.6} />}
+              </button>
+              <div className="home-action-body">
+                <div className={"home-action-text" + (a.done ? " done" : "")}>
+                  {a.text}
+                </div>
+              </div>
+              <DueChip dueMs={a.due_ms} />
+              <span
+                className="workstream-action-source-chip"
+                title={`from ${a.source_kind}`}
+              >
+                from {a.source_kind}
+              </span>
+            </div>
+          );
+        })}
+      </div>
     </section>
   );
 }
