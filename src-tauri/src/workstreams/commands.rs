@@ -54,3 +54,17 @@ pub fn set_workstream_status(
     let c = conn.lock().map_err(|e| e.to_string())?;
     persist::set_status(&c, &id, &status).map_err(|e| e.to_string())
 }
+
+/// Update a workstream's user-authored context (#77). Whitespace-only
+/// input is treated as a clear (persists `NULL`) so the prompt-omission
+/// logic downstream can `filter(|s| !s.is_empty())` cleanly.
+#[tauri::command]
+pub fn set_workstream_user_notes(
+    id: String,
+    notes: Option<String>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let trimmed = notes.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::set_user_notes(&c, &id, trimmed).map_err(|e| e.to_string())
+}

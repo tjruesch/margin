@@ -42,6 +42,10 @@ pub struct Workstream {
     pub last_activity_ms: i64,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// User-authored ground-truth context (#77). Treated as
+    /// authoritative by the synthesizer prompt and surfaced in
+    /// `read_workstream` tool output. `None` when empty.
+    pub user_notes: Option<String>,
     pub email_count: u32,
     pub event_count: u32,
     pub note_count: u32,

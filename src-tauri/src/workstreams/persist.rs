@@ -65,6 +65,7 @@ pub fn set_last_clustered_ms(conn: &Connection, ms: i64) -> rusqlite::Result<()>
 pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workstream>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
+                w.user_notes, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0) AS ec, \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0) AS evc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0) AS nc, \
@@ -82,10 +83,11 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
             last_activity_ms: r.get(4)?,
             created_ms: r.get(5)?,
             updated_ms: r.get(6)?,
-            email_count: r.get::<_, i64>(7)? as u32,
-            event_count: r.get::<_, i64>(8)? as u32,
-            note_count: r.get::<_, i64>(9)? as u32,
-            open_action_count: r.get::<_, i64>(10)? as u32,
+            user_notes: r.get(7)?,
+            email_count: r.get::<_, i64>(8)? as u32,
+            event_count: r.get::<_, i64>(9)? as u32,
+            note_count: r.get::<_, i64>(10)? as u32,
+            open_action_count: r.get::<_, i64>(11)? as u32,
         })
     })?;
     let mut out = Vec::new();
@@ -162,6 +164,7 @@ pub fn get_workstream_detail(
 fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Workstream>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
+                w.user_notes, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
@@ -177,10 +180,11 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
             last_activity_ms: r.get(4)?,
             created_ms: r.get(5)?,
             updated_ms: r.get(6)?,
-            email_count: r.get::<_, i64>(7)? as u32,
-            event_count: r.get::<_, i64>(8)? as u32,
-            note_count: r.get::<_, i64>(9)? as u32,
-            open_action_count: r.get::<_, i64>(10)? as u32,
+            user_notes: r.get(7)?,
+            email_count: r.get::<_, i64>(8)? as u32,
+            event_count: r.get::<_, i64>(9)? as u32,
+            note_count: r.get::<_, i64>(10)? as u32,
+            open_action_count: r.get::<_, i64>(11)? as u32,
         })
     })
     .optional()
@@ -442,6 +446,22 @@ pub fn set_status(conn: &Connection, id: &str, status: &str) -> rusqlite::Result
     Ok(())
 }
 
+/// Update a workstream's user-authored context notes (#77). `None`
+/// clears the field. Caller is responsible for trimming whitespace
+/// and mapping empty strings to `None` so the prompt-omission logic
+/// downstream stays simple.
+pub fn set_user_notes(
+    conn: &Connection,
+    id: &str,
+    notes: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE workstreams SET user_notes = ?2, updated_ms = ?3 WHERE id = ?1",
+        params![id, notes, now_ms()],
+    )?;
+    Ok(())
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -491,6 +511,8 @@ mod tests {
         conn.execute_batch(include_str!("../migrations/011_email.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../migrations/012_workstreams.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../migrations/013_workstream_user_notes.sql"))
             .unwrap();
         conn
     }
@@ -794,5 +816,76 @@ mod tests {
         // But internal whitespace still matters (different action).
         let id3 = action_id("ws1", "Do  thing");
         assert_ne!(id1, id3);
+    }
+
+    // ----- user_notes (#77) ------------------------------------------------
+
+    #[test]
+    fn set_user_notes_round_trips() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        write_workstream(&tx, &make_ws(Some("ws_n"), "WS", &[], &[], &[], vec![]), 1_000)
+            .unwrap();
+        tx.commit().unwrap();
+
+        // Default: no notes.
+        let active = list_workstreams_active(&conn).unwrap();
+        assert_eq!(active[0].user_notes, None);
+
+        // Set, read back.
+        set_user_notes(&conn, "ws_n", Some("Real deadline May 30")).unwrap();
+        let active = list_workstreams_active(&conn).unwrap();
+        assert_eq!(active[0].user_notes.as_deref(), Some("Real deadline May 30"));
+
+        // Detail view returns it too.
+        let detail = get_workstream_detail(&conn, "ws_n").unwrap().unwrap();
+        assert_eq!(
+            detail.workstream.user_notes.as_deref(),
+            Some("Real deadline May 30")
+        );
+    }
+
+    #[test]
+    fn set_user_notes_with_none_clears_field() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        write_workstream(&tx, &make_ws(Some("ws_c"), "WS", &[], &[], &[], vec![]), 1_000)
+            .unwrap();
+        tx.commit().unwrap();
+        set_user_notes(&conn, "ws_c", Some("placeholder")).unwrap();
+        set_user_notes(&conn, "ws_c", None).unwrap();
+        let active = list_workstreams_active(&conn).unwrap();
+        assert_eq!(active[0].user_notes, None);
+    }
+
+    #[test]
+    fn write_workstream_does_not_overwrite_user_notes_on_resync() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        write_workstream(&tx, &make_ws(Some("ws_r"), "Hyundai", &[], &[], &[], vec![]), 1_000)
+            .unwrap();
+        tx.commit().unwrap();
+        set_user_notes(&conn, "ws_r", Some("This is the new POC.")).unwrap();
+
+        // Re-sync the same workstream (fresh title, no carry-over of
+        // user_notes from the synthesizer side — the SynthesizedWorkstream
+        // shape doesn't have user_notes at all).
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_r"), "Hyundai (renamed)", &[], &[], &[], vec![]),
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // Title updated, but user_notes survived.
+        let detail = get_workstream_detail(&conn, "ws_r").unwrap().unwrap();
+        assert_eq!(detail.workstream.title, "Hyundai (renamed)");
+        assert_eq!(
+            detail.workstream.user_notes.as_deref(),
+            Some("This is the new POC."),
+            "user_notes must survive a re-sync that doesn't carry it"
+        );
     }
 }
