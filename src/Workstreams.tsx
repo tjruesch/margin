@@ -95,6 +95,11 @@ export function WorkstreamsView({
     return () => window.removeEventListener("margin:open-workstream", onOpen);
   }, []);
 
+  // Filter dropdown options: every team member referenced as owner or
+  // member on at least one active workstream. Computed via useMemo —
+  // must run before any early return to satisfy the Rules of Hooks.
+  const filterCandidates = useFilterCandidates(workstreams, teamById);
+
   if (selectedId) {
     return (
       <WorkstreamDetailView
@@ -107,9 +112,6 @@ export function WorkstreamsView({
     );
   }
 
-  // Filter dropdown options: every team member referenced as owner or
-  // member on at least one active workstream. Sorted by display_name.
-  const filterCandidates = useFilterCandidates(workstreams, teamById);
   const filteredActive = applyMemberFilter(workstreams, memberFilter);
 
   const nowMs = Date.now();
