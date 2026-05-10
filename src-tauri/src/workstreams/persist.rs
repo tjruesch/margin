@@ -486,9 +486,20 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
 
 /// Bulk-derive members for a slice of workstreams (#81). Members are
 /// the team_member ids that resolve from the workstream's email
-/// recipients and event attendees. One UNION query covers all rows in
-/// the slice — far cheaper than per-workstream fetches in the list
-/// view. No-op when the slice is empty.
+/// recipients, email senders, and event attendees. One UNION query
+/// covers all rows in the slice — far cheaper than per-workstream
+/// fetches in the list view. No-op when the slice is empty.
+///
+/// Resolution paths (each becomes a UNION branch):
+///   1. recipient row with `team_member_id` already cached at sync time
+///   2. recipient row with NULL `team_member_id` but matching a
+///      `team_member_aliases` (kind='email') row added later — closes
+///      the "I added my email today, but old recipient rows haven't
+///      been re-synced" gap
+///   3. email sender (`em.from_email`) matched via aliases — senders
+///      were never recorded on `email_recipients`
+///   4. attendee row with `team_member_id` already cached
+///   5. attendee row with NULL `team_member_id` but matching an alias
 fn attach_members(
     conn: &Connection,
     workstreams: &mut [Workstream],
@@ -500,30 +511,56 @@ fn attach_members(
         .take(workstreams.len())
         .collect::<Vec<_>>()
         .join(",");
-    // Two halves UNION'd then DISTINCT'd at the (workstream, member) level.
-    // Each member appears once per workstream regardless of how many
-    // emails / events they're on.
+    // Five UNION branches (see fn doc): cached recipient, alias-matched
+    // recipient, alias-matched sender, cached attendee, alias-matched
+    // attendee. SQL `--` comments are deliberately omitted because the
+    // Rust `\`-line-continuation collapses newlines, leaving the
+    // comment running to the next `\n` we never emit.
     let sql = format!(
         "SELECT DISTINCT workstream_id, member_id FROM ( \
             SELECT ws.workstream_id, er.team_member_id AS member_id \
             FROM workstream_signals ws \
             JOIN email_recipients er ON er.message_id = ws.item_id \
-            WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) AND er.team_member_id IS NOT NULL \
+            WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND er.team_member_id IS NOT NULL \
+            UNION \
+            SELECT ws.workstream_id, tma.member_id AS member_id \
+            FROM workstream_signals ws \
+            JOIN email_recipients er ON er.message_id = ws.item_id \
+            JOIN team_member_aliases tma \
+              ON tma.kind = 'email' AND LOWER(tma.value) = LOWER(er.email) \
+            WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND er.team_member_id IS NULL \
+            UNION \
+            SELECT ws.workstream_id, tma.member_id AS member_id \
+            FROM workstream_signals ws \
+            JOIN email_messages em ON em.id = ws.item_id \
+            JOIN team_member_aliases tma \
+              ON tma.kind = 'email' AND LOWER(tma.value) = LOWER(em.from_email) \
+            WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
             UNION \
             SELECT ws.workstream_id, ca.team_member_id AS member_id \
             FROM workstream_signals ws \
             JOIN calendar_attendees ca ON ca.event_id = ws.item_id \
-            WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) AND ca.team_member_id IS NOT NULL \
+            WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) \
+              AND ca.team_member_id IS NOT NULL \
+            UNION \
+            SELECT ws.workstream_id, tma.member_id AS member_id \
+            FROM workstream_signals ws \
+            JOIN calendar_attendees ca ON ca.event_id = ws.item_id \
+            JOIN team_member_aliases tma \
+              ON tma.kind = 'email' AND LOWER(tma.value) = LOWER(ca.email) \
+            WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) \
+              AND ca.team_member_id IS NULL \
          ) ORDER BY workstream_id"
     );
     let mut stmt = conn.prepare(&sql)?;
-    // The IN list appears twice in the UNION; bind both.
-    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(workstreams.len() * 2);
-    for w in workstreams.iter() {
-        params_vec.push(&w.id as &dyn rusqlite::ToSql);
-    }
-    for w in workstreams.iter() {
-        params_vec.push(&w.id as &dyn rusqlite::ToSql);
+    // The IN list appears five times in the UNION; bind each.
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(workstreams.len() * 5);
+    for _ in 0..5 {
+        for w in workstreams.iter() {
+            params_vec.push(&w.id as &dyn rusqlite::ToSql);
+        }
     }
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -2119,6 +2156,54 @@ mod tests {
             emails,
             vec!["alice@example.com"],
             "team-member senders excluded by NOT EXISTS alias check"
+        );
+    }
+
+    /// Regression: `email_recipients.team_member_id` is set at sync time,
+    /// so when the user adds an email alias AFTER the email was synced,
+    /// old recipient rows still have NULL team_member_id. `attach_members`
+    /// must also resolve via the alias table; otherwise the team_member
+    /// drops out of the workstream's member list (and the user sees no
+    /// chip even though they're aliased).
+    #[test]
+    fn members_resolves_recipients_via_alias_when_team_member_id_is_stale() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_team_member(&conn, "tm_tj");
+        // Recipient row has NULL team_member_id (sync was before the
+        // user added their alias) but the alias now resolves it.
+        add_recipient(&conn, "mg:test::m1", "tj@example.com", Some("TJ"), None);
+        seed_email_alias(&conn, "tm_tj", "tj@example.com");
+
+        seed_workstream_with_email_signal(&mut conn, "ws_x", "mg:test::m1");
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        assert!(
+            row.members.iter().any(|m| m == "tm_tj"),
+            "alias-resolved team member surfaces despite stale team_member_id; got members={:?}",
+            row.members
+        );
+    }
+
+    /// Mirror: senders never had a `team_member_id` column in the first
+    /// place. They should resolve via the alias table.
+    #[test]
+    fn members_resolves_email_senders_via_alias() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        set_email_sender(&conn, "mg:test::m1", "TJ@Example.com");
+        seed_team_member(&conn, "tm_tj");
+        seed_email_alias(&conn, "tm_tj", "tj@example.com");
+
+        seed_workstream_with_email_signal(&mut conn, "ws_x", "mg:test::m1");
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        assert!(
+            row.members.iter().any(|m| m == "tm_tj"),
+            "sender resolved via alias; got members={:?}",
+            row.members
         );
     }
 
