@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use super::persist::{self, SynthesizedAction, SynthesizedWorkstream};
-use super::{ClusterReport, NoteRef, Workstream};
+use super::signals::{self, SignalRegistry, SnapshotItem, SnapshotPayload};
+use super::{ClusterReport, Workstream};
 use crate::anthropic::{ANTHROPIC_VERSION, DEFAULT_MODEL, ENDPOINT};
-use crate::connectors::{calendar, email, microsoft_graph, oauth};
-use crate::index;
+use crate::connectors::{email, microsoft_graph, oauth};
 use crate::keychain;
 use crate::team;
 
@@ -28,13 +28,10 @@ use crate::team;
 /// landed within this window.
 const CLUSTER_TTL_MS: i64 = 6 * 3600 * 1000;
 
-const EMAIL_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
-const EVENT_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
-const EVENT_WINDOW_FORWARD_MS: i64 = 14 * 24 * 3600 * 1000;
-const NOTE_WINDOW_BACK_MS: i64 = 30 * 24 * 3600 * 1000;
-
 /// Cap on lazy body fetches per pass. Each is a Graph round-trip, so
 /// 100 keeps the pre-call work bounded for users with very busy inboxes.
+/// Cross-cutting (not source-owned) — applies to email body backfill
+/// triggered before the snapshot is rendered.
 const MAX_BODY_FETCHES: usize = 100;
 
 const MAX_TOKENS: u32 = 8192;
@@ -163,7 +160,12 @@ async fn run_cluster_pass(
     }
 
     // ---- 1. Snapshot inputs in a single lock window ---------------------
-    let (existing_active, existing_archived, mut emails, events, notes, team) = {
+    // Workstream lists + per-source snapshots come from the same lock
+    // window so the prompt sees a coherent point-in-time view. Each
+    // source declares its own window+cap (see `signals::Signal`); the
+    // synthesizer just iterates the registry.
+    let registry = signals::registry();
+    let (existing_active, existing_archived, mut snapshots, team) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         // Pull both active and archived (snoozed excluded — they're
         // hidden from synthesis) and partition into separate sections
@@ -181,41 +183,27 @@ async fn run_cluster_pass(
             }
         }
         archived.truncate(ARCHIVED_WORKSTREAM_CAP);
-        let emails = email::list_messages_in_range(
-            &c,
-            now_ms - EMAIL_WINDOW_BACK_MS,
-            now_ms + 24 * 3600 * 1000,
-            None,
-            500,
-        )
-        .map_err(|e| e.to_string())?;
-        let events = calendar::list_events_in_range(
-            &c,
-            now_ms - EVENT_WINDOW_BACK_MS,
-            now_ms + EVENT_WINDOW_FORWARD_MS,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
-        let directory = index::list_directory(&c, 200).map_err(|e| e.to_string())?;
-        let notes_cutoff = now_ms - NOTE_WINDOW_BACK_MS;
-        let notes: Vec<NoteRef> = directory
-            .into_iter()
-            .filter(|d| d.modified_ms >= notes_cutoff)
-            .map(|d| NoteRef {
-                note_path: d.note_path,
-                title: d.title,
-                modified_ms: d.modified_ms,
-            })
-            .collect();
+
+        // Per-source snapshots, keyed by kind. Order is the registry's
+        // prompt-section order — the build_user_message loop relies on
+        // it; storing as a Vec preserves that.
+        let mut snapshots: Vec<(&'static str, Vec<SnapshotItem>)> = Vec::new();
+        for src in registry.iter_in_prompt_order() {
+            let items = src
+                .snapshot(&c, now_ms, src.default_window(), src.default_cap())
+                .map_err(|e| format!("{kind} snapshot: {e}", kind = src.kind()))?;
+            snapshots.push((src.kind(), items));
+        }
         let team = team::list_team_members_raw(&c).unwrap_or_default();
-        (active, archived, emails, events, notes, team)
+        (active, archived, snapshots, team)
     };
     let team_by_id: std::collections::HashMap<String, String> = team
         .iter()
         .map(|m| (m.id.clone(), m.display_name.clone()))
         .collect();
 
-    if emails.is_empty() && events.is_empty() && notes.is_empty() {
+    let total_items: usize = snapshots.iter().map(|(_, v)| v.len()).sum();
+    if total_items == 0 {
         eprintln!("[workstreams] no recent items to cluster; skipping");
         return Ok(ClusterReport {
             state: "skipped".into(),
@@ -225,62 +213,21 @@ async fn run_cluster_pass(
     }
 
     // ---- 2. Lazy-fetch missing email bodies -----------------------------
-    // Bound the work to MAX_BODY_FETCHES per pass; older messages stay
-    // preview-only. Errors per message are logged and skipped — a body
-    // fetch failure must not abort the cluster pass.
-    let mut fetched = 0usize;
-    for m in emails.iter_mut() {
-        if fetched >= MAX_BODY_FETCHES {
-            break;
-        }
-        if m.body_html.is_some() {
-            continue;
-        }
-        let kind = m
-            .connector_id
-            .split_once(':')
-            .map(|(k, _)| k.to_string())
-            .unwrap_or_else(|| "microsoft_graph".to_string());
-        let connector_id = m.connector_id.clone();
-        let external_id = m.external_id.clone();
-        let body_result = oauth::with_valid_token(app, &connector_id, &kind, |access| async move {
-            microsoft_graph::fetch_message_body(&access, &external_id).await
-        })
-        .await;
-        match body_result {
-            Ok(Some(body)) => {
-                {
-                    let c = match conn_state.lock() {
-                        Ok(g) => g,
-                        Err(e) => {
-                            eprintln!("[workstreams] conn lock for body persist: {e}");
-                            continue;
-                        }
-                    };
-                    if let Err(e) = email::set_message_body_html(&c, &m.id, &body) {
-                        eprintln!("[workstreams] persist body for {}: {e}", m.id);
-                    }
-                }
-                m.body_html = Some(body);
-                fetched += 1;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("[workstreams] body fetch failed for {}: {e}", m.id);
-            }
-        }
-    }
+    // Email is the only source today that needs a pre-render async
+    // network step. Bound the work to MAX_BODY_FETCHES per pass; older
+    // messages stay preview-only. Errors per message are logged and
+    // skipped — a body fetch failure must not abort the cluster pass.
+    backfill_email_bodies(app, conn_state, &mut snapshots).await;
 
     // ---- 3. Build prompt, label maps ------------------------------------
     let (user_message, label_maps) = build_user_message(
         &existing_active,
         &existing_archived,
-        &emails,
-        &events,
-        &notes,
+        &snapshots,
+        registry,
         &team_by_id,
     );
-    let items_clustered = (emails.len() + events.len() + notes.len()) as u32;
+    let items_clustered = total_items as u32;
 
     // ---- 4. Single-shot Claude call -------------------------------------
     let api_key = keychain::read_anthropic_api_key().map_err(|_| {
@@ -346,6 +293,67 @@ async fn run_cluster_pass(
     }
 
     Ok(report)
+}
+
+/// Pre-render step that mutates the email snapshot in place: lazy-fetch
+/// missing `body_html` for up to `MAX_BODY_FETCHES` messages so the
+/// cluster prompt has rich excerpts. Other sources are left untouched.
+/// Failures are logged and the message is left preview-only — they
+/// must not abort the cluster pass.
+async fn backfill_email_bodies(
+    app: &AppHandle,
+    conn_state: &std::sync::Mutex<rusqlite::Connection>,
+    snapshots: &mut [(&'static str, Vec<SnapshotItem>)],
+) {
+    let Some((_, items)) = snapshots.iter_mut().find(|(k, _)| *k == "email") else {
+        return;
+    };
+    let mut fetched = 0usize;
+    for item in items.iter_mut() {
+        if fetched >= MAX_BODY_FETCHES {
+            break;
+        }
+        let m = match &mut item.payload {
+            SnapshotPayload::Email(m) => m,
+            _ => continue,
+        };
+        if m.body_html.is_some() {
+            continue;
+        }
+        let kind = m
+            .connector_id
+            .split_once(':')
+            .map(|(k, _)| k.to_string())
+            .unwrap_or_else(|| "microsoft_graph".to_string());
+        let connector_id = m.connector_id.clone();
+        let external_id = m.external_id.clone();
+        let body_result = oauth::with_valid_token(app, &connector_id, &kind, |access| async move {
+            microsoft_graph::fetch_message_body(&access, &external_id).await
+        })
+        .await;
+        match body_result {
+            Ok(Some(body)) => {
+                {
+                    let c = match conn_state.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            eprintln!("[workstreams] conn lock for body persist: {e}");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = email::set_message_body_html(&c, &m.id, &body) {
+                        eprintln!("[workstreams] persist body for {}: {e}", m.id);
+                    }
+                }
+                m.body_html = Some(body);
+                fetched += 1;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("[workstreams] body fetch failed for {}: {e}", m.id);
+            }
+        }
+    }
 }
 
 // ----- Anthropic call ------------------------------------------------------
@@ -426,19 +434,30 @@ async fn call_anthropic(api_key: &str, model: &str, user_message: &str) -> Resul
 
 // ----- Prompt building -----------------------------------------------------
 
-/// Maps from Claude-facing labels (M1, E1, N1) back to canonical IDs.
+/// Maps from Claude-facing labels (M1, E1, N1, …) back to canonical
+/// IDs, keyed by source `kind` ("email", "event", "note", …). Built
+/// from the registry so adding a new source extends this map by one
+/// entry without any synthesizer-side surgery.
 struct LabelMaps {
-    emails: HashMap<String, String>,    // "M1" → "<connector>:<external>"
-    events: HashMap<String, String>,    // "E1" → calendar_events.id
-    notes: HashMap<String, String>,     // "N1" → note_path
+    by_kind: HashMap<&'static str, HashMap<String, String>>,
+}
+
+impl LabelMaps {
+    fn empty() -> Self {
+        Self {
+            by_kind: HashMap::new(),
+        }
+    }
+    fn lookup(&self, kind: &str, label: &str) -> Option<&String> {
+        self.by_kind.get(kind).and_then(|m| m.get(label))
+    }
 }
 
 fn build_user_message(
     existing_active: &[Workstream],
     existing_archived: &[Workstream],
-    emails: &[email::EmailMessage],
-    events: &[calendar::CalendarEvent],
-    notes: &[NoteRef],
+    snapshots: &[(&'static str, Vec<SnapshotItem>)],
+    registry: &SignalRegistry,
     team_by_id: &std::collections::HashMap<String, String>,
 ) -> (String, LabelMaps) {
     let mut s = String::new();
@@ -511,120 +530,49 @@ fn build_user_message(
         }
     }
 
-    let mut email_map = HashMap::new();
-    s.push_str("\n# Recent emails (last 14 days)\n\n");
-    if emails.is_empty() {
-        s.push_str("(none)\n");
-    } else {
-        for (i, m) in emails.iter().enumerate() {
-            let label = format!("M{}", i + 1);
-            email_map.insert(label.clone(), m.id.clone());
-            let date = format_iso_date(m.sent_at_ms);
-            let from = format_from(&m.from_email, m.from_name.as_deref());
-            let body = email_body_excerpt(m);
-            s.push_str(&format!(
-                "[{label}] {date} — From: {from} — Subject: {subject}\n{body}\n\n",
-                subject = m.subject,
-            ));
+    let mut maps = LabelMaps::empty();
+    let mut prefixes: Vec<&'static str> = Vec::new();
+    // One section per registered source, in registry order. Adding a
+    // 4th source (e.g. GitHub) is a pure-add — no churn here.
+    for (kind, items) in snapshots {
+        let src = match registry.get(kind) {
+            Some(s) => s,
+            None => {
+                eprintln!("[workstreams] snapshot kind {kind} has no registered Signal");
+                continue;
+            }
+        };
+        prefixes.push(src.label_prefix());
+        s.push_str(&format!("\n# {}\n\n", src.prompt_section_title()));
+        if items.is_empty() {
+            s.push_str("(none)\n");
+            continue;
+        }
+        let kind_map = maps.by_kind.entry(*kind).or_default();
+        for (i, item) in items.iter().enumerate() {
+            let label = format!("{}{}", src.label_prefix(), i + 1);
+            kind_map.insert(label.clone(), item.id.clone());
+            s.push_str(&src.format(&label, item));
         }
     }
 
-    let mut event_map = HashMap::new();
-    s.push_str("\n# Recent calendar events (window: -14d .. +14d)\n\n");
-    if events.is_empty() {
-        s.push_str("(none)\n");
+    let label_glob = if prefixes.is_empty() {
+        String::new()
     } else {
-        for (i, e) in events.iter().enumerate() {
-            let label = format!("E{}", i + 1);
-            event_map.insert(label.clone(), e.id.clone());
-            let when = format_iso_datetime(e.start_ms);
-            let attendees: Vec<&str> =
-                e.attendees.iter().take(8).map(|a| a.email.as_str()).collect();
-            let attendees_str = if attendees.is_empty() {
-                String::new()
-            } else {
-                format!(" — Attendees: {}", attendees.join(", "))
-            };
-            s.push_str(&format!(
-                "[{label}] {when} — {title}{attendees_str}\n",
-                title = e.title
-            ));
-        }
-    }
-
-    let mut note_map = HashMap::new();
-    s.push_str("\n# Recent notes (last 30 days)\n\n");
-    if notes.is_empty() {
-        s.push_str("(none)\n");
-    } else {
-        for (i, n) in notes.iter().enumerate() {
-            let label = format!("N{}", i + 1);
-            note_map.insert(label.clone(), n.note_path.clone());
-            let date = format_iso_date(n.modified_ms);
-            s.push_str(&format!(
-                "[{label}] {date} — {title}\n",
-                title = n.title
-            ));
-        }
-    }
-
-    s.push_str(
+        prefixes
+            .iter()
+            .map(|p| format!("{p}*"))
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    s.push_str(&format!(
         "\n# Instructions\n\nReturn a JSON array matching the schema in the system prompt. \
          Reuse an existing workstream id when the new items extend it; spawn a new one (id: null) \
          only when no existing fit. Each action's source_label MUST be one of the labels above \
-         (M*/E*/N*). Output JSON only — no prose, no fences.\n",
-    );
+         ({label_glob}). Output JSON only — no prose, no fences.\n"
+    ));
 
-    (
-        s,
-        LabelMaps {
-            emails: email_map,
-            events: event_map,
-            notes: note_map,
-        },
-    )
-}
-
-fn email_body_excerpt(m: &email::EmailMessage) -> String {
-    let raw = m
-        .body_html
-        .as_deref()
-        .or(m.body_preview.as_deref())
-        .unwrap_or("");
-    if raw.is_empty() {
-        return String::new();
-    }
-    // Strip HTML tags + collapse whitespace. Keeps the prompt token-
-    // efficient without pulling in a full HTML parser; preview-only
-    // emails skip the strip logic.
-    let stripped = if raw.contains('<') {
-        strip_html(raw)
-    } else {
-        raw.to_string()
-    };
-    let collapsed = collapse_ws(&stripped);
-    let truncated: String = collapsed.chars().take(800).collect();
-    format!("    {}", truncated)
-}
-
-fn strip_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        if ch == '<' {
-            in_tag = true;
-            continue;
-        }
-        if ch == '>' {
-            in_tag = false;
-            out.push(' ');
-            continue;
-        }
-        if !in_tag {
-            out.push(ch);
-        }
-    }
-    out
+    (s, maps)
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -664,22 +612,9 @@ fn truncate_chars(s: &str, cap: usize) -> String {
     format!("{truncated}…")
 }
 
-fn format_from(email: &str, name: Option<&str>) -> String {
-    match name {
-        Some(n) if !n.is_empty() => format!("{n} <{email}>"),
-        _ => email.to_string(),
-    }
-}
-
 fn format_iso_date(ms: i64) -> String {
     DateTime::<Utc>::from_timestamp_millis(ms)
         .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn format_iso_datetime(ms: i64) -> String {
-    DateTime::<Utc>::from_timestamp_millis(ms)
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -779,11 +714,9 @@ fn parse_synthesizer_response(
             notes: Vec::new(),
         });
 
-        let member_emails =
-            map_labels(&members.emails, &label_maps.emails, "email");
-        let member_events =
-            map_labels(&members.events, &label_maps.events, "event");
-        let member_notes = map_labels(&members.notes, &label_maps.notes, "note");
+        let member_emails = map_labels(&members.emails, label_maps, "email");
+        let member_events = map_labels(&members.events, label_maps, "event");
+        let member_notes = map_labels(&members.notes, label_maps, "note");
 
         let actions = raw
             .actions
@@ -796,12 +729,7 @@ fn parse_synthesizer_response(
                 };
                 let kind = a.source_kind.unwrap_or_default();
                 let label = a.source_label.unwrap_or_default();
-                let source_id = match kind.as_str() {
-                    "email" => label_maps.emails.get(&label).cloned(),
-                    "event" => label_maps.events.get(&label).cloned(),
-                    "note" => label_maps.notes.get(&label).cloned(),
-                    _ => None,
-                };
+                let source_id = label_maps.lookup(&kind, &label).cloned();
                 let source_id = match source_id {
                     Some(s) => s,
                     None => {
@@ -836,13 +764,13 @@ fn parse_synthesizer_response(
 
 fn map_labels(
     labels: &[String],
-    map: &HashMap<String, String>,
+    maps: &LabelMaps,
     kind: &str,
 ) -> Vec<String> {
     let mut out = Vec::with_capacity(labels.len());
     let mut seen = HashSet::new();
     for label in labels {
-        match map.get(label.trim()) {
+        match maps.lookup(kind, label.trim()) {
             Some(id) => {
                 if seen.insert(id.clone()) {
                     out.push(id.clone());
@@ -906,14 +834,18 @@ mod tests {
     use super::*;
 
     fn label_maps() -> LabelMaps {
+        let mut by_kind: HashMap<&'static str, HashMap<String, String>> = HashMap::new();
         let mut emails = HashMap::new();
-        emails.insert("M1".into(), "mg:test::msg-1".to_string());
-        emails.insert("M2".into(), "mg:test::msg-2".to_string());
+        emails.insert("M1".to_string(), "mg:test::msg-1".to_string());
+        emails.insert("M2".to_string(), "mg:test::msg-2".to_string());
+        by_kind.insert("email", emails);
         let mut events = HashMap::new();
-        events.insert("E1".into(), "mg:test::ev-1".to_string());
+        events.insert("E1".to_string(), "mg:test::ev-1".to_string());
+        by_kind.insert("event", events);
         let mut notes = HashMap::new();
-        notes.insert("N1".into(), "/notes/a.md".to_string());
-        LabelMaps { emails, events, notes }
+        notes.insert("N1".to_string(), "/notes/a.md".to_string());
+        by_kind.insert("note", notes);
+        LabelMaps { by_kind }
     }
 
     #[test]
@@ -997,11 +929,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_html_removes_tags_and_keeps_text() {
-        assert_eq!(strip_html("<p>hello <b>world</b></p>").trim(), "hello  world");
-    }
-
-    #[test]
     fn collapse_ws_squashes_runs() {
         assert_eq!(collapse_ws("  a   b\n\nc  "), "a b c");
     }
@@ -1024,5 +951,136 @@ mod tests {
         let parsed = parse_synthesizer_response(raw, &label_maps());
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].status, None);
+    }
+
+    // ----- Prompt parity (#86) -------------------------------------------
+    //
+    // build_user_message is now driven by the registry. Lock the byte-
+    // exact section structure so a future "add a 4th source" PR doesn't
+    // accidentally reflow the email/event/note rendering. One item per
+    // section keeps the assertion readable; the per-source format()
+    // logic is covered in `signals` tests.
+
+    fn make_email() -> SnapshotItem {
+        let m = email::EmailMessage {
+            id: "mg:test::m1".into(),
+            connector_id: "mg:test".into(),
+            external_id: "m1".into(),
+            thread_id: "t".into(),
+            subject: "Hi".into(),
+            from_email: "alice@x.io".into(),
+            from_name: Some("Alice".into()),
+            sent_at_ms: 1_700_000_000_000,
+            body_preview: Some("Body text".into()),
+            body_html: None,
+            has_attachments: false,
+            is_read: true,
+            raw_etag: None,
+            modified_ms: 1_700_000_000_000,
+            recipients: Vec::new(),
+        };
+        SnapshotItem {
+            id: m.id.clone(),
+            payload: SnapshotPayload::Email(m),
+        }
+    }
+
+    fn make_event() -> SnapshotItem {
+        let e = crate::connectors::calendar::CalendarEvent {
+            id: "mg:test::e1".into(),
+            connector_id: "mg:test".into(),
+            external_id: "e1".into(),
+            title: "Sync".into(),
+            start_ms: 1_700_000_000_000,
+            end_ms: 1_700_000_000_000 + 3600_000,
+            all_day: false,
+            location: None,
+            description: None,
+            source_calendar: None,
+            status: None,
+            raw_etag: None,
+            modified_ms: 1_700_000_000_000,
+            linked_note_path: None,
+            attendees: Vec::new(),
+        };
+        SnapshotItem {
+            id: e.id.clone(),
+            payload: SnapshotPayload::Event(e),
+        }
+    }
+
+    fn make_note() -> SnapshotItem {
+        let n = super::super::NoteRef {
+            note_path: "/notes/a.md".into(),
+            title: "Plan".into(),
+            modified_ms: 1_700_000_000_000,
+        };
+        SnapshotItem {
+            id: n.note_path.clone(),
+            payload: SnapshotPayload::Note(n),
+        }
+    }
+
+    #[test]
+    fn build_user_message_matches_locked_layout() {
+        let registry = signals::registry();
+        let snapshots: Vec<(&'static str, Vec<SnapshotItem>)> = vec![
+            ("email", vec![make_email()]),
+            ("event", vec![make_event()]),
+            ("note", vec![make_note()]),
+        ];
+        let team: HashMap<String, String> = HashMap::new();
+        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team);
+
+        let expected = concat!(
+            "# Existing workstreams (active)\n\n",
+            "(none)\n",
+            "\n# Recent emails (last 14 days)\n\n",
+            "[M1] 2023-11-14 — From: Alice <alice@x.io> — Subject: Hi\n",
+            "    Body text\n\n",
+            "\n# Recent calendar events (window: -14d .. +14d)\n\n",
+            "[E1] 2023-11-14 22:13 — Sync\n",
+            "\n# Recent notes (last 30 days)\n\n",
+            "[N1] 2023-11-14 — Plan\n",
+            "\n# Instructions\n\n",
+            "Return a JSON array matching the schema in the system prompt. ",
+            "Reuse an existing workstream id when the new items extend it; spawn a new one (id: null) ",
+            "only when no existing fit. Each action's source_label MUST be one of the labels above ",
+            "(M*/E*/N*). Output JSON only — no prose, no fences.\n",
+        );
+
+        assert_eq!(prompt, expected, "prompt layout drifted");
+
+        // Label maps were built keyed by kind.
+        assert_eq!(
+            maps.lookup("email", "M1").map(String::as_str),
+            Some("mg:test::m1")
+        );
+        assert_eq!(
+            maps.lookup("event", "E1").map(String::as_str),
+            Some("mg:test::e1")
+        );
+        assert_eq!(
+            maps.lookup("note", "N1").map(String::as_str),
+            Some("/notes/a.md")
+        );
+        // Cross-kind lookup must miss (event label can't appear under email).
+        assert!(maps.lookup("email", "E1").is_none());
+    }
+
+    #[test]
+    fn build_user_message_renders_none_for_empty_section() {
+        let registry = signals::registry();
+        let snapshots: Vec<(&'static str, Vec<SnapshotItem>)> = vec![
+            ("email", vec![]),
+            ("event", vec![]),
+            ("note", vec![]),
+        ];
+        let team: HashMap<String, String> = HashMap::new();
+        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team);
+        assert!(prompt.contains("\n# Recent emails (last 14 days)\n\n(none)\n"));
+        assert!(prompt.contains("\n# Recent calendar events (window: -14d .. +14d)\n\n(none)\n"));
+        assert!(prompt.contains("\n# Recent notes (last 30 days)\n\n(none)\n"));
+        assert!(maps.by_kind.is_empty(), "no items, no labels recorded");
     }
 }
