@@ -46,6 +46,15 @@ pub struct Workstream {
     /// authoritative by the synthesizer prompt and surfaced in
     /// `read_workstream` tool output. `None` when empty.
     pub user_notes: Option<String>,
+    /// Stamped on archive transitions (#78). Manual unarchive clears
+    /// this; synthesizer-driven resurrect leaves it as historical
+    /// record so the UI can show "archived 12 days ago, reopened today".
+    pub archived_at_ms: Option<i64>,
+    /// Set when the synthesizer flips a previously-archived workstream
+    /// back to active because new evidence rolled in (#78). Cleared on
+    /// detail-view unmount via `mark_workstream_seen`. The "Reopened"
+    /// badge is just `reopened_at_ms.is_some() && status == "active"`.
+    pub reopened_at_ms: Option<i64>,
     pub email_count: u32,
     pub event_count: u32,
     pub note_count: u32,
@@ -86,6 +95,9 @@ pub struct WorkstreamDetail {
 pub struct ClusterReport {
     pub workstreams_added: u32,
     pub workstreams_updated: u32,
+    /// Workstreams the synthesizer resurrected from archived → active
+    /// because new evidence rolled in (#78).
+    pub workstreams_reopened: u32,
     pub actions_added: u32,
     pub actions_updated: u32,
     pub items_clustered: u32,

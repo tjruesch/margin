@@ -28,6 +28,11 @@ pub struct SynthesizedWorkstream {
     pub member_events: Vec<String>,
     pub member_notes: Vec<String>,
     pub actions: Vec<SynthesizedAction>,
+    /// Optional status hint from Claude (#78). When set to `"active"`
+    /// for a workstream that's currently archived, the synthesizer
+    /// runs `resurrect_if_archived`. Other values are ignored — archive
+    /// flow is user-driven only.
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,7 +70,7 @@ pub fn set_last_clustered_ms(conn: &Connection, ms: i64) -> rusqlite::Result<()>
 pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workstream>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
-                w.user_notes, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0) AS ec, \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0) AS evc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0) AS nc, \
@@ -84,10 +89,12 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
             created_ms: r.get(5)?,
             updated_ms: r.get(6)?,
             user_notes: r.get(7)?,
-            email_count: r.get::<_, i64>(8)? as u32,
-            event_count: r.get::<_, i64>(9)? as u32,
-            note_count: r.get::<_, i64>(10)? as u32,
-            open_action_count: r.get::<_, i64>(11)? as u32,
+            archived_at_ms: r.get(8)?,
+            reopened_at_ms: r.get(9)?,
+            email_count: r.get::<_, i64>(10)? as u32,
+            event_count: r.get::<_, i64>(11)? as u32,
+            note_count: r.get::<_, i64>(12)? as u32,
+            open_action_count: r.get::<_, i64>(13)? as u32,
         })
     })?;
     let mut out = Vec::new();
@@ -95,6 +102,113 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
         out.push(row?);
     }
     Ok(out)
+}
+
+/// Archived workstreams ordered by archive time (most recently archived
+/// first). Used by the Workstreams view's "Archived (N)" accordion (#78).
+pub fn list_workstreams_archived(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<Workstream>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
+                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
+         FROM workstreams w \
+         WHERE w.status = 'archived' \
+         ORDER BY w.archived_at_ms DESC NULLS LAST",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(Workstream {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            summary: r.get(2)?,
+            status: r.get(3)?,
+            last_activity_ms: r.get(4)?,
+            created_ms: r.get(5)?,
+            updated_ms: r.get(6)?,
+            user_notes: r.get(7)?,
+            archived_at_ms: r.get(8)?,
+            reopened_at_ms: r.get(9)?,
+            email_count: r.get::<_, i64>(10)? as u32,
+            event_count: r.get::<_, i64>(11)? as u32,
+            note_count: r.get::<_, i64>(12)? as u32,
+            open_action_count: r.get::<_, i64>(13)? as u32,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Both active and archived workstreams (NOT snoozed) returned as a
+/// single list with an `is_archived` flag, for the synthesizer to
+/// partition into separate prompt sections (#78).
+///
+/// Snoozed workstreams stay hidden from Claude entirely — we treat
+/// "snooze" as "remind me later, don't include in synthesis", distinct
+/// from archive's "this is done, only resurrect on clear continuation".
+pub fn list_workstreams_for_synthesis(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(Workstream, bool)>> {
+    let mut stmt = conn.prepare(
+        "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
+                COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) \
+         FROM workstreams w \
+         WHERE w.status IN ('active', 'archived') \
+         ORDER BY \
+            CASE w.status WHEN 'active' THEN 0 ELSE 1 END, \
+            CASE WHEN w.status = 'active' THEN w.last_activity_ms ELSE w.archived_at_ms END DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let status: String = r.get(3)?;
+        let is_archived = status == "archived";
+        Ok((
+            Workstream {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                summary: r.get(2)?,
+                status,
+                last_activity_ms: r.get(4)?,
+                created_ms: r.get(5)?,
+                updated_ms: r.get(6)?,
+                user_notes: r.get(7)?,
+                archived_at_ms: r.get(8)?,
+                reopened_at_ms: r.get(9)?,
+                email_count: r.get::<_, i64>(10)? as u32,
+                event_count: r.get::<_, i64>(11)? as u32,
+                note_count: r.get::<_, i64>(12)? as u32,
+                open_action_count: r.get::<_, i64>(13)? as u32,
+            },
+            is_archived,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Look up a workstream's status without joining counts. Used by the
+/// synthesizer's persist loop to decide whether a Claude-returned id
+/// is referencing an existing archived workstream (#78). Returns `None`
+/// if the workstream doesn't exist (a fresh ws_<uuid> will be inserted).
+pub fn lookup_pre_status(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+) -> rusqlite::Result<Option<String>> {
+    let mut stmt = tx.prepare("SELECT status FROM workstreams WHERE id = ?1")?;
+    stmt.query_row(params![id], |r| r.get::<_, String>(0))
+        .optional()
 }
 
 pub fn get_workstream_detail(
@@ -164,7 +278,7 @@ pub fn get_workstream_detail(
 fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Workstream>> {
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
-                w.user_notes, \
+                w.user_notes, w.archived_at_ms, w.reopened_at_ms, \
                 COALESCE((SELECT COUNT(*) FROM workstream_emails WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_events WHERE workstream_id = w.id), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_notes  WHERE workstream_id = w.id), 0), \
@@ -181,10 +295,12 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
             created_ms: r.get(5)?,
             updated_ms: r.get(6)?,
             user_notes: r.get(7)?,
-            email_count: r.get::<_, i64>(8)? as u32,
-            event_count: r.get::<_, i64>(9)? as u32,
-            note_count: r.get::<_, i64>(10)? as u32,
-            open_action_count: r.get::<_, i64>(11)? as u32,
+            archived_at_ms: r.get(8)?,
+            reopened_at_ms: r.get(9)?,
+            email_count: r.get::<_, i64>(10)? as u32,
+            event_count: r.get::<_, i64>(11)? as u32,
+            note_count: r.get::<_, i64>(12)? as u32,
+            open_action_count: r.get::<_, i64>(13)? as u32,
         })
     })
     .optional()
@@ -438,10 +554,71 @@ pub fn set_action_done(
     Ok(())
 }
 
+/// Apply a user-driven status change (#78). Stamps the appropriate
+/// timestamps for the lifecycle:
+/// - `archived`: stamps `archived_at_ms = now`, clears `reopened_at_ms`.
+/// - `active`: clears both `archived_at_ms` and `reopened_at_ms` for a
+///   clean slate. The synthesizer-driven resurrect path uses
+///   `resurrect_if_archived` instead, which preserves `archived_at_ms`
+///   as historical record.
+/// - `snoozed`: status only, no timestamps touched.
 pub fn set_status(conn: &Connection, id: &str, status: &str) -> rusqlite::Result<()> {
+    let now = now_ms();
+    match status {
+        "archived" => {
+            conn.execute(
+                "UPDATE workstreams SET status = 'archived', archived_at_ms = ?2, \
+                                        reopened_at_ms = NULL, updated_ms = ?2 \
+                 WHERE id = ?1",
+                params![id, now],
+            )?;
+        }
+        "active" => {
+            conn.execute(
+                "UPDATE workstreams SET status = 'active', archived_at_ms = NULL, \
+                                        reopened_at_ms = NULL, updated_ms = ?2 \
+                 WHERE id = ?1",
+                params![id, now],
+            )?;
+        }
+        _ => {
+            // snoozed (or any future state): touch only status + updated.
+            conn.execute(
+                "UPDATE workstreams SET status = ?2, updated_ms = ?3 WHERE id = ?1",
+                params![id, status, now],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Synthesizer-driven resurrect: flip an archived workstream back to
+/// active, stamp `reopened_at_ms = now`, leave `archived_at_ms` as
+/// historical record. No-op if the workstream isn't currently
+/// archived (defensive — Claude may emit `status: "active"` for an
+/// already-active workstream). Returns `true` when an actual flip
+/// happened so the caller can count it for the ClusterReport.
+pub fn resurrect_if_archived(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<bool> {
+    let updated = tx.execute(
+        "UPDATE workstreams SET status = 'active', reopened_at_ms = ?2, updated_ms = ?2 \
+         WHERE id = ?1 AND status = 'archived'",
+        params![id, now_ms],
+    )?;
+    Ok(updated > 0)
+}
+
+/// Clear the `reopened_at_ms` marker. Called from the detail view's
+/// unmount cleanup when the user has visited a reopened workstream
+/// (#78), so the "Reopened" badge stops showing on subsequent list
+/// renders.
+pub fn mark_seen(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE workstreams SET status = ?2, updated_ms = ?3 WHERE id = ?1",
-        params![id, status, now_ms()],
+        "UPDATE workstreams SET reopened_at_ms = NULL, updated_ms = ?2 WHERE id = ?1",
+        params![id, now_ms()],
     )?;
     Ok(())
 }
@@ -514,6 +691,8 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("../migrations/013_workstream_user_notes.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../migrations/014_workstream_archive_resurface.sql"))
+            .unwrap();
         conn
     }
 
@@ -555,6 +734,7 @@ mod tests {
             member_events: events.iter().map(|s| s.to_string()).collect(),
             member_notes: notes.iter().map(|s| s.to_string()).collect(),
             actions,
+            status: None,
         }
     }
 
@@ -887,5 +1067,156 @@ mod tests {
             Some("This is the new POC."),
             "user_notes must survive a re-sync that doesn't carry it"
         );
+    }
+
+    // ----- archive + resurface (#78) ---------------------------------------
+
+    fn seed_workstream(conn: &mut Connection, id: &str) {
+        let tx = conn.transaction().unwrap();
+        write_workstream(&tx, &make_ws(Some(id), "WS", &[], &[], &[], vec![]), 1_000)
+            .unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn fetch_one_raw(conn: &Connection, id: &str) -> (String, Option<i64>, Option<i64>) {
+        conn.query_row(
+            "SELECT status, archived_at_ms, reopened_at_ms FROM workstreams WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn set_status_to_archived_stamps_archived_at_ms() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_a");
+        set_status(&conn, "ws_a", "archived").unwrap();
+        let (status, archived, reopened) = fetch_one_raw(&conn, "ws_a");
+        assert_eq!(status, "archived");
+        assert!(archived.is_some());
+        assert!(reopened.is_none());
+    }
+
+    #[test]
+    fn set_status_to_active_clears_both_timestamps() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_b");
+        set_status(&conn, "ws_b", "archived").unwrap();
+        // Simulate a synthesizer-driven resurrect setting reopened_at_ms.
+        let tx = conn.transaction().unwrap();
+        resurrect_if_archived(&tx, "ws_b", 5_000).unwrap();
+        tx.commit().unwrap();
+        // Now the user manually unarchives via the status pill.
+        set_status(&conn, "ws_b", "active").unwrap();
+        let (status, archived, reopened) = fetch_one_raw(&conn, "ws_b");
+        assert_eq!(status, "active");
+        assert_eq!(archived, None, "manual unarchive should clear archived_at_ms");
+        assert_eq!(reopened, None, "manual unarchive should clear reopened_at_ms");
+    }
+
+    #[test]
+    fn resurrect_if_archived_flips_status_and_stamps_reopened() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_c");
+        set_status(&conn, "ws_c", "archived").unwrap();
+        let (_, archived_before, _) = fetch_one_raw(&conn, "ws_c");
+
+        let tx = conn.transaction().unwrap();
+        let flipped = resurrect_if_archived(&tx, "ws_c", 9_999).unwrap();
+        tx.commit().unwrap();
+        assert!(flipped);
+
+        let (status, archived_after, reopened) = fetch_one_raw(&conn, "ws_c");
+        assert_eq!(status, "active");
+        assert_eq!(reopened, Some(9_999));
+        assert_eq!(
+            archived_after, archived_before,
+            "synthesizer-driven resurrect should preserve archived_at_ms as history"
+        );
+    }
+
+    #[test]
+    fn resurrect_if_archived_is_no_op_when_already_active() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_d");
+        let tx = conn.transaction().unwrap();
+        let flipped = resurrect_if_archived(&tx, "ws_d", 1_111).unwrap();
+        tx.commit().unwrap();
+        assert!(!flipped);
+        let (status, _, reopened) = fetch_one_raw(&conn, "ws_d");
+        assert_eq!(status, "active");
+        assert!(reopened.is_none());
+    }
+
+    #[test]
+    fn mark_seen_clears_reopened_at_ms() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_e");
+        set_status(&conn, "ws_e", "archived").unwrap();
+        let tx = conn.transaction().unwrap();
+        resurrect_if_archived(&tx, "ws_e", 2_000).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(fetch_one_raw(&conn, "ws_e").2, Some(2_000));
+
+        mark_seen(&conn, "ws_e").unwrap();
+        assert_eq!(fetch_one_raw(&conn, "ws_e").2, None);
+    }
+
+    #[test]
+    fn list_workstreams_for_synthesis_returns_active_and_archived_only() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_active");
+        seed_workstream(&mut conn, "ws_archived");
+        seed_workstream(&mut conn, "ws_snoozed");
+        set_status(&conn, "ws_archived", "archived").unwrap();
+        set_status(&conn, "ws_snoozed", "snoozed").unwrap();
+
+        let rows = list_workstreams_for_synthesis(&conn).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|(w, _)| w.id.as_str()).collect();
+        assert!(ids.contains(&"ws_active"));
+        assert!(ids.contains(&"ws_archived"));
+        assert!(!ids.contains(&"ws_snoozed"), "snoozed workstreams must not surface to the synthesizer");
+
+        // is_archived flag matches status.
+        for (w, is_archived) in &rows {
+            assert_eq!(*is_archived, w.status == "archived");
+        }
+    }
+
+    #[test]
+    fn list_workstreams_archived_orders_by_archived_at_desc() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_old");
+        seed_workstream(&mut conn, "ws_new");
+        set_status(&conn, "ws_old", "archived").unwrap();
+        // Force a later archived_at_ms by sleeping briefly via direct SQL stamp
+        // (now_ms() resolution is millis but tests can run within the same ms).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        set_status(&conn, "ws_new", "archived").unwrap();
+
+        let archived = list_workstreams_archived(&conn).unwrap();
+        let ids: Vec<&str> = archived.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, vec!["ws_new", "ws_old"]);
+    }
+
+    #[test]
+    fn lookup_pre_status_returns_none_for_missing_workstream() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        let res = lookup_pre_status(&tx, "ws_nope").unwrap();
+        tx.commit().unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn lookup_pre_status_returns_status_for_existing() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_x");
+        set_status(&conn, "ws_x", "archived").unwrap();
+        let tx = conn.transaction().unwrap();
+        let res = lookup_pre_status(&tx, "ws_x").unwrap();
+        tx.commit().unwrap();
+        assert_eq!(res.as_deref(), Some("archived"));
     }
 }

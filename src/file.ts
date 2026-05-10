@@ -504,6 +504,14 @@ export type Workstream = {
   /** User-authored ground-truth context (#77). The synthesizer treats
    *  this as authoritative; AI ask surfaces it via read_workstream. */
   user_notes: string | null;
+  /** Stamped on archive transitions (#78). Manual unarchive clears this;
+   *  synthesizer-driven resurrect leaves it as historical record. */
+  archived_at_ms: number | null;
+  /** Set when the synthesizer resurrected this workstream from archived
+   *  back to active (#78). Cleared on detail-view unmount via
+   *  markWorkstreamSeen. The "Reopened" badge shows when this is set
+   *  and status === "active". */
+  reopened_at_ms: number | null;
   email_count: number;
   event_count: number;
   note_count: number;
@@ -538,6 +546,9 @@ export type WorkstreamDetail = Workstream & {
 export type ClusterReport = {
   workstreams_added: number;
   workstreams_updated: number;
+  /** Workstreams the synthesizer resurrected from archived → active
+   *  because new evidence rolled in (#78). */
+  workstreams_reopened: number;
   actions_added: number;
   actions_updated: number;
   items_clustered: number;
@@ -585,6 +596,20 @@ export async function setWorkstreamUserNotes(
   notes: string | null,
 ): Promise<void> {
   await invoke<void>("set_workstream_user_notes", { id, notes });
+}
+
+/** List archived workstreams for the Workstreams view's "Archived (N)"
+ *  collapsed accordion (#78). Most recently archived first. */
+export async function listArchivedWorkstreams(): Promise<Workstream[]> {
+  return invoke<Workstream[]>("list_archived_workstreams");
+}
+
+/** Clear the `reopened_at_ms` marker on a workstream (#78). Called by
+ *  the detail view's unmount cleanup once the user has visited a
+ *  reopened workstream. Idempotent — safe to call when the marker
+ *  isn't set. */
+export async function markWorkstreamSeen(id: string): Promise<void> {
+  await invoke<void>("mark_workstream_seen", { id });
 }
 
 export type NoteMeta = { modified_ms: number };

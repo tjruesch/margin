@@ -68,3 +68,26 @@ pub fn set_workstream_user_notes(
     let c = conn.lock().map_err(|e| e.to_string())?;
     persist::set_user_notes(&c, &id, trimmed).map_err(|e| e.to_string())
 }
+
+/// List archived workstreams for the Workstreams view's collapsed
+/// "Archived (N)" accordion (#78). Most recently archived first.
+#[tauri::command]
+pub fn list_archived_workstreams(
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Vec<Workstream>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::list_workstreams_archived(&c).map_err(|e| e.to_string())
+}
+
+/// Clear the `reopened_at_ms` marker on a workstream (#78). Called by
+/// the detail view's unmount cleanup once the user has visited a
+/// reopened workstream — the "Reopened" badge stops showing on
+/// subsequent list renders.
+#[tauri::command]
+pub fn mark_workstream_seen(
+    id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::mark_seen(&c, &id).map_err(|e| e.to_string())
+}
