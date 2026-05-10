@@ -1,19 +1,32 @@
-//! Workstream signal hydration layer (#85).
+//! Workstream signal hydration + snapshot layer (#85, #86).
 //!
 //! Workstreams cite items from many domains: emails, calendar events,
 //! notes, and (future) GitHub PRs, Slack threads, Linear issues, etc.
 //! The DB-side pivot is uniform — `workstream_signals(workstream_id,
 //! kind, item_id)` — but each domain has its own rich row type. This
-//! module abstracts the per-domain hydration behind a `Signal` trait
-//! plus a `SignalRegistry` so `get_workstream_detail` can dispatch
-//! polymorphically without growing per-source branches.
+//! module abstracts each domain behind a single `Signal` trait plus a
+//! `SignalRegistry` so the synthesizer's prompt loop and
+//! `get_workstream_detail` both dispatch polymorphically without
+//! growing per-source branches.
 //!
-//! Adding a new source after this module lands is one file: define a
-//! `Signal` impl, register it in `default_with_builtins`, done. No
-//! changes to `persist.rs`, `synthesizer.rs`, or any UI code unless
-//! the new kind also gets its own slot on `WorkstreamDetail` (it
-//! doesn't have to — the registry could feed a generic `signals`
-//! field eventually; we kept named fields for v1 minimal churn).
+//! Each impl owns three things:
+//!   - **Hydration** (#85): `hydrate(conn, item_ids)` turns pivot rows
+//!     into rich domain objects for the detail view + AI ask prompts.
+//!   - **Snapshot** (#86): `snapshot(conn, window, cap)` reads the
+//!     recent items the synthesizer should cluster.
+//!   - **Render** (#86): `format(item)` produces the per-item lines
+//!     for the cluster-pass user message. Multi-line is allowed (email
+//!     emits header + indented body excerpt), so this is not strictly
+//!     "one line".
+//!
+//! Per-source defaults — `default_window()`, `default_cap()`,
+//! `label_prefix()` — live next to each impl so adding a source is a
+//! one-file change with no synthesizer-side surgery.
+//!
+//! Adding a new source: define a `Signal` impl, register it in
+//! `default_with_builtins`, done. No changes to `persist.rs`,
+//! `synthesizer.rs`, or any UI code unless the new kind also gets its
+//! own slot on `WorkstreamDetail`.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -23,6 +36,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::NoteRef;
 use crate::connectors::calendar::{self, CalendarEvent};
 use crate::connectors::email::{self, EmailMessage};
+use crate::index;
 
 /// One hydrated item, polymorphic over the registered kinds. The
 /// closed enum is intentional for v1 — every consumer (persist,
@@ -37,8 +51,36 @@ pub enum HydratedSignal {
     Note(NoteRef),
 }
 
-/// Per-domain hydrator. `kind` is the discriminator stored in the
-/// `workstream_signals.kind` column.
+/// One snapshot item from a source. `id` is the canonical id stored in
+/// `workstream_signals.item_id`; `payload` is the rich row used for
+/// rendering. Closed-enum mirrors `HydratedSignal` so consumers can
+/// pattern-match without going through `Any`.
+#[derive(Debug)]
+pub struct SnapshotItem {
+    pub id: String,
+    pub payload: SnapshotPayload,
+}
+
+#[derive(Debug)]
+pub enum SnapshotPayload {
+    Email(EmailMessage),
+    Event(CalendarEvent),
+    Note(NoteRef),
+}
+
+/// Per-source time window for snapshotting. `back_ms` and
+/// `forward_ms` are both non-negative durations; the source applies
+/// `[now - back_ms, now + forward_ms]`. Forward is non-zero for
+/// calendar (upcoming meetings count) and ~1 day for email (covers
+/// clock skew on freshly-sent items); zero for notes.
+#[derive(Debug, Clone, Copy)]
+pub struct SignalWindow {
+    pub back_ms: i64,
+    pub forward_ms: i64,
+}
+
+/// Per-domain hydrator + snapshotter. `kind` is the discriminator
+/// stored in the `workstream_signals.kind` column.
 pub trait Signal: Send + Sync {
     /// The discriminator used in `workstream_signals.kind`. The
     /// registry already keys impls by the same string, so callers
@@ -46,6 +88,47 @@ pub trait Signal: Send + Sync {
     /// in logs and future generic dispatch.
     #[allow(dead_code)]
     fn kind(&self) -> &'static str;
+
+    /// Single-letter prefix for the labels Claude sees in the
+    /// cluster-pass prompt — "M" for email, "E" for events, "N" for
+    /// notes. Each label is `"{prefix}{1-based index}"`. Must be
+    /// unique across registered sources; the registry asserts this.
+    fn label_prefix(&self) -> &'static str;
+
+    /// Markdown header used for this source's section in the cluster
+    /// prompt. Includes the human-readable window so Claude sees the
+    /// time horizon: e.g. "Recent emails (last 14 days)". Does NOT
+    /// include the leading `#` — the synthesizer adds it.
+    fn prompt_section_title(&self) -> &'static str;
+
+    /// Default snapshot window for cluster passes. Lives here (not in
+    /// `synthesizer.rs`) so adding a source is a one-file change.
+    fn default_window(&self) -> SignalWindow;
+
+    /// Default per-source cap on snapshot items. The synthesizer may
+    /// later allocate against a global token budget; for now each
+    /// source returns up to its own cap.
+    fn default_cap(&self) -> usize;
+
+    /// Read recent items from local storage. Implementations return
+    /// recency-desc, already deduplicated. The cap is advisory — the
+    /// caller may pass a smaller value when budget is tight. `now_ms`
+    /// is injected (not read from `SystemTime::now()`) so tests can
+    /// pin the window deterministically.
+    fn snapshot(
+        &self,
+        conn: &Connection,
+        now_ms: i64,
+        window: SignalWindow,
+        cap: usize,
+    ) -> rusqlite::Result<Vec<SnapshotItem>>;
+
+    /// Render one snapshot item for the cluster-pass user message.
+    /// `label` is the Claude-facing identifier (e.g. "M3"). Multi-line
+    /// output is allowed — email emits header + indented body excerpt.
+    /// The trailing newline is the caller's responsibility.
+    fn format(&self, label: &str, item: &SnapshotItem) -> String;
+
     /// Fetch rich rows for the given item ids. Implementations should
     /// return items in recency-desc order (most recent first). Missing
     /// items are dropped silently — the pivot uses soft FKs and an
@@ -57,13 +140,73 @@ pub trait Signal: Send + Sync {
     ) -> rusqlite::Result<Vec<HydratedSignal>>;
 }
 
-// ----- Built-in hydrators -------------------------------------------------
+// ----- Built-in sources ---------------------------------------------------
 
 pub struct EmailSignal;
+
+/// Email: 14d back, +1d forward (covers clock skew on freshly-sent
+/// items), label prefix "M". Cap of 500 mirrors the previous
+/// `list_messages_in_range` limit in `synthesizer.rs`.
+const EMAIL_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
+const EMAIL_WINDOW_FORWARD_MS: i64 = 24 * 3600 * 1000;
+const EMAIL_CAP: usize = 500;
 
 impl Signal for EmailSignal {
     fn kind(&self) -> &'static str {
         "email"
+    }
+    fn label_prefix(&self) -> &'static str {
+        "M"
+    }
+    fn prompt_section_title(&self) -> &'static str {
+        "Recent emails (last 14 days)"
+    }
+    fn default_window(&self) -> SignalWindow {
+        SignalWindow {
+            back_ms: EMAIL_WINDOW_BACK_MS,
+            forward_ms: EMAIL_WINDOW_FORWARD_MS,
+        }
+    }
+    fn default_cap(&self) -> usize {
+        EMAIL_CAP
+    }
+    fn snapshot(
+        &self,
+        conn: &Connection,
+        now_ms: i64,
+        window: SignalWindow,
+        cap: usize,
+    ) -> rusqlite::Result<Vec<SnapshotItem>> {
+        let messages = email::list_messages_in_range(
+            conn,
+            now_ms - window.back_ms,
+            now_ms + window.forward_ms,
+            None,
+            cap,
+        )?;
+        Ok(messages
+            .into_iter()
+            .map(|m| SnapshotItem {
+                id: m.id.clone(),
+                payload: SnapshotPayload::Email(m),
+            })
+            .collect())
+    }
+    fn format(&self, label: &str, item: &SnapshotItem) -> String {
+        let m = match &item.payload {
+            SnapshotPayload::Email(m) => m,
+            _ => return String::new(),
+        };
+        let date = format_iso_date(m.sent_at_ms);
+        let from = format_from(&m.from_email, m.from_name.as_deref());
+        let body = email_body_excerpt(m);
+        // Trailing blank line is intentional — emails are multi-line
+        // and the blank separator keeps headers visually distinct in
+        // the prompt. Events and notes are single-line and don't need it.
+        format!(
+            "[{label}] {date} — From: {from} — Subject: {subject}\n{body}\n\n",
+            subject = m.subject,
+        )
     }
     fn hydrate(
         &self,
@@ -84,9 +227,66 @@ impl Signal for EmailSignal {
 
 pub struct EventSignal;
 
+/// Calendar: ±14d, label prefix "E".
+const EVENT_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
+const EVENT_WINDOW_FORWARD_MS: i64 = 14 * 24 * 3600 * 1000;
+/// list_events_in_range has no LIMIT param; cap is enforced post-fetch.
+const EVENT_CAP: usize = 500;
+
 impl Signal for EventSignal {
     fn kind(&self) -> &'static str {
         "event"
+    }
+    fn label_prefix(&self) -> &'static str {
+        "E"
+    }
+    fn prompt_section_title(&self) -> &'static str {
+        "Recent calendar events (window: -14d .. +14d)"
+    }
+    fn default_window(&self) -> SignalWindow {
+        SignalWindow {
+            back_ms: EVENT_WINDOW_BACK_MS,
+            forward_ms: EVENT_WINDOW_FORWARD_MS,
+        }
+    }
+    fn default_cap(&self) -> usize {
+        EVENT_CAP
+    }
+    fn snapshot(
+        &self,
+        conn: &Connection,
+        now_ms: i64,
+        window: SignalWindow,
+        cap: usize,
+    ) -> rusqlite::Result<Vec<SnapshotItem>> {
+        let mut events =
+            calendar::list_events_in_range(conn, now_ms - window.back_ms, now_ms + window.forward_ms, None)?;
+        events.truncate(cap);
+        Ok(events
+            .into_iter()
+            .map(|e| SnapshotItem {
+                id: e.id.clone(),
+                payload: SnapshotPayload::Event(e),
+            })
+            .collect())
+    }
+    fn format(&self, label: &str, item: &SnapshotItem) -> String {
+        let e = match &item.payload {
+            SnapshotPayload::Event(e) => e,
+            _ => return String::new(),
+        };
+        let when = format_iso_datetime(e.start_ms);
+        let attendees: Vec<&str> =
+            e.attendees.iter().take(8).map(|a| a.email.as_str()).collect();
+        let attendees_str = if attendees.is_empty() {
+            String::new()
+        } else {
+            format!(" — Attendees: {}", attendees.join(", "))
+        };
+        format!(
+            "[{label}] {when} — {title}{attendees_str}\n",
+            title = e.title
+        )
     }
     fn hydrate(
         &self,
@@ -106,9 +306,75 @@ impl Signal for EventSignal {
 
 pub struct NoteSignal;
 
+/// Notes: 30d back, label prefix "N". The directory cap (200) is the
+/// upstream ceiling; window filtering is applied after.
+const NOTE_WINDOW_BACK_MS: i64 = 30 * 24 * 3600 * 1000;
+const NOTE_DIRECTORY_LIMIT: usize = 200;
+const NOTE_CAP: usize = 200;
+
 impl Signal for NoteSignal {
     fn kind(&self) -> &'static str {
         "note"
+    }
+    fn label_prefix(&self) -> &'static str {
+        "N"
+    }
+    fn prompt_section_title(&self) -> &'static str {
+        "Recent notes (last 30 days)"
+    }
+    fn default_window(&self) -> SignalWindow {
+        SignalWindow {
+            back_ms: NOTE_WINDOW_BACK_MS,
+            forward_ms: 0,
+        }
+    }
+    fn default_cap(&self) -> usize {
+        NOTE_CAP
+    }
+    fn snapshot(
+        &self,
+        conn: &Connection,
+        now_ms: i64,
+        window: SignalWindow,
+        cap: usize,
+    ) -> rusqlite::Result<Vec<SnapshotItem>> {
+        let cutoff = now_ms - window.back_ms;
+        let directory = index::list_directory(conn, NOTE_DIRECTORY_LIMIT)?;
+        let mut items: Vec<SnapshotItem> = directory
+            .into_iter()
+            .filter(|d| d.modified_ms >= cutoff)
+            .take(cap)
+            .map(|d| SnapshotItem {
+                id: d.note_path.clone(),
+                payload: SnapshotPayload::Note(NoteRef {
+                    note_path: d.note_path,
+                    title: d.title,
+                    modified_ms: d.modified_ms,
+                }),
+            })
+            .collect();
+        // `index::list_directory` already returns recency-desc; the
+        // sort here just locks the contract in case that ever shifts.
+        items.sort_by(|a, b| {
+            let am = match &a.payload {
+                SnapshotPayload::Note(n) => n.modified_ms,
+                _ => 0,
+            };
+            let bm = match &b.payload {
+                SnapshotPayload::Note(n) => n.modified_ms,
+                _ => 0,
+            };
+            bm.cmp(&am)
+        });
+        Ok(items)
+    }
+    fn format(&self, label: &str, item: &SnapshotItem) -> String {
+        let n = match &item.payload {
+            SnapshotPayload::Note(n) => n,
+            _ => return String::new(),
+        };
+        let date = format_iso_date(n.modified_ms);
+        format!("[{label}] {date} — {title}\n", title = n.title)
     }
     /// Notes are looked up by `note_path` (the soft-FK item_id). Bulk
     /// SELECT keeps it to one query regardless of the input size.
@@ -147,19 +413,141 @@ impl Signal for NoteSignal {
     }
 }
 
+// ----- Render helpers -----------------------------------------------------
+
+fn email_body_excerpt(m: &EmailMessage) -> String {
+    let raw = m
+        .body_html
+        .as_deref()
+        .or(m.body_preview.as_deref())
+        .unwrap_or("");
+    if raw.is_empty() {
+        return String::new();
+    }
+    // Strip HTML tags + collapse whitespace. Keeps the prompt token-
+    // efficient without pulling in a full HTML parser; preview-only
+    // emails skip the strip logic.
+    let stripped = if raw.contains('<') {
+        strip_html(raw)
+    } else {
+        raw.to_string()
+    };
+    let collapsed = collapse_ws(&stripped);
+    let truncated: String = collapsed.chars().take(800).collect();
+    format!("    {}", truncated)
+}
+
+fn strip_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        if ch == '<' {
+            in_tag = true;
+            continue;
+        }
+        if ch == '>' {
+            in_tag = false;
+            out.push(' ');
+            continue;
+        }
+        if !in_tag {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn format_from(email: &str, name: Option<&str>) -> String {
+    match name {
+        Some(n) if !n.is_empty() => format!("{n} <{email}>"),
+        _ => email.to_string(),
+    }
+}
+
+fn format_iso_date(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_iso_datetime(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 // ----- Registry ------------------------------------------------------------
 
 pub struct SignalRegistry {
-    by_kind: HashMap<&'static str, Box<dyn Signal>>,
+    /// Sources in the order they appear in the cluster-pass prompt.
+    /// Stable order is part of the contract: re-ordering would change
+    /// the labels Claude returns and (more importantly) churn the
+    /// prompt Anthropic sees on every cluster pass.
+    sources: Vec<Box<dyn Signal>>,
+    /// Index into `sources` keyed by `kind()`.
+    by_kind: HashMap<&'static str, usize>,
 }
 
 impl SignalRegistry {
     pub fn default_with_builtins() -> Self {
-        let mut by_kind: HashMap<&'static str, Box<dyn Signal>> = HashMap::new();
-        by_kind.insert("email", Box::new(EmailSignal));
-        by_kind.insert("event", Box::new(EventSignal));
-        by_kind.insert("note", Box::new(NoteSignal));
-        Self { by_kind }
+        let sources: Vec<Box<dyn Signal>> = vec![
+            Box::new(EmailSignal),
+            Box::new(EventSignal),
+            Box::new(NoteSignal),
+        ];
+        Self::from_sources(sources)
+    }
+
+    /// Build a registry from an explicit ordered list. Asserts that
+    /// `kind()` and `label_prefix()` are unique across sources — a
+    /// duplicate would silently shadow a peer in `by_kind` or collide
+    /// in Claude's labels.
+    pub fn from_sources(sources: Vec<Box<dyn Signal>>) -> Self {
+        let mut by_kind: HashMap<&'static str, usize> = HashMap::new();
+        let mut seen_prefixes: HashMap<&'static str, &'static str> = HashMap::new();
+        for (idx, src) in sources.iter().enumerate() {
+            let kind = src.kind();
+            assert!(
+                by_kind.insert(kind, idx).is_none(),
+                "duplicate Signal kind: {kind}"
+            );
+            let prefix = src.label_prefix();
+            if let Some(other) = seen_prefixes.insert(prefix, kind) {
+                panic!("Signal label_prefix {prefix:?} used by both {other:?} and {kind:?}");
+            }
+        }
+        Self { sources, by_kind }
+    }
+
+    /// Iterate sources in stable prompt-section order. Used by the
+    /// synthesizer to drive the `# Recent <kind>` loop.
+    pub fn iter_in_prompt_order(&self) -> impl Iterator<Item = &dyn Signal> {
+        self.sources.iter().map(|b| b.as_ref())
+    }
+
+    /// Look up a source by `kind`. `None` for unknown kinds; the
+    /// synthesizer only needs this for the email-specific lazy-body
+    /// pre-step.
+    #[allow(dead_code)]
+    pub fn get(&self, kind: &str) -> Option<&dyn Signal> {
+        self.by_kind.get(kind).map(|&idx| self.sources[idx].as_ref())
     }
 
     pub fn hydrate(
@@ -169,7 +557,7 @@ impl SignalRegistry {
         item_ids: &[String],
     ) -> rusqlite::Result<Vec<HydratedSignal>> {
         match self.by_kind.get(kind) {
-            Some(sig) => sig.hydrate(conn, item_ids),
+            Some(&idx) => self.sources[idx].hydrate(conn, item_ids),
             None => {
                 eprintln!(
                     "[workstreams] no Signal impl for kind={kind}; {n} ids dropped",
@@ -417,5 +805,127 @@ mod tests {
         assert!(matches!(by_kind.get("email").unwrap()[0], HydratedSignal::Email(_)));
         assert!(matches!(by_kind.get("event").unwrap()[0], HydratedSignal::Event(_)));
         assert!(matches!(by_kind.get("note").unwrap()[0], HydratedSignal::Note(_)));
+    }
+
+    // ----- Snapshot + format (#86) ----------------------------------------
+
+    #[test]
+    fn registry_iter_in_prompt_order_is_stable() {
+        let reg = SignalRegistry::default_with_builtins();
+        let kinds: Vec<&'static str> =
+            reg.iter_in_prompt_order().map(|s| s.kind()).collect();
+        assert_eq!(kinds, vec!["email", "event", "note"]);
+        let prefixes: Vec<&'static str> = reg
+            .iter_in_prompt_order()
+            .map(|s| s.label_prefix())
+            .collect();
+        assert_eq!(prefixes, vec!["M", "E", "N"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate Signal kind")]
+    fn registry_panics_on_duplicate_kind() {
+        // Two EmailSignals share kind "email" — registry must reject.
+        let sources: Vec<Box<dyn Signal>> =
+            vec![Box::new(EmailSignal), Box::new(EmailSignal)];
+        SignalRegistry::from_sources(sources);
+    }
+
+    #[test]
+    fn email_snapshot_returns_window_recency_desc() {
+        let conn = open_test_db();
+        let now = 1_000_000_000;
+        let day = 24 * 3600 * 1000;
+        seed_email(&conn, "mg:test::recent", now - day);
+        seed_email(&conn, "mg:test::older", now - 5 * day);
+        seed_email(&conn, "mg:test::ancient", now - 60 * day); // outside 14d window
+
+        let items = EmailSignal
+            .snapshot(&conn, now, EmailSignal.default_window(), 100)
+            .unwrap();
+        let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["mg:test::recent", "mg:test::older"]);
+    }
+
+    #[test]
+    fn email_format_renders_header_then_indented_body() {
+        let m = EmailMessage {
+            id: "mg:test::m".into(),
+            connector_id: "mg:test".into(),
+            external_id: "m".into(),
+            thread_id: "t".into(),
+            subject: "Renewal".into(),
+            from_email: "alice@x.io".into(),
+            from_name: Some("Alice".into()),
+            sent_at_ms: 1_700_000_000_000,
+            body_preview: Some("Hi, please review.".into()),
+            body_html: None,
+            has_attachments: false,
+            is_read: true,
+            raw_etag: None,
+            modified_ms: 1_700_000_000_000,
+            recipients: Vec::new(),
+        };
+        let item = SnapshotItem {
+            id: m.id.clone(),
+            payload: SnapshotPayload::Email(m),
+        };
+        let out = EmailSignal.format("M3", &item);
+        // 2023-11-14 — From: Alice <alice@x.io> — Subject: Renewal
+        assert!(out.starts_with("[M3] 2023-11-14 — From: Alice <alice@x.io> — Subject: Renewal\n"));
+        assert!(out.contains("    Hi, please review."));
+        assert!(out.ends_with("\n\n"), "trailing blank line for multi-line item");
+    }
+
+    #[test]
+    fn event_format_renders_single_line_with_attendees() {
+        let e = CalendarEvent {
+            id: "mg:test::e".into(),
+            connector_id: "mg:test".into(),
+            external_id: "e".into(),
+            title: "Hyundai sync".into(),
+            start_ms: 1_700_000_000_000,
+            end_ms: 1_700_000_000_000 + 3600_000,
+            all_day: false,
+            location: None,
+            description: None,
+            source_calendar: None,
+            status: None,
+            raw_etag: None,
+            modified_ms: 1_700_000_000_000,
+            linked_note_path: None,
+            attendees: vec![calendar::CalendarAttendee {
+                email: "bob@x.io".into(),
+                display_name: None,
+                response_status: None,
+                is_self: false,
+                is_organizer: false,
+                team_member_id: None,
+            }],
+        };
+        let item = SnapshotItem {
+            id: e.id.clone(),
+            payload: SnapshotPayload::Event(e),
+        };
+        let out = EventSignal.format("E2", &item);
+        assert_eq!(
+            out,
+            "[E2] 2023-11-14 22:13 — Hyundai sync — Attendees: bob@x.io\n"
+        );
+    }
+
+    #[test]
+    fn note_format_renders_single_line() {
+        let n = NoteRef {
+            note_path: "/notes/x.md".into(),
+            title: "Sourcing plan".into(),
+            modified_ms: 1_700_000_000_000,
+        };
+        let item = SnapshotItem {
+            id: n.note_path.clone(),
+            payload: SnapshotPayload::Note(n),
+        };
+        let out = NoteSignal.format("N1", &item);
+        assert_eq!(out, "[N1] 2023-11-14 — Sourcing plan\n");
     }
 }
