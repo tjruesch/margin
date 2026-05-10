@@ -104,6 +104,23 @@ pub fn set_workstream_owner(
     persist::set_owner(&c, &id, owner_member_id.as_deref()).map_err(|e| e.to_string())
 }
 
+/// Set or clear a workstream's parent (#89). Pass `null` to make it a
+/// top-level standalone. The 2-level hierarchy is enforced server-side
+/// — invalid edges (self-parent, would-be-grandparent, current
+/// workstream already has children, parent doesn't exist) come back as
+/// a user-facing error string the UI surfaces verbatim.
+#[tauri::command]
+pub fn set_workstream_parent(
+    id: String,
+    parent_id: Option<String>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::set_workstream_parent(&c, &id, parent_id.as_deref())
+        .map_err(|e| e.to_string())?
+        .map_err(|reason| reason)
+}
+
 // ----- User-curated links (#88) ------------------------------------------
 
 #[tauri::command]

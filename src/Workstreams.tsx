@@ -6,6 +6,7 @@
 //! pipeline added in #70 and listens for `workstream-status` to
 //! refetch.
 
+import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -30,11 +31,12 @@ import {
   removeWorkstreamLink,
   setWorkstreamActionDone,
   setWorkstreamOwner,
+  setWorkstreamParent,
   setWorkstreamStatus,
   setWorkstreamUserNotes,
 } from "./file";
 import { DueChip } from "./Home";
-import { IconCheck, IconChevLeft, IconLink, IconPlus, IconTrash } from "./icons";
+import { IconCheck, IconChevLeft, IconLink, IconMore, IconPlus, IconTrash } from "./icons";
 import { avatarColor, initialsFromName } from "./initials";
 
 // ----- List view -----------------------------------------------------------
@@ -113,9 +115,11 @@ export function WorkstreamsView({
       <WorkstreamDetailView
         id={selectedId}
         onBack={() => setSelectedId(null)}
+        onNavigateTo={(id) => setSelectedId(id)}
         onOpenNote={onOpenNote}
         teamMembers={teamMembers}
         teamById={teamById}
+        allWorkstreams={workstreams}
       />
     );
   }
@@ -190,13 +194,14 @@ export function WorkstreamsView({
         </p>
       ) : (
         <div className="workstream-list">
-          {filteredActive.map((w) => (
+          {renderHierarchical(filteredActive, (w) => (
             <WorkstreamCard
               key={w.id}
               workstream={w}
               nowMs={nowMs}
               onClick={() => setSelectedId(w.id)}
               teamById={teamById}
+              nested={w.parent_workstream_id != null}
             />
           ))}
         </div>
@@ -245,6 +250,44 @@ function applyMemberFilter<T extends Workstream>(
   );
 }
 
+/**
+ * Render a flat workstreams list with children visually nested under
+ * their parent (#89). Order: top-level workstreams (no parent or whose
+ * parent isn't in the slice) in input order; each parent immediately
+ * followed by its children in input order. Orphan children — whose
+ * parent was filtered out — render at the top level so the filter
+ * still surfaces them.
+ *
+ * The `render` callback is responsible for the `nested` styling on the
+ * card (it inspects `w.parent_workstream_id` itself); this helper just
+ * decides the iteration order.
+ */
+function renderHierarchical(
+  workstreams: Workstream[],
+  render: (w: Workstream) => React.ReactNode,
+): React.ReactNode[] {
+  const ids = new Set(workstreams.map((w) => w.id));
+  const childrenByParent = new Map<string, Workstream[]>();
+  for (const w of workstreams) {
+    if (w.parent_workstream_id && ids.has(w.parent_workstream_id)) {
+      const arr = childrenByParent.get(w.parent_workstream_id) ?? [];
+      arr.push(w);
+      childrenByParent.set(w.parent_workstream_id, arr);
+    }
+  }
+  const out: React.ReactNode[] = [];
+  for (const w of workstreams) {
+    // Skip children that will render under a visible parent.
+    if (w.parent_workstream_id && ids.has(w.parent_workstream_id)) continue;
+    out.push(render(w));
+    const children = childrenByParent.get(w.id);
+    if (children) {
+      for (const child of children) out.push(render(child));
+    }
+  }
+  return out;
+}
+
 /// Max member chips rendered on the card before overflow collapses
 /// into a `+N` pill. Owner always shows when present; the cap covers
 /// owner + non-owner members combined.
@@ -255,11 +298,15 @@ function WorkstreamCard({
   nowMs,
   onClick,
   teamById,
+  nested = false,
 }: {
   workstream: Workstream;
   nowMs: number;
   onClick: () => void;
   teamById: Map<string, TeamMember>;
+  /** When true, renders with a left indent and muted treatment so the
+   *  card visually nests under its parent (#89). */
+  nested?: boolean;
 }) {
   const isReopened = w.reopened_at_ms != null && w.status === "active";
 
@@ -286,7 +333,11 @@ function WorkstreamCard({
   const overflow = ordered.length - visible.length;
 
   return (
-    <button type="button" className="workstream-card" onClick={onClick}>
+    <button
+      type="button"
+      className={"workstream-card" + (nested ? " nested" : "")}
+      onClick={onClick}
+    >
       <div className="workstream-card-head">
         <span className="workstream-card-title">
           {w.title}
@@ -446,13 +497,14 @@ function ArchivedSection({
           <p className="home-empty">No archived workstreams match this filter.</p>
         ) : (
           <div className="workstream-archived-list">
-            {filtered.map((w) => (
+            {renderHierarchical(filtered, (w) => (
               <WorkstreamCard
                 key={w.id}
                 workstream={w}
                 nowMs={nowMs}
                 onClick={() => onSelect(w.id)}
                 teamById={teamById}
+                nested={w.parent_workstream_id != null}
               />
             ))}
           </div>
@@ -482,19 +534,30 @@ function plural(n: number, singular: string, plural_: string): string {
 function WorkstreamDetailView({
   id,
   onBack,
+  onNavigateTo,
   onOpenNote,
   teamMembers,
   teamById,
+  allWorkstreams,
 }: {
   id: string;
   onBack: () => void;
+  /** Switch the selected workstream without leaving the detail view —
+   *  used by the breadcrumb-up-to-parent and the children section's
+   *  card clicks (#89). */
+  onNavigateTo: (id: string) => void;
   onOpenNote: (path: string) => void;
   teamMembers: TeamMember[];
   teamById: Map<string, TeamMember>;
+  /** All active workstreams in the current list — used by the parent
+   *  picker to enumerate legal parent candidates (NULL-parent and
+   *  no children, excluding self). */
+  allWorkstreams: Workstream[];
 }) {
   const [detail, setDetail] = useState<WorkstreamDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [missing, setMissing] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -605,7 +668,7 @@ function WorkstreamDetailView({
   if (loading && !detail) {
     return (
       <div className="workstream-view">
-        <DetailHeader title="" onBack={onBack} status={null} onChangeStatus={() => {}} />
+        <DetailHeader title="" onBack={onBack} />
         <p className="home-empty">Loading…</p>
       </div>
     );
@@ -613,33 +676,105 @@ function WorkstreamDetailView({
   if (missing || !detail) {
     return (
       <div className="workstream-view">
-        <DetailHeader title="Workstream" onBack={onBack} status={null} onChangeStatus={() => {}} />
+        <DetailHeader title="Workstream" onBack={onBack} />
         <p className="home-empty">Workstream not found.</p>
       </div>
     );
   }
 
+  // Parent-picker candidate workstreams (#89): NULL-parent, no children
+  // of their own, and not self. We recompute on every render — small
+  // arrays + cheap.
+  const parentCandidates = allWorkstreams.filter(
+    (w) =>
+      w.id !== detail.id &&
+      w.parent_workstream_id == null &&
+      // Exclude workstreams that already have children — they ARE
+      // parents themselves, but allowing them would make them a
+      // grandparent if we added the current workstream under them.
+      // Wait, that's actually allowed (2 levels: A→B is fine). The
+      // backend's rule 3 catches the inverse (you can't move a parent
+      // under another parent). So we don't filter these here.
+      true,
+  );
+
+  // Picker is disabled when this workstream has its own children — to
+  // make it a child would push its children to a third level. The
+  // backend rejects this anyway; this just gives a clearer affordance.
+  const isParentItself = allWorkstreams.some(
+    (w) => w.parent_workstream_id === detail.id,
+  );
+
+  const onChangeOwner = async (ownerId: string | null) => {
+    const prev = detail.owner_member_id;
+    setDetail((d) => (d ? { ...d, owner_member_id: ownerId } : d));
+    try {
+      await setWorkstreamOwner(detail.id, ownerId);
+    } catch (e) {
+      console.error("[workstreams] setWorkstreamOwner failed", e);
+      setDetail((d) => (d ? { ...d, owner_member_id: prev } : d));
+    }
+  };
+
+  const onChangeParent = async (parentId: string | null) => {
+    const prev = detail.parent_workstream_id;
+    setDetail((d) => (d ? { ...d, parent_workstream_id: parentId } : d));
+    try {
+      await setWorkstreamParent(detail.id, parentId);
+    } catch (e) {
+      console.error("[workstreams] setWorkstreamParent failed", e);
+      // Revert + surface the backend error string to the user.
+      setDetail((d) => (d ? { ...d, parent_workstream_id: prev } : d));
+      // eslint-disable-next-line no-alert
+      alert(
+        typeof e === "string"
+          ? e
+          : e instanceof Error
+            ? e.message
+            : "Could not set parent",
+      );
+    }
+  };
+
+  const parentTitle = detail.parent_workstream_id
+    ? allWorkstreams.find((w) => w.id === detail.parent_workstream_id)?.title
+    : null;
+
   return (
     <div className="workstream-view">
+      {detail.parent_workstream_id && parentTitle ? (
+        <button
+          type="button"
+          className="workstream-detail-breadcrumb"
+          onClick={() => onNavigateTo(detail.parent_workstream_id as string)}
+          title={`Open ${parentTitle}`}
+        >
+          {parentTitle}
+          <span className="workstream-detail-breadcrumb-sep" aria-hidden>
+            ›
+          </span>
+          <span className="workstream-detail-breadcrumb-self">{detail.title}</span>
+        </button>
+      ) : null}
       <DetailHeader
         title={detail.title}
         onBack={onBack}
-        status={detail.status}
-        onChangeStatus={onChangeStatus}
-        ownerId={detail.owner_member_id}
-        teamMembers={teamMembers}
-        onChangeOwner={async (ownerId) => {
-          // Optimistic local update; revert on error.
-          const prev = detail.owner_member_id;
-          setDetail((d) => (d ? { ...d, owner_member_id: ownerId } : d));
-          try {
-            await setWorkstreamOwner(detail.id, ownerId);
-          } catch (e) {
-            console.error("[workstreams] setWorkstreamOwner failed", e);
-            setDetail((d) => (d ? { ...d, owner_member_id: prev } : d));
-          }
-        }}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
+      {settingsOpen ? (
+        <WorkstreamSettingsModal
+          status={detail.status}
+          onChangeStatus={onChangeStatus}
+          ownerId={detail.owner_member_id}
+          teamMembers={teamMembers}
+          onChangeOwner={onChangeOwner}
+          parentId={detail.parent_workstream_id}
+          parentCandidates={parentCandidates}
+          onChangeParent={onChangeParent}
+          parentDisabled={isParentItself}
+          onClose={() => setSettingsOpen(false)}
+        />
+      ) : null}
       <p className="workstream-detail-summary">{detail.summary}</p>
 
       {detail.members.length > 0 || detail.owner_member_id ? (
@@ -692,7 +827,172 @@ function WorkstreamDetailView({
       />
 
       <NotesSection notes={detail.notes} onOpenNote={onOpenNote} />
+
+      {detail.children.length > 0 ? (
+        <ChildrenSection
+          items={detail.children}
+          teamById={teamById}
+          onSelect={onNavigateTo}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/**
+ * Settings modal for a workstream's owner / parent / status (#89).
+ * Replaces the three inline `<select>` chips that used to crowd the
+ * detail header. Each picker fires its handler optimistically — there
+ * is no Save button, the modal is just a less-cluttered home for the
+ * controls. Esc / backdrop click close.
+ */
+function WorkstreamSettingsModal({
+  status,
+  onChangeStatus,
+  ownerId,
+  teamMembers,
+  onChangeOwner,
+  parentId,
+  parentCandidates,
+  onChangeParent,
+  parentDisabled,
+  onClose,
+}: {
+  status: WorkstreamStatus | null;
+  onChangeStatus: (s: WorkstreamStatus) => void | Promise<void>;
+  ownerId: string | null;
+  teamMembers: TeamMember[];
+  onChangeOwner: (ownerId: string | null) => void | Promise<void>;
+  parentId: string | null;
+  parentCandidates: Workstream[];
+  onChangeParent: (parentId: string | null) => void | Promise<void>;
+  parentDisabled: boolean;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="settings-modal-backdrop"
+      role="presentation"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="settings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Workstream settings"
+      >
+        <header className="settings-modal-header">
+          <h2>Workstream settings</h2>
+        </header>
+        <div className="settings-modal-rows">
+          <label className="settings-modal-row">
+            <span className="settings-modal-label">Owner</span>
+            <select
+              className="settings-modal-select"
+              value={ownerId ?? ""}
+              onChange={(e) => onChangeOwner(e.target.value || null)}
+            >
+              <option value="">Unassigned</option>
+              {teamMembers.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.display_name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="settings-modal-row">
+            <span className="settings-modal-label">Parent</span>
+            <select
+              className="settings-modal-select"
+              value={parentId ?? ""}
+              disabled={parentDisabled}
+              onChange={(e) => onChangeParent(e.target.value || null)}
+              title={
+                parentDisabled
+                  ? "This workstream has children — unparent them before assigning a parent here."
+                  : undefined
+              }
+            >
+              <option value="">No parent</option>
+              {parentCandidates.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.title}
+                </option>
+              ))}
+            </select>
+            {parentDisabled ? (
+              <span className="settings-modal-hint">
+                Has children — unparent them first.
+              </span>
+            ) : null}
+          </label>
+          {status ? (
+            <label className="settings-modal-row">
+              <span className="settings-modal-label">Status</span>
+              <select
+                className="settings-modal-select"
+                value={status}
+                onChange={(e) =>
+                  onChangeStatus(e.target.value as WorkstreamStatus)
+                }
+              >
+                <option value="active">Active</option>
+                <option value="snoozed">Snoozed</option>
+                <option value="archived">Archived</option>
+              </select>
+            </label>
+          ) : null}
+        </div>
+        <footer className="settings-modal-footer">
+          <button
+            type="button"
+            className="settings-modal-done"
+            onClick={onClose}
+          >
+            Done
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function ChildrenSection({
+  items,
+  teamById,
+  onSelect,
+}: {
+  items: Workstream[];
+  teamById: Map<string, TeamMember>;
+  onSelect: (id: string) => void;
+}) {
+  const nowMs = Date.now();
+  return (
+    <section className="workstream-children-section">
+      <h3 className="workstream-section-title">Children ({items.length})</h3>
+      <div className="workstream-list">
+        {items.map((c) => (
+          <WorkstreamCard
+            key={c.id}
+            workstream={c}
+            nowMs={nowMs}
+            onClick={() => onSelect(c.id)}
+            teamById={teamById}
+            nested
+          />
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -826,19 +1126,14 @@ function WorkstreamUserNotes({
 function DetailHeader({
   title,
   onBack,
-  status,
-  onChangeStatus,
-  ownerId,
-  teamMembers,
-  onChangeOwner,
+  onOpenSettings,
 }: {
   title: string;
   onBack: () => void;
-  status: WorkstreamStatus | null;
-  onChangeStatus: (s: WorkstreamStatus) => void | Promise<void>;
-  ownerId?: string | null;
-  teamMembers?: TeamMember[];
-  onChangeOwner?: (ownerId: string | null) => void | Promise<void>;
+  /** Open the settings modal — owner, parent, status (#89). Omitted on
+   *  the loading / missing-workstream sub-states where there's nothing
+   *  to configure. */
+  onOpenSettings?: () => void;
 }) {
   return (
     <header className="workstream-header workstream-detail-header">
@@ -852,32 +1147,16 @@ function DetailHeader({
         Back
       </button>
       <h1 className="workstream-title">{title}</h1>
-      {teamMembers && onChangeOwner ? (
-        <select
-          className="workstream-owner-select"
-          value={ownerId ?? ""}
-          onChange={(e) => onChangeOwner(e.target.value || null)}
-          aria-label="Workstream owner"
+      {onOpenSettings ? (
+        <button
+          type="button"
+          className="workstream-detail-settings-button"
+          onClick={onOpenSettings}
+          aria-label="Workstream settings"
+          title="Settings"
         >
-          <option value="">Unassigned</option>
-          {teamMembers.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.display_name}
-            </option>
-          ))}
-        </select>
-      ) : null}
-      {status ? (
-        <select
-          className="workstream-status"
-          value={status}
-          onChange={(e) => onChangeStatus(e.target.value as WorkstreamStatus)}
-          aria-label="Workstream status"
-        >
-          <option value="active">Active</option>
-          <option value="snoozed">Snoozed</option>
-          <option value="archived">Archived</option>
-        </select>
+          <IconMore size={18} sw={1.8} />
+        </button>
       ) : null}
     </header>
   );

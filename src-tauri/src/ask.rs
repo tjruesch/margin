@@ -1350,6 +1350,29 @@ fn format_workstream_detail(
         }
     }
 
+    // Children rollup (#89). Title + summary + open-action count per
+    // child, no per-child hydration. Lets the model answer
+    // "how's [Bridge] going?" with a parent-level summary plus
+    // status across each sub-thread without growing the prompt by
+    // a full WorkstreamDetail per child.
+    if !detail.children.is_empty() {
+        s.push_str("\n## Children\n\n");
+        for child in &detail.children {
+            let summary = truncate_chars(child.summary.trim(), 200);
+            let open = child.open_action_count;
+            let action_phrase = if open == 1 {
+                "1 open action".to_string()
+            } else {
+                format!("{open} open actions")
+            };
+            s.push_str(&format!(
+                "- [{id}] {title} — {summary} ({action_phrase})\n",
+                id = child.id,
+                title = child.title.trim(),
+            ));
+        }
+    }
+
     s
 }
 
@@ -1809,6 +1832,7 @@ mod tests {
             note_count: 0,
             open_action_count: 0,
             link_count: 0,
+            parent_workstream_id: None,
             external_participants: Vec::new(),
         }
     }
@@ -1902,6 +1926,7 @@ mod tests {
                 note_count: 1,
                 open_action_count: 1,
                 link_count: 0,
+                parent_workstream_id: None,
                 external_participants: Vec::new(),
             },
             emails: vec![
@@ -1916,6 +1941,7 @@ mod tests {
             }],
             actions: vec![make_action("Reply to invoice", false), make_action("Send quote", true)],
             links: Vec::new(),
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W1", &detail, &team_map);
@@ -1959,6 +1985,7 @@ mod tests {
                 note_count: 0,
                 open_action_count: 0,
                 link_count: 0,
+                parent_workstream_id: None,
                 external_participants: Vec::new(),
             },
             emails,
@@ -1966,6 +1993,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W2", &detail, &team_map);
@@ -2017,6 +2045,7 @@ mod tests {
                 note_count: 0,
                 open_action_count: 0,
                 link_count: 0,
+                parent_workstream_id: None,
                 external_participants: Vec::new(),
             },
             emails: vec![],
@@ -2024,6 +2053,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W1", &detail, &team_map);
@@ -2056,6 +2086,7 @@ mod tests {
                 note_count: 0,
                 open_action_count: 0,
                 link_count: 0,
+                parent_workstream_id: None,
                 external_participants: Vec::new(),
             },
             emails: vec![],
@@ -2063,6 +2094,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W3", &detail, &team_map);
@@ -2090,6 +2122,7 @@ mod tests {
                 note_count: 0,
                 open_action_count: 1,
                 link_count: 2,
+                parent_workstream_id: None,
                 external_participants: Vec::new(),
             },
             emails: vec![],
@@ -2116,6 +2149,7 @@ mod tests {
                     created_ms: 0,
                 },
             ],
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W4", &detail, &team_map);
@@ -2156,6 +2190,7 @@ mod tests {
                 note_count: 0,
                 open_action_count: 0,
                 link_count: 0,
+                parent_workstream_id: None,
                 external_participants: Vec::new(),
             },
             emails: vec![],
@@ -2163,6 +2198,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W5", &detail, &team_map);
@@ -2191,6 +2227,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W6", &detail, &team_map);
@@ -2207,9 +2244,94 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W7", &detail, &team_map);
         assert!(!out.contains("External:"));
+    }
+
+    fn make_child(id: &str, title: &str, summary: &str, open: u32) -> Workstream {
+        let mut w = make_ws(id, title, summary, 0);
+        w.open_action_count = open;
+        w
+    }
+
+    #[test]
+    fn format_workstream_detail_emits_children_section_after_notes() {
+        let detail = WorkstreamDetail {
+            workstream: Workstream {
+                id: "ws_bridge".into(),
+                title: "ELAN AI Bridge".into(),
+                summary: "Umbrella for Bridge sub-threads.".into(),
+                status: "active".into(),
+                last_activity_ms: 0,
+                created_ms: 0,
+                updated_ms: 0,
+                user_notes: None,
+                archived_at_ms: None,
+                reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
+                email_count: 0,
+                event_count: 0,
+                note_count: 0,
+                open_action_count: 0,
+                link_count: 0,
+                parent_workstream_id: None,
+                external_participants: Vec::new(),
+            },
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![],
+            links: Vec::new(),
+            children: vec![
+                make_child("ws_talgo", "Talgo demo", "Vendor evaluation.", 1),
+                make_child("ws_comptia", "CompTIA setup", "Onboarding.", 0),
+            ],
+        };
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W8", &detail, &team_map);
+
+        assert!(out.contains("## Children"));
+        assert!(out.contains("- [ws_talgo] Talgo demo — Vendor evaluation. (1 open action)"));
+        assert!(out.contains("- [ws_comptia] CompTIA setup — Onboarding. (0 open actions)"));
+    }
+
+    #[test]
+    fn format_workstream_detail_skips_children_section_when_empty() {
+        let detail = WorkstreamDetail {
+            workstream: Workstream {
+                id: "ws_leaf".into(),
+                title: "Leaf".into(),
+                summary: "".into(),
+                status: "active".into(),
+                last_activity_ms: 0,
+                created_ms: 0,
+                updated_ms: 0,
+                user_notes: None,
+                archived_at_ms: None,
+                reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
+                email_count: 0,
+                event_count: 0,
+                note_count: 0,
+                open_action_count: 0,
+                link_count: 0,
+                parent_workstream_id: None,
+                external_participants: Vec::new(),
+            },
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![],
+            links: Vec::new(),
+            children: Vec::new(),
+        };
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W9", &detail, &team_map);
+        assert!(!out.contains("## Children"));
     }
 }
