@@ -158,6 +158,32 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
     return () => window.removeEventListener("mousedown", onMouseDown);
   }, [open, onClose]);
 
+  // Window-level Escape handler. The dialog's onKeyDown also handles
+  // Escape, but only when focus is inside the dialog. When voice mode
+  // is active the <input> is unmounted (replaced by VoiceComposer)
+  // and focus falls back to <body>, so dialog-level keydown stops
+  // firing and Esc would silently no-op. Listening on window covers
+  // every focus state.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      if (voiceState.kind === "recording") {
+        // Best-effort cancel; don't await.
+        void stopVoiceRecording().catch(() => {});
+      }
+      if (voiceState.kind !== "off") {
+        setVoiceState({ kind: "off" });
+        // Returns to whichever non-voice mode (search/chat) was active.
+        return;
+      }
+      onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open, onClose, voiceState.kind]);
+
   // Scroll the active search row into view when navigating with arrows.
   useEffect(() => {
     if (mode !== "search") return;
