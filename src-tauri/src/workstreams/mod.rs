@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 
 pub mod commands;
 pub mod persist;
+pub mod signals;
 pub mod synthesizer;
 
 /// Process-wide guard against overlapping synthesis passes. The boot
