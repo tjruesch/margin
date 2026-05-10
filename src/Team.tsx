@@ -135,6 +135,7 @@ function ListPane({
   onSelect: (id: string) => void;
   onCreated: (member: TeamMember) => void;
 }) {
+  const [composerOpen, setComposerOpen] = useState(false);
   return (
     <section className="home-section">
       <div className="home-section-head">
@@ -142,8 +143,26 @@ function ListPane({
           <div className="home-section-eyebrow">Team</div>
           <h2 className="home-section-title">Your team</h2>
         </div>
+        {!composerOpen && (
+          <button
+            type="button"
+            className="home-section-add"
+            onClick={() => setComposerOpen(true)}
+          >
+            <IconPlus size={12} sw={1.8} />
+            Add team member
+          </button>
+        )}
       </div>
-      <TeamComposer onCreated={onCreated} />
+      {composerOpen && (
+        <TeamComposerForm
+          onClose={() => setComposerOpen(false)}
+          onCreated={(m) => {
+            setComposerOpen(false);
+            onCreated(m);
+          }}
+        />
+      )}
       {members.length === 0 ? (
         <p className="home-empty">
           No team members yet — start with someone you work with regularly so
@@ -205,15 +224,20 @@ function Avatar({ member, size }: { member: TeamMember; size: number }) {
   );
 }
 
-function TeamComposer({ onCreated }: { onCreated: (member: TeamMember) => void }) {
-  const [open, setOpen] = useState(false);
+function TeamComposerForm({
+  onClose,
+  onCreated,
+}: {
+  onClose: () => void;
+  onCreated: (member: TeamMember) => void;
+}) {
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    if (open) inputRef.current?.focus();
-  }, [open]);
+    inputRef.current?.focus();
+  }, []);
 
   const submit = async () => {
     const trimmed = text.trim();
@@ -222,7 +246,6 @@ function TeamComposer({ onCreated }: { onCreated: (member: TeamMember) => void }
     try {
       const member = await createTeamMember(trimmed, "", []);
       setText("");
-      setOpen(false);
       onCreated(member);
     } catch (err) {
       console.error("createTeamMember failed:", err);
@@ -230,19 +253,6 @@ function TeamComposer({ onCreated }: { onCreated: (member: TeamMember) => void }
       setBusy(false);
     }
   };
-
-  if (!open) {
-    return (
-      <button
-        type="button"
-        className="inbox-composer-toggle"
-        onClick={() => setOpen(true)}
-      >
-        <IconPlus size={12} sw={1.8} />
-        Add team member
-      </button>
-    );
-  }
 
   return (
     <div className="team-composer">
@@ -258,8 +268,8 @@ function TeamComposer({ onCreated }: { onCreated: (member: TeamMember) => void }
             e.preventDefault();
             void submit();
           } else if (e.key === "Escape") {
-            setOpen(false);
             setText("");
+            onClose();
           }
         }}
       />
@@ -268,8 +278,8 @@ function TeamComposer({ onCreated }: { onCreated: (member: TeamMember) => void }
           type="button"
           className="inbox-composer-cancel"
           onClick={() => {
-            setOpen(false);
             setText("");
+            onClose();
           }}
         >
           Cancel
