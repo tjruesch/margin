@@ -4280,6 +4280,25 @@ input.nh-title {
   border-color: color-mix(in srgb, #c44a1f 30%, transparent);
 }
 
+/* Workstream citation chips ([W*]) — workstreams are synthesized
+   clusters, distinct from notes (default accent) and events (orange).
+   A muted forest green reads as "ongoing thread". */
+.palette-cite.is-workstream {
+  border-color: color-mix(in srgb, #2f7a4d 30%, transparent);
+  background: color-mix(in srgb, #2f7a4d 12%, transparent);
+  color: #2f7a4d;
+}
+.palette-cite.is-workstream:hover {
+  background: color-mix(in srgb, #2f7a4d 22%, transparent);
+}
+.palette-source-chip.is-workstream .palette-source-num {
+  background: color-mix(in srgb, #2f7a4d 14%, transparent);
+  color: #2f7a4d;
+}
+.palette-source-chip.is-workstream:hover {
+  border-color: color-mix(in srgb, #2f7a4d 30%, transparent);
+}
+
 .palette-sources {
   margin-top: 8px;
   width: 100%;

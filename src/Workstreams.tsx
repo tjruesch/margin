@@ -41,6 +41,22 @@ export function WorkstreamsView({
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
 
+  // External open: the AI ask palette dispatches `margin:open-workstream`
+  // when a `[W*]` citation chip is clicked (#72). This view is only
+  // mounted when nav === "workstreams", so the dispatcher fires the
+  // event a microtask after switching nav so we're guaranteed to be
+  // listening by the time it lands.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent<unknown>).detail;
+      if (typeof detail === "string" && detail.length > 0) {
+        setSelectedId(detail);
+      }
+    };
+    window.addEventListener("margin:open-workstream", onOpen);
+    return () => window.removeEventListener("margin:open-workstream", onOpen);
+  }, []);
+
   if (selectedId) {
     return (
       <WorkstreamDetailView

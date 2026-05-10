@@ -213,15 +213,17 @@ export async function searchNotes(query: string, limit = 20): Promise<SearchHit[
 
 // --- AI Q&A (#31 follow-up) ---------------------------------------------
 
-export type AskSourceKind = "note" | "event";
+export type AskSourceKind = "note" | "event" | "workstream";
 
 /** A single citation source the model can reference. Notes use `[N]`
- *  labels (e.g. `"3"`), events use `[E<N>]` labels (e.g. `"E2"`).
- *  Frontend picks chip styling and click destination from `kind`. */
+ *  labels (e.g. `"3"`), events use `[E<N>]` labels (e.g. `"E2"`),
+ *  workstreams use `[W<N>]` labels (e.g. `"W2"`). Frontend picks chip
+ *  styling and click destination from `kind`. */
 export type AskSource = {
   kind: AskSourceKind;
   /** Citation label as it appears between the brackets in the model's
-   *  output. Notes: `"3"` / `"12"`. Events: `"E1"` / `"E14"`. */
+   *  output. Notes: `"3"` / `"12"`. Events: `"E1"` / `"E14"`.
+   *  Workstreams: `"W1"` / `"W14"`. */
   label: string;
   title: string;
   modified_ms: number;
@@ -231,6 +233,9 @@ export type AskSource = {
   /** Set when `kind === "event"`. Click handler invokes
    *  `openOrCreateEventNote(event_id)` (#62). */
   event_id?: string;
+  /** Set when `kind === "workstream"`. Click handler dispatches
+   *  `margin:open-workstream` with this id (#72). */
+  workstream_id?: string;
 };
 
 export type ChatTurn = {
