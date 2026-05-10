@@ -42,18 +42,30 @@ const MAX_TOKENS: u32 = 8192;
 /// (#77). DB has no cap; this only protects the token budget.
 const USER_NOTES_PROMPT_CAP: usize = 4000;
 
+/// Cap on archived workstreams listed in the prompt (#78). Sorted by
+/// archived_at_ms desc (most recent first) so older threads fall off.
+/// Same default as the active cap.
+const ARCHIVED_WORKSTREAM_CAP: usize = 30;
+
 const SYSTEM_PROMPT: &str = "You are a workstream synthesizer. Given a user's recent emails, calendar events, \
 and notes, group them into 3-15 active workstreams: ongoing efforts the user is participating in \
 (projects, hiring loops, vendor evaluations, support escalations, etc.).
 
-Stickiness: an \"Existing workstreams\" section lists workstream ids already in the database. When new \
-items naturally extend one of those, REUSE its id verbatim. Spawn a new workstream only when no \
-existing one is a clean fit.
+Stickiness: the \"Existing workstreams (active)\" section lists workstream ids already in the \
+database. When new items naturally extend one of those, REUSE its id verbatim. Spawn a new \
+workstream only when no existing one is a clean fit.
 
 Some existing workstreams may carry an indented \"Notes:\" line — these are user-authored ground truth. \
 Treat them as authoritative: prefer them when reconciling new evidence, never write a summary that \
 contradicts them. If the notes describe scope, ownership, deadlines, or identity that conflicts \
 with what the recent items suggest, the notes win.
+
+Some workstreams are listed in a separate \"Archived workstreams\" section. Those are off-limits \
+for clustering: do NOT roll new items into them, do NOT cite them. ONLY reuse an archived id when \
+the new evidence unambiguously continues that thread (same project, same people, clear continuation \
+of the work). When you do resurrect an archived workstream, set \"status\": \"active\" in its \
+response object so the system flips its state. Casual subject overlap or shared participants are \
+NOT enough — only resurrect when the items are clearly the next chapter of the same thread.
 
 Titles: short, specific, proper-noun-leaning (\"Hyundai POC review\", \"Q3 sourcing\", \
 \"Bridge integration\") — not generic (\"Project work\", \"Various meetings\").
@@ -69,6 +81,7 @@ Schema:
 [
   {
     \"id\": \"<existing workstream id or null>\",
+    \"status\": \"active\" | null,
     \"title\": \"...\",
     \"summary\": \"...\",
     \"members\": { \"emails\": [\"M1\", \"M2\"], \"events\": [\"E3\"], \"notes\": [\"N1\"] },
@@ -137,9 +150,24 @@ async fn run_cluster_pass(
     now_ms: i64,
 ) -> Result<ClusterReport, String> {
     // ---- 1. Snapshot inputs in a single lock window ---------------------
-    let (existing_ws, mut emails, events, notes) = {
+    let (existing_active, existing_archived, mut emails, events, notes) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
-        let existing = persist::list_workstreams_active(&c).map_err(|e| e.to_string())?;
+        // Pull both active and archived (snoozed excluded — they're
+        // hidden from synthesis) and partition into separate sections
+        // for the prompt. Active workstreams are clusterable; archived
+        // ones are off-limits unless Claude explicitly resurrects.
+        let mut active: Vec<crate::workstreams::Workstream> = Vec::new();
+        let mut archived: Vec<crate::workstreams::Workstream> = Vec::new();
+        for (w, is_archived) in persist::list_workstreams_for_synthesis(&c)
+            .map_err(|e| e.to_string())?
+        {
+            if is_archived {
+                archived.push(w);
+            } else {
+                active.push(w);
+            }
+        }
+        archived.truncate(ARCHIVED_WORKSTREAM_CAP);
         let emails = email::list_messages_in_range(
             &c,
             now_ms - EMAIL_WINDOW_BACK_MS,
@@ -166,7 +194,7 @@ async fn run_cluster_pass(
                 modified_ms: d.modified_ms,
             })
             .collect();
-        (existing, emails, events, notes)
+        (active, archived, emails, events, notes)
     };
 
     if emails.is_empty() && events.is_empty() && notes.is_empty() {
@@ -226,7 +254,13 @@ async fn run_cluster_pass(
     }
 
     // ---- 3. Build prompt, label maps ------------------------------------
-    let (user_message, label_maps) = build_user_message(&existing_ws, &emails, &events, &notes);
+    let (user_message, label_maps) = build_user_message(
+        &existing_active,
+        &existing_archived,
+        &emails,
+        &events,
+        &notes,
+    );
     let items_clustered = (emails.len() + events.len() + notes.len()) as u32;
 
     // ---- 4. Single-shot Claude call -------------------------------------
@@ -251,6 +285,34 @@ async fn run_cluster_pass(
         let mut c = conn_state.lock().map_err(|e| e.to_string())?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
         for ws in &synthesized {
+            // For records that reference an existing workstream id we
+            // need to know its current status to decide whether to
+            // resurrect, refresh-as-active, or skip entirely (#78).
+            let pre_status: Option<String> = match ws.id.as_deref() {
+                Some(id) if !id.is_empty() => persist::lookup_pre_status(&tx, id)
+                    .map_err(|e| format!("lookup pre-status: {e}"))?,
+                _ => None,
+            };
+
+            if pre_status.as_deref() == Some("archived") {
+                if ws.status.as_deref() == Some("active") {
+                    let id = ws.id.as_deref().unwrap_or_default();
+                    if persist::resurrect_if_archived(&tx, id, now_ms)
+                        .map_err(|e| format!("resurrect: {e}"))?
+                    {
+                        report.workstreams_reopened += 1;
+                    }
+                    // Fall through to write_workstream — it will refresh
+                    // title/summary/pivots/actions on the now-active row.
+                } else {
+                    eprintln!(
+                        "[workstreams] Claude referenced archived id {} without status='active'; skipping",
+                        ws.id.as_deref().unwrap_or("?")
+                    );
+                    continue;
+                }
+            }
+
             let counts = persist::write_workstream(&tx, ws, now_ms)
                 .map_err(|e| format!("write workstream: {e}"))?;
             if counts.workstream_added {
@@ -353,17 +415,18 @@ struct LabelMaps {
 }
 
 fn build_user_message(
-    existing: &[Workstream],
+    existing_active: &[Workstream],
+    existing_archived: &[Workstream],
     emails: &[email::EmailMessage],
     events: &[calendar::CalendarEvent],
     notes: &[NoteRef],
 ) -> (String, LabelMaps) {
     let mut s = String::new();
-    s.push_str("# Existing workstreams\n\n");
-    if existing.is_empty() {
+    s.push_str("# Existing workstreams (active)\n\n");
+    if existing_active.is_empty() {
         s.push_str("(none)\n");
     } else {
-        for w in existing {
+        for w in existing_active {
             s.push_str(&format!(
                 "[{}] {} — {} (active)\n",
                 w.id,
@@ -377,6 +440,29 @@ fn build_user_message(
                     "   Notes (user-authored, ground truth): {truncated}\n"
                 ));
             }
+        }
+    }
+
+    if !existing_archived.is_empty() {
+        s.push_str(
+            "\n# Archived workstreams (do not resurrect on casual overlap)\n\n",
+        );
+        for w in existing_archived {
+            let archived_label = w
+                .archived_at_ms
+                .map(format_iso_date)
+                .unwrap_or_else(|| "unknown".to_string());
+            s.push_str(&format!(
+                "[{}] {} — {} (archived {})\n",
+                w.id,
+                w.title,
+                summarize_one_line(&w.summary),
+                archived_label,
+            ));
+            // Deliberately do NOT render user_notes for archived
+            // workstreams — they're inactive context. If Claude
+            // resurrects, the next pass will see the active version
+            // (with notes) again.
         }
     }
 
@@ -558,6 +644,10 @@ fn format_iso_datetime(ms: i64) -> String {
 struct RawWorkstream {
     #[serde(default)]
     id: Option<String>,
+    /// Optional status hint (#78). Claude sets `"active"` to resurrect
+    /// a previously-archived workstream. Other values ignored.
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -631,6 +721,12 @@ fn parse_synthesizer_response(
                 eprintln!("[workstreams] duplicate workstream id {existing} in response");
             }
         }
+        let status = raw
+            .status
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(|s| s.to_string());
 
         let members = raw.members.unwrap_or(RawMembers {
             emails: Vec::new(),
@@ -687,6 +783,7 @@ fn parse_synthesizer_response(
             member_events,
             member_notes,
             actions,
+            status,
         });
     }
     out
@@ -862,5 +959,25 @@ mod tests {
     #[test]
     fn collapse_ws_squashes_runs() {
         assert_eq!(collapse_ws("  a   b\n\nc  "), "a b c");
+    }
+
+    #[test]
+    fn parse_synthesizer_response_captures_status_field() {
+        let raw = r#"[
+            {"id": "ws_arc", "status": "active", "title": "Resurrected", "summary": ""},
+            {"id": null, "title": "New", "summary": ""}
+        ]"#;
+        let parsed = parse_synthesizer_response(raw, &label_maps());
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].status.as_deref(), Some("active"));
+        assert_eq!(parsed[1].status, None);
+    }
+
+    #[test]
+    fn parse_synthesizer_response_treats_missing_status_as_none() {
+        let raw = r#"[{"id": "ws_x", "title": "T", "summary": ""}]"#;
+        let parsed = parse_synthesizer_response(raw, &label_maps());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].status, None);
     }
 }

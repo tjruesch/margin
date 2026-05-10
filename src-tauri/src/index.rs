@@ -44,7 +44,8 @@ const SCHEMA_V10: &str = include_str!("migrations/010_event_note_link.sql");
 const SCHEMA_V11: &str = include_str!("migrations/011_email.sql");
 const SCHEMA_V12: &str = include_str!("migrations/012_workstreams.sql");
 const SCHEMA_V13: &str = include_str!("migrations/013_workstream_user_notes.sql");
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_V14: &str = include_str!("migrations/014_workstream_archive_resurface.sql");
+const SCHEMA_VERSION: i64 = 14;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -138,6 +139,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 12 {
         conn.execute_batch(SCHEMA_V13)?;
         version = 13;
+    }
+    if version == 13 {
+        conn.execute_batch(SCHEMA_V14)?;
+        version = 14;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.

@@ -4693,6 +4693,60 @@ input.nh-title {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+
+/* "Reopened" badge — shown on active cards whose synthesizer flipped
+   them back from archived. Clears when the user opens the detail view
+   and navigates away (#78). */
+.workstream-card-reopened {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, #2f7a4d 14%, transparent);
+  color: #2f7a4d;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+/* Archived workstreams collapsed accordion at the bottom of the list
+   view (#78). Default closed; click the toggle to expand. */
+.workstream-archived-section {
+  margin-top: 22px;
+  padding-top: 12px;
+  border-top: 0.5px solid var(--home-line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.workstream-archived-toggle {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.workstream-archived-toggle:hover {
+  color: var(--accent);
+  background: var(--home-chip);
+}
+.workstream-archived-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  opacity: 0.85;
+}
 .workstream-card-counts {
   font-size: 12px;
   color: var(--fg-muted);

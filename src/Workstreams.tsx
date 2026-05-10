@@ -16,6 +16,8 @@ import {
   type WorkstreamStatus,
   getEmailBody,
   getWorkstreamDetails,
+  listArchivedWorkstreams,
+  markWorkstreamSeen,
   openOrCreateEventNote,
   setWorkstreamActionDone,
   setWorkstreamStatus,
@@ -115,27 +117,121 @@ export function WorkstreamsView({
       ) : (
         <div className="workstream-list">
           {workstreams.map((w) => (
-            <button
-              type="button"
+            <WorkstreamCard
               key={w.id}
-              className="workstream-card"
+              workstream={w}
+              nowMs={nowMs}
               onClick={() => setSelectedId(w.id)}
-            >
-              <div className="workstream-card-head">
-                <span className="workstream-card-title">{w.title}</span>
-                <span className="workstream-card-time">
-                  {formatPast(w.last_activity_ms, nowMs)}
-                </span>
-              </div>
-              <p className="workstream-card-summary">{w.summary}</p>
-              <div className="workstream-card-counts">
-                {countLine(w)}
-              </div>
-            </button>
+            />
           ))}
         </div>
       )}
+
+      {!loading && (
+        <ArchivedSection
+          onSelect={(id) => setSelectedId(id)}
+          nowMs={nowMs}
+          synthInFlight={synthInFlight}
+        />
+      )}
     </div>
+  );
+}
+
+function WorkstreamCard({
+  workstream: w,
+  nowMs,
+  onClick,
+}: {
+  workstream: Workstream;
+  nowMs: number;
+  onClick: () => void;
+}) {
+  const isReopened = w.reopened_at_ms != null && w.status === "active";
+  return (
+    <button type="button" className="workstream-card" onClick={onClick}>
+      <div className="workstream-card-head">
+        <span className="workstream-card-title">
+          {w.title}
+          {isReopened ? (
+            <span className="workstream-card-reopened" aria-label="Reopened">
+              Reopened
+            </span>
+          ) : null}
+        </span>
+        <span className="workstream-card-time">
+          {formatPast(w.last_activity_ms, nowMs)}
+        </span>
+      </div>
+      <p className="workstream-card-summary">{w.summary}</p>
+      <div className="workstream-card-counts">{countLine(w)}</div>
+    </button>
+  );
+}
+
+/// Collapsed accordion at the bottom of the Workstreams list. Loads
+/// archived workstreams on mount + whenever the synthesizer finishes
+/// (resurrected ones drop off the archived list and reappear in
+/// active). Lazy expansion would also work but archived sets are small
+/// in practice; eager keeps the count badge accurate without wiring an
+/// extra click-through fetch.
+function ArchivedSection({
+  onSelect,
+  nowMs,
+  synthInFlight,
+}: {
+  onSelect: (id: string) => void;
+  nowMs: number;
+  synthInFlight: boolean;
+}) {
+  const [archived, setArchived] = useState<Workstream[]>([]);
+  const [expanded, setExpanded] = useState(false);
+
+  const reload = useCallback(async () => {
+    try {
+      setArchived(await listArchivedWorkstreams());
+    } catch (e) {
+      console.error("[workstreams] listArchivedWorkstreams failed", e);
+    }
+  }, []);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  // Refetch whenever a synthesis pass finishes — a resurrected
+  // workstream's status flips from archived → active.
+  useEffect(() => {
+    if (!synthInFlight) {
+      void reload();
+    }
+  }, [synthInFlight, reload]);
+
+  if (archived.length === 0) return null;
+  return (
+    <section className="workstream-archived-section">
+      <button
+        type="button"
+        className="workstream-archived-toggle"
+        onClick={() => setExpanded((v) => !v)}
+        aria-expanded={expanded}
+      >
+        <span>{expanded ? "▾" : "▸"}</span>
+        Archived ({archived.length})
+      </button>
+      {expanded ? (
+        <div className="workstream-archived-list">
+          {archived.map((w) => (
+            <WorkstreamCard
+              key={w.id}
+              workstream={w}
+              nowMs={nowMs}
+              onClick={() => onSelect(w.id)}
+            />
+          ))}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -191,6 +287,36 @@ function WorkstreamDetailView({
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  // Reopened-marker clearing (#78). When the user opens a workstream
+  // that was just reopened by the synthesizer, fire markWorkstreamSeen
+  // on UNMOUNT so the user has the entire detail-view lifetime to see
+  // the badge before it clears. The unmount cleanup runs when the user
+  // navigates back, switches to a different workstream, or leaves the
+  // Workstreams view entirely.
+  const reopenedRef = useRef<{ id: string; needsClear: boolean }>({
+    id,
+    needsClear: false,
+  });
+  useEffect(() => {
+    reopenedRef.current = {
+      id,
+      needsClear:
+        !!detail &&
+        detail.reopened_at_ms != null &&
+        detail.status === "active",
+    };
+  }, [id, detail?.reopened_at_ms, detail?.status]);
+  useEffect(() => {
+    return () => {
+      const snap = reopenedRef.current;
+      if (snap.needsClear) {
+        void markWorkstreamSeen(snap.id).catch((e) => {
+          console.error("[workstreams] markWorkstreamSeen failed", e);
+        });
+      }
+    };
+  }, []);
 
   // Optimistic update for action toggle. On error, revert and refetch
   // to reconcile.
