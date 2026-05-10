@@ -48,14 +48,12 @@ export function WorkstreamsView({
   loading,
   synthInFlight,
   synthMessage,
-  onRefresh,
   onOpenNote,
 }: {
   workstreams: Workstream[];
   loading: boolean;
   synthInFlight: boolean;
   synthMessage: string | null;
-  onRefresh: () => void;
   onOpenNote: (path: string) => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -132,30 +130,6 @@ export function WorkstreamsView({
 
   return (
     <div className="workstream-view">
-      <header className="workstream-header">
-        <div>
-          <h1 className="workstream-title">Workstreams</h1>
-          <p className="workstream-subtitle">
-            Ongoing efforts synthesized from emails, meetings, and notes.
-          </p>
-        </div>
-        <button
-          type="button"
-          className="workstream-refresh"
-          onClick={onRefresh}
-          disabled={synthInFlight}
-        >
-          {synthInFlight ? (
-            <>
-              <span className="workstream-spinner" aria-hidden />
-              Synthesizing…
-            </>
-          ) : (
-            "Refresh"
-          )}
-        </button>
-      </header>
-
       {synthMessage ? (
         <div className="workstream-toast" role="status">
           {synthMessage}
@@ -1153,29 +1127,31 @@ function DetailHeader({
   onOpenSettings?: () => void;
 }) {
   return (
-    <header className="workstream-header workstream-detail-header">
+    <>
       <button
         type="button"
-        className="workstream-back"
+        className="workstream-back-link"
         onClick={onBack}
         aria-label="Back to workstreams"
       >
-        <IconChevLeft size={20} />
-        Back
+        <IconChevLeft size={13} sw={1.8} />
+        Workstreams
       </button>
-      <h1 className="workstream-title">{title}</h1>
-      {onOpenSettings ? (
-        <button
-          type="button"
-          className="workstream-detail-settings-button"
-          onClick={onOpenSettings}
-          aria-label="Workstream settings"
-          title="Settings"
-        >
-          <IconMore size={18} sw={1.8} />
-        </button>
-      ) : null}
-    </header>
+      <header className="workstream-header workstream-detail-header">
+        <h1 className="workstream-title">{title}</h1>
+        {onOpenSettings ? (
+          <button
+            type="button"
+            className="workstream-detail-settings-button"
+            onClick={onOpenSettings}
+            aria-label="Workstream settings"
+            title="Settings"
+          >
+            <IconMore size={18} sw={1.8} />
+          </button>
+        ) : null}
+      </header>
+    </>
   );
 }
 

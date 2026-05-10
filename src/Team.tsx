@@ -136,24 +136,17 @@ function ListPane({
   onCreated: (member: TeamMember) => void;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+  // The "Add team member" trigger lives in PageHeader (Home.tsx) when
+  // nav === "team"; we listen for its dispatched event and open the
+  // inline composer below.
+  useEffect(() => {
+    const onOpen = () => setComposerOpen(true);
+    window.addEventListener("margin:open-team-composer", onOpen);
+    return () =>
+      window.removeEventListener("margin:open-team-composer", onOpen);
+  }, []);
   return (
     <section className="home-section">
-      <div className="home-section-head">
-        <div>
-          <div className="home-section-eyebrow">Team</div>
-          <h2 className="home-section-title">Your team</h2>
-        </div>
-        {!composerOpen && (
-          <button
-            type="button"
-            className="home-section-add"
-            onClick={() => setComposerOpen(true)}
-          >
-            <IconPlus size={12} sw={1.8} />
-            Add team member
-          </button>
-        )}
-      </div>
       {composerOpen && (
         <TeamComposerForm
           onClose={() => setComposerOpen(false)}

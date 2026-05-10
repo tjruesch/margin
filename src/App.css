@@ -1356,6 +1356,47 @@ select.settings-input {
   margin-top: auto;
   padding-top: 8px;
   border-top: 0.5px solid var(--home-line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* New-note / New-meeting CTAs surfaced in the sidebar footer when not
+   on Home. Sized down from the Greeting variant so they fit the
+   narrow sidebar column. */
+.home-side-cta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 10px;
+}
+.home-side-cta-secondary,
+.home-side-cta-primary {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--home-line);
+  background: transparent;
+  color: var(--fg);
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.home-side-cta-secondary:hover {
+  background: var(--bg-soft, rgba(0, 0, 0, 0.04));
+}
+.home-side-cta-primary {
+  background: var(--accent, #4a90e2);
+  border-color: var(--accent, #4a90e2);
+  color: #fff;
+}
+.home-side-cta-primary:hover {
+  filter: brightness(0.95);
 }
 
 /* ----- Main column ----- */
@@ -1495,6 +1536,15 @@ select.settings-input {
   justify-content: space-between;
   border-bottom: 0.5px solid var(--home-line);
   padding-bottom: 10px;
+}
+/* Toolbar variant: section heads on sub-pages where the page title
+   already lives in `PageHeader`. No left-side eyebrow + h2 anymore;
+   the affordance (Refresh, Add team member, New todo) right-aligns. */
+.home-section-head-toolbar {
+  justify-content: flex-end;
+  border-bottom: none;
+  padding-bottom: 0;
+  min-height: 32px;
 }
 .home-section-eyebrow {
   font-size: 10.5px;
@@ -4732,6 +4782,15 @@ input.nh-title {
   flex-direction: column;
   gap: 18px;
 }
+/* List-view toolbar variant of `.workstream-header`. The page title
+   moved into `PageHeader` upstream, so the inner header is just a
+   right-aligned action bar (Refresh button) with no bottom border. */
+.workstream-toolbar {
+  border-bottom: none !important;
+  padding-bottom: 0 !important;
+  justify-content: flex-end;
+  min-height: 32px;
+}
 .workstream-header {
   display: flex;
   align-items: center;
@@ -4946,6 +5005,31 @@ input.nh-title {
 .workstream-detail-breadcrumb-self {
   color: var(--fg);
   font-weight: 500;
+}
+
+/* Back-to-list eyebrow — matches `.home-section-eyebrow` so the
+   detail-view title reads as the section title with a clickable
+   "WORKSTREAMS" eyebrow above it (rather than an inline `< Back`
+   button that pushed the title off-flush). */
+.workstream-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  padding: 0;
+  margin-bottom: 4px;
+  align-self: flex-start;
+}
+.workstream-back-link:hover {
+  color: var(--accent, #4a90e2);
 }
 
 /* Detail-header kebab button (#89). Replaces the three inline native
