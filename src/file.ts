@@ -644,11 +644,29 @@ export async function deleteNote(notePath: string): Promise<void> {
 
 // --- Team members --------------------------------------------------------
 
+/**
+ * One typed identity attached to a team_member. `kind` is a soft enum;
+ * canonical values are exported as constants on `AliasKind` below.
+ * Adding a new kind is non-breaking: backend and frontend just need to
+ * agree on the string.
+ */
+export type TypedAlias = {
+  kind: string;
+  value: string;
+};
+
+export const AliasKind = {
+  Email: "email",
+  Name: "name",
+  GithubLogin: "github_login",
+  SlackId: "slack_id",
+} as const;
+
 export type TeamMember = {
   id: string;
   display_name: string;
   role: string;
-  aliases: string[];
+  aliases: TypedAlias[];
   profile_md_path: string;
   is_self: boolean;
   created_ms: number;
@@ -666,14 +684,14 @@ export async function getTeamMember(id: string): Promise<TeamMember> {
 export async function createTeamMember(
   displayName: string,
   role: string,
-  aliases: string[],
+  aliases: TypedAlias[],
 ): Promise<TeamMember> {
   return invoke<TeamMember>("create_team_member", { displayName, role, aliases });
 }
 
 export async function updateTeamMember(
   id: string,
-  fields: { displayName?: string; role?: string; aliases?: string[] },
+  fields: { displayName?: string; role?: string; aliases?: TypedAlias[] },
 ): Promise<TeamMember> {
   return invoke<TeamMember>("update_team_member", { id, ...fields });
 }
