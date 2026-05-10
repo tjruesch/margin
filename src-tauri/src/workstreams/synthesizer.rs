@@ -22,6 +22,7 @@ use crate::anthropic::{ANTHROPIC_VERSION, DEFAULT_MODEL, ENDPOINT};
 use crate::connectors::{calendar, email, microsoft_graph, oauth};
 use crate::index;
 use crate::keychain;
+use crate::team;
 
 /// 6 hours. Boot tick + manual Refresh are no-ops if a successful pass
 /// landed within this window.
@@ -150,7 +151,7 @@ async fn run_cluster_pass(
     now_ms: i64,
 ) -> Result<ClusterReport, String> {
     // ---- 1. Snapshot inputs in a single lock window ---------------------
-    let (existing_active, existing_archived, mut emails, events, notes) = {
+    let (existing_active, existing_archived, mut emails, events, notes, team) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         // Pull both active and archived (snoozed excluded — they're
         // hidden from synthesis) and partition into separate sections
@@ -194,8 +195,13 @@ async fn run_cluster_pass(
                 modified_ms: d.modified_ms,
             })
             .collect();
-        (active, archived, emails, events, notes)
+        let team = team::list_team_members_raw(&c).unwrap_or_default();
+        (active, archived, emails, events, notes, team)
     };
+    let team_by_id: std::collections::HashMap<String, String> = team
+        .iter()
+        .map(|m| (m.id.clone(), m.display_name.clone()))
+        .collect();
 
     if emails.is_empty() && events.is_empty() && notes.is_empty() {
         eprintln!("[workstreams] no recent items to cluster; skipping");
@@ -260,6 +266,7 @@ async fn run_cluster_pass(
         &emails,
         &events,
         &notes,
+        &team_by_id,
     );
     let items_clustered = (emails.len() + events.len() + notes.len()) as u32;
 
@@ -420,6 +427,7 @@ fn build_user_message(
     emails: &[email::EmailMessage],
     events: &[calendar::CalendarEvent],
     notes: &[NoteRef],
+    team_by_id: &std::collections::HashMap<String, String>,
 ) -> (String, LabelMaps) {
     let mut s = String::new();
     s.push_str("# Existing workstreams (active)\n\n");
@@ -433,6 +441,31 @@ fn build_user_message(
                 w.title,
                 summarize_one_line(&w.summary)
             ));
+            if let Some(owner_id) = w.owner_member_id.as_deref() {
+                if let Some(name) = team_by_id.get(owner_id) {
+                    s.push_str(&format!("   Owner: {name}\n"));
+                }
+            }
+            if !w.members.is_empty() {
+                let names: Vec<&str> = w
+                    .members
+                    .iter()
+                    .filter_map(|id| team_by_id.get(id).map(String::as_str))
+                    .take(8)
+                    .collect();
+                if !names.is_empty() {
+                    let suffix = if w.members.len() > names.len() {
+                        format!(" (+{} more)", w.members.len() - names.len())
+                    } else {
+                        String::new()
+                    };
+                    s.push_str(&format!(
+                        "   Members: {names}{suffix}\n",
+                        names = names.join(", "),
+                        suffix = suffix
+                    ));
+                }
+            }
             if let Some(notes) = w.user_notes.as_deref().filter(|s| !s.trim().is_empty()) {
                 let collapsed = collapse_ws(notes);
                 let truncated = truncate_chars(&collapsed, USER_NOTES_PROMPT_CAP);

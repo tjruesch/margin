@@ -4747,6 +4747,102 @@ input.nh-title {
   gap: 10px;
   opacity: 0.85;
 }
+
+/* ----- Owner + members (#81) ----- */
+
+.workstream-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+}
+.workstream-filter select {
+  font: inherit;
+  font-size: 12.5px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--home-chip);
+  color: var(--fg);
+  border: 0.5px solid var(--home-line);
+  cursor: pointer;
+}
+
+.workstream-owner-select {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--home-chip);
+  color: var(--fg);
+  border: 0.5px solid var(--home-line);
+  cursor: pointer;
+  max-width: 180px;
+}
+
+.workstream-card-people {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+.workstream-card-owner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.workstream-card-members {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: var(--home-chip);
+}
+
+.workstream-members-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0;
+}
+.workstream-member-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 3px;
+  border-radius: 14px;
+  background: var(--bg-elev);
+  border: 0.5px solid var(--home-line);
+  font-size: 12px;
+  color: var(--fg);
+}
+.workstream-member-chip.is-owner {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-elev));
+}
+.workstream-member-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: white;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.workstream-member-name {
+  padding-right: 2px;
+}
 .workstream-card-counts {
   font-size: 12px;
   color: var(--fg-muted);
