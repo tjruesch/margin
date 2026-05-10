@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { siFigma, siGithub, siLinear, siNotion } from "simple-icons";
 
 type IconProps = {
   size?: number;
@@ -70,6 +71,40 @@ export const IconLink = (p: Props) => (
     <path d="M14 10a4 4 0 00-5.6 0l-3 3a4 4 0 105.6 5.6l1-1" />
   </Icon>
 );
+
+/// Per-kind brand glyphs for workstream link chips. Maps each
+/// canonical `link_kinds::*` value to its Simple Icons path; falls
+/// back to the generic `IconLink` for `other` / null / unknown.
+/// Brand path uses `currentColor` so the chip's own color rules drive
+/// the glyph — keeps the palette consistent with the rest of the UI.
+const BRAND_PATHS: Record<string, string> = {
+  github: siGithub.path,
+  linear: siLinear.path,
+  notion: siNotion.path,
+  figma: siFigma.path,
+};
+
+export const IconBrand = ({
+  kind,
+  size = 12,
+}: {
+  kind: string | null;
+  size?: number;
+}) => {
+  const path = kind ? BRAND_PATHS[kind] : undefined;
+  if (!path) return <IconLink size={size} sw={1.8} />;
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden="true"
+    >
+      <path d={path} />
+    </svg>
+  );
+};
 export const IconBriefcase = (p: Props) => (
   <Icon {...p}>
     <rect x="3" y="7" width="18" height="13" rx="2" />

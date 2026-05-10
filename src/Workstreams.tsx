@@ -38,7 +38,15 @@ import {
   setWorkstreamUserNotes,
 } from "./file";
 import { DueChip } from "./Home";
-import { IconCheck, IconChevLeft, IconLink, IconMore, IconPlus, IconTrash } from "./icons";
+import {
+  IconBrand,
+  IconCheck,
+  IconChevLeft,
+  IconLink,
+  IconMore,
+  IconPlus,
+  IconTrash,
+} from "./icons";
 import { avatarColor, initialsFromName } from "./initials";
 
 // ----- List view -----------------------------------------------------------
@@ -1462,7 +1470,7 @@ function LinksSection({
                 onClick={() => void handleOpen(link.url)}
                 title={link.url}
               >
-                <IconLink size={12} sw={1.8} />
+                <IconBrand kind={link.kind} size={12} />
                 <span className="workstream-link-chip-label">
                   {link.label}
                 </span>

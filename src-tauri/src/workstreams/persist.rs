@@ -384,6 +384,18 @@ pub fn list_workstream_links(
 /// `MAX(position) + 1` for the workstream so insertion order survives
 /// even when the caller skips it. Trims label / url / kind; rejects
 /// empty label or url.
+/// Canonical kind strings accepted by the link writers. Mirrors the
+/// soft enum in [`super::link_kinds`]; gives those constants their
+/// only Rust caller and lets the writer reject typos before hitting
+/// the schema (which itself stores `kind` as opaque TEXT).
+const ALLOWED_LINK_KINDS: &[&str] = &[
+    super::link_kinds::GITHUB,
+    super::link_kinds::LINEAR,
+    super::link_kinds::NOTION,
+    super::link_kinds::FIGMA,
+    super::link_kinds::OTHER,
+];
+
 pub fn add_workstream_link(
     conn: &Connection,
     workstream_id: &str,
@@ -403,6 +415,13 @@ pub fn add_workstream_link(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    if let Some(k) = kind_owned.as_deref() {
+        if !ALLOWED_LINK_KINDS.contains(&k) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "unknown link kind: {k}"
+            )));
+        }
+    }
     let next_position: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM workstream_links \
@@ -1953,6 +1972,47 @@ mod tests {
         seed_workstream(&mut conn, "ws_l");
         assert!(add_workstream_link(&conn, "ws_l", "  ", "https://x", None, 100).is_err());
         assert!(add_workstream_link(&conn, "ws_l", "Ok", "  ", None, 100).is_err());
+    }
+
+    #[test]
+    fn add_workstream_link_accepts_each_canonical_kind() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        for kind in [
+            super::super::link_kinds::GITHUB,
+            super::super::link_kinds::LINEAR,
+            super::super::link_kinds::NOTION,
+            super::super::link_kinds::FIGMA,
+            super::super::link_kinds::OTHER,
+        ] {
+            let row = add_workstream_link(
+                &conn,
+                "ws_l",
+                "Label",
+                &format!("https://example.com/{kind}"),
+                Some(kind),
+                100,
+            )
+            .expect("canonical kind accepted");
+            assert_eq!(row.kind.as_deref(), Some(kind));
+        }
+    }
+
+    #[test]
+    fn add_workstream_link_rejects_unknown_kind() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        let res = add_workstream_link(
+            &conn,
+            "ws_l",
+            "Label",
+            "https://x",
+            Some("slack"),
+            100,
+        );
+        assert!(res.is_err());
+        let listed = list_workstream_links(&conn, "ws_l").unwrap();
+        assert!(listed.is_empty(), "no row inserted for invalid kind");
     }
 
     #[test]
