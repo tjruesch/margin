@@ -1037,12 +1037,13 @@ export function ActionRow({
 
 // ---- Inbox composer -----------------------------------------------------
 
-function InboxComposer({
+function InboxComposerForm({
   onAdd,
+  onClose,
 }: {
   onAdd: (text: string, dueToken: string | null) => Promise<void>;
+  onClose: () => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [dateStr, setDateStr] = useState("");
   const [includeTime, setIncludeTime] = useState(false);
@@ -1051,8 +1052,8 @@ function InboxComposer({
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    if (open) inputRef.current?.focus();
-  }, [open]);
+    inputRef.current?.focus();
+  }, []);
 
   const reset = () => {
     setText("");
@@ -1078,19 +1079,6 @@ function InboxComposer({
     }
   };
 
-  if (!open) {
-    return (
-      <button
-        type="button"
-        className="inbox-composer-toggle"
-        onClick={() => setOpen(true)}
-      >
-        <IconPlus size={12} sw={1.8} />
-        New todo
-      </button>
-    );
-  }
-
   return (
     <div className="inbox-composer">
       <input
@@ -1105,8 +1093,8 @@ function InboxComposer({
             e.preventDefault();
             void submit();
           } else if (e.key === "Escape") {
-            setOpen(false);
             reset();
+            onClose();
           }
         }}
       />
@@ -1140,8 +1128,8 @@ function InboxComposer({
           type="button"
           className="inbox-composer-cancel"
           onClick={() => {
-            setOpen(false);
             reset();
+            onClose();
           }}
         >
           Cancel
@@ -1174,6 +1162,7 @@ function ActionsFeed({
   members: TeamMember[];
   onReassign: (actionId: string, memberId: string | null) => void;
 }) {
+  const [composerOpen, setComposerOpen] = useState(false);
   // Split dated vs. undated, then bucket the dated half by urgency.
   // Backend already orders dated rows by `due_ms ASC`, so each bucket is
   // chronological without further sorting. Undated rows fall into one
@@ -1197,16 +1186,39 @@ function ActionsFeed({
     return { byBucket: buckets, undated: undatedRows };
   }, [actions]);
 
+  // Header used by both the empty and populated states. Toggle button on
+  // the right collapses out of view when the composer is expanded so the
+  // form below isn't competing with a redundant trigger.
+  const head = (
+    <div className="home-section-head">
+      <div>
+        <div className="home-section-eyebrow">Action items</div>
+        <h2 className="home-section-title">Things to do</h2>
+      </div>
+      {!composerOpen && (
+        <button
+          type="button"
+          className="home-section-add"
+          onClick={() => setComposerOpen(true)}
+        >
+          <IconPlus size={12} sw={1.8} />
+          New todo
+        </button>
+      )}
+    </div>
+  );
+  const composer = composerOpen ? (
+    <InboxComposerForm
+      onAdd={onAddInboxTodo}
+      onClose={() => setComposerOpen(false)}
+    />
+  ) : null;
+
   if (actions.length === 0) {
     return (
       <section className="home-section">
-        <div className="home-section-head">
-          <div>
-            <div className="home-section-eyebrow">Action items</div>
-            <h2 className="home-section-title">Things to do</h2>
-          </div>
-        </div>
-        <InboxComposer onAdd={onAddInboxTodo} />
+        {head}
+        {composer}
         <p className="home-empty">
           No open action items. Add <code>- [ ] task</code> lines to any note,
           trail with <code>@2026-01-15</code> / <code>@tomorrow</code> /{" "}
@@ -1218,14 +1230,9 @@ function ActionsFeed({
 
   return (
     <section className="home-section">
-      <div className="home-section-head">
-        <div>
-          <div className="home-section-eyebrow">Action items</div>
-          <h2 className="home-section-title">Things to do</h2>
-        </div>
-      </div>
+      {head}
 
-      <InboxComposer onAdd={onAddInboxTodo} />
+      {composer}
 
       {BUCKET_ORDER.map(({ key, label }) => {
         const items = byBucket[key];
