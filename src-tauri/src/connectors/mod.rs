@@ -28,6 +28,7 @@ use serde::Serialize;
 pub mod calendar;
 pub mod commands;
 pub mod email;
+pub mod google;
 pub mod microsoft_graph;
 pub mod oauth;
 pub mod providers;
@@ -68,6 +69,20 @@ pub trait Connector: Send + Sync {
     /// storage. Should commit DB writes through `ctx.conn` directly —
     /// callers don't write to the DB on the connector's behalf.
     async fn sync(&self, ctx: SyncCtx<'_>) -> Result<SyncReport, ConnectorError>;
+
+    /// Lazy-fetch the full body of an email message (#69, #61). The
+    /// default returns `None` for connectors that don't ingest mail.
+    /// Mail-capable connectors (Microsoft Graph, Google Gmail)
+    /// override this with a provider-specific GET so the
+    /// `get_email_body` Tauri command is fully provider-agnostic at
+    /// the command layer.
+    async fn fetch_message_body(
+        &self,
+        _app: &tauri::AppHandle,
+        _external_id: &str,
+    ) -> Result<Option<String>, ConnectorError> {
+        Ok(None)
+    }
 }
 
 /// Per-sync context passed to `Connector::sync`. Borrows are tied to

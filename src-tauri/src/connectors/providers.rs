@@ -29,12 +29,13 @@ pub struct OAuthProvider {
 
 pub const PROVIDERS: &[OAuthProvider] = &[
     OAuthProvider {
-        kind: "google_calendar",
-        display_name: "Google Calendar",
+        kind: "google",
+        display_name: "Google",
         auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
         token_url: "https://oauth2.googleapis.com/token",
         scopes: &[
             "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/gmail.readonly",
             "https://www.googleapis.com/auth/userinfo.email",
             "openid",
         ],

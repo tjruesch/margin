@@ -138,6 +138,23 @@ impl Connector for MicrosoftGraphConnector {
             skipped: mail_report.skipped,
         })
     }
+
+    /// Lazy body fetch (#69). The trait method dispatches here once
+    /// the registry resolves connector_id → this concrete connector
+    /// (post-#61 refactor in `commands.rs::get_email_body`).
+    async fn fetch_message_body(
+        &self,
+        app: &tauri::AppHandle,
+        external_id: &str,
+    ) -> Result<Option<String>, ConnectorError> {
+        let id = self.id.clone();
+        let kind = self.kind.clone();
+        let external = external_id.to_string();
+        with_valid_token(app, &id, &kind, |access| async move {
+            fetch_message_body(&access, &external).await
+        })
+        .await
+    }
 }
 
 impl MicrosoftGraphConnector {

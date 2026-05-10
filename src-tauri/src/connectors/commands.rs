@@ -343,13 +343,22 @@ pub fn list_email_messages(
         .map_err(|e| e.to_string())
 }
 
-/// Lazy-fetch a message body. On first call we GET `body` from Graph,
-/// persist it, and return. Subsequent calls return the cached value.
+/// Lazy-fetch a message body. On first call we hand off to the
+/// connector's `fetch_message_body` trait method (which knows how to
+/// talk to its own provider — Graph for Microsoft, Gmail for Google).
+/// We then persist the result and return. Subsequent calls return the
+/// cached value.
+///
+/// Pre-#61 this function had a hardcoded fallback to `microsoft_graph`
+/// when parsing connector_id failed; now dispatch is by registered
+/// connector instance, so any provider that overrides
+/// `fetch_message_body` works automatically.
 #[tauri::command]
 pub async fn get_email_body(
     app: AppHandle,
     message_id: String,
     conn: tauri::State<'_, Mutex<Connection>>,
+    registry: tauri::State<'_, Arc<ConnectorRegistry>>,
 ) -> Result<Option<String>, String> {
     // Fast path: already cached.
     {
@@ -372,16 +381,15 @@ pub async fn get_email_body(
         None => return Ok(None),
     };
 
-    // Fetch via Graph.
-    let kind = connector_id
-        .split_once(':')
-        .map(|(k, _)| k.to_string())
-        .unwrap_or_else(|| "microsoft_graph".to_string());
-    let body = oauth::with_valid_token(&app, &connector_id, &kind, |access| async move {
-        super::microsoft_graph::fetch_message_body(&access, &external_id).await
-    })
-    .await
-    .map_err(|e| e.to_string())?;
+    // Dispatch through the connector trait. Calendar-only connectors
+    // get the default Ok(None) — UI then renders the empty state.
+    let connector = registry
+        .get(&connector_id)
+        .ok_or_else(|| format!("connector {connector_id} not registered"))?;
+    let body = connector
+        .fetch_message_body(&app, &external_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if let Some(ref html) = body {
         let c = conn.lock().map_err(|e| e.to_string())?;

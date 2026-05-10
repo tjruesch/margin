@@ -476,7 +476,7 @@ async fn extract_email(
 
     // Fallback: provider-specific userinfo endpoint.
     let url = match provider.kind {
-        "google_calendar" => "https://openidconnect.googleapis.com/v1/userinfo",
+        "google" => "https://openidconnect.googleapis.com/v1/userinfo",
         "microsoft_graph" => "https://graph.microsoft.com/v1.0/me",
         _ => return None,
     };

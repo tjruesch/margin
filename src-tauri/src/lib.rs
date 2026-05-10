@@ -532,6 +532,7 @@ pub fn run() {
             // factories are skipped with a warning.
             let registry = std::sync::Arc::new(connectors::ConnectorRegistry::new());
             connectors::microsoft_graph::register(&registry);
+            connectors::google::register(&registry);
             if let Err(e) = registry.rebuild_instances(app.handle(), &conn) {
                 eprintln!("connector registry rebuild failed at boot: {e}");
             }
