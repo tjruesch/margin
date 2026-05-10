@@ -7,11 +7,17 @@
 # persistent self-signed code-signing certificate (Keychain Access →
 # Certificate Assistant → Create a Certificate, type Code Signing) and
 # put either the certificate name or its SHA1 in `MARGIN_DEV_SIGNING_IDENTITY`
-# (e.g. in `.env`). `security find-identity -v -p codesigning` will show
-# the SHA1 once the cert exists. cargo run then signs with that identity
-# every time, producing the same signature, and Keychain's ACL holds.
+# in `.env`. `security find-identity -v -p codesigning` will show the SHA1
+# once the cert exists. cargo run then signs with that identity every
+# time, producing the same signature, and Keychain's ACL holds.
+#
+# The runner sources `.env` directly because `bun run tauri dev` only
+# loads .env into Bun's JS runtime; it doesn't propagate to spawned
+# binaries (tauri → cargo → this runner shell). Quote values containing
+# spaces (e.g. `MARGIN_DEV_SIGNING_IDENTITY="Margin Dev"`) so the
+# POSIX-shell `set -a; . ../.env; set +a` parses them correctly.
 [target.'cfg(target_os = "macos")']
-runner = ["sh", "-c", "codesign --force --sign \"${MARGIN_DEV_SIGNING_IDENTITY:--}\" --identifier com.margin.app \"$0\" 2>/dev/null; exec \"$0\" \"$@\""]
+runner = ["sh", "-c", "if [ -f ../.env ]; then set -a; . ../.env; set +a; fi; codesign --force --sign \"${MARGIN_DEV_SIGNING_IDENTITY:--}\" --identifier com.margin.app \"$0\" 2>/dev/null; exec \"$0\" \"$@\""]
 
 # whisper-rs links against whisper.cpp's C++ object files; macOS needs libc++
 # and the Accelerate framework explicitly so the linker resolves
