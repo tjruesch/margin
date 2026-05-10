@@ -237,6 +237,11 @@ function applyMemberFilter<T extends Workstream>(
   );
 }
 
+/// Max member chips rendered on the card before overflow collapses
+/// into a `+N` pill. Owner always shows when present; the cap covers
+/// owner + non-owner members combined.
+const CARD_CHIP_CAP = 4;
+
 function WorkstreamCard({
   workstream: w,
   nowMs,
@@ -249,11 +254,29 @@ function WorkstreamCard({
   teamById: Map<string, TeamMember>;
 }) {
   const isReopened = w.reopened_at_ms != null && w.status === "active";
-  const owner = w.owner_member_id ? teamById.get(w.owner_member_id) : null;
-  // +N badge counts members beyond the owner.
-  const otherMemberCount = w.members.filter(
-    (id) => id !== w.owner_member_id,
-  ).length;
+
+  // Build the ordered list: owner first (if resolvable), then other
+  // members (deduped), in the order persist returned them.
+  const ordered: TeamMember[] = [];
+  const seen = new Set<string>();
+  if (w.owner_member_id) {
+    const m = teamById.get(w.owner_member_id);
+    if (m) {
+      ordered.push(m);
+      seen.add(m.id);
+    }
+  }
+  for (const id of w.members) {
+    if (seen.has(id)) continue;
+    const m = teamById.get(id);
+    if (m) {
+      ordered.push(m);
+      seen.add(m.id);
+    }
+  }
+  const visible = ordered.slice(0, CARD_CHIP_CAP);
+  const overflow = ordered.length - visible.length;
+
   return (
     <button type="button" className="workstream-card" onClick={onClick}>
       <div className="workstream-card-head">
@@ -265,33 +288,66 @@ function WorkstreamCard({
             </span>
           ) : null}
         </span>
-        <span className="workstream-card-people">
-          {owner ? (
-            <span
-              className="workstream-card-owner"
-              title={`Owner: ${owner.display_name}`}
-              style={{ background: avatarColor(owner.display_name) }}
-            >
-              {initialsFromName(owner.display_name)}
-            </span>
-          ) : null}
-          {otherMemberCount > 0 ? (
-            <span
-              className="workstream-card-members"
-              title={`${otherMemberCount} other member${otherMemberCount === 1 ? "" : "s"}`}
-            >
-              +{otherMemberCount}
-            </span>
-          ) : null}
-          <span className="workstream-card-time">
-            {formatPast(w.last_activity_ms, nowMs)}
-          </span>
+        <span className="workstream-card-time">
+          {formatPast(w.last_activity_ms, nowMs)}
         </span>
       </div>
+      {ordered.length > 0 ? (
+        <div className="workstream-card-people">
+          {visible.map((m) => {
+            const isOwner = m.id === w.owner_member_id;
+            if (isOwner) {
+              return (
+                <span
+                  key={m.id}
+                  className="workstream-card-owner-chip"
+                  title={`${m.display_name} (owner)`}
+                >
+                  <span aria-hidden className="workstream-card-owner-mark">
+                    ★
+                  </span>
+                  {firstName(m.display_name)}
+                </span>
+              );
+            }
+            return (
+              <span
+                key={m.id}
+                className="workstream-card-chip"
+                title={m.display_name}
+              >
+                <span
+                  className="workstream-card-chip-avatar"
+                  style={{ background: avatarColor(m.display_name) }}
+                >
+                  {initialsFromName(m.display_name)}
+                </span>
+                <span className="workstream-card-chip-name">
+                  {firstName(m.display_name)}
+                </span>
+              </span>
+            );
+          })}
+          {overflow > 0 ? (
+            <span
+              className="workstream-card-overflow"
+              title={`${overflow} more member${overflow === 1 ? "" : "s"}`}
+            >
+              +{overflow}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       <p className="workstream-card-summary">{w.summary}</p>
       <div className="workstream-card-counts">{countLine(w)}</div>
     </button>
   );
+}
+
+function firstName(displayName: string): string {
+  const trimmed = displayName.trim();
+  const space = trimmed.indexOf(" ");
+  return space === -1 ? trimmed : trimmed.slice(0, space);
 }
 
 /// Collapsed accordion at the bottom of the Workstreams list. Loads
@@ -800,11 +856,25 @@ function MembersStrip({
     <section className="workstream-members-strip">
       {ordered.map((m) => {
         const isOwner = m.id === ownerId;
+        if (isOwner) {
+          return (
+            <span
+              key={m.id}
+              className="workstream-member-owner-chip"
+              title={`${m.display_name} (owner)`}
+            >
+              <span aria-hidden className="workstream-member-owner-mark">
+                ★
+              </span>
+              {m.display_name}
+            </span>
+          );
+        }
         return (
           <span
             key={m.id}
-            className={`workstream-member-chip ${isOwner ? "is-owner" : ""}`}
-            title={isOwner ? `${m.display_name} (owner)` : m.display_name}
+            className="workstream-member-chip"
+            title={m.display_name}
           >
             <span
               className="workstream-member-avatar"
