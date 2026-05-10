@@ -1192,6 +1192,25 @@ fn format_workstream_detail(
         }
     }
 
+    // External participants (#?) — email addresses on the workstream's
+    // emails / events that don't resolve to a team_member. Lets the
+    // model answer "who else is on Bridge?" without us having to
+    // re-render every email. Cap mirrors the per-workstream cap in
+    // `attach_external_participants`; no truncation suffix because
+    // that cap already bounds the list.
+    if !detail.workstream.external_participants.is_empty() {
+        let externals: Vec<String> = detail
+            .workstream
+            .external_participants
+            .iter()
+            .map(|p| match p.display_name.as_deref().filter(|n| !n.trim().is_empty()) {
+                Some(name) => format!("{name} <{}>", p.email),
+                None => p.email.clone(),
+            })
+            .collect();
+        s.push_str(&format!("External: {}\n", externals.join(", ")));
+    }
+
     // User-authored notes are ground truth (#77). Surface in full near
     // the top so the model reads them before reasoning about the
     // synthesized summary or any inferred state.
@@ -1790,6 +1809,7 @@ mod tests {
             note_count: 0,
             open_action_count: 0,
             link_count: 0,
+            external_participants: Vec::new(),
         }
     }
 
@@ -1882,6 +1902,7 @@ mod tests {
                 note_count: 1,
                 open_action_count: 1,
                 link_count: 0,
+                external_participants: Vec::new(),
             },
             emails: vec![
                 make_email("m1", "Re: invoice", 1000),
@@ -1937,7 +1958,8 @@ mod tests {
                 event_count: 0,
                 note_count: 0,
                 open_action_count: 0,
-            link_count: 0,
+                link_count: 0,
+                external_participants: Vec::new(),
             },
             emails,
             events: vec![],
@@ -1994,7 +2016,8 @@ mod tests {
                 event_count: 0,
                 note_count: 0,
                 open_action_count: 0,
-            link_count: 0,
+                link_count: 0,
+                external_participants: Vec::new(),
             },
             emails: vec![],
             events: vec![],
@@ -2032,7 +2055,8 @@ mod tests {
                 event_count: 0,
                 note_count: 0,
                 open_action_count: 0,
-            link_count: 0,
+                link_count: 0,
+                external_participants: Vec::new(),
             },
             emails: vec![],
             events: vec![],
@@ -2066,6 +2090,7 @@ mod tests {
                 note_count: 0,
                 open_action_count: 1,
                 link_count: 2,
+                external_participants: Vec::new(),
             },
             emails: vec![],
             events: vec![],
@@ -2131,6 +2156,7 @@ mod tests {
                 note_count: 0,
                 open_action_count: 0,
                 link_count: 0,
+                external_participants: Vec::new(),
             },
             emails: vec![],
             events: vec![],
@@ -2141,5 +2167,49 @@ mod tests {
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W5", &detail, &team_map);
         assert!(!out.contains("## Links"));
+    }
+
+    #[test]
+    fn format_workstream_detail_renders_external_line() {
+        let mut workstream = make_ws("ws_e", "Hyundai POC", "", 0);
+        workstream.external_participants = vec![
+            crate::workstreams::ExternalParticipant {
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+                count: 3,
+            },
+            crate::workstreams::ExternalParticipant {
+                email: "bob@example.com".into(),
+                display_name: None,
+                count: 1,
+            },
+        ];
+        let detail = WorkstreamDetail {
+            workstream,
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![],
+            links: Vec::new(),
+        };
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W6", &detail, &team_map);
+        assert!(out.contains("External: Alice <alice@example.com>, bob@example.com\n"));
+    }
+
+    #[test]
+    fn format_workstream_detail_skips_external_line_when_empty() {
+        let workstream = make_ws("ws_e", "Hyundai POC", "", 0);
+        let detail = WorkstreamDetail {
+            workstream,
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![],
+            links: Vec::new(),
+        };
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W7", &detail, &team_map);
+        assert!(!out.contains("External:"));
     }
 }

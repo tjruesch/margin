@@ -12,6 +12,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
   type EmailMessage,
+  type ExternalParticipant,
   LinkKind,
   type TeamMember,
   type Workstream,
@@ -302,6 +303,23 @@ function WorkstreamCard({
             >
               <IconLink size={11} sw={1.8} />
               {w.link_count}
+            </span>
+          ) : null}
+          {w.external_participants.length > 0 ? (
+            <span
+              className="workstream-card-externals-badge"
+              aria-label={`${w.external_participants.length} external participant${w.external_participants.length === 1 ? "" : "s"}`}
+              title={
+                w.external_participants
+                  .slice(0, 5)
+                  .map((p) => p.display_name?.trim() || p.email)
+                  .join(", ") +
+                (w.external_participants.length > 5
+                  ? `, +${w.external_participants.length - 5} more`
+                  : "")
+              }
+            >
+              +{w.external_participants.length} external
             </span>
           ) : null}
         </span>
@@ -632,6 +650,10 @@ function WorkstreamDetailView({
         />
       ) : null}
 
+      {detail.external_participants.length > 0 ? (
+        <ExternalsStrip externals={detail.external_participants} />
+      ) : null}
+
       <WorkstreamUserNotes
         workstreamId={detail.id}
         initialNotes={detail.user_notes}
@@ -923,6 +945,35 @@ function MembersStrip({
           </span>
         );
       })}
+    </section>
+  );
+}
+
+// ----- External participants ---------------------------------------------
+
+const EXTERNAL_VISIBLE_CAP = 8;
+
+function ExternalsStrip({ externals }: { externals: ExternalParticipant[] }) {
+  const visible = externals.slice(0, EXTERNAL_VISIBLE_CAP);
+  const overflow = externals.length - visible.length;
+  return (
+    <section className="workstream-externals-strip">
+      <span className="workstream-externals-label">External</span>
+      {visible.map((p) => {
+        const display = p.display_name?.trim() || p.email;
+        return (
+          <span
+            key={p.email}
+            className="workstream-external-chip"
+            title={p.display_name ? `${p.display_name} <${p.email}>` : p.email}
+          >
+            {display}
+          </span>
+        );
+      })}
+      {overflow > 0 ? (
+        <span className="workstream-externals-overflow">+{overflow}</span>
+      ) : null}
     </section>
   );
 }

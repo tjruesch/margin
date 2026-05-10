@@ -9,7 +9,10 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-use super::{NoteRef, WorkstreamDetail, Workstream, WorkstreamAction, WorkstreamLink, WriteCounts};
+use super::{
+    ExternalParticipant, NoteRef, Workstream, WorkstreamAction, WorkstreamDetail, WorkstreamLink,
+    WriteCounts,
+};
 use crate::connectors::calendar;
 use crate::connectors::email;
 
@@ -99,6 +102,7 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
             note_count: r.get::<_, i64>(13)? as u32,
             open_action_count: r.get::<_, i64>(14)? as u32,
             link_count: r.get::<_, i64>(15)? as u32,
+            external_participants: Vec::new(),
         })
     })?;
     let mut out = Vec::new();
@@ -106,6 +110,7 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
         out.push(row?);
     }
     attach_members(conn, &mut out)?;
+    attach_external_participants(conn, &mut out)?;
     Ok(out)
 }
 
@@ -145,6 +150,7 @@ pub fn list_workstreams_archived(
             note_count: r.get::<_, i64>(13)? as u32,
             open_action_count: r.get::<_, i64>(14)? as u32,
             link_count: r.get::<_, i64>(15)? as u32,
+            external_participants: Vec::new(),
         })
     })?;
     let mut out = Vec::new();
@@ -152,6 +158,7 @@ pub fn list_workstreams_archived(
         out.push(row?);
     }
     attach_members(conn, &mut out)?;
+    attach_external_participants(conn, &mut out)?;
     Ok(out)
 }
 
@@ -201,6 +208,7 @@ pub fn list_workstreams_for_synthesis(
                 note_count: r.get::<_, i64>(13)? as u32,
                 open_action_count: r.get::<_, i64>(14)? as u32,
                 link_count: r.get::<_, i64>(15)? as u32,
+                external_participants: Vec::new(),
             },
             is_archived,
         ))
@@ -209,12 +217,15 @@ pub fn list_workstreams_for_synthesis(
     for row in rows {
         out.push(row?);
     }
-    // Attach members to the workstreams (mutating in place via a
+    // Attach members + external participants (mutating in place via a
     // throwaway view onto just the Workstream side of the tuple).
     let mut just_ws: Vec<Workstream> = out.iter().map(|(w, _)| w.clone()).collect();
     attach_members(conn, &mut just_ws)?;
+    attach_external_participants(conn, &mut just_ws)?;
     for (i, (w, _)) in out.iter_mut().enumerate() {
         w.members = std::mem::take(&mut just_ws[i].members);
+        w.external_participants =
+            std::mem::take(&mut just_ws[i].external_participants);
     }
     Ok(out)
 }
@@ -393,12 +404,14 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 note_count: r.get::<_, i64>(13)? as u32,
                 open_action_count: r.get::<_, i64>(14)? as u32,
                 link_count: r.get::<_, i64>(15)? as u32,
+                external_participants: Vec::new(),
             })
         })
         .optional()?;
     if let Some(ref mut w) = ws {
         let mut single = vec![std::mem::take(w)];
         attach_members(conn, &mut single)?;
+        attach_external_participants(conn, &mut single)?;
         *w = single.pop().unwrap();
     }
     Ok(ws)
@@ -457,6 +470,107 @@ fn attach_members(
     for w in workstreams.iter_mut() {
         if let Some(members) = by_id.remove(&w.id) {
             w.members = members;
+        }
+    }
+    Ok(())
+}
+
+/// Cap on per-workstream external participants. Bounds the chip strip
+/// + the AI-ask `External:` line — most workstreams have a handful of
+/// counterparties; long mailing-list threads can produce hundreds, and
+/// we want to surface the top recurring ones, not all of them.
+const EXTERNAL_PARTICIPANT_CAP: usize = 12;
+
+/// Bulk-derive external participants for a slice of workstreams (#?). An
+/// "external participant" is an email address that appears in the
+/// workstream's emails (recipients OR senders) or events (attendees)
+/// but does NOT resolve to a `team_member`. Resolution rules:
+///
+///   * recipient/attendee rows are excluded when `team_member_id IS
+///     NOT NULL` (sync-time resolution already mapped them).
+///   * sender rows on `email_messages.from_email` are excluded when a
+///     `team_member_aliases` row of kind 'email' matches the lowercased
+///     address. (The senders path is the only place we re-check by
+///     alias; the existing `attach_members` does not surface senders
+///     at all today, which is a pre-existing gap not addressed here.)
+///
+/// The result is deduplicated case-insensitively by email; display
+/// name is the first non-null encountered. Per-workstream count =
+/// number of signal rows the email appeared on; ordered count desc,
+/// email asc, capped at `EXTERNAL_PARTICIPANT_CAP`.
+fn attach_external_participants(
+    conn: &Connection,
+    workstreams: &mut [Workstream],
+) -> rusqlite::Result<()> {
+    if workstreams.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(workstreams.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Three halves: recipients (no team_member), senders (no matching
+    // email-kind alias), attendees (no team_member). Each emits one row
+    // per signal occurrence so the outer GROUP BY can count.
+    let sql = format!(
+        "SELECT workstream_id, email_lc, MAX(display_name) AS display_name, COUNT(*) AS cnt FROM ( \
+            SELECT ws.workstream_id, LOWER(er.email) AS email_lc, er.display_name \
+            FROM workstream_signals ws \
+            JOIN email_recipients er ON er.message_id = ws.item_id \
+            WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND er.team_member_id IS NULL \
+            UNION ALL \
+            SELECT ws.workstream_id, LOWER(em.from_email) AS email_lc, em.from_name AS display_name \
+            FROM workstream_signals ws \
+            JOIN email_messages em ON em.id = ws.item_id \
+            WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND NOT EXISTS ( \
+                SELECT 1 FROM team_member_aliases tma \
+                WHERE tma.kind = 'email' AND LOWER(tma.value) = LOWER(em.from_email) \
+              ) \
+            UNION ALL \
+            SELECT ws.workstream_id, LOWER(ca.email) AS email_lc, ca.display_name \
+            FROM workstream_signals ws \
+            JOIN calendar_attendees ca ON ca.event_id = ws.item_id \
+            WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) \
+              AND ca.team_member_id IS NULL \
+         ) \
+         WHERE email_lc IS NOT NULL AND email_lc <> '' \
+         GROUP BY workstream_id, email_lc \
+         ORDER BY workstream_id, cnt DESC, email_lc ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(workstreams.len() * 3);
+    for _ in 0..3 {
+        for w in workstreams.iter() {
+            params_vec.push(&w.id as &dyn rusqlite::ToSql);
+        }
+    }
+    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |r| {
+        Ok((
+            r.get::<_, String>(0)?,        // workstream_id
+            r.get::<_, String>(1)?,        // email_lc
+            r.get::<_, Option<String>>(2)?, // display_name
+            r.get::<_, i64>(3)?,           // count
+        ))
+    })?;
+    let mut by_id: std::collections::HashMap<String, Vec<ExternalParticipant>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (ws_id, email, display_name, count) = row?;
+        let bucket = by_id.entry(ws_id).or_default();
+        if bucket.len() >= EXTERNAL_PARTICIPANT_CAP {
+            continue;
+        }
+        bucket.push(ExternalParticipant {
+            email,
+            display_name: display_name.filter(|s| !s.trim().is_empty()),
+            count: count as u32,
+        });
+    }
+    for w in workstreams.iter_mut() {
+        if let Some(externals) = by_id.remove(&w.id) {
+            w.external_participants = externals;
         }
     }
     Ok(())
@@ -1659,5 +1773,245 @@ mod tests {
         let listed = list_workstreams_active(&conn).unwrap();
         let row = listed.iter().find(|w| w.id == "ws_l").expect("present");
         assert_eq!(row.link_count, 2);
+    }
+
+    // ----- External participants ----------------------------------------
+
+    /// Seed a workstream + an email-kind signal so the per-pivot
+    /// queries have something to join against. Returns the workstream
+    /// id for chaining test asserts.
+    fn seed_workstream_with_email_signal(
+        conn: &mut Connection,
+        ws_id: &str,
+        email_id: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO workstreams(id, title, summary, status, last_activity_ms, created_ms, updated_ms) \
+             VALUES (?1, 'WS', '', 'active', 0, 0, 0)",
+            params![ws_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workstream_signals(workstream_id, kind, item_id, added_ms) \
+             VALUES (?1, 'email', ?2, 0)",
+            params![ws_id, email_id],
+        )
+        .unwrap();
+    }
+
+    fn add_recipient(
+        conn: &Connection,
+        message_id: &str,
+        email: &str,
+        display_name: Option<&str>,
+        team_member_id: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO email_recipients(message_id, email, display_name, recipient_type, team_member_id) \
+             VALUES (?1, ?2, ?3, 'to', ?4)",
+            params![message_id, email, display_name, team_member_id],
+        )
+        .unwrap();
+    }
+
+    /// Seed a member into the (test) team_members table so FKs from
+    /// `email_recipients.team_member_id` resolve. Tests can then mark
+    /// recipients as resolved by passing this id.
+    fn seed_team_member(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO team_members(id) VALUES (?1)",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    /// Seed an email-kind alias on a team member so the externals
+    /// query's NOT EXISTS check excludes that address from senders.
+    fn seed_email_alias(conn: &Connection, member_id: &str, email: &str) {
+        conn.execute(
+            "INSERT INTO team_member_aliases(member_id, kind, value) \
+             VALUES (?1, 'email', ?2)",
+            params![member_id, email],
+        )
+        .unwrap();
+    }
+
+    /// Replace the auto-seeded sender on a previously-`seed_email`-ed row.
+    /// Lets tests vary `from_email` per case without re-implementing
+    /// the seed helper.
+    fn set_email_sender(conn: &Connection, message_id: &str, from_email: &str) {
+        conn.execute(
+            "UPDATE email_messages SET from_email = ?2 WHERE id = ?1",
+            params![message_id, from_email],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn external_participants_lists_recipients_with_null_team_id() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        set_email_sender(&conn, "mg:test::m1", "internal-noreply@x.io");
+        // Two external recipients (no team_member_id) and one resolved.
+        seed_team_member(&conn, "tm_tom");
+        add_recipient(&conn, "mg:test::m1", "alice@example.com", Some("Alice"), None);
+        add_recipient(&conn, "mg:test::m1", "bob@example.com", None, None);
+        add_recipient(&conn, "mg:test::m1", "tom@x.io", Some("Tom"), Some("tm_tom"));
+        // Mark the sender as a known team member by alias so it doesn't
+        // pollute the externals.
+        seed_team_member(&conn, "tm_noreply");
+        seed_email_alias(&conn, "tm_noreply", "internal-noreply@x.io");
+
+        seed_workstream_with_email_signal(&mut conn, "ws_x", "mg:test::m1");
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        let emails: Vec<&str> = row
+            .external_participants
+            .iter()
+            .map(|p| p.email.as_str())
+            .collect();
+        assert_eq!(
+            emails,
+            vec!["alice@example.com", "bob@example.com"],
+            "only the unresolved recipients surface; team_member rows are filtered"
+        );
+        assert_eq!(
+            row.external_participants[0].display_name.as_deref(),
+            Some("Alice")
+        );
+        assert!(row.external_participants[1].display_name.is_none());
+    }
+
+    #[test]
+    fn external_participants_includes_senders_with_no_team_alias() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        // Sender has no matching team_member_aliases entry.
+        set_email_sender(&conn, "mg:test::m1", "Outsider@External.com");
+        // Recipients are all team members so they don't dominate the
+        // signal — we want to verify the sender path on its own.
+        seed_team_member(&conn, "tm_tom");
+        add_recipient(&conn, "mg:test::m1", "tom@x.io", Some("Tom"), Some("tm_tom"));
+
+        seed_workstream_with_email_signal(&mut conn, "ws_x", "mg:test::m1");
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        let emails: Vec<&str> = row
+            .external_participants
+            .iter()
+            .map(|p| p.email.as_str())
+            .collect();
+        assert_eq!(
+            emails,
+            vec!["outsider@external.com"],
+            "sender lowercased + included when no email-alias matches"
+        );
+    }
+
+    #[test]
+    fn external_participants_excludes_team_member_senders() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        set_email_sender(&conn, "mg:test::m1", "Tom@X.io");
+        seed_team_member(&conn, "tm_tom");
+        seed_email_alias(&conn, "tm_tom", "tom@x.io");
+        // Add an external recipient so the helper has SOMETHING to
+        // surface — keeps the assertion clear.
+        add_recipient(&conn, "mg:test::m1", "alice@example.com", None, None);
+
+        seed_workstream_with_email_signal(&mut conn, "ws_x", "mg:test::m1");
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        let emails: Vec<&str> = row
+            .external_participants
+            .iter()
+            .map(|p| p.email.as_str())
+            .collect();
+        assert_eq!(
+            emails,
+            vec!["alice@example.com"],
+            "team-member senders excluded by NOT EXISTS alias check"
+        );
+    }
+
+    #[test]
+    fn external_participants_dedupes_case_insensitively_and_picks_a_display_name() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_email(&conn, "mg:test::m2", 2_000);
+        set_email_sender(&conn, "mg:test::m1", "system@noreply.io");
+        set_email_sender(&conn, "mg:test::m2", "system@noreply.io");
+        seed_team_member(&conn, "tm_noreply");
+        seed_email_alias(&conn, "tm_noreply", "system@noreply.io");
+        // Same external email across two messages, varying case + null name.
+        add_recipient(&conn, "mg:test::m1", "Alice@Example.com", Some("Alice"), None);
+        add_recipient(&conn, "mg:test::m2", "alice@example.com", None, None);
+
+        conn.execute(
+            "INSERT INTO workstreams(id, title, summary, status, last_activity_ms, created_ms, updated_ms) \
+             VALUES ('ws_x', 'WS', '', 'active', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workstream_signals(workstream_id, kind, item_id, added_ms) \
+             VALUES ('ws_x', 'email', 'mg:test::m1', 0), \
+                    ('ws_x', 'email', 'mg:test::m2', 0)",
+            [],
+        )
+        .unwrap();
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        assert_eq!(row.external_participants.len(), 1, "deduped case-insensitively");
+        let p = &row.external_participants[0];
+        assert_eq!(p.email, "alice@example.com");
+        assert_eq!(p.display_name.as_deref(), Some("Alice"));
+        assert_eq!(p.count, 2);
+    }
+
+    #[test]
+    fn external_participants_orders_by_count_desc() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_email(&conn, "mg:test::m2", 2_000);
+        seed_email(&conn, "mg:test::m3", 3_000);
+        for id in ["mg:test::m1", "mg:test::m2", "mg:test::m3"] {
+            set_email_sender(&conn, id, "noreply@x.io");
+        }
+        seed_team_member(&conn, "tm_noreply");
+        seed_email_alias(&conn, "tm_noreply", "noreply@x.io");
+        // bob shows up on 1 message, alice on 3.
+        add_recipient(&conn, "mg:test::m1", "alice@x.io", None, None);
+        add_recipient(&conn, "mg:test::m2", "alice@x.io", None, None);
+        add_recipient(&conn, "mg:test::m3", "alice@x.io", None, None);
+        add_recipient(&conn, "mg:test::m1", "bob@x.io", None, None);
+
+        conn.execute(
+            "INSERT INTO workstreams(id, title, summary, status, last_activity_ms, created_ms, updated_ms) \
+             VALUES ('ws_x', 'WS', '', 'active', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for id in ["mg:test::m1", "mg:test::m2", "mg:test::m3"] {
+            conn.execute(
+                "INSERT INTO workstream_signals(workstream_id, kind, item_id, added_ms) \
+                 VALUES ('ws_x', 'email', ?1, 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        let pairs: Vec<(&str, u32)> = row
+            .external_participants
+            .iter()
+            .map(|p| (p.email.as_str(), p.count))
+            .collect();
+        assert_eq!(pairs, vec![("alice@x.io", 3), ("bob@x.io", 1)]);
     }
 }

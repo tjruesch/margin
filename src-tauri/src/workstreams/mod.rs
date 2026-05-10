@@ -74,6 +74,30 @@ pub struct Workstream {
     /// link-icon badge on the list card; the actual links land in
     /// `WorkstreamDetail.links` on detail-view fetch.
     pub link_count: u32,
+    /// Email addresses that participate in the workstream's emails or
+    /// events but don't resolve to any team_member. Sorted by signal
+    /// count desc; deduped case-insensitively. Capped per workstream
+    /// (see `EXTERNAL_PARTICIPANT_CAP` in `persist.rs`). Drives the
+    /// "External" chip strip on the detail view and the "+N external"
+    /// pill on the list card.
+    pub external_participants: Vec<ExternalParticipant>,
+}
+
+/// One email address that participates in a workstream but has no
+/// corresponding `team_member` (no team_member_id on the recipient /
+/// attendee row, and — for senders — no matching `team_member_aliases`
+/// entry of kind 'email'). Surfaces external counterparties on the
+/// workstream detail + list views.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalParticipant {
+    /// Lowercased canonical email.
+    pub email: String,
+    /// First non-null display name encountered across the joined rows.
+    /// `None` when only the bare address is known.
+    pub display_name: Option<String>,
+    /// Number of signals (emails + events) that involve this address.
+    /// Used to sort the chip strip — frequent counterparties first.
+    pub count: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
