@@ -12,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
+  AliasKind,
   type EmailMessage,
   type ExternalParticipant,
   LinkKind,
@@ -22,6 +23,7 @@ import {
   type WorkstreamLink,
   type WorkstreamStatus,
   addWorkstreamLink,
+  createTeamMember,
   getEmailBody,
   getWorkstreamDetails,
   listArchivedWorkstreams,
@@ -558,6 +560,7 @@ function WorkstreamDetailView({
   const [loading, setLoading] = useState(true);
   const [missing, setMissing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [externalDialog, setExternalDialog] = useState<ExternalParticipant | null>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -786,7 +789,21 @@ function WorkstreamDetailView({
       ) : null}
 
       {detail.external_participants.length > 0 ? (
-        <ExternalsStrip externals={detail.external_participants} />
+        <ExternalsStrip
+          externals={detail.external_participants}
+          onChipClick={(p) => setExternalDialog(p)}
+        />
+      ) : null}
+      {externalDialog ? (
+        <ExternalChipModal
+          participant={externalDialog}
+          onClose={() => setExternalDialog(null)}
+          onAddedToTeam={() => {
+            // Refetch detail so the chip moves into MembersStrip on
+            // the next render.
+            void reload();
+          }}
+        />
       ) : null}
 
       <WorkstreamUserNotes
@@ -1232,7 +1249,13 @@ function MembersStrip({
 
 const EXTERNAL_VISIBLE_CAP = 8;
 
-function ExternalsStrip({ externals }: { externals: ExternalParticipant[] }) {
+function ExternalsStrip({
+  externals,
+  onChipClick,
+}: {
+  externals: ExternalParticipant[];
+  onChipClick: (p: ExternalParticipant) => void;
+}) {
   const visible = externals.slice(0, EXTERNAL_VISIBLE_CAP);
   const overflow = externals.length - visible.length;
   return (
@@ -1241,19 +1264,142 @@ function ExternalsStrip({ externals }: { externals: ExternalParticipant[] }) {
       {visible.map((p) => {
         const display = p.display_name?.trim() || p.email;
         return (
-          <span
+          <button
             key={p.email}
+            type="button"
             className="workstream-external-chip"
             title={p.display_name ? `${p.display_name} <${p.email}>` : p.email}
+            onClick={() => onChipClick(p)}
           >
             {display}
-          </span>
+          </button>
         );
       })}
       {overflow > 0 ? (
         <span className="workstream-externals-overflow">+{overflow}</span>
       ) : null}
     </section>
+  );
+}
+
+function ExternalChipModal({
+  participant,
+  onClose,
+  onAddedToTeam,
+}: {
+  participant: ExternalParticipant;
+  onClose: () => void;
+  /** Fired after the participant becomes a team member, so the parent
+   *  detail view can refetch — the chip will move from the External
+   *  strip into the Members strip on the next render. */
+  onAddedToTeam: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+
+  // Esc closes; backdrop click closes.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const displayName = participant.display_name?.trim() || participant.email;
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(participant.email);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (err) {
+      console.error("[workstreams] copy email failed", err);
+    }
+  };
+
+  const onAdd = async () => {
+    setBusy(true);
+    setAddError(null);
+    try {
+      // Create the team member with the email as a typed alias so the
+      // resolver picks them up on the next refresh. display_name is
+      // the address itself when no display name was on the source row;
+      // the user can rename them later from the team detail view.
+      await createTeamMember(displayName, "", [
+        { kind: AliasKind.Email, value: participant.email },
+      ]);
+      window.dispatchEvent(new CustomEvent("margin:team-changed"));
+      onAddedToTeam();
+      onClose();
+    } catch (err) {
+      console.error("[workstreams] createTeamMember failed", err);
+      setAddError(
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : "Could not add to team",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="settings-modal-backdrop"
+      role="presentation"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="settings-modal external-chip-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Identity: ${displayName}`}
+      >
+        <header className="settings-modal-header">
+          <h2>{displayName}</h2>
+          <p className="external-chip-modal-email">{participant.email}</p>
+          <p className="external-chip-modal-count">
+            Seen on {participant.count} signal{participant.count === 1 ? "" : "s"} in this workstream
+          </p>
+        </header>
+        <div className="external-chip-modal-actions">
+          <button
+            type="button"
+            className="external-chip-modal-action"
+            onClick={() => void onCopy()}
+          >
+            {copied ? "Copied!" : "Copy email"}
+          </button>
+          <button
+            type="button"
+            className="external-chip-modal-action primary"
+            onClick={() => void onAdd()}
+            disabled={busy}
+          >
+            {busy ? "Adding…" : "Add to team"}
+          </button>
+        </div>
+        {addError ? (
+          <p className="external-chip-modal-error">{addError}</p>
+        ) : null}
+        <footer className="settings-modal-footer">
+          <button
+            type="button"
+            className="settings-modal-done"
+            onClick={onClose}
+            disabled={busy}
+          >
+            Close
+          </button>
+        </footer>
+      </div>
+    </div>
   );
 }
 

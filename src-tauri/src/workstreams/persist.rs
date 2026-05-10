@@ -579,6 +579,14 @@ fn attach_external_participants(
     // Three halves: recipients (no team_member), senders (no matching
     // email-kind alias), attendees (no team_member). Each emits one row
     // per signal occurrence so the outer GROUP BY can count.
+    // For all three sources: a row is "external" only if the email
+    // doesn't match a team_member by alias. The sync-time
+    // `team_member_id` column on recipients/attendees is treated as a
+    // fast-path hint, but typed aliases added AFTER sync (#87) are not
+    // backfilled into those rows — so the alias NOT EXISTS check is
+    // the source of truth. Keep the `team_member_id IS NULL` filter
+    // too: it short-circuits before the correlated subquery for the
+    // common case.
     let sql = format!(
         "SELECT workstream_id, email_lc, MAX(display_name) AS display_name, COUNT(*) AS cnt FROM ( \
             SELECT ws.workstream_id, LOWER(er.email) AS email_lc, er.display_name \
@@ -586,6 +594,10 @@ fn attach_external_participants(
             JOIN email_recipients er ON er.message_id = ws.item_id \
             WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
               AND er.team_member_id IS NULL \
+              AND NOT EXISTS ( \
+                SELECT 1 FROM team_member_aliases tma \
+                WHERE tma.kind = 'email' AND LOWER(tma.value) = LOWER(er.email) \
+              ) \
             UNION ALL \
             SELECT ws.workstream_id, LOWER(em.from_email) AS email_lc, em.from_name AS display_name \
             FROM workstream_signals ws \
@@ -601,6 +613,10 @@ fn attach_external_participants(
             JOIN calendar_attendees ca ON ca.event_id = ws.item_id \
             WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) \
               AND ca.team_member_id IS NULL \
+              AND NOT EXISTS ( \
+                SELECT 1 FROM team_member_aliases tma \
+                WHERE tma.kind = 'email' AND LOWER(tma.value) = LOWER(ca.email) \
+              ) \
          ) \
          WHERE email_lc IS NOT NULL AND email_lc <> '' \
          GROUP BY workstream_id, email_lc \
@@ -2103,6 +2119,49 @@ mod tests {
             emails,
             vec!["alice@example.com"],
             "team-member senders excluded by NOT EXISTS alias check"
+        );
+    }
+
+    /// Regression: `email_recipients.team_member_id` is set at sync time,
+    /// so when the user adds a typed-alias email to a team member AFTER
+    /// the email was synced, old recipient rows still have NULL
+    /// team_member_id. The externals query must check the aliases too,
+    /// not just the cached column.
+    #[test]
+    fn external_participants_excludes_recipients_resolved_by_alias_after_sync() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        set_email_sender(&conn, "mg:test::m1", "tom@x.io");
+        seed_team_member(&conn, "tm_tom");
+        seed_email_alias(&conn, "tm_tom", "tom@x.io");
+        // Heike was on the recipient list when the email was synced,
+        // but her team_member_id wasn't set on the recipient row.
+        // Later the user added her email as an alias on tm_heike.
+        seed_team_member(&conn, "tm_heike");
+        add_recipient(
+            &conn,
+            "mg:test::m1",
+            "heike@example.com",
+            Some("Heike"),
+            None, // team_member_id NULL — sync-time mapping missed her
+        );
+        seed_email_alias(&conn, "tm_heike", "heike@example.com");
+        // And one genuinely external recipient as a control.
+        add_recipient(&conn, "mg:test::m1", "alice@example.com", None, None);
+
+        seed_workstream_with_email_signal(&mut conn, "ws_x", "mg:test::m1");
+
+        let listed = list_workstreams_active(&conn).unwrap();
+        let row = listed.iter().find(|w| w.id == "ws_x").unwrap();
+        let emails: Vec<&str> = row
+            .external_participants
+            .iter()
+            .map(|p| p.email.as_str())
+            .collect();
+        assert_eq!(
+            emails,
+            vec!["alice@example.com"],
+            "Heike is now a team member by alias even though the recipient row's team_member_id is stale"
         );
     }
 
