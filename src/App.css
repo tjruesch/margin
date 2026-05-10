@@ -4780,31 +4780,74 @@ input.nh-title {
   max-width: 180px;
 }
 
+/* Card people row: owner + members rendered as chips (#81). Owner is
+   highlighted with the accent color; overflow collapses into a +N
+   pill when the workstream has more participants than the chip cap. */
 .workstream-card-people {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 2px 0 6px;
+}
+/* Owner chip: filled-accent treatment + star prefix, distinct from
+   participant chips (which are outlined with an avatar). Visually
+   communicates "primary / role-bearing person". */
+.workstream-card-owner-chip {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  white-space: nowrap;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: 11px;
+  background: var(--accent);
+  border: 0.5px solid var(--accent);
+  color: white;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
 }
-.workstream-card-owner {
+.workstream-card-owner-mark {
+  display: inline-flex;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.workstream-card-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px 2px 2px;
+  border-radius: 11px;
+  background: var(--bg-elev);
+  border: 0.5px solid var(--home-line);
+  font-size: 11.5px;
+  color: var(--fg);
+  line-height: 1.2;
+}
+.workstream-card-chip-avatar {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
   color: white;
-  font-size: 10px;
+  font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.04em;
 }
-.workstream-card-members {
+.workstream-card-chip-name {
+  padding-right: 1px;
+}
+.workstream-card-overflow {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 11px;
+  background: var(--home-chip);
+  color: var(--fg-muted);
   font-size: 11px;
   font-weight: 600;
-  color: var(--fg-muted);
-  padding: 2px 6px;
-  border-radius: 10px;
-  background: var(--home-chip);
 }
 
 .workstream-members-strip {
@@ -4824,9 +4867,26 @@ input.nh-title {
   font-size: 12px;
   color: var(--fg);
 }
-.workstream-member-chip.is-owner {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 10%, var(--bg-elev));
+/* Detail-view owner chip — matches the list card's filled-accent
+   treatment so owner is visually distinct from participants both
+   places. */
+.workstream-member-owner-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  border-radius: 14px;
+  background: var(--accent);
+  border: 0.5px solid var(--accent);
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.workstream-member-owner-mark {
+  display: inline-flex;
+  font-size: 10.5px;
+  line-height: 1;
 }
 .workstream-member-avatar {
   display: inline-flex;
