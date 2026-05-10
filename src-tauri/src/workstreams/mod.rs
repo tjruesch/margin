@@ -33,7 +33,7 @@ pub fn cluster_lock() -> &'static Mutex<()> {
 }
 
 /// Persisted workstream row + joined counts for the list view.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Workstream {
     pub id: String,
     pub title: String,
@@ -55,6 +55,16 @@ pub struct Workstream {
     /// detail-view unmount via `mark_workstream_seen`. The "Reopened"
     /// badge is just `reopened_at_ms.is_some() && status == "active"`.
     pub reopened_at_ms: Option<i64>,
+    /// User-set internal owner of the workstream (#81). Single
+    /// team_member id; `None` when unassigned. Synthesizer never sets
+    /// this — same authority pattern as user_notes.
+    pub owner_member_id: Option<String>,
+    /// Derived list of team_member ids involved in the workstream
+    /// (#81). Computed on read by joining the workstream's pivot
+    /// emails / events against `email_recipients` / `calendar_attendees`
+    /// where `team_member_id IS NOT NULL`. UI maps ids to names via
+    /// the existing `listTeamMembers` cache.
+    pub members: Vec<String>,
     pub email_count: u32,
     pub event_count: u32,
     pub note_count: u32,

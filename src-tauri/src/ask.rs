@@ -1115,7 +1115,7 @@ fn dispatch_read_workstream(
     let ws = &workstreams[n - 1];
     let label = format!("W{n}");
 
-    let detail = {
+    let (detail, team_by_id) = {
         let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
         let c = match conn_state.lock() {
             Ok(g) => g,
@@ -1126,7 +1126,7 @@ fn dispatch_read_workstream(
                 };
             }
         };
-        match crate::workstreams::persist::get_workstream_detail(&c, &ws.id) {
+        let detail = match crate::workstreams::persist::get_workstream_detail(&c, &ws.id) {
             Ok(Some(d)) => d,
             Ok(None) => {
                 return ToolResult {
@@ -1143,11 +1143,17 @@ fn dispatch_read_workstream(
                     is_error: true,
                 };
             }
-        }
+        };
+        let team = crate::team::list_team_members_raw(&c).unwrap_or_default();
+        let team_by_id: std::collections::HashMap<String, String> = team
+            .into_iter()
+            .map(|m| (m.id, m.display_name))
+            .collect();
+        (detail, team_by_id)
     };
 
     ToolResult {
-        content: format_workstream_detail(&label, &detail),
+        content: format_workstream_detail(&label, &detail, &team_by_id),
         is_error: false,
     }
 }
@@ -1155,6 +1161,7 @@ fn dispatch_read_workstream(
 fn format_workstream_detail(
     label: &str,
     detail: &crate::workstreams::WorkstreamDetail,
+    team_by_id: &std::collections::HashMap<String, String>,
 ) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -1164,6 +1171,25 @@ fn format_workstream_detail(
     ));
     if !detail.workstream.summary.is_empty() {
         s.push_str(&format!("\n{}\n", detail.workstream.summary.trim()));
+    }
+
+    // Owner + members (#81). Both are user/derived data — show before
+    // user_notes so the model has the people first.
+    if let Some(owner_id) = detail.workstream.owner_member_id.as_deref() {
+        if let Some(name) = team_by_id.get(owner_id) {
+            s.push_str(&format!("\nOwner: {name}\n"));
+        }
+    }
+    if !detail.workstream.members.is_empty() {
+        let names: Vec<&str> = detail
+            .workstream
+            .members
+            .iter()
+            .filter_map(|id| team_by_id.get(id).map(String::as_str))
+            .collect();
+        if !names.is_empty() {
+            s.push_str(&format!("Members: {}\n", names.join(", ")));
+        }
     }
 
     // User-authored notes are ground truth (#77). Surface in full near
@@ -1488,7 +1514,11 @@ fn format_user_message(
     s.push_str(&format_schedule_section(schedule));
 
     if !workstreams.is_empty() {
-        s.push_str(&format_workstreams_section(workstreams));
+        let team_by_id: std::collections::HashMap<&str, &str> = profiles
+            .iter()
+            .map(|(m, _)| (m.id.as_str(), m.display_name.as_str()))
+            .collect();
+        s.push_str(&format_workstreams_section(workstreams, &team_by_id));
     }
 
     s.push_str("# Question\n\n");
@@ -1500,7 +1530,10 @@ fn format_user_message(
 /// Each workstream becomes one line with its `[W<N>]` label, title,
 /// one-line summary, and item counts. Empty input emits nothing — the
 /// caller decides whether to skip the section entirely.
-fn format_workstreams_section(workstreams: &[crate::workstreams::Workstream]) -> String {
+fn format_workstreams_section(
+    workstreams: &[crate::workstreams::Workstream],
+    team_by_id: &std::collections::HashMap<&str, &str>,
+) -> String {
     let mut s = String::new();
     s.push_str("# Workstreams\n\n");
     for (i, w) in workstreams.iter().enumerate() {
@@ -1534,6 +1567,33 @@ fn format_workstreams_section(workstreams: &[crate::workstreams::Workstream]) ->
                 counts = counts_suffix,
             ),
         );
+        // Owner + members (#81). One-line excerpts; the full lists are
+        // in `read_workstream` for richer reasoning.
+        if let Some(owner_id) = w.owner_member_id.as_deref() {
+            if let Some(name) = team_by_id.get(owner_id) {
+                s.push_str(&format!("    Owner: {name}\n"));
+            }
+        }
+        if !w.members.is_empty() {
+            let names: Vec<&str> = w
+                .members
+                .iter()
+                .filter_map(|id| team_by_id.get(id.as_str()).copied())
+                .take(8)
+                .collect();
+            if !names.is_empty() {
+                let suffix = if w.members.len() > names.len() {
+                    format!(" (+{} more)", w.members.len() - names.len())
+                } else {
+                    String::new()
+                };
+                s.push_str(&format!(
+                    "    Members: {names}{suffix}\n",
+                    names = names.join(", "),
+                    suffix = suffix
+                ));
+            }
+        }
         // User-authored ground truth (#77). Show a one-line excerpt
         // here so the model knows it exists; the full text is in the
         // `read_workstream` tool result.
@@ -1702,6 +1762,8 @@ mod tests {
             user_notes: None,
             archived_at_ms: None,
             reopened_at_ms: None,
+            owner_member_id: None,
+            members: Vec::new(),
             email_count: 0,
             event_count: 0,
             note_count: 0,
@@ -1718,7 +1780,8 @@ mod tests {
 
         let b = make_ws("ws_b", "Q3 hiring", "Sourcing two seniors.", 50);
 
-        let out = format_workstreams_section(&[a, b]);
+        let team_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let out = format_workstreams_section(&[a, b], &team_map);
         assert!(out.starts_with("# Workstreams\n\n"));
         assert!(out.contains("[W1] Hyundai POC"));
         assert!(out.contains("[W2] Q3 hiring"));
@@ -1735,7 +1798,8 @@ mod tests {
     fn format_workstreams_section_truncates_long_summary() {
         let long = "X".repeat(WORKSTREAM_SUMMARY_CAP + 50);
         let w = make_ws("ws", "Title", &long, 0);
-        let out = format_workstreams_section(&[w]);
+        let team_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let out = format_workstreams_section(&[w], &team_map);
         // Truncated with the …  marker from truncate_chars.
         assert!(out.contains('…'), "expected truncation marker in: {out}");
         // Doesn't contain the trailing portion (50 chars past the cap).
@@ -1789,6 +1853,8 @@ mod tests {
                 user_notes: None,
                 archived_at_ms: None,
                 reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
                 email_count: 2,
                 event_count: 0,
                 note_count: 1,
@@ -1806,7 +1872,8 @@ mod tests {
             }],
             actions: vec![make_action("Reply to invoice", false), make_action("Send quote", true)],
         };
-        let out = format_workstream_detail("W1", &detail);
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W1", &detail, &team_map);
         assert!(out.starts_with("# [W1] Hyundai POC\n"));
         assert!(out.contains("Invoicing in flight."));
         assert!(out.contains("Actions (1 open, 1 done)"));
@@ -1840,6 +1907,8 @@ mod tests {
                 user_notes: None,
                 archived_at_ms: None,
                 reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
                 email_count: emails.len() as u32,
                 event_count: 0,
                 note_count: 0,
@@ -1850,7 +1919,8 @@ mod tests {
             notes: vec![],
             actions: vec![],
         };
-        let out = format_workstream_detail("W2", &detail);
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W2", &detail, &team_map);
         let total = WORKSTREAM_DETAIL_TOP_N + 3;
         assert!(
             out.contains(&format!("Recent emails (top {} of {})", WORKSTREAM_DETAIL_TOP_N, total)),
@@ -1869,7 +1939,8 @@ mod tests {
     fn format_workstreams_section_one_line_excerpt_when_user_notes_present() {
         let mut a = make_ws("ws_a", "Hyundai POC", "Final invoice details.", 100);
         a.user_notes = Some("Real deadline May 30 (calendar shows June). TJ owns this internally.".into());
-        let out = format_workstreams_section(&[a]);
+        let team_map: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let out = format_workstreams_section(&[a], &team_map);
         assert!(out.contains("[W1] Hyundai POC"));
         assert!(
             out.contains("(user notes: Real deadline May 30"),
@@ -1891,6 +1962,8 @@ mod tests {
                 user_notes: Some("Real deadline May 30. New POC, not legacy contract.".into()),
                 archived_at_ms: None,
                 reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
@@ -1901,7 +1974,8 @@ mod tests {
             notes: vec![],
             actions: vec![],
         };
-        let out = format_workstream_detail("W1", &detail);
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W1", &detail, &team_map);
         assert!(out.contains("# [W1] Hyundai POC"));
         // Summary still rendered.
         assert!(out.contains("Invoicing in flight."));
@@ -1924,6 +1998,8 @@ mod tests {
                 user_notes: None,
                 archived_at_ms: None,
                 reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
@@ -1934,7 +2010,8 @@ mod tests {
             notes: vec![],
             actions: vec![],
         };
-        let out = format_workstream_detail("W3", &detail);
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W3", &detail, &team_map);
         assert_eq!(out, "# [W3] Bare\n");
     }
 }

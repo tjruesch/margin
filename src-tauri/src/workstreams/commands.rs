@@ -91,3 +91,15 @@ pub fn mark_workstream_seen(
     let c = conn.lock().map_err(|e| e.to_string())?;
     persist::mark_seen(&c, &id).map_err(|e| e.to_string())
 }
+
+/// Set or clear a workstream's owner (#81). Pass `None` to unassign.
+/// User-only authority — synthesizer never sets this.
+#[tauri::command]
+pub fn set_workstream_owner(
+    id: String,
+    owner_member_id: Option<String>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::set_owner(&c, &id, owner_member_id.as_deref()).map_err(|e| e.to_string())
+}
