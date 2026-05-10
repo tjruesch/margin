@@ -25,11 +25,9 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::anthropic::{ANTHROPIC_VERSION, DEFAULT_MODEL, ENDPOINT};
 use crate::{index::DirectoryEntry, keychain};
 
-const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u32 = 2048;
 
 /// Top-K retrieved notes whose full body is loaded into the prompt.
