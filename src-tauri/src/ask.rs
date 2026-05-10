@@ -1486,7 +1486,8 @@ fn format_user_message(
             let aliases = if m.aliases.is_empty() {
                 String::new()
             } else {
-                format!(" (aliases: {})", m.aliases.join(", "))
+                let vals: Vec<&str> = m.aliases.iter().map(|a| a.value.as_str()).collect();
+                format!(" (aliases: {})", vals.join(", "))
             };
             let role = if m.role.is_empty() {
                 String::new()

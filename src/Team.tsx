@@ -6,8 +6,10 @@ import { Editor } from "./Editor";
 import { ActionRow, BUCKET_ORDER } from "./Home";
 import { IconChevLeft, IconPlus, IconTrash } from "./icons";
 import {
+  AliasKind,
   type ActionListItem,
   type TeamMember,
+  type TypedAlias,
   createTeamMember,
   deleteTeamMember,
   listActions,
@@ -399,19 +401,11 @@ function TeamDetail({
     }
   };
 
-  const commitAliases = async (next: string) => {
-    const parsed = next
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (
-      parsed.length === member.aliases.length &&
-      parsed.every((v, i) => v === member.aliases[i])
-    ) {
-      return;
-    }
+  const [showIdentitiesModal, setShowIdentitiesModal] = useState(false);
+
+  const saveIdentities = async (next: TypedAlias[]) => {
     try {
-      const updated = await updateTeamMember(member.id, { aliases: parsed });
+      const updated = await updateTeamMember(member.id, { aliases: next });
       onUpdated(updated);
     } catch (err) {
       console.error("updateTeamMember (aliases) failed:", err);
@@ -479,14 +473,25 @@ function TeamDetail({
             onCommit={(v) => void commitRole(v)}
             className="team-detail-role"
           />
-          <EditableField
-            value={member.aliases.join(", ")}
-            placeholder="Aliases, comma-separated (e.g. SR, Sara)"
-            onCommit={(v) => void commitAliases(v)}
-            className="team-detail-aliases"
-          />
+          <button
+            type="button"
+            className="team-detail-aliases-trigger"
+            onClick={() => setShowIdentitiesModal(true)}
+          >
+            {identitiesSummary(member.aliases)}
+          </button>
         </div>
       </header>
+      {showIdentitiesModal && (
+        <IdentitiesModal
+          aliases={member.aliases}
+          onClose={() => setShowIdentitiesModal(false)}
+          onSave={async (next) => {
+            await saveIdentities(next);
+            setShowIdentitiesModal(false);
+          }}
+        />
+      )}
       <div className="team-detail-tabs">
         <div className="nh-segmented" role="tablist" aria-label="Section">
           <button
@@ -843,4 +848,189 @@ function TasksTab({
       )}
     </div>
   );
+}
+
+// ---------- Identities modal --------------------------------------------
+
+const ALIAS_KIND_LABELS: Array<{ value: string; label: string }> = [
+  { value: AliasKind.Email, label: "Email" },
+  { value: AliasKind.Name, label: "Name" },
+  { value: AliasKind.GithubLogin, label: "GitHub login" },
+  { value: AliasKind.SlackId, label: "Slack ID" },
+];
+
+function identitiesSummary(aliases: TypedAlias[]): string {
+  if (aliases.length === 0) return "Manage identities…";
+  if (aliases.length === 1) return `1 identity · manage…`;
+  return `${aliases.length} identities · manage…`;
+}
+
+type Draft = { kind: string; value: string };
+
+function IdentitiesModal({
+  aliases,
+  onClose,
+  onSave,
+}: {
+  aliases: TypedAlias[];
+  onClose: () => void;
+  onSave: (next: TypedAlias[]) => Promise<void> | void;
+}) {
+  const [drafts, setDrafts] = useState<Draft[]>(() =>
+    aliases.map((a) => ({ kind: a.kind, value: a.value })),
+  );
+  const [saving, setSaving] = useState(false);
+
+  // Esc closes; backdrop click closes. Save / Add affordances are
+  // explicit buttons inside the modal.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const updateRow = (i: number, patch: Partial<Draft>) => {
+    setDrafts((prev) =>
+      prev.map((d, idx) => (idx === i ? { ...d, ...patch } : d)),
+    );
+  };
+
+  const removeRow = (i: number) => {
+    setDrafts((prev) => prev.filter((_, idx) => idx !== i));
+  };
+
+  const addRow = () => {
+    setDrafts((prev) => [...prev, { kind: AliasKind.Email, value: "" }]);
+  };
+
+  const handleSave = async () => {
+    // Filter empty values, dedupe (kind, value) pairs client-side. The
+    // backend's PRIMARY KEY also enforces this, but trimming here keeps
+    // the optimistic state aligned with what the server will store.
+    const cleaned: TypedAlias[] = [];
+    const seen = new Set<string>();
+    for (const d of drafts) {
+      const kind = d.kind.trim();
+      const value = d.value.trim();
+      if (!kind || !value) continue;
+      const key = `${kind}\x00${value}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cleaned.push({ kind, value });
+    }
+    setSaving(true);
+    try {
+      await onSave(cleaned);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      className="identities-modal-backdrop"
+      role="presentation"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="identities-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Manage identities"
+      >
+        <header className="identities-modal-header">
+          <h2>Manage identities</h2>
+          <p className="identities-modal-help">
+            Each identity is tagged with a kind so connectors (email, GitHub,
+            Slack…) can resolve people back to this team member.
+          </p>
+        </header>
+        <div className="identities-modal-rows">
+          {drafts.length === 0 && (
+            <div className="identities-modal-empty">
+              No identities yet — add an email or connector handle below.
+            </div>
+          )}
+          {drafts.map((d, i) => (
+            <div className="identities-modal-row" key={i}>
+              <select
+                className="identities-modal-kind"
+                value={d.kind}
+                onChange={(e) => updateRow(i, { kind: e.target.value })}
+              >
+                {ALIAS_KIND_LABELS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              <input
+                className="identities-modal-value"
+                type="text"
+                placeholder={placeholderFor(d.kind)}
+                value={d.value}
+                onChange={(e) => updateRow(i, { value: e.target.value })}
+                autoFocus={i === drafts.length - 1 && d.value === ""}
+              />
+              <button
+                type="button"
+                className="identities-modal-remove"
+                onClick={() => removeRow(i)}
+                aria-label="Remove identity"
+              >
+                <IconTrash size={13} sw={1.8} />
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="identities-modal-add-row">
+          <button
+            type="button"
+            className="identities-modal-add"
+            onClick={addRow}
+          >
+            <IconPlus size={13} sw={1.8} />
+            Add identity
+          </button>
+        </div>
+        <footer className="identities-modal-footer">
+          <button
+            type="button"
+            className="identities-modal-cancel"
+            onClick={onClose}
+            disabled={saving}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            className="identities-modal-save"
+            onClick={() => void handleSave()}
+            disabled={saving}
+          >
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function placeholderFor(kind: string): string {
+  switch (kind) {
+    case AliasKind.Email:
+      return "name@example.com";
+    case AliasKind.Name:
+      return "First Last (or nickname)";
+    case AliasKind.GithubLogin:
+      return "github-handle";
+    case AliasKind.SlackId:
+      return "U0ABCDE12";
+    default:
+      return "value";
+  }
 }

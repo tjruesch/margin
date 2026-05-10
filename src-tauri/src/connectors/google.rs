@@ -356,7 +356,7 @@ fn map_event(
                         .map(|e| e.eq_ignore_ascii_case(&email_lc))
                         .unwrap_or(false),
                     is_organizer: true,
-                    team_member_id: resolver.resolve(&email_lc, org.display_name.as_deref()),
+                    team_member_id: resolver.resolve_attendee(&email_lc, org.display_name.as_deref()),
                 });
             }
         }
@@ -381,7 +381,7 @@ fn map_event(
             response_status: raw_a.response_status,
             is_self,
             is_organizer,
-            team_member_id: resolver.resolve(&email, raw_a.display_name.as_deref()),
+            team_member_id: resolver.resolve_attendee(&email, raw_a.display_name.as_deref()),
         });
     }
 
@@ -671,7 +671,7 @@ fn map_message(
                     continue;
                 }
                 recipients.push(EmailRecipient {
-                    team_member_id: resolver.resolve(&email, name.as_deref()),
+                    team_member_id: resolver.resolve_attendee(&email, name.as_deref()),
                     email,
                     display_name: name,
                     recipient_type: kind.to_string(),
@@ -902,12 +902,18 @@ mod tests {
     use super::*;
     use crate::team::TeamMember;
 
-    fn mk_member(id: &str, name: &str, aliases: &[&str]) -> TeamMember {
+    fn mk_member(id: &str, name: &str, aliases: &[(&str, &str)]) -> TeamMember {
         TeamMember {
             id: id.to_string(),
             display_name: name.to_string(),
             role: String::new(),
-            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            aliases: aliases
+                .iter()
+                .map(|(k, v)| crate::team::TypedAlias {
+                    kind: (*k).to_string(),
+                    value: (*v).to_string(),
+                })
+                .collect(),
             profile_md_path: String::new(),
             is_self: false,
             created_ms: 0,
@@ -1004,7 +1010,7 @@ mod tests {
             }),
             updated: Some("2026-05-09T12:00:00Z".into()),
         };
-        let members = [mk_member("hk1", "Heike", &["heike@example.com"])];
+        let members = [mk_member("hk1", "Heike", &[("email", "heike@example.com")])];
         let resolver = AttendeeResolver::new(&members);
         let ev = map_event("google:tj@example.com", raw, &resolver, Some("tj@example.com"));
 

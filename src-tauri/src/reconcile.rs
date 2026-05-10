@@ -362,7 +362,7 @@ fn format_attendee_entry(member: &TeamMember, excerpt: &str) -> String {
     let alias_list: Vec<&str> = member
         .aliases
         .iter()
-        .map(|a| a.trim())
+        .map(|a| a.value.trim())
         .filter(|a| !a.is_empty())
         .collect();
     if !alias_list.is_empty() {
@@ -770,12 +770,18 @@ mod tests {
         assert_eq!(got, "first part second part");
     }
 
-    fn member(name: &str, role: &str, aliases: &[&str], is_self: bool) -> TeamMember {
+    fn member(name: &str, role: &str, aliases: &[(&str, &str)], is_self: bool) -> TeamMember {
         TeamMember {
             id: format!("{}-id", name.to_ascii_lowercase()),
             display_name: name.into(),
             role: role.into(),
-            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            aliases: aliases
+                .iter()
+                .map(|(k, v)| crate::team::TypedAlias {
+                    kind: (*k).to_string(),
+                    value: (*v).to_string(),
+                })
+                .collect(),
             profile_md_path: format!("/tmp/{}.md", name),
             is_self,
             created_ms: 0,
@@ -830,7 +836,7 @@ mod tests {
     fn format_attendees_section_marks_self_and_omits_empty_fields() {
         let entries = vec![
             (
-                member("Tom Ruesch", "CEO", &["TJ", "Tom"], true),
+                member("Tom Ruesch", "CEO", &[("name", "TJ"), ("name", "Tom")], true),
                 "Leads engineering.".to_string(),
             ),
             (member("Sarah Smith", "", &[], false), String::new()),

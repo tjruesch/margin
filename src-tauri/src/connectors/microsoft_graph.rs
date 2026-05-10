@@ -438,7 +438,7 @@ pub(crate) fn map_event(
                     response_status: Some("organizer".to_string()),
                     is_self: self_email.map(|e| e.eq_ignore_ascii_case(&email_lc)).unwrap_or(false),
                     is_organizer: true,
-                    team_member_id: resolver.resolve(&email_lc, org.name.as_deref()),
+                    team_member_id: resolver.resolve_attendee(&email_lc, org.name.as_deref()),
                 });
             }
         }
@@ -463,7 +463,7 @@ pub(crate) fn map_event(
             response_status: raw_a.status.and_then(|s| s.response),
             is_self: self_email.map(|e| e.eq_ignore_ascii_case(&email)).unwrap_or(false),
             is_organizer: false,
-            team_member_id: resolver.resolve(&email, None),
+            team_member_id: resolver.resolve_attendee(&email, None),
         });
     }
 
@@ -651,7 +651,7 @@ pub(crate) fn map_message(
                 continue;
             }
             recipients.push(EmailRecipient {
-                team_member_id: resolver.resolve(&email, addr.name.as_deref()),
+                team_member_id: resolver.resolve_attendee(&email, addr.name.as_deref()),
                 email,
                 display_name: addr.name,
                 recipient_type: kind.to_string(),
@@ -699,52 +699,91 @@ fn percent_encode_path(s: &str) -> String {
 
 // ----- Attendee resolver -------------------------------------------------
 
-/// Resolve an attendee's `email` (and optional display name) to a
-/// `team_member_id`, if Margin knows the person.
-///
-/// Strategy:
-///   1. Email match: lowercased email vs. team_member's display_name
-///      (some teams use email-as-name) AND any of their aliases.
-///   2. Name match: display_name through the existing
-///      `team::OwnerResolver` (handles diacritic-insensitive
-///      first-name matching).
-///
-/// `OwnerResolver` is in #[allow(dead_code)] until owner resolution
-/// expands beyond the action-items pipeline; we hold a reference here.
+/// Resolve a person identifier (email, GitHub login, Slack id, …) to a
+/// `team_member_id`, if Margin knows the person. Each alias kind has
+/// its own lookup map built from the typed `team_member_aliases` rows
+/// (#87). Connectors call the per-kind methods directly; the email +
+/// calendar pipelines use the convenience `resolve_attendee` shim that
+/// preserves the existing email-then-name fallback.
 pub(crate) struct AttendeeResolver<'a> {
+    by_email: HashMap<String, String>,        // email_lc → team_member_id
+    by_github_login: HashMap<String, String>, // login_lc → team_member_id
+    by_slack_id: HashMap<String, String>,     // slack_id → team_member_id (case-preserved)
     by_name: OwnerResolver,
-    by_email: HashMap<String, String>, // email_lc → team_member_id
     _members: &'a [TeamMember],
 }
 
 impl<'a> AttendeeResolver<'a> {
     pub(crate) fn new(members: &'a [TeamMember]) -> Self {
         let mut by_email: HashMap<String, String> = HashMap::new();
+        let mut by_github_login: HashMap<String, String> = HashMap::new();
+        let mut by_slack_id: HashMap<String, String> = HashMap::new();
         for m in members {
             // Some teams put the email itself as display_name; treat
-            // that as an email key too.
+            // that as an email key too — preserves prior behavior.
             if m.display_name.contains('@') {
                 by_email.insert(m.display_name.to_lowercase(), m.id.clone());
             }
             for alias in &m.aliases {
-                if alias.contains('@') {
-                    by_email.insert(alias.to_lowercase(), m.id.clone());
+                match alias.kind.as_str() {
+                    team::kinds::EMAIL => {
+                        by_email.insert(alias.value.to_lowercase(), m.id.clone());
+                    }
+                    team::kinds::GITHUB_LOGIN => {
+                        by_github_login.insert(alias.value.to_lowercase(), m.id.clone());
+                    }
+                    team::kinds::SLACK_ID => {
+                        // Slack ids are case-significant ("U0ABCDE")
+                        // but practically uppercase; index as-is.
+                        by_slack_id.insert(alias.value.clone(), m.id.clone());
+                    }
+                    // `name` aliases live in `OwnerResolver`; other
+                    // unknown kinds are dropped here and re-added when
+                    // a future resolver method is registered.
+                    _ => {}
                 }
             }
         }
         Self {
-            by_name: OwnerResolver::from_members(members),
             by_email,
+            by_github_login,
+            by_slack_id,
+            by_name: OwnerResolver::from_members(members),
             _members: members,
         }
     }
 
-    pub(crate) fn resolve(&self, email_lc: &str, display_name: Option<&str>) -> Option<String> {
-        if let Some(id) = self.by_email.get(email_lc) {
-            return Some(id.clone());
+    pub(crate) fn resolve_by_email(&self, email_lc: &str) -> Option<String> {
+        self.by_email.get(email_lc).cloned()
+    }
+
+    pub(crate) fn resolve_by_name(&self, name: &str) -> Option<String> {
+        self.by_name.resolve(name)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolve_by_github_login(&self, login: &str) -> Option<String> {
+        self.by_github_login.get(&login.to_lowercase()).cloned()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolve_by_slack_id(&self, slack_id: &str) -> Option<String> {
+        self.by_slack_id.get(slack_id).cloned()
+    }
+
+    /// Combined helper preserving the existing email-then-name dispatch
+    /// used by every email/calendar connector. New connectors that
+    /// don't carry both kinds should call the per-kind methods directly.
+    pub(crate) fn resolve_attendee(
+        &self,
+        email_lc: &str,
+        display_name: Option<&str>,
+    ) -> Option<String> {
+        if let Some(id) = self.resolve_by_email(email_lc) {
+            return Some(id);
         }
         if let Some(name) = display_name {
-            if let Some(id) = self.by_name.resolve(name) {
+            if let Some(id) = self.resolve_by_name(name) {
                 return Some(id);
             }
         }
@@ -793,12 +832,18 @@ use chrono::TimeZone as _;
 mod tests {
     use super::*;
 
-    fn mk_member(id: &str, name: &str, aliases: &[&str]) -> TeamMember {
+    fn mk_member(id: &str, name: &str, aliases: &[(&str, &str)]) -> TeamMember {
         TeamMember {
             id: id.to_string(),
             display_name: name.to_string(),
             role: String::new(),
-            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+            aliases: aliases
+                .iter()
+                .map(|(k, v)| team::TypedAlias {
+                    kind: (*k).to_string(),
+                    value: (*v).to_string(),
+                })
+                .collect(),
             profile_md_path: String::new(),
             is_self: false,
             created_ms: 0,
@@ -850,7 +895,7 @@ mod tests {
             etag: Some("W/\"abc\"".to_string()),
             last_modified: Some("2026-05-09T12:34:56Z".to_string()),
         };
-        let members = [mk_member("hk1", "Heike", &["heike@example.com"])];
+        let members = [mk_member("hk1", "Heike", &[("email", "heike@example.com")])];
         let resolver = AttendeeResolver::new(&members);
         let ev = map_event("microsoft_graph:tj@example.com", raw, &resolver, Some("tj@example.com"));
 
@@ -929,11 +974,11 @@ mod tests {
 
     #[test]
     fn attendee_resolver_email_match() {
-        let members = [mk_member("hk1", "Heike Müller", &["heike@contoso.com"])];
+        let members = [mk_member("hk1", "Heike Müller", &[("email", "heike@contoso.com")])];
         let r = AttendeeResolver::new(&members);
-        assert_eq!(r.resolve("heike@contoso.com", None).as_deref(), Some("hk1"));
+        assert_eq!(r.resolve_attendee("heike@contoso.com", None).as_deref(), Some("hk1"));
         // Case-insensitive
-        assert_eq!(r.resolve("Heike@CONTOSO.com".to_lowercase().as_str(), None).as_deref(), Some("hk1"));
+        assert_eq!(r.resolve_attendee("Heike@CONTOSO.com".to_lowercase().as_str(), None).as_deref(), Some("hk1"));
     }
 
     #[test]
@@ -941,13 +986,47 @@ mod tests {
         let members = [mk_member("hk1", "Heike Müller", &[])];
         let r = AttendeeResolver::new(&members);
         // Email not registered as alias.
-        assert_eq!(r.resolve("unknown@x.com", Some("Heike Müller")).as_deref(), Some("hk1"));
+        assert_eq!(r.resolve_attendee("unknown@x.com", Some("Heike Müller")).as_deref(), Some("hk1"));
     }
 
     #[test]
     fn attendee_resolver_no_match_returns_none() {
         let r = AttendeeResolver::new(&[]);
-        assert!(r.resolve("nobody@nope.com", Some("Nobody")).is_none());
+        assert!(r.resolve_attendee("nobody@nope.com", Some("Nobody")).is_none());
+    }
+
+    #[test]
+    fn attendee_resolver_resolves_by_github_login() {
+        let members = [mk_member(
+            "hk1",
+            "Heike Müller",
+            &[("github_login", "heike-mueller")],
+        )];
+        let r = AttendeeResolver::new(&members);
+        assert_eq!(r.resolve_by_github_login("heike-mueller").as_deref(), Some("hk1"));
+        // Case-insensitive
+        assert_eq!(r.resolve_by_github_login("Heike-Mueller").as_deref(), Some("hk1"));
+        // Email map untouched by a github_login alias.
+        assert!(r.resolve_by_email("heike-mueller").is_none());
+    }
+
+    #[test]
+    fn attendee_resolver_resolves_by_slack_id() {
+        let members = [mk_member("hk1", "Heike Müller", &[("slack_id", "U0ABCDE12")])];
+        let r = AttendeeResolver::new(&members);
+        assert_eq!(r.resolve_by_slack_id("U0ABCDE12").as_deref(), Some("hk1"));
+        // Slack ids are case-significant; lowercase shouldn't match.
+        assert!(r.resolve_by_slack_id("u0abcde12").is_none());
+    }
+
+    #[test]
+    fn attendee_resolver_kinds_are_isolated() {
+        // A `name` alias whose value matches an email local part should
+        // not leak into the email map (#87).
+        let members = [mk_member("hk1", "Heike Müller", &[("name", "heike")])];
+        let r = AttendeeResolver::new(&members);
+        assert!(r.resolve_by_email("heike").is_none(), "no email alias was registered");
+        assert_eq!(r.resolve_by_name("heike").as_deref(), Some("hk1"));
     }
 
     fn mk_recip(email: &str, name: Option<&str>) -> RawRecipientWrapper {
@@ -1059,7 +1138,7 @@ mod tests {
 
     #[test]
     fn map_message_resolves_recipients_via_team() {
-        let members = [mk_member("hk1", "Heike Müller", &["heike@contoso.com"])];
+        let members = [mk_member("hk1", "Heike Müller", &[("email", "heike@contoso.com")])];
         let resolver = AttendeeResolver::new(&members);
         let raw = RawMessage {
             id: "MSG5".into(),
