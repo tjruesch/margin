@@ -644,6 +644,9 @@ pub fn run() {
             keychain::set_anthropic_api_key,
             keychain::delete_anthropic_api_key,
             keychain::has_anthropic_api_key,
+            keychain::set_firecrawl_api_key,
+            keychain::delete_firecrawl_api_key,
+            keychain::has_firecrawl_api_key,
             start_meeting_recording,
             stop_meeting_recording,
             start_voice_recording,
@@ -698,6 +701,7 @@ pub fn run() {
             workstreams::commands::set_workstream_owner,
             workstreams::commands::list_workstream_links,
             workstreams::commands::add_workstream_link,
+            workstreams::commands::add_workstream_link_from_url,
             workstreams::commands::remove_workstream_link,
             workstreams::commands::set_workstream_parent
         ])

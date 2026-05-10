@@ -9,20 +9,21 @@
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
   AliasKind,
   type EmailMessage,
   type ExternalParticipant,
-  LinkKind,
   type TeamMember,
   type Workstream,
   type WorkstreamAction,
   type WorkstreamDetail,
   type WorkstreamLink,
+  type WorkstreamLinkSummarizedEvent,
   type WorkstreamStatus,
-  addWorkstreamLink,
+  addWorkstreamLinkFromUrl,
   createTeamMember,
   getEmailBody,
   getWorkstreamDetails,
@@ -1389,13 +1390,18 @@ function ExternalChipModal({
 
 // ----- User-curated links (#88) -------------------------------------------
 
-const LINK_KIND_OPTIONS: Array<{ value: string; label: string }> = [
-  { value: LinkKind.GitHub, label: "GitHub" },
-  { value: LinkKind.Linear, label: "Linear" },
-  { value: LinkKind.Notion, label: "Notion" },
-  { value: LinkKind.Figma, label: "Figma" },
-  { value: LinkKind.Other, label: "Other" },
-];
+/// Subscribe to the backend's `workstream-link-summarized` event,
+/// which fires after the Firecrawl + Haiku background task lands a
+/// row. Returns the unlisten handle so callers can clean up on
+/// unmount.
+async function listenForSummary(
+  cb: (payload: WorkstreamLinkSummarizedEvent) => void,
+): Promise<() => void> {
+  return listen<WorkstreamLinkSummarizedEvent>(
+    "workstream-link-summarized",
+    (event) => cb(event.payload),
+  );
+}
 
 function LinksSection({
   workstreamId,
@@ -1407,6 +1413,36 @@ function LinksSection({
   onLinksChanged: (next: WorkstreamLink[]) => void;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+
+  // The summarization background task fires `workstream-link-summarized`
+  // when it lands a row. Refs keep the listener stable across renders
+  // while still seeing the freshest props.
+  const linksRef = useRef(links);
+  const onLinksChangedRef = useRef(onLinksChanged);
+  useEffect(() => {
+    linksRef.current = links;
+  }, [links]);
+  useEffect(() => {
+    onLinksChangedRef.current = onLinksChanged;
+  }, [onLinksChanged]);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listenForSummary((payload) => {
+      const next = linksRef.current.map((l) =>
+        l.id === payload.link_id ? { ...l, summary: payload.summary } : l,
+      );
+      // Only re-render when this workstream actually owned the link;
+      // avoids unnecessary state updates on cross-workstream events.
+      if (next.some((l) => l.id === payload.link_id)) {
+        onLinksChangedRef.current(next);
+      }
+    }).then((stop) => {
+      unlisten = stop;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   const handleOpen = async (url: string) => {
     try {
@@ -1429,13 +1465,19 @@ function LinksSection({
     }
   };
 
-  const handleAdd = async (label: string, url: string, kind: string | null) => {
+  const handleAdd = async (url: string): Promise<string | null> => {
     try {
-      const created = await addWorkstreamLink(workstreamId, label, url, kind);
+      const created = await addWorkstreamLinkFromUrl(workstreamId, url);
       onLinksChanged([...links, created]);
       setComposerOpen(false);
+      return null;
     } catch (err) {
-      console.error("[workstreams] addWorkstreamLink failed", err);
+      console.error("[workstreams] addWorkstreamLinkFromUrl failed", err);
+      return typeof err === "string"
+        ? err
+        : err instanceof Error
+          ? err.message
+          : "Could not add link";
     }
   };
 
@@ -1463,20 +1505,33 @@ function LinksSection({
       {links.length > 0 ? (
         <div className="workstream-links-chips">
           {links.map((link) => (
-            <div className="workstream-link-chip" key={link.id}>
+            <div
+              className={
+                "workstream-link-chip" +
+                (link.summary ? " has-summary" : "")
+              }
+              key={link.id}
+            >
               <button
                 type="button"
                 className="workstream-link-chip-open"
                 onClick={() => void handleOpen(link.url)}
-                title={link.url}
+                title={link.summary ?? link.url}
               >
-                <IconBrand kind={link.kind} size={12} />
-                <span className="workstream-link-chip-label">
-                  {link.label}
+                <span className="workstream-link-chip-row">
+                  <IconBrand kind={link.kind} size={12} />
+                  <span className="workstream-link-chip-label">
+                    {link.label}
+                  </span>
+                  {link.kind ? (
+                    <span className="workstream-link-chip-kind">
+                      {link.kind}
+                    </span>
+                  ) : null}
                 </span>
-                {link.kind ? (
-                  <span className="workstream-link-chip-kind">
-                    {link.kind}
+                {link.summary ? (
+                  <span className="workstream-link-chip-summary">
+                    {link.summary}
                   </span>
                 ) : null}
               </button>
@@ -1496,7 +1551,7 @@ function LinksSection({
       {composerOpen ? (
         <LinkComposer
           onCancel={() => setComposerOpen(false)}
-          onSubmit={(label, url, kind) => void handleAdd(label, url, kind)}
+          onSubmit={(url) => handleAdd(url)}
         />
       ) : null}
     </section>
@@ -1508,73 +1563,55 @@ function LinkComposer({
   onSubmit,
 }: {
   onCancel: () => void;
-  onSubmit: (label: string, url: string, kind: string | null) => void;
+  /** Returns `null` on success (composer dismissed by parent), or an
+   *  error string the composer surfaces inline. */
+  onSubmit: (url: string) => Promise<string | null>;
 }) {
-  const [label, setLabel] = useState("");
   const [url, setUrl] = useState("");
-  const [kind, setKind] = useState<string>(LinkKind.Other);
-  const labelRef = useRef<HTMLInputElement | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const urlRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
-    labelRef.current?.focus();
+    urlRef.current?.focus();
   }, []);
 
-  const canSubmit = label.trim() !== "" && url.trim() !== "";
+  const canSubmit = url.trim() !== "" && !busy;
 
-  const submit = () => {
+  const submit = async () => {
     if (!canSubmit) return;
-    onSubmit(label.trim(), url.trim(), kind || null);
+    setBusy(true);
+    setError(null);
+    const err = await onSubmit(url.trim());
+    setBusy(false);
+    if (err) setError(err);
   };
 
   return (
-    <div className="workstream-link-composer">
+    <div className="workstream-link-composer workstream-link-composer-pasted">
       <input
-        ref={labelRef}
-        type="text"
-        className="workstream-link-composer-input"
-        placeholder="Label (e.g. Repo)"
-        value={label}
-        onChange={(e) => setLabel(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            submit();
-          } else if (e.key === "Escape") {
-            onCancel();
-          }
-        }}
-      />
-      <input
+        ref={urlRef}
         type="url"
         className="workstream-link-composer-input"
-        placeholder="https://…"
+        placeholder="Paste a URL — we'll name it for you"
         value={url}
+        disabled={busy}
         onChange={(e) => setUrl(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Enter") {
             e.preventDefault();
-            submit();
+            void submit();
           } else if (e.key === "Escape") {
             onCancel();
           }
         }}
       />
-      <select
-        className="workstream-link-composer-kind"
-        value={kind}
-        onChange={(e) => setKind(e.target.value)}
-      >
-        {LINK_KIND_OPTIONS.map((opt) => (
-          <option key={opt.value} value={opt.value}>
-            {opt.label}
-          </option>
-        ))}
-      </select>
       <div className="workstream-link-composer-actions">
         <button
           type="button"
           className="workstream-link-composer-cancel"
           onClick={onCancel}
+          disabled={busy}
         >
           Cancel
         </button>
@@ -1582,11 +1619,14 @@ function LinkComposer({
           type="button"
           className="workstream-link-composer-save"
           disabled={!canSubmit}
-          onClick={submit}
+          onClick={() => void submit()}
         >
-          Add
+          {busy ? "Naming…" : "Add"}
         </button>
       </div>
+      {error ? (
+        <p className="workstream-link-composer-error">{error}</p>
+      ) : null}
     </div>
   );
 }

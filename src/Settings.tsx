@@ -6,11 +6,14 @@ import {
   type ConnectorStatusEvent,
   deleteAnthropicApiKey,
   deleteConnector,
+  deleteFirecrawlApiKey,
   hasAnthropicApiKey,
+  hasFirecrawlApiKey,
   listConnectors,
   listOAuthProviders,
   type OAuthProviderInfo,
   setAnthropicApiKey,
+  setFirecrawlApiKey,
   startOAuthConnector,
 } from "./file";
 import {
@@ -518,8 +521,14 @@ function AISection({ ai, onChange }: AISectionProps) {
   const [saving, setSaving] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [hasFirecrawlKey, setHasFirecrawlKey] = useState<boolean>(false);
+  const [firecrawlDraft, setFirecrawlDraft] = useState<string>("");
+  const [firecrawlSaving, setFirecrawlSaving] = useState<boolean>(false);
+  const [firecrawlError, setFirecrawlError] = useState<string | null>(null);
+
   useEffect(() => {
     void hasAnthropicApiKey().then(setHasKey);
+    void hasFirecrawlApiKey().then(setHasFirecrawlKey);
   }, []);
 
   const onSaveKey = async () => {
@@ -555,6 +564,45 @@ function AISection({ ai, onChange }: AISectionProps) {
       setError(typeof e === "string" ? e : "Failed to remove key");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const onSaveFirecrawl = async () => {
+    const value = firecrawlDraft.trim();
+    if (!value) return;
+    setFirecrawlSaving(true);
+    setFirecrawlError(null);
+    try {
+      await setFirecrawlApiKey(value);
+      setFirecrawlDraft("");
+      setHasFirecrawlKey(true);
+    } catch (e) {
+      setFirecrawlError(typeof e === "string" ? e : "Failed to save key");
+    } finally {
+      setFirecrawlSaving(false);
+    }
+  };
+
+  const onRemoveFirecrawl = async () => {
+    const ok = await ask(
+      "This will clear the Firecrawl API key from your keychain. Workstream link summaries will stop populating until you paste it back.",
+      {
+        title: "Remove Firecrawl key?",
+        kind: "warning",
+        okLabel: "Remove",
+        cancelLabel: "Cancel",
+      },
+    );
+    if (!ok) return;
+    setFirecrawlSaving(true);
+    setFirecrawlError(null);
+    try {
+      await deleteFirecrawlApiKey();
+      setHasFirecrawlKey(false);
+    } catch (e) {
+      setFirecrawlError(typeof e === "string" ? e : "Failed to remove key");
+    } finally {
+      setFirecrawlSaving(false);
     }
   };
 
@@ -597,6 +645,55 @@ function AISection({ ai, onChange }: AISectionProps) {
             </span>
           </div>
           {error && <div className="settings-error">{error}</div>}
+        </div>
+      </div>
+
+      <div className="settings-row">
+        <div className="settings-row-label">Firecrawl API key</div>
+        <div className="settings-row-control settings-row-control--col">
+          <div className="settings-actions">
+            <input
+              type="password"
+              className="settings-input"
+              placeholder={
+                hasFirecrawlKey ? "•••••••• (saved in Keychain)" : "fc-…"
+              }
+              value={firecrawlDraft}
+              onChange={(e) => setFirecrawlDraft(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              className="ghost"
+              onClick={() => void onSaveFirecrawl()}
+              disabled={firecrawlSaving || !firecrawlDraft.trim()}
+            >
+              Save
+            </button>
+            {hasFirecrawlKey && (
+              <button
+                className="ghost"
+                onClick={() => void onRemoveFirecrawl()}
+                disabled={firecrawlSaving}
+              >
+                Remove
+              </button>
+            )}
+          </div>
+          <div className="settings-row-control">
+            <span
+              className={"settings-status " + (hasFirecrawlKey ? "ok" : "muted")}
+            >
+              {hasFirecrawlKey ? "Configured" : "Not configured"}
+            </span>
+            <span className="settings-hint">
+              Stored in macOS Keychain. Optional — without it, workstream
+              link chips won't populate AI-generated summaries.
+            </span>
+          </div>
+          {firecrawlError && (
+            <div className="settings-error">{firecrawlError}</div>
+          )}
         </div>
       </div>
 

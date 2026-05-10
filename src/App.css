@@ -5582,6 +5582,10 @@ button.workstream-external-chip:hover {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  /* Reserve the row height so the heading doesn't jump when the
+     "+ Add link" button hides on composer open. Matches the button's
+     1px border + ~6.5px vertical padding + 12px line-height. */
+  min-height: 28px;
 }
 .workstream-links-title {
   margin: 0;
@@ -5674,6 +5678,41 @@ button.workstream-external-chip:hover {
   background: var(--bg-soft, rgba(0, 0, 0, 0.04));
   color: var(--danger, #b00020);
 }
+
+/* Two-line variant — kicks in once the AI summary lands. The chip
+   stops being a pill (rounded rect makes the second line readable),
+   and the open button stacks header row + summary line vertically.
+   We allow up to ~2 rendered lines of summary via line-clamp; the
+   full text stays accessible via the title="" tooltip. */
+.workstream-link-chip.has-summary {
+  align-items: stretch;
+  border-radius: 10px;
+}
+.workstream-link-chip.has-summary .workstream-link-chip-open {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 6px 12px;
+  max-width: 360px;
+}
+.workstream-link-chip-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+.workstream-link-chip-summary {
+  font-size: 11.5px;
+  font-style: italic;
+  color: var(--fg-muted);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
 .workstream-link-composer {
   display: grid;
   grid-template-columns: 1fr 1fr 130px;
@@ -5683,6 +5722,32 @@ button.workstream-external-chip:hover {
   border: 1px solid var(--home-line);
   border-radius: 8px;
   background: var(--bg, #fff);
+}
+/* Paste-only variant: URL input + actions on a single inline row,
+   no chrome wrapper. Haiku derives label + kind in the background,
+   so the input is the whole UI. */
+.workstream-link-composer-pasted {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+.workstream-link-composer-pasted .workstream-link-composer-input {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.workstream-link-composer-pasted .workstream-link-composer-actions {
+  display: contents;
+}
+.workstream-link-composer-error {
+  flex-basis: 100%;
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--danger, #b00020);
 }
 .workstream-link-composer-input,
 .workstream-link-composer-kind {

@@ -1234,14 +1234,31 @@ fn format_workstream_detail(
         for link in &detail.links {
             let label = link.label.trim();
             let url = link.url.trim();
-            match link.kind.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
-                Some(kind) => {
-                    s.push_str(&format!("- [{label}]({url}) ({kind})\n"));
-                }
-                None => {
-                    s.push_str(&format!("- [{label}]({url})\n"));
-                }
-            }
+            let kind_suffix = match link
+                .kind
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+            {
+                Some(kind) => format!(" ({kind})"),
+                None => String::new(),
+            };
+            // Append the AI-generated summary (#?) when populated. The
+            // chip view shows the same text inline; including it here
+            // means "what does this link describe?" questions land
+            // without an extra tool call.
+            let summary_suffix = match link
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(summary) => format!(" — {summary}"),
+                None => String::new(),
+            };
+            s.push_str(&format!(
+                "- [{label}]({url}){kind_suffix}{summary_suffix}\n"
+            ));
         }
     }
 
@@ -2138,6 +2155,7 @@ mod tests {
                     kind: Some("github".into()),
                     position: 0,
                     created_ms: 0,
+                    summary: None,
                 },
                 crate::workstreams::WorkstreamLink {
                     id: "wsl_2".into(),
@@ -2147,6 +2165,7 @@ mod tests {
                     kind: None,
                     position: 1,
                     created_ms: 0,
+                    summary: None,
                 },
             ],
             children: Vec::new(),
@@ -2203,6 +2222,67 @@ mod tests {
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W5", &detail, &team_map);
         assert!(!out.contains("## Links"));
+    }
+
+    #[test]
+    fn format_workstream_detail_appends_link_summary_when_set() {
+        let detail = WorkstreamDetail {
+            workstream: Workstream {
+                id: "ws_links".into(),
+                title: "Bridge".into(),
+                summary: "".into(),
+                status: "active".into(),
+                last_activity_ms: 0,
+                created_ms: 0,
+                updated_ms: 0,
+                user_notes: None,
+                archived_at_ms: None,
+                reopened_at_ms: None,
+                owner_member_id: None,
+                members: Vec::new(),
+                email_count: 0,
+                event_count: 0,
+                note_count: 0,
+                open_action_count: 0,
+                link_count: 1,
+                parent_workstream_id: None,
+                external_participants: Vec::new(),
+            },
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![],
+            links: vec![
+                crate::workstreams::WorkstreamLink {
+                    id: "wsl_1".into(),
+                    workstream_id: "ws_links".into(),
+                    label: "Repo".into(),
+                    url: "https://github.com/x/y".into(),
+                    kind: Some("github".into()),
+                    position: 0,
+                    created_ms: 0,
+                    summary: Some("A small Rust crate for X.".into()),
+                },
+                crate::workstreams::WorkstreamLink {
+                    id: "wsl_2".into(),
+                    workstream_id: "ws_links".into(),
+                    label: "Spec".into(),
+                    url: "https://docs.example.com".into(),
+                    kind: None,
+                    position: 1,
+                    created_ms: 0,
+                    summary: None,
+                },
+            ],
+            children: Vec::new(),
+        };
+        let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let out = format_workstream_detail("W6", &detail, &team_map);
+        assert!(out.contains(
+            "- [Repo](https://github.com/x/y) (github) — A small Rust crate for X.\n"
+        ));
+        // No summary suffix on the second link.
+        assert!(out.contains("- [Spec](https://docs.example.com)\n"));
     }
 
     #[test]
