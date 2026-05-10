@@ -38,6 +38,10 @@ const MAX_BODY_FETCHES: usize = 100;
 
 const MAX_TOKENS: u32 = 8192;
 
+/// Cap on user_notes length when included in the synthesizer prompt
+/// (#77). DB has no cap; this only protects the token budget.
+const USER_NOTES_PROMPT_CAP: usize = 4000;
+
 const SYSTEM_PROMPT: &str = "You are a workstream synthesizer. Given a user's recent emails, calendar events, \
 and notes, group them into 3-15 active workstreams: ongoing efforts the user is participating in \
 (projects, hiring loops, vendor evaluations, support escalations, etc.).
@@ -45,6 +49,11 @@ and notes, group them into 3-15 active workstreams: ongoing efforts the user is 
 Stickiness: an \"Existing workstreams\" section lists workstream ids already in the database. When new \
 items naturally extend one of those, REUSE its id verbatim. Spawn a new workstream only when no \
 existing one is a clean fit.
+
+Some existing workstreams may carry an indented \"Notes:\" line — these are user-authored ground truth. \
+Treat them as authoritative: prefer them when reconciling new evidence, never write a summary that \
+contradicts them. If the notes describe scope, ownership, deadlines, or identity that conflicts \
+with what the recent items suggest, the notes win.
 
 Titles: short, specific, proper-noun-leaning (\"Hyundai POC review\", \"Q3 sourcing\", \
 \"Bridge integration\") — not generic (\"Project work\", \"Various meetings\").
@@ -361,6 +370,13 @@ fn build_user_message(
                 w.title,
                 summarize_one_line(&w.summary)
             ));
+            if let Some(notes) = w.user_notes.as_deref().filter(|s| !s.trim().is_empty()) {
+                let collapsed = collapse_ws(notes);
+                let truncated = truncate_chars(&collapsed, USER_NOTES_PROMPT_CAP);
+                s.push_str(&format!(
+                    "   Notes (user-authored, ground truth): {truncated}\n"
+                ));
+            }
         }
     }
 
@@ -505,6 +521,16 @@ fn summarize_one_line(s: &str) -> String {
         let truncated: String = collapsed.chars().take(200).collect();
         format!("{}…", truncated)
     }
+}
+
+/// Char-aware truncation with a `…` suffix when over the cap. Preserves
+/// UTF-8 boundaries.
+fn truncate_chars(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(cap).collect();
+    format!("{truncated}…")
 }
 
 fn format_from(email: &str, name: Option<&str>) -> String {

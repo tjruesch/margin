@@ -69,6 +69,11 @@ const WORKSTREAM_CAP: usize = 30;
 const WORKSTREAM_DETAIL_TOP_N: usize = 5;
 /// Per-workstream summary cap when listed in the prompt section.
 const WORKSTREAM_SUMMARY_CAP: usize = 200;
+/// Cap on user_notes length when included in any prompt (#77). DB has
+/// no cap; this only protects the token budget. Mirrors the same
+/// constant in `workstreams::synthesizer` so the two consumers
+/// truncate identically.
+const USER_NOTES_PROMPT_CAP: usize = 4000;
 
 /// Emitted on the unified `ai-stream` channel. The frontend filters by
 /// `turn_id` so a stale stream that arrives after the user navigates
@@ -1161,6 +1166,20 @@ fn format_workstream_detail(
         s.push_str(&format!("\n{}\n", detail.workstream.summary.trim()));
     }
 
+    // User-authored notes are ground truth (#77). Surface in full near
+    // the top so the model reads them before reasoning about the
+    // synthesized summary or any inferred state.
+    if let Some(notes) = detail
+        .workstream
+        .user_notes
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        s.push_str("\nUser notes (ground truth):\n");
+        s.push_str(&truncate_chars(notes.trim(), USER_NOTES_PROMPT_CAP));
+        s.push('\n');
+    }
+
     // Actions: open first, then recently done.
     if !detail.actions.is_empty() {
         let open: Vec<&crate::workstreams::WorkstreamAction> =
@@ -1515,6 +1534,13 @@ fn format_workstreams_section(workstreams: &[crate::workstreams::Workstream]) ->
                 counts = counts_suffix,
             ),
         );
+        // User-authored ground truth (#77). Show a one-line excerpt
+        // here so the model knows it exists; the full text is in the
+        // `read_workstream` tool result.
+        if let Some(notes) = w.user_notes.as_deref().filter(|s| !s.trim().is_empty()) {
+            let one_line = workstream_one_line_summary(notes);
+            s.push_str(&format!("    (user notes: {one_line})\n"));
+        }
     }
     s.push('\n');
     s
@@ -1673,6 +1699,7 @@ mod tests {
             last_activity_ms: last_activity,
             created_ms: 0,
             updated_ms: 0,
+            user_notes: None,
             email_count: 0,
             event_count: 0,
             note_count: 0,
@@ -1757,6 +1784,7 @@ mod tests {
                 last_activity_ms: 1000,
                 created_ms: 0,
                 updated_ms: 0,
+                user_notes: None,
                 email_count: 2,
                 event_count: 0,
                 note_count: 1,
@@ -1805,6 +1833,7 @@ mod tests {
                 last_activity_ms: 1000,
                 created_ms: 0,
                 updated_ms: 0,
+                user_notes: None,
                 email_count: emails.len() as u32,
                 event_count: 0,
                 note_count: 0,
@@ -1831,6 +1860,49 @@ mod tests {
     }
 
     #[test]
+    fn format_workstreams_section_one_line_excerpt_when_user_notes_present() {
+        let mut a = make_ws("ws_a", "Hyundai POC", "Final invoice details.", 100);
+        a.user_notes = Some("Real deadline May 30 (calendar shows June). TJ owns this internally.".into());
+        let out = format_workstreams_section(&[a]);
+        assert!(out.contains("[W1] Hyundai POC"));
+        assert!(
+            out.contains("(user notes: Real deadline May 30"),
+            "expected one-line user notes excerpt, got: {out}"
+        );
+    }
+
+    #[test]
+    fn format_workstream_detail_includes_user_notes_block() {
+        let detail = WorkstreamDetail {
+            workstream: Workstream {
+                id: "ws_n".into(),
+                title: "Hyundai POC".into(),
+                summary: "Invoicing in flight.".into(),
+                status: "active".into(),
+                last_activity_ms: 1000,
+                created_ms: 0,
+                updated_ms: 0,
+                user_notes: Some("Real deadline May 30. New POC, not legacy contract.".into()),
+                email_count: 0,
+                event_count: 0,
+                note_count: 0,
+                open_action_count: 0,
+            },
+            emails: vec![],
+            events: vec![],
+            notes: vec![],
+            actions: vec![],
+        };
+        let out = format_workstream_detail("W1", &detail);
+        assert!(out.contains("# [W1] Hyundai POC"));
+        // Summary still rendered.
+        assert!(out.contains("Invoicing in flight."));
+        // User notes block present, full text (under the cap).
+        assert!(out.contains("User notes (ground truth):"));
+        assert!(out.contains("Real deadline May 30. New POC, not legacy contract."));
+    }
+
+    #[test]
     fn format_workstream_detail_handles_empty_summary_and_actions() {
         let detail = WorkstreamDetail {
             workstream: Workstream {
@@ -1841,6 +1913,7 @@ mod tests {
                 last_activity_ms: 0,
                 created_ms: 0,
                 updated_ms: 0,
+                user_notes: None,
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,

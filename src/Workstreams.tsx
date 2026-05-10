@@ -6,7 +6,7 @@
 //! pipeline added in #70 and listens for `workstream-status` to
 //! refetch.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   type EmailMessage,
@@ -19,6 +19,7 @@ import {
   openOrCreateEventNote,
   setWorkstreamActionDone,
   setWorkstreamStatus,
+  setWorkstreamUserNotes,
 } from "./file";
 import { IconChevLeft } from "./icons";
 
@@ -271,6 +272,14 @@ function WorkstreamDetailView({
       />
       <p className="workstream-detail-summary">{detail.summary}</p>
 
+      <WorkstreamUserNotes
+        workstreamId={detail.id}
+        initialNotes={detail.user_notes}
+        onSaved={(notes) =>
+          setDetail((d) => (d ? { ...d, user_notes: notes } : d))
+        }
+      />
+
       <ActionsSection actions={detail.actions} onToggle={onToggleAction} />
 
       <EmailsSection emails={detail.emails} />
@@ -282,6 +291,133 @@ function WorkstreamDetailView({
 
       <NotesSection notes={detail.notes} onOpenNote={onOpenNote} />
     </div>
+  );
+}
+
+// ----- User notes (#77) ----------------------------------------------------
+
+type SaveStatus = "idle" | "saving" | "saved" | "error";
+
+function WorkstreamUserNotes({
+  workstreamId,
+  initialNotes,
+  onSaved,
+}: {
+  workstreamId: string;
+  initialNotes: string | null;
+  onSaved: (notes: string | null) => void;
+}) {
+  const [draft, setDraft] = useState<string>(initialNotes ?? "");
+  const [editing, setEditing] = useState<boolean>(!!initialNotes);
+  const [status, setStatus] = useState<SaveStatus>("idle");
+
+  // Re-seed when navigating between workstreams. The detail view
+  // unmount/remounts on selectedId change, but useState keeps initial
+  // values across renders — guard by id.
+  const seededIdRef = useRef<string>(workstreamId);
+  useEffect(() => {
+    if (seededIdRef.current !== workstreamId) {
+      seededIdRef.current = workstreamId;
+      setDraft(initialNotes ?? "");
+      setEditing(!!initialNotes);
+      setStatus("idle");
+    }
+  }, [workstreamId, initialNotes]);
+
+  // Latest persisted text — used for revert-on-error and to detect
+  // no-op saves.
+  const persistedRef = useRef<string | null>(initialNotes);
+  // Latest workstream id at fire time so a debounced save that resolves
+  // after the user navigates away doesn't mis-patch a different
+  // workstream.
+  const idRef = useRef<string>(workstreamId);
+  useEffect(() => {
+    idRef.current = workstreamId;
+  }, [workstreamId]);
+
+  const save = useCallback(
+    async (text: string) => {
+      const idAtFire = idRef.current;
+      const normalized = text.trim().length === 0 ? null : text;
+      if (normalized === persistedRef.current) {
+        return; // no-op, draft matches DB
+      }
+      setStatus("saving");
+      try {
+        await setWorkstreamUserNotes(idAtFire, normalized);
+        // If the user navigated to a different workstream while this
+        // was in flight, drop the patch on the floor.
+        if (idAtFire !== idRef.current) return;
+        persistedRef.current = normalized;
+        onSaved(normalized);
+        setStatus("saved");
+      } catch (e) {
+        console.error("[workstreams] save user notes failed", e);
+        if (idAtFire !== idRef.current) return;
+        setStatus("error");
+      }
+    },
+    [onSaved],
+  );
+
+  // 600ms debounce on draft change. Fires when the user pauses typing.
+  useEffect(() => {
+    if (!editing) return;
+    if ((draft || "") === (persistedRef.current ?? "")) return;
+    const t = window.setTimeout(() => {
+      void save(draft);
+    }, 600);
+    return () => window.clearTimeout(t);
+  }, [draft, editing, save]);
+
+  // Auto-clear the "saved" indicator after a beat so it doesn't sit
+  // there permanently.
+  useEffect(() => {
+    if (status !== "saved") return;
+    const t = window.setTimeout(() => setStatus("idle"), 1500);
+    return () => window.clearTimeout(t);
+  }, [status]);
+
+  if (!editing) {
+    return (
+      <section className="workstream-user-notes is-empty">
+        <button
+          type="button"
+          className="workstream-user-notes-add-link"
+          onClick={() => setEditing(true)}
+        >
+          Add context…
+        </button>
+      </section>
+    );
+  }
+
+  return (
+    <section className="workstream-user-notes">
+      <div className="workstream-user-notes-head">
+        <span className="workstream-user-notes-label">Your notes</span>
+        <span
+          className={`workstream-user-notes-status status-${status}`}
+          aria-live="polite"
+        >
+          {status === "saving"
+            ? "Saving…"
+            : status === "saved"
+            ? "Saved"
+            : status === "error"
+            ? "Couldn't save — try again"
+            : ""}
+        </span>
+      </div>
+      <textarea
+        className="workstream-user-notes-textarea"
+        value={draft}
+        placeholder="Real deadline, internal owner, dollar value, scope clarifications…"
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => void save(draft)}
+        rows={4}
+      />
+    </section>
   );
 }
 

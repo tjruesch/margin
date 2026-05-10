@@ -501,6 +501,9 @@ export type Workstream = {
   last_activity_ms: number;
   created_ms: number;
   updated_ms: number;
+  /** User-authored ground-truth context (#77). The synthesizer treats
+   *  this as authoritative; AI ask surfaces it via read_workstream. */
+  user_notes: string | null;
   email_count: number;
   event_count: number;
   note_count: number;
@@ -571,6 +574,17 @@ export async function setWorkstreamStatus(
   status: WorkstreamStatus,
 ): Promise<void> {
   await invoke<void>("set_workstream_status", { id, status });
+}
+
+/** Update a workstream's user-authored context (#77). Pass `null` to
+ *  clear. Whitespace-only strings are treated as a clear by the
+ *  backend, which persists `NULL` so the prompt-omission downstream
+ *  stays simple. */
+export async function setWorkstreamUserNotes(
+  id: string,
+  notes: string | null,
+): Promise<void> {
+  await invoke<void>("set_workstream_user_notes", { id, notes });
 }
 
 export type NoteMeta = { modified_ms: number };
