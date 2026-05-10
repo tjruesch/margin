@@ -54,8 +54,11 @@ import {
   shareNote,
   listActions,
   listTeamMembers,
+  listWorkstreams,
+  synthesizeWorkstreams,
   type ActionListItem,
   type TeamMember,
+  type Workstream,
   startMeetingRecording,
   stopMeetingRecording,
   transcribe,
@@ -295,6 +298,15 @@ export default function App() {
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [notesLoading, setNotesLoading] = useState<boolean>(true);
   const [actions, setActions] = useState<ActionListItem[]>([]);
+  // Synthesized workstreams (#71). Populated by listWorkstreams on
+  // mount; refreshed when the synthesizer emits `workstream-status`.
+  const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
+  const [workstreamsLoading, setWorkstreamsLoading] = useState<boolean>(true);
+  // True while a synthesis pass is in flight (set on Refresh click and
+  // by `workstream-status: clustering` events from the boot tick).
+  const [synthInFlight, setSynthInFlight] = useState<boolean>(false);
+  // Toast slot below the Workstreams header. Auto-clears after 4s.
+  const [synthMessage, setSynthMessage] = useState<string | null>(null);
   // Team members for the assignee-chip dropdown on action rows (#51).
   // Loaded once at mount and refreshed on `margin:nav` events so adds /
   // edits / deletes done on the Team page are reflected next time the
@@ -432,6 +444,37 @@ export default function App() {
       setActions(items);
     } catch (err) {
       console.error("listActions failed:", err);
+    }
+  }, []);
+
+  const refreshWorkstreams = useCallback(async () => {
+    try {
+      const items = await listWorkstreams();
+      setWorkstreams(items);
+    } catch (err) {
+      console.error("listWorkstreams failed:", err);
+    } finally {
+      setWorkstreamsLoading(false);
+    }
+  }, []);
+
+  const triggerSynthesize = useCallback(async () => {
+    setSynthInFlight(true);
+    setSynthMessage(null);
+    try {
+      const report = await synthesizeWorkstreams(true);
+      if (report.state === "skipped") {
+        // The TTL skip path doesn't fire `workstream-status: synced`,
+        // so reset the spinner here.
+        setSynthInFlight(false);
+        setSynthMessage("Already up to date");
+      }
+      // For state === "synced" / "errored", the workstream-status
+      // listener flips synthInFlight off and refetches.
+    } catch (e) {
+      console.error("synthesizeWorkstreams failed:", e);
+      setSynthInFlight(false);
+      setSynthMessage(`Synthesis failed: ${String(e)}`);
     }
   }, []);
 
@@ -1213,6 +1256,46 @@ export default function App() {
     };
   }, []);
 
+  // Workstream synthesizer status (#71). Boot tick fires this with
+  // state "clustering" → "synced" / "errored" / "skipped". The boot
+  // happens ~5s after launch, so this listener has to be installed
+  // mount-first to catch it.
+  useEffect(() => {
+    const unlisten = listen<{ state: string; message?: string }>(
+      "workstream-status",
+      (e) => {
+        const s = e.payload.state;
+        if (s === "clustering") {
+          setSynthInFlight(true);
+          return;
+        }
+        if (s === "synced" || s === "errored" || s === "skipped") {
+          setSynthInFlight(false);
+          if (s === "errored" && e.payload.message) {
+            setSynthMessage(`Synthesis failed: ${e.payload.message}`);
+          }
+          void refreshWorkstreams();
+        }
+      },
+    );
+    return () => {
+      unlisten.then((u) => u());
+    };
+  }, [refreshWorkstreams]);
+
+  // Auto-clear the workstream toast after 4s.
+  useEffect(() => {
+    if (!synthMessage) return;
+    const t = setTimeout(() => setSynthMessage(null), 4000);
+    return () => clearTimeout(t);
+  }, [synthMessage]);
+
+  // Initial load + refetch when nav lands on workstreams via custom
+  // event (mirrors the team refetch pattern at the same handler).
+  useEffect(() => {
+    void refreshWorkstreams();
+  }, [refreshWorkstreams]);
+
   const onReloadFromDisk = useCallback(async () => {
     if (!externalChange) return;
     try {
@@ -1889,6 +1972,11 @@ export default function App() {
             onReassignAction={onReassignAction}
             notifications={notifications}
             onMarkAllNotificationsRead={markNotificationsRead}
+            workstreams={workstreams}
+            workstreamsLoading={workstreamsLoading}
+            synthInFlight={synthInFlight}
+            synthMessage={synthMessage}
+            onRefreshWorkstreams={() => void triggerSynthesize()}
           />
         )}
       </main>

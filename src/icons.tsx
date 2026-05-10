@@ -70,6 +70,13 @@ export const IconLink = (p: Props) => (
     <path d="M14 10a4 4 0 00-5.6 0l-3 3a4 4 0 105.6 5.6l1-1" />
   </Icon>
 );
+export const IconBriefcase = (p: Props) => (
+  <Icon {...p}>
+    <rect x="3" y="7" width="18" height="13" rx="2" />
+    <path d="M9 7V5a2 2 0 012-2h2a2 2 0 012 2v2" />
+    <path d="M3 12h18" />
+  </Icon>
+);
 export const IconMore = (p: Props) => (
   <Icon {...p}>
     <circle cx="5" cy="12" r="1.2" />
