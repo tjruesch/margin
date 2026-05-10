@@ -36,7 +36,7 @@ import {
   setWorkstreamUserNotes,
 } from "./file";
 import { DueChip } from "./Home";
-import { IconCheck, IconChevLeft, IconLink, IconPlus, IconTrash } from "./icons";
+import { IconCheck, IconChevLeft, IconLink, IconMore, IconPlus, IconTrash } from "./icons";
 import { avatarColor, initialsFromName } from "./initials";
 
 // ----- List view -----------------------------------------------------------
@@ -557,6 +557,7 @@ function WorkstreamDetailView({
   const [detail, setDetail] = useState<WorkstreamDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [missing, setMissing] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -667,7 +668,7 @@ function WorkstreamDetailView({
   if (loading && !detail) {
     return (
       <div className="workstream-view">
-        <DetailHeader title="" onBack={onBack} status={null} onChangeStatus={() => {}} />
+        <DetailHeader title="" onBack={onBack} />
         <p className="home-empty">Loading…</p>
       </div>
     );
@@ -675,7 +676,7 @@ function WorkstreamDetailView({
   if (missing || !detail) {
     return (
       <div className="workstream-view">
-        <DetailHeader title="Workstream" onBack={onBack} status={null} onChangeStatus={() => {}} />
+        <DetailHeader title="Workstream" onBack={onBack} />
         <p className="home-empty">Workstream not found.</p>
       </div>
     );
@@ -703,6 +704,17 @@ function WorkstreamDetailView({
   const isParentItself = allWorkstreams.some(
     (w) => w.parent_workstream_id === detail.id,
   );
+
+  const onChangeOwner = async (ownerId: string | null) => {
+    const prev = detail.owner_member_id;
+    setDetail((d) => (d ? { ...d, owner_member_id: ownerId } : d));
+    try {
+      await setWorkstreamOwner(detail.id, ownerId);
+    } catch (e) {
+      console.error("[workstreams] setWorkstreamOwner failed", e);
+      setDetail((d) => (d ? { ...d, owner_member_id: prev } : d));
+    }
+  };
 
   const onChangeParent = async (parentId: string | null) => {
     const prev = detail.parent_workstream_id;
@@ -747,26 +759,22 @@ function WorkstreamDetailView({
       <DetailHeader
         title={detail.title}
         onBack={onBack}
-        status={detail.status}
-        onChangeStatus={onChangeStatus}
-        ownerId={detail.owner_member_id}
-        teamMembers={teamMembers}
-        onChangeOwner={async (ownerId) => {
-          // Optimistic local update; revert on error.
-          const prev = detail.owner_member_id;
-          setDetail((d) => (d ? { ...d, owner_member_id: ownerId } : d));
-          try {
-            await setWorkstreamOwner(detail.id, ownerId);
-          } catch (e) {
-            console.error("[workstreams] setWorkstreamOwner failed", e);
-            setDetail((d) => (d ? { ...d, owner_member_id: prev } : d));
-          }
-        }}
-        parentId={detail.parent_workstream_id}
-        parentCandidates={parentCandidates}
-        onChangeParent={onChangeParent}
-        parentDisabled={isParentItself}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
+      {settingsOpen ? (
+        <WorkstreamSettingsModal
+          status={detail.status}
+          onChangeStatus={onChangeStatus}
+          ownerId={detail.owner_member_id}
+          teamMembers={teamMembers}
+          onChangeOwner={onChangeOwner}
+          parentId={detail.parent_workstream_id}
+          parentCandidates={parentCandidates}
+          onChangeParent={onChangeParent}
+          parentDisabled={isParentItself}
+          onClose={() => setSettingsOpen(false)}
+        />
+      ) : null}
       <p className="workstream-detail-summary">{detail.summary}</p>
 
       {detail.members.length > 0 || detail.owner_member_id ? (
@@ -827,6 +835,134 @@ function WorkstreamDetailView({
           onSelect={onNavigateTo}
         />
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * Settings modal for a workstream's owner / parent / status (#89).
+ * Replaces the three inline `<select>` chips that used to crowd the
+ * detail header. Each picker fires its handler optimistically — there
+ * is no Save button, the modal is just a less-cluttered home for the
+ * controls. Esc / backdrop click close.
+ */
+function WorkstreamSettingsModal({
+  status,
+  onChangeStatus,
+  ownerId,
+  teamMembers,
+  onChangeOwner,
+  parentId,
+  parentCandidates,
+  onChangeParent,
+  parentDisabled,
+  onClose,
+}: {
+  status: WorkstreamStatus | null;
+  onChangeStatus: (s: WorkstreamStatus) => void | Promise<void>;
+  ownerId: string | null;
+  teamMembers: TeamMember[];
+  onChangeOwner: (ownerId: string | null) => void | Promise<void>;
+  parentId: string | null;
+  parentCandidates: Workstream[];
+  onChangeParent: (parentId: string | null) => void | Promise<void>;
+  parentDisabled: boolean;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="settings-modal-backdrop"
+      role="presentation"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="settings-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Workstream settings"
+      >
+        <header className="settings-modal-header">
+          <h2>Workstream settings</h2>
+        </header>
+        <div className="settings-modal-rows">
+          <label className="settings-modal-row">
+            <span className="settings-modal-label">Owner</span>
+            <select
+              className="settings-modal-select"
+              value={ownerId ?? ""}
+              onChange={(e) => onChangeOwner(e.target.value || null)}
+            >
+              <option value="">Unassigned</option>
+              {teamMembers.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.display_name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="settings-modal-row">
+            <span className="settings-modal-label">Parent</span>
+            <select
+              className="settings-modal-select"
+              value={parentId ?? ""}
+              disabled={parentDisabled}
+              onChange={(e) => onChangeParent(e.target.value || null)}
+              title={
+                parentDisabled
+                  ? "This workstream has children — unparent them before assigning a parent here."
+                  : undefined
+              }
+            >
+              <option value="">No parent</option>
+              {parentCandidates.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.title}
+                </option>
+              ))}
+            </select>
+            {parentDisabled ? (
+              <span className="settings-modal-hint">
+                Has children — unparent them first.
+              </span>
+            ) : null}
+          </label>
+          {status ? (
+            <label className="settings-modal-row">
+              <span className="settings-modal-label">Status</span>
+              <select
+                className="settings-modal-select"
+                value={status}
+                onChange={(e) =>
+                  onChangeStatus(e.target.value as WorkstreamStatus)
+                }
+              >
+                <option value="active">Active</option>
+                <option value="snoozed">Snoozed</option>
+                <option value="archived">Archived</option>
+              </select>
+            </label>
+          ) : null}
+        </div>
+        <footer className="settings-modal-footer">
+          <button
+            type="button"
+            className="settings-modal-done"
+            onClick={onClose}
+          >
+            Done
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }
@@ -990,33 +1126,14 @@ function WorkstreamUserNotes({
 function DetailHeader({
   title,
   onBack,
-  status,
-  onChangeStatus,
-  ownerId,
-  teamMembers,
-  onChangeOwner,
-  parentId,
-  parentCandidates,
-  onChangeParent,
-  parentDisabled,
+  onOpenSettings,
 }: {
   title: string;
   onBack: () => void;
-  status: WorkstreamStatus | null;
-  onChangeStatus: (s: WorkstreamStatus) => void | Promise<void>;
-  ownerId?: string | null;
-  teamMembers?: TeamMember[];
-  onChangeOwner?: (ownerId: string | null) => void | Promise<void>;
-  /** Current parent id (#89). `null` = top-level. */
-  parentId?: string | null;
-  /** Workstreams the user is allowed to set as parent. The picker is
-   *  filtered to top-level (NULL-parent), no-children-yet, non-self
-   *  candidates by the caller. */
-  parentCandidates?: Workstream[];
-  onChangeParent?: (parentId: string | null) => void | Promise<void>;
-  /** Disabled when this workstream itself has children — the backend
-   *  rejects the write anyway; this lets the UI explain why. */
-  parentDisabled?: boolean;
+  /** Open the settings modal — owner, parent, status (#89). Omitted on
+   *  the loading / missing-workstream sub-states where there's nothing
+   *  to configure. */
+  onOpenSettings?: () => void;
 }) {
   return (
     <header className="workstream-header workstream-detail-header">
@@ -1030,53 +1147,16 @@ function DetailHeader({
         Back
       </button>
       <h1 className="workstream-title">{title}</h1>
-      {teamMembers && onChangeOwner ? (
-        <select
-          className="workstream-owner-select"
-          value={ownerId ?? ""}
-          onChange={(e) => onChangeOwner(e.target.value || null)}
-          aria-label="Workstream owner"
+      {onOpenSettings ? (
+        <button
+          type="button"
+          className="workstream-detail-settings-button"
+          onClick={onOpenSettings}
+          aria-label="Workstream settings"
+          title="Settings"
         >
-          <option value="">Unassigned</option>
-          {teamMembers.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.display_name}
-            </option>
-          ))}
-        </select>
-      ) : null}
-      {parentCandidates && onChangeParent ? (
-        <select
-          className="workstream-parent-select"
-          value={parentId ?? ""}
-          disabled={parentDisabled}
-          onChange={(e) => onChangeParent(e.target.value || null)}
-          aria-label="Workstream parent"
-          title={
-            parentDisabled
-              ? "This workstream has children — unparent them before assigning a parent here."
-              : "Set a parent workstream"
-          }
-        >
-          <option value="">No parent</option>
-          {parentCandidates.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.title}
-            </option>
-          ))}
-        </select>
-      ) : null}
-      {status ? (
-        <select
-          className="workstream-status"
-          value={status}
-          onChange={(e) => onChangeStatus(e.target.value as WorkstreamStatus)}
-          aria-label="Workstream status"
-        >
-          <option value="active">Active</option>
-          <option value="snoozed">Snoozed</option>
-          <option value="archived">Archived</option>
-        </select>
+          <IconMore size={18} sw={1.8} />
+        </button>
       ) : null}
     </header>
   );

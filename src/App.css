@@ -4948,25 +4948,128 @@ input.nh-title {
   font-weight: 500;
 }
 
-/* Parent picker (#89). Same chrome as the existing status pill so
-   the three pickers (status / owner / parent) align in the header. */
-.workstream-parent-select {
-  font: inherit;
-  font-size: 12.5px;
+/* Detail-header kebab button (#89). Replaces the three inline native
+   `<select>` chips with a single icon that opens the settings modal —
+   keeps the title row clean and gives the pickers room to breathe. */
+.workstream-detail-settings-button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 6px;
+  cursor: pointer;
   color: var(--fg-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.workstream-detail-settings-button:hover {
+  background: var(--bg-soft, rgba(0, 0, 0, 0.04));
+  color: var(--fg);
+  border-color: var(--home-line);
+}
+
+/* Settings modal (#89). Reuses the layout idiom from the identities
+   modal — dimmed backdrop, centered dialog, three labeled rows of
+   pickers. Each picker fires immediately; the Done button just
+   dismisses the modal. */
+.settings-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.settings-modal {
   background: var(--bg, #fff);
+  color: var(--fg);
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.settings-modal-header {
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--home-line);
+}
+.settings-modal-header h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.settings-modal-rows {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.settings-modal-row {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 12px;
+  align-items: center;
+}
+.settings-modal-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--fg-muted);
+}
+.settings-modal-select {
+  box-sizing: border-box;
+  height: 32px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 28px 0 10px;
   border: 1px solid var(--home-line);
   border-radius: 6px;
-  padding: 4px 10px;
-  cursor: pointer;
-}
-.workstream-parent-select:hover:not(:disabled) {
+  background: var(--bg, #fff);
   color: var(--fg);
-  border-color: var(--border-strong, rgba(0, 0, 0, 0.25));
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M3 4.5l3 3 3-3' fill='none' stroke='%23808080' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 10px 10px;
 }
-.workstream-parent-select:disabled {
+.settings-modal-select:focus {
+  outline: none;
+  border-color: var(--accent, #4a90e2);
+}
+.settings-modal-select:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+.settings-modal-hint {
+  grid-column: 2 / -1;
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  margin-top: -4px;
+}
+.settings-modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--home-line);
+}
+.settings-modal-done {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--accent, #4a90e2);
+  background: var(--accent, #4a90e2);
+  color: #fff;
+  cursor: pointer;
+}
+.settings-modal-done:hover {
+  filter: brightness(0.95);
 }
 
 /* Children section on a parent's detail view (#89). Same layout

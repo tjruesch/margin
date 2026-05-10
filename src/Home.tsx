@@ -23,7 +23,6 @@ import {
   IconArchive,
   IconBell,
   IconBriefcase,
-  IconCalendar,
   IconCheck,
   IconChecklist,
   IconChevRight,
@@ -96,7 +95,6 @@ type Props = {
 type NavId =
   | "home"
   | "actions"
-  | "meetings"
   | "workstreams"
   | "favorites"
   | "archive"
@@ -392,7 +390,6 @@ export function Home({
     const VALID: NavId[] = [
       "home",
       "actions",
-      "meetings",
       "workstreams",
       "favorites",
       "archive",
@@ -499,7 +496,6 @@ export function Home({
           active={nav}
           onSelect={setNav}
           actionCount={openActionCount}
-          meetingCount={upcoming.length}
           workstreamCount={workstreams.filter((w) => w.open_action_count > 0).length}
           tags={allTags}
           activeTag={tagFilter}
@@ -554,7 +550,7 @@ export function Home({
           onNewMeeting={onNewMeeting}
         />
 
-        {(nav === "home" || nav === "meetings") && upcoming.length > 0 && (
+        {nav === "home" && upcoming.length > 0 && (
           <UpcomingStrip events={upcoming} onOpen={openEventNote} />
         )}
 
@@ -585,7 +581,7 @@ export function Home({
           />
         ) : (
           <>
-            {openActionCount > 0 && (
+            {nav !== "favorites" && openActionCount > 0 && (
               <ActionItemsTeaser
                 items={actions}
                 onToggle={onToggleAction}
@@ -625,7 +621,6 @@ function Sidebar({
   active,
   onSelect,
   actionCount,
-  meetingCount,
   workstreamCount,
   tags,
   activeTag,
@@ -636,7 +631,6 @@ function Sidebar({
   active: NavId;
   onSelect: (id: NavId) => void;
   actionCount: number;
-  meetingCount: number;
   workstreamCount: number;
   tags: string[];
   activeTag: string | null;
@@ -675,13 +669,6 @@ function Sidebar({
           badge={actionCount > 0 ? String(actionCount) : null}
           active={active === "actions"}
           onClick={() => onSelect("actions")}
-        />
-        <NavItem
-          icon={<IconCalendar size={14} sw={1.7} />}
-          label="Meetings"
-          badge={meetingCount > 0 ? String(meetingCount) : null}
-          active={active === "meetings"}
-          onClick={() => onSelect("meetings")}
         />
         <NavItem
           icon={<IconBriefcase size={14} sw={1.7} />}
