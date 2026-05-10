@@ -1356,17 +1356,27 @@ function ExternalChipModal({
       }}
     >
       <div
-        className="settings-modal external-chip-modal"
+        className="external-chip-modal"
         role="dialog"
         aria-modal="true"
         aria-label={`Identity: ${displayName}`}
       >
-        <header className="settings-modal-header">
-          <h2>{displayName}</h2>
-          <p className="external-chip-modal-email">{participant.email}</p>
-          <p className="external-chip-modal-count">
+        <button
+          type="button"
+          className="external-chip-modal-close"
+          onClick={onClose}
+          disabled={busy}
+          aria-label="Close"
+          title="Close"
+        >
+          ×
+        </button>
+        <header className="external-chip-modal-header">
+          <h2 className="external-chip-modal-name">{displayName}</h2>
+          <div className="external-chip-modal-email">{participant.email}</div>
+          <div className="external-chip-modal-count">
             Seen on {participant.count} signal{participant.count === 1 ? "" : "s"} in this workstream
-          </p>
+          </div>
         </header>
         <div className="external-chip-modal-actions">
           <button
@@ -1388,16 +1398,6 @@ function ExternalChipModal({
         {addError ? (
           <p className="external-chip-modal-error">{addError}</p>
         ) : null}
-        <footer className="settings-modal-footer">
-          <button
-            type="button"
-            className="settings-modal-done"
-            onClick={onClose}
-            disabled={busy}
-          >
-            Close
-          </button>
-        </footer>
       </div>
     </div>
   );
