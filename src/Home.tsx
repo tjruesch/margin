@@ -18,9 +18,11 @@ import { type NotificationRecord, unreadCount } from "./notifications";
 import { NotificationsPanel } from "./NotificationsPanel";
 import { SearchPalette } from "./SearchPalette";
 import { TeamView, type EditorSettings as TeamEditorSettings } from "./Team";
+import { WorkstreamsView } from "./Workstreams";
 import {
   IconArchive,
   IconBell,
+  IconBriefcase,
   IconCalendar,
   IconCheck,
   IconChecklist,
@@ -83,12 +85,20 @@ type Props = {
   /** Stamp `read_at` on every unread notification. Called when the
    *  user opens the panel. */
   onMarkAllNotificationsRead: () => void;
+  /** Synthesized workstreams (#71). Cards in the Workstreams view. */
+  workstreams: import("./file").Workstream[];
+  workstreamsLoading: boolean;
+  synthInFlight: boolean;
+  synthMessage: string | null;
+  /** Force a synthesis pass via `synthesize_workstreams(true)`. */
+  onRefreshWorkstreams: () => void;
 };
 
 type NavId =
   | "home"
   | "actions"
   | "meetings"
+  | "workstreams"
   | "shared"
   | "favorites"
   | "archive"
@@ -289,6 +299,11 @@ export function Home({
   onReassignAction,
   notifications,
   onMarkAllNotificationsRead,
+  workstreams,
+  workstreamsLoading,
+  synthInFlight,
+  synthMessage,
+  onRefreshWorkstreams,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -380,6 +395,7 @@ export function Home({
       "home",
       "actions",
       "meetings",
+      "workstreams",
       "shared",
       "favorites",
       "archive",
@@ -476,6 +492,7 @@ export function Home({
           onSelect={setNav}
           actionCount={openActionCount}
           meetingCount={upcoming.length}
+          workstreamCount={workstreams.filter((w) => w.open_action_count > 0).length}
           tags={allTags}
           activeTag={tagFilter}
           onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
@@ -538,6 +555,15 @@ export function Home({
             onToggleAction={onToggleAction}
             onReassignAction={onReassignAction}
           />
+        ) : nav === "workstreams" ? (
+          <WorkstreamsView
+            workstreams={workstreams}
+            loading={workstreamsLoading}
+            synthInFlight={synthInFlight}
+            synthMessage={synthMessage}
+            onRefresh={onRefreshWorkstreams}
+            onOpenNote={onOpen}
+          />
         ) : nav === "actions" ? (
           <ActionsFeed
             actions={actions}
@@ -590,6 +616,7 @@ function Sidebar({
   onSelect,
   actionCount,
   meetingCount,
+  workstreamCount,
   tags,
   activeTag,
   onTagSelect,
@@ -600,6 +627,7 @@ function Sidebar({
   onSelect: (id: NavId) => void;
   actionCount: number;
   meetingCount: number;
+  workstreamCount: number;
   tags: string[];
   activeTag: string | null;
   onTagSelect: (tag: string) => void;
@@ -644,6 +672,13 @@ function Sidebar({
           badge={meetingCount > 0 ? String(meetingCount) : null}
           active={active === "meetings"}
           onClick={() => onSelect("meetings")}
+        />
+        <NavItem
+          icon={<IconBriefcase size={14} sw={1.7} />}
+          label="Workstreams"
+          badge={workstreamCount > 0 ? String(workstreamCount) : null}
+          active={active === "workstreams"}
+          onClick={() => onSelect("workstreams")}
         />
         <NavItem
           icon={<IconUser size={14} sw={1.7} />}
