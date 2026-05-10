@@ -502,6 +502,8 @@ export function Home({
           onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
           onOpenSettings={onOpenSettings}
           onOpenPalette={() => setPaletteOpen(true)}
+          onNewNote={onNewNote}
+          onNewMeeting={onNewMeeting}
         />
       )}
       <div className="home-main">
@@ -543,12 +545,22 @@ export function Home({
           </div>
         </div>
 
-        <Greeting
-          upcomingCount={todayCount}
-          nextEvent={nextEvent}
-          onNewNote={onNewNote}
-          onNewMeeting={onNewMeeting}
-        />
+        {nav === "home" ? (
+          <Greeting
+            upcomingCount={todayCount}
+            nextEvent={nextEvent}
+            onNewNote={onNewNote}
+            onNewMeeting={onNewMeeting}
+          />
+        ) : (
+          <PageHeader
+            title={pageHeaderTitle(nav)}
+            actions={renderScopedActions(nav, {
+              onRefreshWorkstreams,
+              synthInFlight,
+            })}
+          />
+        )}
 
         {nav === "home" && upcoming.length > 0 && (
           <UpcomingStrip events={upcoming} onOpen={openEventNote} />
@@ -567,7 +579,6 @@ export function Home({
             loading={workstreamsLoading}
             synthInFlight={synthInFlight}
             synthMessage={synthMessage}
-            onRefresh={onRefreshWorkstreams}
             onOpenNote={onOpen}
           />
         ) : nav === "actions" ? (
@@ -627,6 +638,8 @@ function Sidebar({
   onTagSelect,
   onOpenSettings,
   onOpenPalette,
+  onNewNote,
+  onNewMeeting,
 }: {
   active: NavId;
   onSelect: (id: NavId) => void;
@@ -637,6 +650,12 @@ function Sidebar({
   onTagSelect: (tag: string) => void;
   onOpenSettings: () => void;
   onOpenPalette: () => void;
+  /** Global compose CTAs. The Greeting on Home renders these inline;
+   *  on every other nav we surface them from the sidebar footer
+   *  instead so they stay reachable without crowding the page header
+   *  (where scoped page actions live). */
+  onNewNote: () => void;
+  onNewMeeting: () => void;
 }) {
   return (
     <aside className="home-sidebar">
@@ -724,6 +743,26 @@ function Sidebar({
       </div>
 
       <div className="home-side-foot">
+        {active !== "home" ? (
+          <div className="home-side-cta">
+            <button
+              type="button"
+              className="home-side-cta-secondary"
+              onClick={onNewNote}
+            >
+              <IconPlus size={12} sw={1.8} />
+              New note
+            </button>
+            <button
+              type="button"
+              className="home-side-cta-primary"
+              onClick={onNewMeeting}
+            >
+              <span className="home-cta-dot" />
+              New meeting
+            </button>
+          </div>
+        ) : null}
         <NavItem
           icon={<IconSettings size={14} sw={1.7} />}
           label="Settings"
@@ -818,6 +857,100 @@ function Greeting({
           New meeting
         </button>
       </div>
+    </header>
+  );
+}
+
+/** Page-scoped actions for the right side of `PageHeader`. Composer
+ *  toggles dispatch CustomEvents because the composer state lives
+ *  inside the sub-page component (TeamSection / ActionsFeed); the
+ *  page header just fires the open trigger. Refresh on Workstreams
+ *  has its handler already at Home.tsx scope so it's a direct call. */
+function renderScopedActions(
+  nav: NavId,
+  ctx: { onRefreshWorkstreams: () => void; synthInFlight: boolean },
+): React.ReactNode {
+  switch (nav) {
+    case "team":
+      return (
+        <button
+          type="button"
+          className="home-section-add"
+          onClick={() =>
+            window.dispatchEvent(new CustomEvent("margin:open-team-composer"))
+          }
+        >
+          <IconPlus size={13} sw={1.8} />
+          Add team member
+        </button>
+      );
+    case "actions":
+      return (
+        <button
+          type="button"
+          className="home-section-add"
+          onClick={() =>
+            window.dispatchEvent(new CustomEvent("margin:open-actions-composer"))
+          }
+        >
+          <IconPlus size={13} sw={1.8} />
+          New todo
+        </button>
+      );
+    case "workstreams":
+      return (
+        <button
+          type="button"
+          className="home-section-add"
+          onClick={ctx.onRefreshWorkstreams}
+          disabled={ctx.synthInFlight}
+        >
+          {ctx.synthInFlight ? "Synthesizing…" : "Refresh"}
+        </button>
+      );
+    case "favorites":
+    case "archive":
+    case "home":
+      return null;
+  }
+}
+
+function pageHeaderTitle(nav: NavId): string {
+  switch (nav) {
+    case "actions":
+      return "Action items";
+    case "workstreams":
+      return "Workstreams";
+    case "team":
+      return "Team";
+    case "favorites":
+      return "Favorites";
+    case "archive":
+      return "Archive";
+    case "home":
+      // Home renders the Greeting variant; this branch is unreachable
+      // from the call site but kept exhaustive for the compiler.
+      return "Margin";
+  }
+}
+
+function PageHeader({
+  title,
+  actions,
+}: {
+  title: string;
+  /** Page-scoped actions rendered on the right of the header. e.g.
+   *  "Add team member" on Team, "New todo" on Actions, "Refresh" on
+   *  Workstreams. The global New-note / New-meeting CTAs live in the
+   *  sidebar footer for non-home pages instead of competing here. */
+  actions?: React.ReactNode;
+}) {
+  return (
+    <header className="home-greeting page-header">
+      <div className="home-greeting-text">
+        <h1 className="home-greeting-title">{title}</h1>
+      </div>
+      {actions ? <div className="home-greeting-cta">{actions}</div> : null}
     </header>
   );
 }
@@ -1150,6 +1283,14 @@ function ActionsFeed({
   onReassign: (actionId: string, memberId: string | null) => void;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+  // The "New todo" trigger lives in PageHeader (when nav === "actions");
+  // we listen for its dispatched event and open the inline composer.
+  useEffect(() => {
+    const onOpen = () => setComposerOpen(true);
+    window.addEventListener("margin:open-actions-composer", onOpen);
+    return () =>
+      window.removeEventListener("margin:open-actions-composer", onOpen);
+  }, []);
   // Split dated vs. undated, then bucket the dated half by urgency.
   // Backend already orders dated rows by `due_ms ASC`, so each bucket is
   // chronological without further sorting. Undated rows fall into one
@@ -1173,27 +1314,8 @@ function ActionsFeed({
     return { byBucket: buckets, undated: undatedRows };
   }, [actions]);
 
-  // Header used by both the empty and populated states. Toggle button on
-  // the right collapses out of view when the composer is expanded so the
-  // form below isn't competing with a redundant trigger.
-  const head = (
-    <div className="home-section-head">
-      <div>
-        <div className="home-section-eyebrow">Action items</div>
-        <h2 className="home-section-title">Things to do</h2>
-      </div>
-      {!composerOpen && (
-        <button
-          type="button"
-          className="home-section-add"
-          onClick={() => setComposerOpen(true)}
-        >
-          <IconPlus size={12} sw={1.8} />
-          New todo
-        </button>
-      )}
-    </div>
-  );
+  // Page-level "New todo" trigger lives in PageHeader (Home.tsx);
+  // ActionsFeed renders only the composer form when open.
   const composer = composerOpen ? (
     <InboxComposerForm
       onAdd={onAddInboxTodo}
@@ -1204,7 +1326,6 @@ function ActionsFeed({
   if (actions.length === 0) {
     return (
       <section className="home-section">
-        {head}
         {composer}
         <p className="home-empty">
           No open action items. Add <code>- [ ] task</code> lines to any note,
@@ -1217,8 +1338,6 @@ function ActionsFeed({
 
   return (
     <section className="home-section">
-      {head}
-
       {composer}
 
       {BUCKET_ORDER.map(({ key, label }) => {
