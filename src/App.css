@@ -3068,6 +3068,13 @@ select.settings-input {
 .nh-more-item:hover {
   background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
+.nh-more-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.nh-more-item:disabled:hover {
+  background: transparent;
+}
 .nh-more-item.danger {
   color: #e5484d;
 }
@@ -4366,6 +4373,65 @@ input.nh-title {
   color: var(--accent);
 }
 
+/* Workstream picker (#101) — owner / parent selection. Reuses
+   palette-dialog chrome; its rows are simpler than search hits, just a
+   bolded label + optional muted sublabel and a current-selection check. */
+.workstream-picker-results {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+  display: flex;
+  flex-direction: column;
+}
+.workstream-picker-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 14px;
+  text-align: left;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--fg);
+  font: inherit;
+}
+.workstream-picker-row.active {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.workstream-picker-row.current {
+  position: relative;
+}
+.workstream-picker-row.current::after {
+  content: "✓";
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--accent);
+  font-weight: 600;
+}
+.workstream-picker-label {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.workstream-picker-sublabel {
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.workstream-picker-empty {
+  margin: 0;
+  padding: 22px 18px;
+  text-align: center;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+}
+
 .palette-row-body {
   flex: 1;
   min-width: 0;
@@ -5166,7 +5232,8 @@ input.nh-title {
   margin-left: auto;
   transition: background 0.15s, color 0.15s, border-color 0.15s;
 }
-.workstream-detail-settings-button:hover {
+.workstream-detail-settings-button:hover,
+.workstream-detail-settings-button.active {
   background: var(--bg-soft, rgba(0, 0, 0, 0.04));
   color: var(--fg);
   border-color: var(--home-line);

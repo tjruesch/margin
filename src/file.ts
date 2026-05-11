@@ -582,6 +582,9 @@ export type WorkstreamAction = {
   source_id: string;
   done: boolean;
   created_ms: number;
+  /** Optional team_members.id when the synthesizer stamped an owner
+   *  (#100) or the user reassigned via set_workstream_action_assignee. */
+  assignee_id: string | null;
 };
 
 export type WorkstreamNoteRef = {

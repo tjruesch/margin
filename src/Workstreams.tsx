@@ -10,6 +10,7 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { listen } from "@tauri-apps/api/event";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
@@ -34,20 +35,28 @@ import {
   openOrCreateEventNote,
   removeWorkstreamLink,
   setWorkstreamActionDone,
+  setWorkstreamActionAssignee,
+  deleteWorkstreamAction,
   setWorkstreamOwner,
   setWorkstreamParent,
   setWorkstreamStatus,
   setWorkstreamUserNotes,
 } from "./file";
+import { AssigneeChip } from "./AssigneeChip";
 import { DueChip } from "./Home";
 import {
+  IconArchive,
+  IconBell,
   IconBrand,
+  IconBriefcase,
   IconCheck,
   IconChevLeft,
   IconLink,
   IconMore,
   IconPlus,
+  IconSearch,
   IconTrash,
+  IconUser,
 } from "./icons";
 import { avatarColor, initialsFromName } from "./initials";
 
@@ -134,6 +143,22 @@ export function WorkstreamsView({
   // must run before any early return to satisfy the Rules of Hooks.
   const filterCandidates = useFilterCandidates(workstreams, teamById);
 
+  // Count direct children per parent across the full active set so the
+  // umbrella count survives the member filter (an umbrella's "size" is
+  // metadata about the workstream itself, not about what's currently
+  // visible). Hierarchy is capped at 2 levels — nested children never
+  // accumulate further descendants. Must run before the early return
+  // below to satisfy Rules of Hooks (#101).
+  const childCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const w of workstreams) {
+      if (w.parent_workstream_id) {
+        m.set(w.parent_workstream_id, (m.get(w.parent_workstream_id) ?? 0) + 1);
+      }
+    }
+    return m;
+  }, [workstreams]);
+
   if (selectedId) {
     return (
       <WorkstreamDetailView
@@ -216,6 +241,7 @@ export function WorkstreamsView({
               onClick={() => setSelectedId(w.id)}
               teamById={teamById}
               nested={w.parent_workstream_id != null}
+              childCount={childCounts.get(w.id) ?? 0}
             />
           ))}
         </div>
@@ -432,6 +458,7 @@ function WorkstreamCard({
   onClick,
   teamById,
   nested = false,
+  childCount = 0,
 }: {
   workstream: Workstream;
   nowMs: number;
@@ -440,6 +467,10 @@ function WorkstreamCard({
   /** When true, renders with a left indent and muted treatment so the
    *  card visually nests under its parent (#89). */
   nested?: boolean;
+  /** Number of direct child workstreams when this card is a top-level
+   *  parent. Surfaces as "N sub-workstreams" in the count line so an
+   *  umbrella with no direct signals still reads as non-empty (#101). */
+  childCount?: number;
 }) {
   const isReopened = w.reopened_at_ms != null && w.status === "active";
 
@@ -558,7 +589,7 @@ function WorkstreamCard({
         </div>
       ) : null}
       <p className="workstream-card-summary">{w.summary}</p>
-      <div className="workstream-card-counts">{countLine(w)}</div>
+      <div className="workstream-card-counts">{countLine(w, childCount)}</div>
     </button>
   );
 }
@@ -647,8 +678,10 @@ function ArchivedSection({
   );
 }
 
-function countLine(w: Workstream): string {
+function countLine(w: Workstream, childCount = 0): string {
   const parts: string[] = [];
+  if (childCount > 0)
+    parts.push(plural(childCount, "sub-workstream", "sub-workstreams"));
   if (w.open_action_count > 0)
     parts.push(plural(w.open_action_count, "open action", "open actions"));
   if (w.email_count > 0) parts.push(plural(w.email_count, "email", "emails"));
@@ -690,7 +723,11 @@ function WorkstreamDetailView({
   const [detail, setDetail] = useState<WorkstreamDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [missing, setMissing] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Dropdown + per-action modals replaced the old settings modal (#101).
+  // `moreOpen` toggles the `...` popover; `pickerMode` opens the
+  // search-palette-style picker for either owner or parent.
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [pickerMode, setPickerMode] = useState<"owner" | "parent" | null>(null);
   const [externalDialog, setExternalDialog] = useState<ExternalParticipant | null>(null);
 
   const reload = useCallback(async () => {
@@ -769,6 +806,57 @@ function WorkstreamDetailView({
     [reload],
   );
 
+  // Reassign an action's owner. Optimistic local update first; refetch
+  // on error to reconcile.
+  const onReassignAction = useCallback(
+    async (actionId: string, memberId: string | null) => {
+      setDetail((d) => {
+        if (!d) return d;
+        return {
+          ...d,
+          actions: d.actions.map((a) =>
+            a.id === actionId ? { ...a, assignee_id: memberId } : a,
+          ),
+        };
+      });
+      try {
+        await setWorkstreamActionAssignee(actionId, memberId);
+      } catch (e) {
+        console.error("[workstreams] reassign action failed", e);
+        await reload();
+      }
+    },
+    [reload],
+  );
+
+  // Delete an action from the workstream. Confirms first to match the
+  // Action items page UX, then optimistically removes the row.
+  const onDeleteAction = useCallback(
+    async (actionId: string) => {
+      const ok = await ask(
+        "This action item will be removed from this workstream.",
+        {
+          title: "Delete action item?",
+          kind: "warning",
+          okLabel: "Delete",
+          cancelLabel: "Cancel",
+        },
+      );
+      if (!ok) return;
+      setDetail((d) => {
+        if (!d) return d;
+        return { ...d, actions: d.actions.filter((a) => a.id !== actionId) };
+      });
+      try {
+        await deleteWorkstreamAction(actionId);
+      } catch (e) {
+        console.error("[workstreams] delete action failed", e);
+        await reload();
+      }
+    },
+    [reload],
+  );
+
   const onChangeStatus = useCallback(
     async (status: WorkstreamStatus) => {
       try {
@@ -802,7 +890,8 @@ function WorkstreamDetailView({
   if (loading && !detail) {
     return (
       <div className="workstream-view">
-        <DetailHeader title="" onBack={onBack} />
+        <WorkstreamBackLink onBack={onBack} />
+        <DetailHeader title="" />
         <p className="home-empty">Loading…</p>
       </div>
     );
@@ -810,7 +899,8 @@ function WorkstreamDetailView({
   if (missing || !detail) {
     return (
       <div className="workstream-view">
-        <DetailHeader title="Workstream" onBack={onBack} />
+        <WorkstreamBackLink onBack={onBack} />
+        <DetailHeader title="Workstream" />
         <p className="home-empty">Workstream not found.</p>
       </div>
     );
@@ -876,6 +966,7 @@ function WorkstreamDetailView({
 
   return (
     <div className="workstream-view">
+      <WorkstreamBackLink onBack={onBack} />
       {detail.parent_workstream_id && parentTitle ? (
         <button
           type="button"
@@ -892,23 +983,78 @@ function WorkstreamDetailView({
       ) : null}
       <DetailHeader
         title={detail.title}
-        onBack={onBack}
-        onOpenSettings={() => setSettingsOpen(true)}
+        trailing={
+          <div className="nh-popover-anchor">
+            <button
+              type="button"
+              className={
+                "workstream-detail-settings-button" + (moreOpen ? " active" : "")
+              }
+              aria-label="More actions"
+              title="More"
+              onClick={(e) => {
+                e.stopPropagation();
+                setMoreOpen((v) => !v);
+              }}
+            >
+              <IconMore size={18} sw={1.8} />
+            </button>
+            {moreOpen && (
+              <WorkstreamMoreMenu
+                status={detail.status}
+                onClose={() => setMoreOpen(false)}
+                onChangeOwner={() => setPickerMode("owner")}
+                onChangeParent={() => setPickerMode("parent")}
+                onChangeStatus={(s) => void onChangeStatus(s)}
+                parentDisabled={isParentItself}
+                parentDisabledReason={
+                  isParentItself
+                    ? "This workstream has children — unparent them before setting a parent here."
+                    : undefined
+                }
+              />
+            )}
+          </div>
+        }
       />
-      {settingsOpen ? (
-        <WorkstreamSettingsModal
-          status={detail.status}
-          onChangeStatus={onChangeStatus}
-          ownerId={detail.owner_member_id}
-          teamMembers={teamMembers}
-          onChangeOwner={onChangeOwner}
-          parentId={detail.parent_workstream_id}
-          parentCandidates={parentCandidates}
-          onChangeParent={onChangeParent}
-          parentDisabled={isParentItself}
-          onClose={() => setSettingsOpen(false)}
+      {pickerMode === "owner" && (
+        <WorkstreamPickerModal
+          title="Change owner"
+          placeholder="Search team members…"
+          items={teamMembers.map((m) => ({
+            id: m.id,
+            label: m.display_name,
+            sublabel: m.role || undefined,
+          }))}
+          currentId={detail.owner_member_id}
+          allowClear
+          clearLabel="Unassigned"
+          onClose={() => setPickerMode(null)}
+          onPick={(id) => {
+            setPickerMode(null);
+            void onChangeOwner(id);
+          }}
         />
-      ) : null}
+      )}
+      {pickerMode === "parent" && (
+        <WorkstreamPickerModal
+          title="Set parent"
+          placeholder="Search workstreams…"
+          items={parentCandidates.map((w) => ({
+            id: w.id,
+            label: w.title,
+            sublabel: w.summary || undefined,
+          }))}
+          currentId={detail.parent_workstream_id}
+          allowClear
+          clearLabel="No parent (top-level)"
+          onClose={() => setPickerMode(null)}
+          onPick={(id) => {
+            setPickerMode(null);
+            void onChangeParent(id);
+          }}
+        />
+      )}
       <p className="workstream-detail-summary">{detail.summary}</p>
 
       {detail.members.length > 0 || detail.owner_member_id ? (
@@ -958,6 +1104,9 @@ function WorkstreamDetailView({
       <ActionsSection
         actions={detail.actions}
         onToggle={onToggleAction}
+        onReassign={onReassignAction}
+        onDelete={onDeleteAction}
+        members={teamMembers}
         onOpenSource={async (kind, sourceId) => {
           if (kind === "note") {
             onOpenNote(sourceId);
@@ -994,127 +1143,6 @@ function WorkstreamDetailView({
  * is no Save button, the modal is just a less-cluttered home for the
  * controls. Esc / backdrop click close.
  */
-function WorkstreamSettingsModal({
-  status,
-  onChangeStatus,
-  ownerId,
-  teamMembers,
-  onChangeOwner,
-  parentId,
-  parentCandidates,
-  onChangeParent,
-  parentDisabled,
-  onClose,
-}: {
-  status: WorkstreamStatus | null;
-  onChangeStatus: (s: WorkstreamStatus) => void | Promise<void>;
-  ownerId: string | null;
-  teamMembers: TeamMember[];
-  onChangeOwner: (ownerId: string | null) => void | Promise<void>;
-  parentId: string | null;
-  parentCandidates: Workstream[];
-  onChangeParent: (parentId: string | null) => void | Promise<void>;
-  parentDisabled: boolean;
-  onClose: () => void;
-}) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  return (
-    <div
-      className="settings-modal-backdrop"
-      role="presentation"
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div
-        className="settings-modal"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Workstream settings"
-      >
-        <header className="settings-modal-header">
-          <h2>Workstream settings</h2>
-        </header>
-        <div className="settings-modal-rows">
-          <label className="settings-modal-row">
-            <span className="settings-modal-label">Owner</span>
-            <select
-              className="settings-modal-select"
-              value={ownerId ?? ""}
-              onChange={(e) => onChangeOwner(e.target.value || null)}
-            >
-              <option value="">Unassigned</option>
-              {teamMembers.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.display_name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="settings-modal-row">
-            <span className="settings-modal-label">Parent</span>
-            <select
-              className="settings-modal-select"
-              value={parentId ?? ""}
-              disabled={parentDisabled}
-              onChange={(e) => onChangeParent(e.target.value || null)}
-              title={
-                parentDisabled
-                  ? "This workstream has children — unparent them before assigning a parent here."
-                  : undefined
-              }
-            >
-              <option value="">No parent</option>
-              {parentCandidates.map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.title}
-                </option>
-              ))}
-            </select>
-            {parentDisabled ? (
-              <span className="settings-modal-hint">
-                Has children — unparent them first.
-              </span>
-            ) : null}
-          </label>
-          {status ? (
-            <label className="settings-modal-row">
-              <span className="settings-modal-label">Status</span>
-              <select
-                className="settings-modal-select"
-                value={status}
-                onChange={(e) =>
-                  onChangeStatus(e.target.value as WorkstreamStatus)
-                }
-              >
-                <option value="active">Active</option>
-                <option value="snoozed">Snoozed</option>
-                <option value="archived">Archived</option>
-              </select>
-            </label>
-          ) : null}
-        </div>
-        <footer className="settings-modal-footer">
-          <button
-            type="button"
-            className="settings-modal-done"
-            onClick={onClose}
-          >
-            Done
-          </button>
-        </footer>
-      </div>
-    </div>
-  );
-}
-
 function ChildrenSection({
   items,
   teamById,
@@ -1271,44 +1299,306 @@ function WorkstreamUserNotes({
   );
 }
 
-function DetailHeader({
-  title,
-  onBack,
-  onOpenSettings,
+/// Dropdown menu rendered under the `...` button on the workstream
+/// detail view (#101). Mirrors the NoteHeader MoreMenu pattern: direct
+/// items for status transitions (Archive / Snooze / Activate) plus
+/// entry points into the owner / parent picker modals. Status items
+/// are mutually-exclusive per current state — the dropdown only shows
+/// transitions that make sense.
+function WorkstreamMoreMenu({
+  status,
+  onClose,
+  onChangeOwner,
+  onChangeParent,
+  onChangeStatus,
+  parentDisabled,
+  parentDisabledReason,
 }: {
-  title: string;
-  onBack: () => void;
-  /** Open the settings modal — owner, parent, status (#89). Omitted on
-   *  the loading / missing-workstream sub-states where there's nothing
-   *  to configure. */
-  onOpenSettings?: () => void;
+  status: WorkstreamStatus | null;
+  onClose: () => void;
+  onChangeOwner: () => void;
+  onChangeParent: () => void;
+  onChangeStatus: (s: WorkstreamStatus) => void;
+  parentDisabled: boolean;
+  parentDisabledReason?: string;
 }) {
+  const canArchive = status === "active" || status === "snoozed";
+  const canSnooze = status === "active";
+  const canActivate = status === "snoozed" || status === "archived";
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
   return (
-    <>
+    <div
+      className="nh-popover nh-more-popover"
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+    >
       <button
         type="button"
-        className="workstream-back-link"
-        onClick={onBack}
-        aria-label="Back to workstreams"
+        className="nh-more-item"
+        onClick={() => {
+          onClose();
+          onChangeOwner();
+        }}
       >
-        <IconChevLeft size={13} sw={1.8} />
-        Workstreams
+        <IconUser size={14} sw={1.7} />
+        <span>Change owner</span>
       </button>
-      <header className="workstream-header workstream-detail-header">
-        <h1 className="workstream-title">{title}</h1>
-        {onOpenSettings ? (
-          <button
-            type="button"
-            className="workstream-detail-settings-button"
-            onClick={onOpenSettings}
-            aria-label="Workstream settings"
-            title="Settings"
-          >
-            <IconMore size={18} sw={1.8} />
-          </button>
-        ) : null}
-      </header>
-    </>
+      <button
+        type="button"
+        className="nh-more-item"
+        disabled={parentDisabled}
+        title={parentDisabled ? parentDisabledReason : undefined}
+        onClick={() => {
+          if (parentDisabled) return;
+          onClose();
+          onChangeParent();
+        }}
+      >
+        <IconBriefcase size={14} sw={1.7} />
+        <span>Set parent</span>
+      </button>
+      <div className="nh-more-sep" />
+      {canSnooze && (
+        <button
+          type="button"
+          className="nh-more-item"
+          onClick={() => {
+            onClose();
+            onChangeStatus("snoozed");
+          }}
+        >
+          <IconBell size={14} sw={1.7} />
+          <span>Snooze</span>
+        </button>
+      )}
+      {canActivate && (
+        <button
+          type="button"
+          className="nh-more-item"
+          onClick={() => {
+            onClose();
+            onChangeStatus("active");
+          }}
+        >
+          <IconCheck size={14} sw={1.7} />
+          <span>Mark as active</span>
+        </button>
+      )}
+      {canArchive && (
+        <button
+          type="button"
+          className="nh-more-item"
+          onClick={() => {
+            onClose();
+            onChangeStatus("archived");
+          }}
+        >
+          <IconArchive size={14} sw={1.7} />
+          <span>Archive</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
+/// Search-palette-style picker (#101) for owner / parent selection.
+/// Filter narrows the list as the user types; Enter picks the active
+/// row, Escape closes. Items render with a label + optional sublabel
+/// to disambiguate (e.g. workstream summary or team-member role).
+function WorkstreamPickerModal({
+  title,
+  placeholder,
+  items,
+  currentId,
+  allowClear,
+  clearLabel,
+  onPick,
+  onClose,
+}: {
+  title: string;
+  placeholder: string;
+  items: { id: string; label: string; sublabel?: string }[];
+  currentId: string | null;
+  /** When true, exposes a "no selection" row that calls onPick(null). */
+  allowClear: boolean;
+  clearLabel: string;
+  onPick: (id: string | null) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter(
+      (it) =>
+        it.label.toLowerCase().includes(q) ||
+        (it.sublabel?.toLowerCase().includes(q) ?? false),
+    );
+  }, [query, items]);
+
+  // Active row: the first match. Reset to 0 whenever the filter
+  // changes (or the user navigates).
+  const [activeIdx, setActiveIdx] = useState(0);
+  useEffect(() => {
+    setActiveIdx(0);
+  }, [query]);
+
+  const totalRows = matches.length + (allowClear ? 1 : 0);
+
+  const pickRow = (idx: number) => {
+    if (allowClear && idx === 0) {
+      onPick(null);
+      return;
+    }
+    const itemIdx = allowClear ? idx - 1 : idx;
+    const it = matches[itemIdx];
+    if (it) onPick(it.id);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActiveIdx((i) => Math.min(i + 1, totalRows - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActiveIdx((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      pickRow(activeIdx);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      onClose();
+    }
+  };
+
+  return (
+    <div
+      className="palette-backdrop"
+      role="presentation"
+      onMouseDown={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        className="palette-dialog mode-search"
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onKeyDown={onKeyDown}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="palette-input-row">
+          <span className="palette-input-icon" aria-hidden="true">
+            <IconSearch size={14} sw={1.7} />
+          </span>
+          <input
+            ref={inputRef}
+            type="text"
+            className="palette-input"
+            placeholder={placeholder}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+          />
+          <span className="palette-input-kbd">esc</span>
+        </div>
+        <div ref={listRef} className="workstream-picker-results">
+          {allowClear && (
+            <button
+              type="button"
+              className={
+                "workstream-picker-row" +
+                (activeIdx === 0 ? " active" : "") +
+                (currentId === null ? " current" : "")
+              }
+              onMouseEnter={() => setActiveIdx(0)}
+              onClick={() => pickRow(0)}
+            >
+              <span className="workstream-picker-label">{clearLabel}</span>
+            </button>
+          )}
+          {matches.length === 0 ? (
+            <p className="workstream-picker-empty">No matches.</p>
+          ) : (
+            matches.map((it, i) => {
+              const idx = allowClear ? i + 1 : i;
+              const isActive = activeIdx === idx;
+              const isCurrent = currentId === it.id;
+              return (
+                <button
+                  key={it.id}
+                  type="button"
+                  className={
+                    "workstream-picker-row" +
+                    (isActive ? " active" : "") +
+                    (isCurrent ? " current" : "")
+                  }
+                  onMouseEnter={() => setActiveIdx(idx)}
+                  onClick={() => pickRow(idx)}
+                >
+                  <span className="workstream-picker-label">{it.label}</span>
+                  {it.sublabel && (
+                    <span className="workstream-picker-sublabel">
+                      {it.sublabel}
+                    </span>
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/// Standalone back link rendered above the breadcrumb on the detail
+/// view (#101). Splitting it out of DetailHeader lets us render
+/// `back → breadcrumb → title` for nested workstreams instead of the
+/// older `breadcrumb → back → title` order.
+function WorkstreamBackLink({ onBack }: { onBack: () => void }) {
+  return (
+    <button
+      type="button"
+      className="workstream-back-link"
+      onClick={onBack}
+      aria-label="Back to workstreams"
+    >
+      <IconChevLeft size={13} sw={1.8} />
+      Workstreams
+    </button>
+  );
+}
+
+function DetailHeader({
+  title,
+  trailing,
+}: {
+  title: string;
+  /** Right-aligned slot. Used to render the `...` more-menu trigger +
+   *  its popover (#101). Omitted on loading / missing sub-states. */
+  trailing?: React.ReactNode;
+}) {
+  return (
+    <header className="workstream-header workstream-detail-header">
+      <h1 className="workstream-title">{title}</h1>
+      {trailing}
+    </header>
   );
 }
 
@@ -1858,19 +2148,29 @@ function LinkComposer({
 function ActionsSection({
   actions,
   onToggle,
+  onReassign,
+  onDelete,
   onOpenSource,
+  members,
 }: {
   actions: WorkstreamAction[];
   onToggle: (actionId: string, nextDone: boolean) => void | Promise<void>;
+  onReassign: (actionId: string, memberId: string | null) => void | Promise<void>;
+  onDelete: (actionId: string) => void | Promise<void>;
   onOpenSource: (sourceKind: string, sourceId: string) => void | Promise<void>;
+  members: TeamMember[];
 }) {
   if (actions.length === 0) return null;
+  const memberById = new Map(members.map((m) => [m.id, m] as const));
   return (
     <section className="workstream-section">
       <h2 className="workstream-section-title">Actions ({actions.length})</h2>
       <div className="home-actions">
         {actions.map((a) => {
           const openable = a.source_kind === "note" || a.source_kind === "event";
+          const assigneeName = a.assignee_id
+            ? memberById.get(a.assignee_id)?.display_name ?? null
+            : null;
           return (
             <div
               key={a.id}
@@ -1911,12 +2211,30 @@ function ActionsSection({
                 </div>
               </div>
               <DueChip dueMs={a.due_ms} />
+              <AssigneeChip
+                assigneeId={a.assignee_id}
+                assigneeDisplayName={assigneeName}
+                members={members}
+                onPick={(memberId) => void onReassign(a.id, memberId)}
+              />
               <span
                 className="workstream-action-source-chip"
                 title={`from ${a.source_kind}`}
               >
                 from {a.source_kind}
               </span>
+              <button
+                type="button"
+                className="home-action-delete"
+                aria-label="Delete action item"
+                title="Delete"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void onDelete(a.id);
+                }}
+              >
+                <IconTrash size={14} sw={1.7} />
+              </button>
             </div>
           );
         })}
