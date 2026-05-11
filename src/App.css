@@ -5713,6 +5713,36 @@ button.workstream-external-chip:hover {
   text-overflow: ellipsis;
   text-align: left;
 }
+/* "Summarizing…" placeholder shown right after a link is added,
+   until the Firecrawl + Haiku background task fires the event. */
+.workstream-link-chip-summary-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  opacity: 0.85;
+}
+/* "No summary available" line for links the summarizer tried but
+   couldn't produce text for (paywall, login wall, scrape error,
+   model declined). Lives at the same slot as a real summary so the
+   chip stays one shape; visually slightly more muted. */
+.workstream-link-chip-summary-unavailable {
+  font-style: normal;
+  opacity: 0.65;
+}
+.workstream-link-summary-spinner {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--home-line);
+  border-top-color: var(--fg-muted);
+  border-radius: 50%;
+  animation: workstream-link-summary-spin 0.85s linear infinite;
+  display: inline-block;
+}
+@keyframes workstream-link-summary-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 .workstream-link-composer {
   display: grid;
   grid-template-columns: 1fr 1fr 130px;

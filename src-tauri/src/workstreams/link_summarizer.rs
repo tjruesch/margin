@@ -50,42 +50,74 @@ If the input looks like a login wall, paywall, error, or 404 page, return only t
 /// after `add_workstream_link_from_url` inserts the row. Idempotent
 /// in the sense that if the link is gone by the time the work
 /// completes, the UPDATE no-ops.
+///
+/// Always emits `workstream-link-summarized` exactly once — with the
+/// summary string on success, or `null` (+ a short reason) on every
+/// failure path. The frontend uses the null case to clear the
+/// "Summarizing…" spinner without leaving it spinning to the 60s
+/// safety timeout.
 pub async fn populate_summary(app: AppHandle, link_id: String, url: String) {
+    let outcome = run_summary(&app, &link_id, &url).await;
+    let event = match outcome {
+        SummaryOutcome::Ok(summary) => SummarizedEvent {
+            link_id,
+            summary: Some(summary),
+            reason: None,
+        },
+        SummaryOutcome::Failed(reason) => SummarizedEvent {
+            link_id,
+            summary: None,
+            reason: Some(reason),
+        },
+    };
+    let _ = app.emit("workstream-link-summarized", event);
+}
+
+enum SummaryOutcome {
+    Ok(String),
+    /// Short, user-displayable reason. The frontend can choose to
+    /// surface it or just clear the spinner.
+    Failed(String),
+}
+
+async fn run_summary(app: &AppHandle, link_id: &str, url: &str) -> SummaryOutcome {
     let firecrawl_key = match crate::keychain::read_firecrawl_api_key() {
         Ok(k) => k,
         Err(_) => {
             eprintln!("[link-summarizer] no Firecrawl key, skipping");
-            return;
+            return SummaryOutcome::Failed("Firecrawl API key not configured".into());
         }
     };
     let anthropic_key = match crate::keychain::read_anthropic_api_key() {
         Ok(k) => k,
         Err(_) => {
             eprintln!("[link-summarizer] no Anthropic key, skipping");
-            return;
+            return SummaryOutcome::Failed("Anthropic API key not configured".into());
         }
     };
-    let scraped = match firecrawl_scrape(&firecrawl_key, &url).await {
+    let scraped = match firecrawl_scrape(&firecrawl_key, url).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[link-summarizer] scrape failed for {url}: {e}");
-            return;
+            return SummaryOutcome::Failed("Couldn't reach the page".into());
         }
     };
     if scraped.markdown.trim().len() < 80 {
         eprintln!("[link-summarizer] scraped content too thin for {url}, skipping");
-        return;
+        return SummaryOutcome::Failed("Page content was too thin to summarize".into());
     }
     let summary = match summarize_with_haiku(&anthropic_key, &scraped).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[link-summarizer] summarize failed for {url}: {e}");
-            return;
+            return SummaryOutcome::Failed("Summarizer call failed".into());
         }
     };
     if summary.trim().is_empty() || summary.trim() == "NO_SUMMARY" {
         eprintln!("[link-summarizer] model declined to summarize {url}");
-        return;
+        return SummaryOutcome::Failed(
+            "No summary available (page may need login)".into(),
+        );
     }
     let summary = truncate_summary(&summary);
     {
@@ -94,29 +126,31 @@ pub async fn populate_summary(app: AppHandle, link_id: String, url: String) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("[link-summarizer] conn lock failed: {e}");
-                return;
+                return SummaryOutcome::Failed("Database busy".into());
             }
         };
         if let Err(e) =
-            super::persist::set_workstream_link_summary(&conn, &link_id, Some(&summary))
+            super::persist::set_workstream_link_summary(&conn, link_id, Some(&summary))
         {
             eprintln!("[link-summarizer] persist update failed for {link_id}: {e}");
-            return;
+            return SummaryOutcome::Failed("Couldn't save summary".into());
         }
     }
-    let _ = app.emit(
-        "workstream-link-summarized",
-        SummarizedEvent {
-            link_id: link_id.clone(),
-            summary: summary.clone(),
-        },
-    );
+    SummaryOutcome::Ok(summary)
 }
 
 #[derive(Serialize, Clone)]
 struct SummarizedEvent {
     link_id: String,
-    summary: String,
+    /// `Some(summary)` on success, `None` when no summary could be
+    /// produced — the frontend clears the in-flight spinner either
+    /// way; only the success case re-renders the chip with text.
+    summary: Option<String>,
+    /// Short user-readable explanation when `summary` is `None`.
+    /// Frontend surfaces this as a small muted "unavailable" line so
+    /// the user knows the system tried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]

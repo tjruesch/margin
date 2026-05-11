@@ -595,12 +595,15 @@ export type WorkstreamLink = {
 };
 
 /** Payload shape for the `workstream-link-summarized` Tauri event the
- *  backend emits after the summarization task lands a row. The
- *  detail view subscribes and patches its in-state link so the chip
- *  re-renders without a refetch. */
+ *  backend emits after the summarization task finishes — fires once
+ *  per add. `summary` is the rendered text on success; `null` on any
+ *  failure path (no key, scrape error, model declined, etc.) with
+ *  `reason` carrying a short user-displayable explanation. The
+ *  frontend clears its in-flight spinner either way. */
 export type WorkstreamLinkSummarizedEvent = {
   link_id: string;
-  summary: string;
+  summary: string | null;
+  reason?: string;
 };
 
 export const LinkKind = {

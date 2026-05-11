@@ -1413,6 +1413,17 @@ function LinksSection({
   onLinksChanged: (next: WorkstreamLink[]) => void;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+  /** Link ids currently being summarized in the background. The
+   *  summary task fires `workstream-link-summarized` once per add
+   *  (success OR failure). The 60s ceiling is a belt-and-braces
+   *  fallback in case the event somehow never lands. */
+  const [pending, setPending] = useState<Set<string>>(() => new Set());
+  /** Per-link "couldn't generate" reason, surfaced as a muted line
+   *  on the chip when the summary task finished without producing
+   *  text (paywalled / login-walled / scrape failed / etc.). */
+  const [unavailable, setUnavailable] = useState<Map<string, string>>(
+    () => new Map(),
+  );
 
   // The summarization background task fires `workstream-link-summarized`
   // when it lands a row. Refs keep the listener stable across renders
@@ -1426,23 +1437,75 @@ function LinksSection({
     onLinksChangedRef.current = onLinksChanged;
   }, [onLinksChanged]);
   useEffect(() => {
+    // React StrictMode + HMR will mount → unmount → mount again. Track
+    // `cancelled` so that if the component unmounts before
+    // `listenForSummary` resolves, we immediately invoke `stop` from
+    // the resolution callback rather than stashing it on a stale
+    // closure (which then triggers `listeners[eventId].handlerId` on
+    // a torn-down listener).
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     void listenForSummary((payload) => {
-      const next = linksRef.current.map((l) =>
-        l.id === payload.link_id ? { ...l, summary: payload.summary } : l,
-      );
-      // Only re-render when this workstream actually owned the link;
-      // avoids unnecessary state updates on cross-workstream events.
-      if (next.some((l) => l.id === payload.link_id)) {
-        onLinksChangedRef.current(next);
+      // Success path: patch the link with the new summary text.
+      if (payload.summary) {
+        const next = linksRef.current.map((l) =>
+          l.id === payload.link_id ? { ...l, summary: payload.summary } : l,
+        );
+        if (next.some((l) => l.id === payload.link_id)) {
+          onLinksChangedRef.current(next);
+        }
+      } else if (payload.reason) {
+        // Failure path: surface the reason inline so the user knows
+        // the system tried, even though it couldn't produce text.
+        setUnavailable((prev) => {
+          const next = new Map(prev);
+          next.set(payload.link_id, payload.reason ?? "No summary available");
+          return next;
+        });
       }
+      // Clear the in-flight spinner regardless of outcome.
+      setPending((prev) => {
+        if (!prev.has(payload.link_id)) return prev;
+        const next = new Set(prev);
+        next.delete(payload.link_id);
+        return next;
+      });
     }).then((stop) => {
-      unlisten = stop;
+      if (cancelled) {
+        try {
+          stop();
+        } catch {
+          /* listener already torn down */
+        }
+      } else {
+        unlisten = stop;
+      }
     });
     return () => {
-      unlisten?.();
+      cancelled = true;
+      try {
+        unlisten?.();
+      } catch {
+        /* listener already torn down */
+      }
     };
   }, []);
+
+  /** Mark a link as in-flight and auto-expire after a generous
+   *  ceiling so a silently-failed summarization doesn't leave the
+   *  spinner spinning forever. The Firecrawl scrape is bounded at
+   *  30s and Haiku at 15s; 60s is the safe upper bound. */
+  const trackPending = (linkId: string) => {
+    setPending((prev) => new Set(prev).add(linkId));
+    window.setTimeout(() => {
+      setPending((prev) => {
+        if (!prev.has(linkId)) return prev;
+        const next = new Set(prev);
+        next.delete(linkId);
+        return next;
+      });
+    }, 60_000);
+  };
 
   const handleOpen = async (url: string) => {
     try {
@@ -1469,6 +1532,9 @@ function LinksSection({
     try {
       const created = await addWorkstreamLinkFromUrl(workstreamId, url);
       onLinksChanged([...links, created]);
+      // Backend just kicked off the summary task; show the
+      // "Summarizing…" placeholder until the event lands.
+      trackPending(created.id);
       setComposerOpen(false);
       return null;
     } catch (err) {
@@ -1508,7 +1574,11 @@ function LinksSection({
             <div
               className={
                 "workstream-link-chip" +
-                (link.summary ? " has-summary" : "")
+                (link.summary ||
+                pending.has(link.id) ||
+                unavailable.has(link.id)
+                  ? " has-summary"
+                  : "")
               }
               key={link.id}
             >
@@ -1523,15 +1593,19 @@ function LinksSection({
                   <span className="workstream-link-chip-label">
                     {link.label}
                   </span>
-                  {link.kind ? (
-                    <span className="workstream-link-chip-kind">
-                      {link.kind}
-                    </span>
-                  ) : null}
                 </span>
                 {link.summary ? (
                   <span className="workstream-link-chip-summary">
                     {link.summary}
+                  </span>
+                ) : pending.has(link.id) ? (
+                  <span className="workstream-link-chip-summary workstream-link-chip-summary-pending">
+                    <span className="workstream-link-summary-spinner" aria-hidden />
+                    Summarizing…
+                  </span>
+                ) : unavailable.has(link.id) ? (
+                  <span className="workstream-link-chip-summary workstream-link-chip-summary-unavailable">
+                    {unavailable.get(link.id)}
                   </span>
                 ) : null}
               </button>
