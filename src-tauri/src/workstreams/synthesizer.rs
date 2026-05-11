@@ -167,6 +167,15 @@ pub async fn maybe_cluster(app: &AppHandle, force: bool) -> Result<ClusterReport
     }
 
     emit_status(app, "synced", Some(format_report_summary(&report)));
+
+    // Chain the edge synthesizer (#103): fresh workstream_signals from
+    // this pass should immediately produce INCLUDES + CO_ATTENDED + new
+    // MENTIONED edges. Edge synth has its own lock + TTL, so this is a
+    // safe fire-and-forget. Failures are logged, not propagated.
+    if let Err(e) = crate::edges::synthesizer::maybe_run(app, false).await {
+        eprintln!("[edges] post-cluster synth failed: {e}");
+    }
+
     Ok(report)
 }
 

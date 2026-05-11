@@ -692,6 +692,25 @@ fn tool_definitions() -> serde_json::Value {
                 },
                 "required": ["n"]
             }
+        },
+        {
+            "name": "read_edges",
+            "description": "Retrieve the 1-hop graph neighborhood of a node. Returns every edge whose source OR target is the given node, with the relationship kind, confidence, and the other side's display label. Use to discover relationships ('who attended this meeting', 'what does this person own', 'who is mentioned in this note', 'which workstreams include this email'). The graph is populated by the deterministic edge synthesizer (#103); current edge kinds are AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED, ATTENDED, INCLUDES, OWNS.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "node_kind": {
+                        "type": "string",
+                        "enum": ["person", "event", "note", "email", "action", "workstream"],
+                        "description": "Entity kind of the node to look up."
+                    },
+                    "node_id": {
+                        "type": "string",
+                        "description": "Canonical id of the node. For person: team_members.id. For event: calendar_events.id. For note: note_path. For email: email_messages.id. For action: actions.id or workstream_actions.id. For workstream: workstreams.id."
+                    }
+                },
+                "required": ["node_kind", "node_id"]
+            }
         }
     ])
 }
@@ -970,6 +989,12 @@ fn dispatch_tool(
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
 ) -> ToolResult {
+    // read_edges takes (node_kind, node_id) strings, not the `n` index
+    // every other tool uses. Handle it before the `n` validation.
+    if name == "read_edges" {
+        return dispatch_read_edges(app, input);
+    }
+
     let n = match input.get("n").and_then(|v| v.as_u64()) {
         Some(v) if v >= 1 => v as usize,
         _ => {
@@ -1155,6 +1180,263 @@ fn dispatch_read_workstream(
     ToolResult {
         content: format_workstream_detail(&label, &detail, &team_by_id),
         is_error: false,
+    }
+}
+
+/// 1-hop graph neighborhood for a node (#103). Walks the `edges` table
+/// for any row whose source OR target matches `(node_kind, node_id)`,
+/// joins the other side back to a display label, and formats the
+/// result grouped by edge_kind. Output is markdown bullets so it pastes
+/// cleanly into the assistant's reply context.
+fn dispatch_read_edges(app: &AppHandle, input: &serde_json::Value) -> ToolResult {
+    let node_kind = match input.get("node_kind").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return ToolResult {
+                content: "read_edges: missing or empty `node_kind`.".into(),
+                is_error: true,
+            };
+        }
+    };
+    let node_id = match input.get("node_id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return ToolResult {
+                content: "read_edges: missing or empty `node_id`.".into(),
+                is_error: true,
+            };
+        }
+    };
+
+    let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+    let c = match conn_state.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            return ToolResult {
+                content: format!("read_edges: db lock: {e}"),
+                is_error: true,
+            };
+        }
+    };
+
+    let mut rows: Vec<EdgeRow> = Vec::new();
+    let sql = "SELECT src_kind, src_id, tgt_kind, tgt_id, edge_kind, confidence, last_seen_ms \
+               FROM edges \
+               WHERE (src_kind = ?1 AND src_id = ?2) \
+                  OR (tgt_kind = ?1 AND tgt_id = ?2) \
+               ORDER BY last_seen_ms DESC \
+               LIMIT 200";
+    let mut stmt = match c.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => {
+            return ToolResult {
+                content: format!("read_edges: prepare: {e}"),
+                is_error: true,
+            };
+        }
+    };
+    let qrows = stmt.query_map(rusqlite::params![&node_kind, &node_id], |r| {
+        Ok(EdgeRow {
+            src_kind: r.get(0)?,
+            src_id: r.get(1)?,
+            tgt_kind: r.get(2)?,
+            tgt_id: r.get(3)?,
+            edge_kind: r.get(4)?,
+            confidence: r.get(5)?,
+            last_seen_ms: r.get(6)?,
+        })
+    });
+    match qrows {
+        Ok(iter) => {
+            for r in iter.flatten() {
+                rows.push(r);
+            }
+        }
+        Err(e) => {
+            return ToolResult {
+                content: format!("read_edges: query: {e}"),
+                is_error: true,
+            };
+        }
+    }
+
+    if rows.is_empty() {
+        return ToolResult {
+            content: format!(
+                "No edges found for ({kind}, {id}). The edge synthesizer (#103) may not have run yet, \
+                 or this node has no resolvable relationships.",
+                kind = node_kind,
+                id = node_id
+            ),
+            is_error: false,
+        };
+    }
+
+    // Resolve other-side display labels in batches per kind.
+    let labels = resolve_edge_labels(&c, &rows);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# Edges for ({kind}, {id}) — {n} rows\n\n",
+        kind = node_kind,
+        id = node_id,
+        n = rows.len()
+    ));
+
+    // Group by edge_kind in stable order, then by direction.
+    let mut grouped: std::collections::BTreeMap<&str, Vec<&EdgeRow>> =
+        std::collections::BTreeMap::new();
+    for r in &rows {
+        grouped.entry(r.edge_kind.as_str()).or_default().push(r);
+    }
+    for (kind, group) in grouped {
+        out.push_str(&format!("## {kind} ({})\n", group.len()));
+        for r in group {
+            let is_outgoing = r.src_kind == node_kind && r.src_id == node_id;
+            let (other_kind, other_id, arrow) = if is_outgoing {
+                (r.tgt_kind.as_str(), r.tgt_id.as_str(), "→")
+            } else {
+                (r.src_kind.as_str(), r.src_id.as_str(), "←")
+            };
+            let label = labels
+                .get(&(other_kind.to_string(), other_id.to_string()))
+                .map(String::as_str)
+                .unwrap_or(other_id);
+            out.push_str(&format!(
+                "- {arrow} [{other_kind}] {label} (conf {conf:.2})\n",
+                arrow = arrow,
+                other_kind = other_kind,
+                label = label,
+                conf = r.confidence
+            ));
+        }
+        out.push('\n');
+    }
+
+    ToolResult {
+        content: out,
+        is_error: false,
+    }
+}
+
+struct EdgeRow {
+    src_kind: String,
+    src_id: String,
+    tgt_kind: String,
+    tgt_id: String,
+    edge_kind: String,
+    confidence: f64,
+    last_seen_ms: i64,
+}
+
+/// Resolve `(kind, id)` pairs from the other side of each edge into a
+/// short human-readable label. Looks up:
+/// - person → team_members.display_name
+/// - event → calendar_events.title
+/// - note → notes.title
+/// - email → email_messages.subject
+/// - workstream → workstreams.title
+/// - action → actions.text (or workstream_actions.text)
+/// Missing rows fall back to the raw id at render time.
+fn resolve_edge_labels(
+    conn: &rusqlite::Connection,
+    rows: &[EdgeRow],
+) -> std::collections::HashMap<(String, String), String> {
+    use std::collections::HashMap;
+    let mut by_kind: HashMap<&'static str, Vec<String>> = HashMap::new();
+    for r in rows {
+        by_kind.entry(map_kind(&r.src_kind)).or_default().push(r.src_id.clone());
+        by_kind.entry(map_kind(&r.tgt_kind)).or_default().push(r.tgt_id.clone());
+    }
+    let mut out: HashMap<(String, String), String> = HashMap::new();
+    for (k, ids) in by_kind {
+        if k.is_empty() || ids.is_empty() {
+            continue;
+        }
+        let (sql, kind_str) = match k {
+            "person" => (
+                "SELECT id, display_name FROM team_members WHERE id = ?1",
+                "person",
+            ),
+            "event" => ("SELECT id, title FROM calendar_events WHERE id = ?1", "event"),
+            "note" => ("SELECT note_path, title FROM notes WHERE note_path = ?1", "note"),
+            "email" => (
+                "SELECT id, subject FROM email_messages WHERE id = ?1",
+                "email",
+            ),
+            "workstream" => (
+                "SELECT id, title FROM workstreams WHERE id = ?1",
+                "workstream",
+            ),
+            "action" => {
+                // Try `actions` first; fall back to `workstream_actions`.
+                if let Ok(mut stmt) =
+                    conn.prepare("SELECT id, text FROM actions WHERE id = ?1")
+                {
+                    for id in &ids {
+                        if let Ok(Some((rid, txt))) = stmt
+                            .query_row(rusqlite::params![id], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            })
+                            .map(Some)
+                            .or(Ok::<_, rusqlite::Error>(None))
+                        {
+                            out.insert(("action".into(), rid), trim_label(&txt));
+                        }
+                    }
+                }
+                if let Ok(mut stmt) =
+                    conn.prepare("SELECT id, text FROM workstream_actions WHERE id = ?1")
+                {
+                    for id in &ids {
+                        if let Ok(Some((rid, txt))) = stmt
+                            .query_row(rusqlite::params![id], |r| {
+                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            })
+                            .map(Some)
+                            .or(Ok::<_, rusqlite::Error>(None))
+                        {
+                            out.entry(("action".into(), rid))
+                                .or_insert_with(|| trim_label(&txt));
+                        }
+                    }
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            for id in &ids {
+                if let Ok((rid, label)) = stmt.query_row(rusqlite::params![id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                }) {
+                    out.insert((kind_str.into(), rid), trim_label(&label));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn map_kind(k: &str) -> &'static str {
+    match k {
+        "person" => "person",
+        "event" => "event",
+        "note" => "note",
+        "email" => "email",
+        "workstream" => "workstream",
+        "action" => "action",
+        _ => "",
+    }
+}
+
+fn trim_label(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= 80 {
+        trimmed.to_string()
+    } else {
+        let cut: String = trimmed.chars().take(77).collect();
+        format!("{cut}…")
     }
 }
 

@@ -70,7 +70,7 @@ pub fn open_or_init(db_path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn apply_migrations(conn: &Connection) -> Result<()> {
+pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     // `meta` doesn't exist on a fresh DB — `query_row` returns
     // QueryReturnedNoRows in that case (mapped to None via `optional`),
     // but the table-missing error is a different shape and would surface

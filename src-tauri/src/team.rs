@@ -248,8 +248,10 @@ pub fn list_team_members(
 
 /// NFD-decompose, drop combining marks (the diacritics), then lowercase.
 /// Used by `OwnerResolver` to match action-item owner candidates against
-/// `display_name ∪ aliases` regardless of case or accent (#49).
-fn fold_for_match(s: &str) -> String {
+/// `display_name ∪ aliases` regardless of case or accent (#49). The
+/// edges synthesizer's MENTIONED text scanner (#103) also reads through
+/// this so its word-bounded matching is consistent with owner resolution.
+pub(crate) fn fold_for_match(s: &str) -> String {
     s.nfd()
         .filter(|c| !is_combining_mark(*c))
         .flat_map(|c| c.to_lowercase())

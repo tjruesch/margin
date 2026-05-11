@@ -5,6 +5,7 @@ mod chunker;
 mod connectors;
 mod dates;
 mod diarize;
+mod edges;
 mod index;
 mod keychain;
 mod notes;
@@ -620,7 +621,9 @@ pub fn run() {
 
             // Workstream synthesizer boot tick (#70). Stale-checks
             // last_clustered_ms inside; no-op if a fresh pass landed
-            // within the last 6h.
+            // within the last 6h. Edge synth chains onto the same task
+            // so fresh workstream signals immediately feed INCLUDES /
+            // CO_ATTENDED / MENTIONED edge derivation (#103).
             let app_for_cluster = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -628,6 +631,9 @@ pub fn run() {
                     workstreams::synthesizer::maybe_cluster(&app_for_cluster, false).await
                 {
                     eprintln!("[workstreams] boot cluster failed: {e}");
+                }
+                if let Err(e) = edges::synthesizer::maybe_run(&app_for_cluster, false).await {
+                    eprintln!("[edges] boot synth failed: {e}");
                 }
             });
 
@@ -692,6 +698,7 @@ pub fn run() {
             connectors::commands::list_email_messages,
             connectors::commands::get_email_body,
             workstreams::commands::synthesize_workstreams,
+            edges::commands::synthesize_edges,
             workstreams::commands::list_workstreams,
             workstreams::commands::create_workstream,
             workstreams::commands::get_workstream_details,
