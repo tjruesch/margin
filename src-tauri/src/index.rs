@@ -52,7 +52,8 @@ const SCHEMA_V18: &str = include_str!("migrations/018_workstream_links.sql");
 const SCHEMA_V19: &str = include_str!("migrations/019_workstream_parent.sql");
 const SCHEMA_V20: &str = include_str!("migrations/020_workstream_link_summary.sql");
 const SCHEMA_V21: &str = include_str!("migrations/021_workstream_action_assignee.sql");
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_V22: &str = include_str!("migrations/022_events_edges.sql");
+const SCHEMA_VERSION: i64 = 22;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -178,6 +179,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 20 {
         conn.execute_batch(SCHEMA_V21)?;
         version = 21;
+    }
+    if version == 21 {
+        conn.execute_batch(SCHEMA_V22)?;
+        version = 22;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
@@ -1890,5 +1895,333 @@ mod tests {
         let items = list_all(&conn, NoteScope::Active).unwrap();
         let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, vec!["new", "mid", "old"]);
+    }
+
+    // ----- events + edges backfill (#102) -----------------------------------
+
+    /// Seed two team members: a self row (id 'tm_self', alias 'me@x.io')
+    /// and a teammate ('tm_bob', alias 'bob@x.io'). Required setup for
+    /// every backfill test below.
+    fn seed_self_and_teammate(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
+             VALUES ('tm_self', 'Me', '', '/x/self.md', 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
+             VALUES ('tm_bob', 'Bob', '', '/x/bob.md', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO team_member_aliases(member_id, kind, value) VALUES ('tm_self', 'email', 'me@x.io')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO team_member_aliases(member_id, kind, value) VALUES ('tm_bob', 'email', 'bob@x.io')",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn seed_connector(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO connectors(id, kind, display_name, enabled, config_json, created_ms, updated_ms) \
+             VALUES (?1, 'email', 'test', 1, '{}', 0, 0)",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    fn seed_email(conn: &Connection, id: &str, from: &str, sent_at: i64) {
+        seed_connector(conn, "mg:test");
+        conn.execute(
+            "INSERT INTO email_messages(\
+                id, connector_id, external_id, thread_id, subject, from_email, from_name, \
+                sent_at_ms, body_preview, body_html, has_attachments, is_read, raw_etag, modified_ms\
+             ) VALUES (?1, 'mg:test', ?1, 't1', 'Sub', ?2, NULL, ?3, NULL, NULL, 0, 0, NULL, ?3)",
+            rusqlite::params![id, from, sent_at],
+        )
+        .unwrap();
+    }
+
+    fn seed_event_with_attendee(conn: &Connection, id: &str, member_id: &str, start: i64) {
+        seed_connector(conn, "mg:test");
+        conn.execute(
+            "INSERT INTO calendar_events(\
+                id, connector_id, external_id, title, start_ms, end_ms, all_day, modified_ms\
+             ) VALUES (?1, 'mg:test', ?1, 'Sync', ?2, ?2, 0, ?2)",
+            rusqlite::params![id, start],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calendar_attendees(event_id, email, team_member_id, is_self, is_organizer) \
+             VALUES (?1, ?2, ?3, 0, 0)",
+            rusqlite::params![id, format!("{member_id}@x.io"), member_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_note_row(conn: &Connection, path: &str, modified: i64) {
+        conn.execute(
+            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
+             VALUES (?1, 'b', 'Title', ?2, 0)",
+            rusqlite::params![path, modified],
+        )
+        .unwrap();
+    }
+
+    fn seed_action(conn: &Connection, id: &str, note_path: &str, assignee: Option<&str>) {
+        conn.execute(
+            "INSERT INTO actions(id, note_path, line, text, done, created_ms, assignee_id) \
+             VALUES (?1, ?2, 1, 'task', 0, 100, ?3)",
+            rusqlite::params![id, note_path, assignee],
+        )
+        .unwrap();
+    }
+
+    fn seed_workstream(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO workstreams(id, title, summary, status, last_activity_ms, created_ms, updated_ms) \
+             VALUES (?1, 'W', 'S', 'active', 100, 100, 100)",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    }
+
+    fn seed_workstream_signal(conn: &Connection, ws_id: &str, kind: &str, item_id: &str) {
+        conn.execute(
+            "INSERT INTO workstream_signals(workstream_id, kind, item_id, added_ms) \
+             VALUES (?1, ?2, ?3, 100)",
+            rusqlite::params![ws_id, kind, item_id],
+        )
+        .unwrap();
+    }
+
+    fn seed_workstream_action(conn: &Connection, id: &str, ws_id: &str, assignee: Option<&str>) {
+        conn.execute(
+            "INSERT INTO workstream_actions(\
+                id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms, assignee_id\
+             ) VALUES (?1, ?2, 'task', NULL, 'email', 'src', 0, 100, ?3)",
+            rusqlite::params![id, ws_id, assignee],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn events_and_edges_backfill_from_existing_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&conn).unwrap();
+
+        seed_self_and_teammate(&conn);
+        // Three emails: self → email_sent; teammate → email_received w/ actor; external → email_received w/ NULL actor.
+        seed_email(&conn, "mg:test::msg-1", "me@x.io", 1_000);
+        seed_email(&conn, "mg:test::msg-2", "bob@x.io", 2_000);
+        seed_email(&conn, "mg:test::msg-3", "external@y.io", 3_000);
+        // One calendar event with one resolved attendee.
+        seed_event_with_attendee(&conn, "mg:test::evt-1", "tm_bob", 4_000);
+        // One note.
+        seed_note_row(&conn, "/n/x/note.md", 5_000);
+        // One note-backed action with an assignee.
+        seed_action(&conn, "a-1", "/n/x/note.md", Some("tm_bob"));
+        // One workstream + one signal + one workstream-action with assignee.
+        seed_workstream(&conn, "ws_1");
+        seed_workstream_signal(&conn, "ws_1", "email", "mg:test::msg-1");
+        seed_workstream_action(&conn, "wsa_1", "ws_1", Some("tm_bob"));
+
+        // Re-run apply_migrations to confirm the version gate is idempotent.
+        // No rows added on the second pass.
+        apply_migrations(&conn).unwrap();
+
+        // events: 3 emails + 1 meeting + 1 note + 2 actions = 7 rows.
+        let total_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_events, 0, "no rows yet — backfill ran during apply_migrations *before* we seeded");
+
+        // The migration ran during apply_migrations() but BEFORE we seeded
+        // the source rows. To verify the backfill SQL, simulate a fresh
+        // upgrade: drop + recreate the tables and re-run just the
+        // backfill block. Easier: re-run the migration's INSERTs manually.
+        rerun_backfill_inserts(&conn);
+
+        let total_events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total_events, 7, "3 emails + 1 meeting + 1 note + 2 actions");
+
+        let sent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'email_sent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sent, 1, "only the from=self email is 'email_sent'");
+
+        let received: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'email_received'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(received, 2, "teammate + external both classify as received");
+
+        let null_actor: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'email_received' AND actor_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_actor, 1, "external sender has no team_member → actor_id NULL");
+
+        let bob_received: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'email_received' AND actor_id = 'tm_bob'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bob_received, 1);
+
+        // edges
+        let includes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE edge_kind = 'INCLUDES'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(includes, 1);
+
+        let attended: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE edge_kind = 'ATTENDED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(attended, 1, "1 resolved attendee");
+
+        let owns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE edge_kind = 'OWNS'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owns, 2, "1 note action + 1 workstream action, both with assignees");
+    }
+
+    /// Mirrors the INSERT statements at the bottom of 022_events_edges.sql.
+    /// Used by tests that seed data *after* the migration ran.
+    fn rerun_backfill_inserts(conn: &Connection) {
+        conn.execute_batch(
+            r#"
+            INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms)
+            SELECT
+              e.sent_at_ms,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM team_member_aliases a
+                JOIN team_members m ON m.id = a.member_id
+                WHERE a.kind = 'email'
+                  AND lower(a.value) = lower(e.from_email)
+                  AND m.is_self = 1
+              ) THEN 'email_sent' ELSE 'email_received' END,
+              (SELECT a.member_id FROM team_member_aliases a
+                WHERE a.kind = 'email' AND lower(a.value) = lower(e.from_email)
+                LIMIT 1),
+              'email', e.id,
+              json_object('thread_id', e.thread_id, 'subject', e.subject),
+              e.sent_at_ms
+            FROM email_messages e;
+
+            INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms)
+            SELECT
+              c.start_ms, 'meeting',
+              (SELECT id FROM team_members WHERE is_self = 1 LIMIT 1),
+              'event', c.id,
+              json_object('title', c.title, 'all_day', c.all_day),
+              c.start_ms
+            FROM calendar_events c;
+
+            INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms)
+            SELECT
+              n.modified_ms, 'note_modified',
+              (SELECT id FROM team_members WHERE is_self = 1 LIMIT 1),
+              'note', n.note_path,
+              json_object('title', n.title, 'bundle_id', n.bundle_id),
+              n.modified_ms
+            FROM notes n;
+
+            INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms)
+            SELECT
+              a.created_ms, 'action_created',
+              COALESCE(a.assignee_id, (SELECT id FROM team_members WHERE is_self = 1 LIMIT 1)),
+              'action', a.id,
+              json_object('text', a.text, 'note_path', a.note_path),
+              a.created_ms
+            FROM actions a;
+
+            INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms)
+            SELECT
+              wa.created_ms, 'action_created',
+              COALESCE(wa.assignee_id, (SELECT id FROM team_members WHERE is_self = 1 LIMIT 1)),
+              'action', wa.id,
+              json_object('text', wa.text, 'workstream_id', wa.workstream_id),
+              wa.created_ms
+            FROM workstream_actions wa;
+
+            INSERT OR IGNORE INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, first_seen_ms, last_seen_ms)
+            SELECT 'workstream', s.workstream_id, s.kind, s.item_id, 'INCLUDES',
+                   s.added_ms, s.added_ms
+            FROM workstream_signals s
+            ;
+
+            INSERT OR IGNORE INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, first_seen_ms, last_seen_ms)
+            SELECT 'person', ca.team_member_id, 'event', ca.event_id, 'ATTENDED',
+                   ce.start_ms, ce.start_ms
+            FROM calendar_attendees ca
+            JOIN calendar_events ce ON ce.id = ca.event_id
+            WHERE ca.team_member_id IS NOT NULL
+            ;
+
+            INSERT OR IGNORE INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, first_seen_ms, last_seen_ms)
+            SELECT 'person', a.assignee_id, 'action', a.id, 'OWNS',
+                   a.created_ms, a.created_ms
+            FROM actions a
+            WHERE a.assignee_id IS NOT NULL
+            ;
+
+            INSERT OR IGNORE INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, first_seen_ms, last_seen_ms)
+            SELECT 'person', wa.assignee_id, 'action', wa.id, 'OWNS',
+                   wa.created_ms, wa.created_ms
+            FROM workstream_actions wa
+            WHERE wa.assignee_id IS NOT NULL
+            ;
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn empty_db_apply_migrations_creates_events_and_edges() {
+        // Smoke test: fresh DB applies all migrations including 022;
+        // both new tables exist and are empty (no source data to backfill).
+        let conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&conn).unwrap();
+        let events: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
+        let edges: i64 = conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edges, 0);
     }
 }
