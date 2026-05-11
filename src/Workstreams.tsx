@@ -51,6 +51,7 @@ import {
   IconBriefcase,
   IconCheck,
   IconChevLeft,
+  IconChevRight,
   IconLink,
   IconMore,
   IconPlus,
@@ -233,17 +234,27 @@ export function WorkstreamsView({
         </p>
       ) : (
         <div className="workstream-list">
-          {renderHierarchical(filteredActive, (w) => (
-            <WorkstreamCard
-              key={w.id}
-              workstream={w}
-              nowMs={nowMs}
-              onClick={() => setSelectedId(w.id)}
-              teamById={teamById}
-              nested={w.parent_workstream_id != null}
-              childCount={childCounts.get(w.id) ?? 0}
-            />
-          ))}
+          {renderHierarchical(
+            filteredActive,
+            (w) => (
+              <WorkstreamCard
+                key={w.id}
+                workstream={w}
+                nowMs={nowMs}
+                onClick={() => setSelectedId(w.id)}
+                teamById={teamById}
+                nested={w.parent_workstream_id != null}
+                childCount={childCounts.get(w.id) ?? 0}
+              />
+            ),
+            (w) => (
+              <WorkstreamChildRow
+                key={w.id}
+                workstream={w}
+                onClick={() => setSelectedId(w.id)}
+              />
+            ),
+          )}
         </div>
       )}
 
@@ -417,13 +428,14 @@ function applyMemberFilter<T extends Workstream>(
  * parent was filtered out — render at the top level so the filter
  * still surfaces them.
  *
- * The `render` callback is responsible for the `nested` styling on the
- * card (it inspects `w.parent_workstream_id` itself); this helper just
- * decides the iteration order.
+ * Two callbacks: full card for top-level / orphan rows, slim child
+ * row for children rendered under a visible parent (#101). The slim
+ * variant keeps umbrellas readable without dominating the list.
  */
 function renderHierarchical(
   workstreams: Workstream[],
-  render: (w: Workstream) => React.ReactNode,
+  renderRoot: (w: Workstream) => React.ReactNode,
+  renderChild: (w: Workstream) => React.ReactNode,
 ): React.ReactNode[] {
   const ids = new Set(workstreams.map((w) => w.id));
   const childrenByParent = new Map<string, Workstream[]>();
@@ -438,13 +450,39 @@ function renderHierarchical(
   for (const w of workstreams) {
     // Skip children that will render under a visible parent.
     if (w.parent_workstream_id && ids.has(w.parent_workstream_id)) continue;
-    out.push(render(w));
+    out.push(renderRoot(w));
     const children = childrenByParent.get(w.id);
     if (children) {
-      for (const child of children) out.push(render(child));
+      for (const child of children) out.push(renderChild(child));
     }
   }
   return out;
+}
+
+/// Slim child row used for nested workstreams (#101). One line with
+/// title and a chev — full card chrome would dwarf the parent. Click
+/// navigates into the child's detail view.
+function WorkstreamChildRow({
+  workstream,
+  onClick,
+}: {
+  workstream: Workstream;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="workstream-child-row"
+      onClick={onClick}
+      title={`Open ${workstream.title}`}
+    >
+      <span className="workstream-child-row-marker" aria-hidden>
+        ↳
+      </span>
+      <span className="workstream-child-row-title">{workstream.title}</span>
+      <IconChevRight size={12} sw={1.7} />
+    </button>
+  );
 }
 
 /// Max member chips rendered on the card before overflow collapses
@@ -661,16 +699,26 @@ function ArchivedSection({
           <p className="home-empty">No archived workstreams match this filter.</p>
         ) : (
           <div className="workstream-archived-list">
-            {renderHierarchical(filtered, (w) => (
-              <WorkstreamCard
-                key={w.id}
-                workstream={w}
-                nowMs={nowMs}
-                onClick={() => onSelect(w.id)}
-                teamById={teamById}
-                nested={w.parent_workstream_id != null}
-              />
-            ))}
+            {renderHierarchical(
+              filtered,
+              (w) => (
+                <WorkstreamCard
+                  key={w.id}
+                  workstream={w}
+                  nowMs={nowMs}
+                  onClick={() => onSelect(w.id)}
+                  teamById={teamById}
+                  nested={w.parent_workstream_id != null}
+                />
+              ),
+              (w) => (
+                <WorkstreamChildRow
+                  key={w.id}
+                  workstream={w}
+                  onClick={() => onSelect(w.id)}
+                />
+              ),
+            )}
           </div>
         )
       ) : null}
@@ -1126,11 +1174,7 @@ function WorkstreamDetailView({
       <NotesSection notes={detail.notes} onOpenNote={onOpenNote} />
 
       {detail.children.length > 0 ? (
-        <ChildrenSection
-          items={detail.children}
-          teamById={teamById}
-          onSelect={onNavigateTo}
-        />
+        <ChildrenSection items={detail.children} onSelect={onNavigateTo} />
       ) : null}
     </div>
   );
@@ -1145,26 +1189,20 @@ function WorkstreamDetailView({
  */
 function ChildrenSection({
   items,
-  teamById,
   onSelect,
 }: {
   items: Workstream[];
-  teamById: Map<string, TeamMember>;
   onSelect: (id: string) => void;
 }) {
-  const nowMs = Date.now();
   return (
     <section className="workstream-children-section">
       <h3 className="workstream-section-title">Children ({items.length})</h3>
-      <div className="workstream-list">
+      <div className="workstream-child-list">
         {items.map((c) => (
-          <WorkstreamCard
+          <WorkstreamChildRow
             key={c.id}
             workstream={c}
-            nowMs={nowMs}
             onClick={() => onSelect(c.id)}
-            teamById={teamById}
-            nested
           />
         ))}
       </div>
