@@ -49,6 +49,18 @@ export async function deleteAnthropicApiKey(): Promise<void> {
   await invoke<void>("delete_anthropic_api_key");
 }
 
+export async function hasFirecrawlApiKey(): Promise<boolean> {
+  return invoke<boolean>("has_firecrawl_api_key");
+}
+
+export async function setFirecrawlApiKey(key: string): Promise<void> {
+  await invoke<void>("set_firecrawl_api_key", { key });
+}
+
+export async function deleteFirecrawlApiKey(): Promise<void> {
+  await invoke<void>("delete_firecrawl_api_key");
+}
+
 // --- Notes (bundle abstraction) ------------------------------------------
 
 export type NoteRef = { id: string; note_path: string };
@@ -575,6 +587,23 @@ export type WorkstreamLink = {
   kind: string | null;
   position: number;
   created_ms: number;
+  /** AI-generated 2–3 sentence summary of the linked page. Populated
+   *  by a background task after the link row lands; `null` while in
+   *  flight or after a silent failure. The chip surfaces it as a
+   *  second muted italic line; absent when null. */
+  summary: string | null;
+};
+
+/** Payload shape for the `workstream-link-summarized` Tauri event the
+ *  backend emits after the summarization task finishes — fires once
+ *  per add. `summary` is the rendered text on success; `null` on any
+ *  failure path (no key, scrape error, model declined, etc.) with
+ *  `reason` carrying a short user-displayable explanation. The
+ *  frontend clears its in-flight spinner either way. */
+export type WorkstreamLinkSummarizedEvent = {
+  link_id: string;
+  summary: string | null;
+  reason?: string;
 };
 
 export const LinkKind = {
@@ -706,6 +735,21 @@ export async function addWorkstreamLink(
     label,
     url,
     kind: kind ?? null,
+  });
+}
+
+/** Paste-only link entry: backend asks Haiku to derive a `(label, kind)`
+ *  pair from the URL and persists via the same path as `addWorkstreamLink`.
+ *  Falls back to `(hostname, "other")` when categorization fails (no API
+ *  key, network blip, malformed model output) — the user always gets a
+ *  usable chip back. */
+export async function addWorkstreamLinkFromUrl(
+  workstreamId: string,
+  url: string,
+): Promise<WorkstreamLink> {
+  return invoke<WorkstreamLink>("add_workstream_link_from_url", {
+    workstreamId,
+    url,
   });
 }
 

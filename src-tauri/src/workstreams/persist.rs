@@ -357,7 +357,7 @@ pub fn list_workstream_links(
     workstream_id: &str,
 ) -> rusqlite::Result<Vec<WorkstreamLink>> {
     let mut stmt = conn.prepare(
-        "SELECT id, workstream_id, label, url, kind, position, created_ms \
+        "SELECT id, workstream_id, label, url, kind, position, created_ms, summary \
          FROM workstream_links \
          WHERE workstream_id = ?1 \
          ORDER BY position ASC, created_ms ASC",
@@ -371,6 +371,7 @@ pub fn list_workstream_links(
             kind: r.get(4)?,
             position: r.get(5)?,
             created_ms: r.get(6)?,
+            summary: r.get(7)?,
         })
     })?;
     let mut out = Vec::new();
@@ -384,6 +385,18 @@ pub fn list_workstream_links(
 /// `MAX(position) + 1` for the workstream so insertion order survives
 /// even when the caller skips it. Trims label / url / kind; rejects
 /// empty label or url.
+/// Canonical kind strings accepted by the link writers. Mirrors the
+/// soft enum in [`super::link_kinds`]; gives those constants their
+/// only Rust caller and lets the writer reject typos before hitting
+/// the schema (which itself stores `kind` as opaque TEXT).
+const ALLOWED_LINK_KINDS: &[&str] = &[
+    super::link_kinds::GITHUB,
+    super::link_kinds::LINEAR,
+    super::link_kinds::NOTION,
+    super::link_kinds::FIGMA,
+    super::link_kinds::OTHER,
+];
+
 pub fn add_workstream_link(
     conn: &Connection,
     workstream_id: &str,
@@ -403,6 +416,13 @@ pub fn add_workstream_link(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    if let Some(k) = kind_owned.as_deref() {
+        if !ALLOWED_LINK_KINDS.contains(&k) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "unknown link kind: {k}"
+            )));
+        }
+    }
     let next_position: i64 = conn
         .query_row(
             "SELECT COALESCE(MAX(position), -1) + 1 FROM workstream_links \
@@ -425,7 +445,25 @@ pub fn add_workstream_link(
         kind: kind_owned,
         position: next_position,
         created_ms: now_ms,
+        summary: None,
     })
+}
+
+/// Update a link's AI-generated summary. Used by the background
+/// summarization task once Firecrawl + Haiku finish. Returns whether
+/// the update touched a row — false means the link was removed
+/// (or the workstream deleted) while the task was in flight; the
+/// caller treats that as a harmless no-op.
+pub fn set_workstream_link_summary(
+    conn: &Connection,
+    link_id: &str,
+    summary: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let n = conn.execute(
+        "UPDATE workstream_links SET summary = ?2 WHERE id = ?1",
+        params![link_id, summary],
+    )?;
+    Ok(n > 0)
 }
 
 /// Delete a single link by id. Returns whether a row was actually
@@ -1224,6 +1262,8 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("../migrations/019_workstream_parent.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../migrations/020_workstream_link_summary.sql"))
+            .unwrap();
         conn
     }
 
@@ -1953,6 +1993,71 @@ mod tests {
         seed_workstream(&mut conn, "ws_l");
         assert!(add_workstream_link(&conn, "ws_l", "  ", "https://x", None, 100).is_err());
         assert!(add_workstream_link(&conn, "ws_l", "Ok", "  ", None, 100).is_err());
+    }
+
+    #[test]
+    fn add_workstream_link_accepts_each_canonical_kind() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        for kind in [
+            super::super::link_kinds::GITHUB,
+            super::super::link_kinds::LINEAR,
+            super::super::link_kinds::NOTION,
+            super::super::link_kinds::FIGMA,
+            super::super::link_kinds::OTHER,
+        ] {
+            let row = add_workstream_link(
+                &conn,
+                "ws_l",
+                "Label",
+                &format!("https://example.com/{kind}"),
+                Some(kind),
+                100,
+            )
+            .expect("canonical kind accepted");
+            assert_eq!(row.kind.as_deref(), Some(kind));
+        }
+    }
+
+    #[test]
+    fn add_workstream_link_rejects_unknown_kind() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        let res = add_workstream_link(
+            &conn,
+            "ws_l",
+            "Label",
+            "https://x",
+            Some("slack"),
+            100,
+        );
+        assert!(res.is_err());
+        let listed = list_workstream_links(&conn, "ws_l").unwrap();
+        assert!(listed.is_empty(), "no row inserted for invalid kind");
+    }
+
+    #[test]
+    fn set_workstream_link_summary_round_trips() {
+        let mut conn = open_test_db();
+        seed_workstream(&mut conn, "ws_l");
+        let added =
+            add_workstream_link(&conn, "ws_l", "Repo", "https://x", Some("github"), 100)
+                .unwrap();
+        assert!(added.summary.is_none());
+
+        let updated =
+            set_workstream_link_summary(&conn, &added.id, Some("It's a repo.")).unwrap();
+        assert!(updated);
+        let listed = list_workstream_links(&conn, "ws_l").unwrap();
+        assert_eq!(listed[0].summary.as_deref(), Some("It's a repo."));
+    }
+
+    #[test]
+    fn set_workstream_link_summary_no_op_when_link_missing() {
+        let conn = open_test_db();
+        let updated =
+            set_workstream_link_summary(&conn, "wsl_nonexistent", Some("anything")).unwrap();
+        assert!(!updated, "no row touched, no error");
     }
 
     #[test]

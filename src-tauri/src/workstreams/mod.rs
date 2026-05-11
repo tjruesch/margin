@@ -19,6 +19,8 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 pub mod commands;
+pub mod link_categorizer;
+pub mod link_summarizer;
 pub mod persist;
 pub mod signals;
 pub mod synthesizer;
@@ -141,6 +143,11 @@ pub struct WorkstreamLink {
     pub kind: Option<String>,
     pub position: i64,
     pub created_ms: i64,
+    /// AI-generated 2–3 sentence summary of the linked page. Populated
+    /// by a background task (Firecrawl scrape + Haiku summarize) after
+    /// the link row is inserted; `None` while the task is in flight or
+    /// after a silent failure (missing keys, scrape error, etc.).
+    pub summary: Option<String>,
 }
 
 /// Canonical string values for `WorkstreamLink.kind`. Soft enum so

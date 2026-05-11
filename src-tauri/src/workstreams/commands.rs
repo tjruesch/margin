@@ -156,3 +156,53 @@ pub fn remove_workstream_link(
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
+
+/// Paste-only link entry: the user supplies just a URL; Haiku
+/// categorizes it into a `(label, kind)` tuple, and we persist via the
+/// same `add_workstream_link` path. Categorization failures fall back
+/// to `{label: <hostname>, kind: "other"}` so the user still gets a
+/// usable chip — they can rename it later via the inline composer.
+///
+/// After the row lands, a fire-and-forget background task fetches the
+/// page via Firecrawl and asks Haiku for a 2–3 sentence summary; the
+/// result lands on the row and a `workstream-link-summarized` event
+/// fires so the frontend re-renders without a refetch.
+#[tauri::command]
+pub async fn add_workstream_link_from_url(
+    app: tauri::AppHandle,
+    workstream_id: String,
+    url: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<WorkstreamLink, String> {
+    let trimmed = url.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("URL is required".into());
+    }
+    // Run the AI categorization OUTSIDE the connection lock — the
+    // network round-trip can take ~1s and we don't want to block
+    // other commands behind it.
+    let categorized = super::link_categorizer::categorize_or_fallback(&trimmed).await;
+    let now_ms = chrono::Local::now().timestamp_millis();
+    let link = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        persist::add_workstream_link(
+            &c,
+            &workstream_id,
+            &categorized.label,
+            &trimmed,
+            Some(&categorized.kind),
+            now_ms,
+        )
+        .map_err(|e| e.to_string())?
+    };
+    // Fire-and-forget summarization. Skips silently if either key is
+    // missing or the scrape returns thin content; emits the
+    // `workstream-link-summarized` event on success.
+    let app_clone = app.clone();
+    let link_id = link.id.clone();
+    let url_clone = trimmed.clone();
+    tauri::async_runtime::spawn(async move {
+        super::link_summarizer::populate_summary(app_clone, link_id, url_clone).await;
+    });
+    Ok(link)
+}

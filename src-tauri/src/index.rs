@@ -50,7 +50,8 @@ const SCHEMA_V16: &str = include_str!("migrations/016_workstream_signals.sql");
 const SCHEMA_V17: &str = include_str!("migrations/017_typed_aliases.sql");
 const SCHEMA_V18: &str = include_str!("migrations/018_workstream_links.sql");
 const SCHEMA_V19: &str = include_str!("migrations/019_workstream_parent.sql");
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_V20: &str = include_str!("migrations/020_workstream_link_summary.sql");
+const SCHEMA_VERSION: i64 = 20;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -168,6 +169,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 18 {
         conn.execute_batch(SCHEMA_V19)?;
         version = 19;
+    }
+    if version == 19 {
+        conn.execute_batch(SCHEMA_V20)?;
+        version = 20;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
