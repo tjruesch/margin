@@ -25,6 +25,7 @@ import {
   type WorkstreamStatus,
   addWorkstreamLinkFromUrl,
   createTeamMember,
+  createWorkstream,
   getEmailBody,
   getWorkstreamDetails,
   listArchivedWorkstreams,
@@ -58,14 +59,28 @@ export function WorkstreamsView({
   synthInFlight,
   synthMessage,
   onOpenNote,
+  onCreated,
 }: {
   workstreams: Workstream[];
   loading: boolean;
   synthInFlight: boolean;
   synthMessage: string | null;
   onOpenNote: (path: string) => void;
+  /** Fires after a manual create succeeds (#101). Parent uses it to
+   *  refetch the list so the new card appears without a synth pass. */
+  onCreated: () => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [composerOpen, setComposerOpen] = useState(false);
+  // Page header dispatches `margin:open-workstream-composer` when the
+  // user clicks "New workstream". Composer state lives here so we can
+  // close it from the form's Cancel / save paths.
+  useEffect(() => {
+    const onOpen = () => setComposerOpen(true);
+    window.addEventListener("margin:open-workstream-composer", onOpen);
+    return () =>
+      window.removeEventListener("margin:open-workstream-composer", onOpen);
+  }, []);
   // Team-member cache for owner / member chips (#81). Loaded once and
   // refreshed on `margin:team-changed` events.
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
@@ -163,6 +178,20 @@ export function WorkstreamsView({
         </div>
       ) : null}
 
+      {composerOpen && (
+        <WorkstreamComposer
+          workstreams={workstreams}
+          onCancel={() => setComposerOpen(false)}
+          onCreated={(id) => {
+            setComposerOpen(false);
+            onCreated();
+            // Open the new workstream's detail so the user can add
+            // notes / set owner before the next synth pass runs.
+            setSelectedId(id);
+          }}
+        />
+      )}
+
       {loading ? (
         <p className="home-empty">Loading…</p>
       ) : workstreams.length === 0 ? (
@@ -201,6 +230,125 @@ export function WorkstreamsView({
           memberFilter={memberFilter}
         />
       )}
+    </div>
+  );
+}
+
+/// Inline composer for manual workstream creation (#101). Title is
+/// required; summary anchors the synthesizer's auto-attach pass;
+/// parent (top-level workstreams only) drives the sub-workstream path.
+/// On success the parent surfaces the new id so we can deep-link
+/// straight into the detail view.
+function WorkstreamComposer({
+  workstreams,
+  onCancel,
+  onCreated,
+}: {
+  workstreams: Workstream[];
+  onCancel: () => void;
+  onCreated: (id: string) => void;
+}) {
+  const [title, setTitle] = useState("");
+  const [summary, setSummary] = useState("");
+  const [parentId, setParentId] = useState<string>("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+  }, []);
+
+  // Only top-level workstreams are valid parents — the backend caps
+  // hierarchy at 2 levels and rejects attempts to nest deeper.
+  const parentOptions = useMemo(
+    () => workstreams.filter((w) => w.parent_workstream_id == null),
+    [workstreams],
+  );
+
+  const submit = async () => {
+    const t = title.trim();
+    if (!t || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const id = await createWorkstream(
+        t,
+        summary.trim() || null,
+        parentId || null,
+      );
+      onCreated(id);
+    } catch (e) {
+      setError(String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="workstream-composer">
+      <input
+        ref={inputRef}
+        type="text"
+        className="workstream-composer-title"
+        placeholder="Workstream title"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          }
+        }}
+      />
+      <input
+        type="text"
+        className="workstream-composer-summary"
+        placeholder="Short summary (optional, anchors auto-attach)"
+        value={summary}
+        onChange={(e) => setSummary(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            void submit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            onCancel();
+          }
+        }}
+      />
+      <div className="workstream-composer-actions">
+        <label className="workstream-composer-parent">
+          <span>Parent</span>
+          <select
+            value={parentId}
+            onChange={(e) => setParentId(e.target.value)}
+          >
+            <option value="">No parent (top-level)</option>
+            {parentOptions.map((w) => (
+              <option key={w.id} value={w.id}>
+                {w.title}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="workstream-composer-spacer" />
+        <button
+          type="button"
+          className="workstream-composer-cancel"
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="workstream-composer-save"
+          disabled={!title.trim() || busy}
+          onClick={() => void submit()}
+        >
+          {busy ? "Creating…" : "Create"}
+        </button>
+      </div>
+      {error && <p className="workstream-composer-error">{error}</p>}
     </div>
   );
 }

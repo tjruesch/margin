@@ -23,6 +23,26 @@ pub fn list_workstreams(
     persist::list_workstreams_active(&c).map_err(|e| e.to_string())
 }
 
+/// User-driven workstream creation (#101). Mainly used to spin up
+/// umbrella parents that later collect synthesized children, but also
+/// works for standalone manual workstreams. Returns the new id on
+/// success. Parent-validation rejections come back as a user-facing
+/// error string the composer surfaces inline.
+#[tauri::command]
+pub fn create_workstream(
+    title: String,
+    summary: Option<String>,
+    parent_id: Option<String>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<String, String> {
+    let summary = summary.unwrap_or_default();
+    let parent = parent_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::create_workstream(&c, &title, &summary, parent)
+        .map_err(|e| e.to_string())?
+        .map_err(|reason| reason)
+}
+
 #[tauri::command]
 pub fn get_workstream_details(
     id: String,

@@ -94,6 +94,10 @@ type Props = {
   synthMessage: string | null;
   /** Force a synthesis pass via `synthesize_workstreams(true)`. */
   onRefreshWorkstreams: () => void;
+  /** Callback fired by WorkstreamsView after a manual create lands so
+   *  App.tsx can refetch the list (#101). No synth pass — that's the
+   *  user's call to make via Refresh. */
+  onWorkstreamCreated: () => void;
 };
 
 type NavId =
@@ -305,6 +309,7 @@ export function Home({
   synthInFlight,
   synthMessage,
   onRefreshWorkstreams,
+  onWorkstreamCreated,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -599,6 +604,7 @@ export function Home({
             synthInFlight={synthInFlight}
             synthMessage={synthMessage}
             onOpenNote={onOpen}
+            onCreated={onWorkstreamCreated}
           />
         ) : nav === "actions" ? (
           <ActionsFeed
@@ -921,14 +927,28 @@ function renderScopedActions(
       );
     case "workstreams":
       return (
-        <button
-          type="button"
-          className="home-section-add"
-          onClick={ctx.onRefreshWorkstreams}
-          disabled={ctx.synthInFlight}
-        >
-          {ctx.synthInFlight ? "Synthesizing…" : "Refresh"}
-        </button>
+        <>
+          <button
+            type="button"
+            className="home-section-add"
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent("margin:open-workstream-composer"),
+              )
+            }
+          >
+            <IconPlus size={13} sw={1.8} />
+            New workstream
+          </button>
+          <button
+            type="button"
+            className="home-section-add"
+            onClick={ctx.onRefreshWorkstreams}
+            disabled={ctx.synthInFlight}
+          >
+            {ctx.synthInFlight ? "Synthesizing…" : "Refresh"}
+          </button>
+        </>
       );
     case "favorites":
     case "archive":

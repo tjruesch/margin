@@ -665,6 +665,21 @@ export async function listWorkstreams(): Promise<Workstream[]> {
   return invoke<Workstream[]>("list_workstreams");
 }
 
+/** Create a new workstream manually (#101). Returns the new id. Parent
+ *  validation errors come back as Tauri errors with a user-facing
+ *  message the composer surfaces inline. */
+export async function createWorkstream(
+  title: string,
+  summary: string | null,
+  parentId: string | null,
+): Promise<string> {
+  return invoke<string>("create_workstream", {
+    title,
+    summary,
+    parentId,
+  });
+}
+
 export async function getWorkstreamDetails(id: string): Promise<WorkstreamDetail | null> {
   return invoke<WorkstreamDetail | null>("get_workstream_details", { id });
 }

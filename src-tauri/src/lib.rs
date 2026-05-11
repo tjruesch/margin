@@ -693,6 +693,7 @@ pub fn run() {
             connectors::commands::get_email_body,
             workstreams::commands::synthesize_workstreams,
             workstreams::commands::list_workstreams,
+            workstreams::commands::create_workstream,
             workstreams::commands::get_workstream_details,
             workstreams::commands::set_workstream_action_done,
             workstreams::commands::set_workstream_action_assignee,

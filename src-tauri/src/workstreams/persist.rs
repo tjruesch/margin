@@ -986,6 +986,41 @@ fn max_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
+/// Insert a user-created workstream (#101). Mirrors the synthesizer
+/// insert path but takes only the fields the user can author at create
+/// time. Title is required; summary defaults to empty. When `parent_id`
+/// is supplied, it goes through the same `validate_proposed_parent`
+/// check as `set_workstream_parent` — invalid edges come back as a
+/// user-facing error string so the composer can surface them inline.
+/// Returns the new workstream id on success.
+pub fn create_workstream(
+    conn: &Connection,
+    title: &str,
+    summary: &str,
+    parent_id: Option<&str>,
+) -> rusqlite::Result<Result<String, String>> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(Err("title is required".to_string()));
+    }
+    let id = format!("ws_{}", uuid::Uuid::new_v4());
+    if let Some(p) = parent_id {
+        match validate_proposed_parent(conn, &id, p)? {
+            Ok(()) => {}
+            Err(reason) => return Ok(Err(reason)),
+        }
+    }
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO workstreams(\
+            id, title, summary, status, last_activity_ms, created_ms, updated_ms, \
+            parent_workstream_id\
+         ) VALUES (?1, ?2, ?3, 'active', ?4, ?4, ?4, ?5)",
+        params![id, title, summary, now, parent_id],
+    )?;
+    Ok(Ok(id))
+}
+
 pub fn set_action_done(
     conn: &Connection,
     action_id: &str,
@@ -1588,6 +1623,85 @@ mod tests {
         // touch assignee_id.
         let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
         assert_eq!(detail.actions[0].assignee_id.as_deref(), Some("tm_bob"));
+    }
+
+    #[test]
+    fn create_workstream_inserts_active_row() {
+        let conn = open_test_db();
+        let id = create_workstream(&conn, "  Q1 hiring  ", "scope: backend", None)
+            .unwrap()
+            .unwrap();
+        assert!(id.starts_with("ws_"));
+
+        let active = list_workstreams_active(&conn).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, id);
+        // Title gets trimmed; summary preserved verbatim.
+        assert_eq!(active[0].title, "Q1 hiring");
+        assert_eq!(active[0].summary, "scope: backend");
+        assert!(active[0].parent_workstream_id.is_none());
+    }
+
+    #[test]
+    fn create_workstream_rejects_empty_title() {
+        let conn = open_test_db();
+        let r = create_workstream(&conn, "   ", "", None).unwrap();
+        assert!(r.is_err(), "empty title must be rejected");
+    }
+
+    #[test]
+    fn create_workstream_with_valid_parent() {
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_umbrella"), "Umbrella", &[], &[], &[], vec![]),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let child = create_workstream(&conn, "Sub", "", Some("ws_umbrella"))
+            .unwrap()
+            .unwrap();
+        let active = list_workstreams_active(&conn).unwrap();
+        let child_row = active.iter().find(|w| w.id == child).unwrap();
+        assert_eq!(child_row.parent_workstream_id.as_deref(), Some("ws_umbrella"));
+    }
+
+    #[test]
+    fn create_workstream_rejects_unknown_parent() {
+        let conn = open_test_db();
+        let r = create_workstream(&conn, "Sub", "", Some("ws_ghost")).unwrap();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn create_workstream_rejects_grandparent_chain() {
+        // A 2-level cap: child parented to a parent that already has a
+        // parent must fail.
+        let mut conn = open_test_db();
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_g"), "Grand", &[], &[], &[], vec![]),
+            1_000,
+        )
+        .unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(Some("ws_p"), "Parent", &[], &[], &[], vec![]),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        // Make ws_p a child of ws_g.
+        set_workstream_parent(&conn, "ws_p", Some("ws_g")).unwrap().unwrap();
+
+        // Now try to create a workstream under ws_p — should fail
+        // because ws_p is itself a child.
+        let r = create_workstream(&conn, "Leaf", "", Some("ws_p")).unwrap();
+        assert!(r.is_err());
     }
 
     #[test]

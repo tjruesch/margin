@@ -1972,6 +1972,100 @@ select.settings-input {
 .inbox-composer-save:not(:disabled):hover {
   filter: brightness(1.05);
 }
+
+/* Manual workstream composer (#101). Inline form on the Workstreams
+   page, mirrors inbox-composer's chrome. */
+.workstream-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 14px;
+  padding: 12px 14px;
+  border: 0.5px solid var(--home-line);
+  background: var(--home-card);
+  border-radius: 10px;
+}
+.workstream-composer-title,
+.workstream-composer-summary {
+  width: 100%;
+  padding: 6px 0;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  outline: none;
+  caret-color: var(--accent);
+}
+.workstream-composer-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+.workstream-composer-summary {
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+.workstream-composer-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.workstream-composer-parent {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+}
+.workstream-composer-parent select {
+  appearance: auto;
+  -webkit-appearance: auto;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--fg);
+  background-color: color-mix(in srgb, var(--fg) 22%, transparent);
+  border: none;
+  border-radius: 6px;
+  padding: 3px 6px;
+}
+.workstream-composer-spacer {
+  flex: 1;
+}
+.workstream-composer-cancel,
+.workstream-composer-save {
+  padding: 5px 12px;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+.workstream-composer-cancel {
+  background: transparent;
+  border: none;
+  color: var(--fg-muted);
+}
+.workstream-composer-cancel:hover {
+  color: var(--fg);
+}
+.workstream-composer-save {
+  background: var(--accent);
+  color: var(--bg);
+  border: none;
+  font-weight: 600;
+}
+.workstream-composer-save:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.workstream-composer-save:not(:disabled):hover {
+  filter: brightness(1.05);
+}
+.workstream-composer-error {
+  margin: 0;
+  font-size: 12.5px;
+  color: #e5484d;
+}
 .home-action-bucket-head {
   display: inline-flex;
   align-items: center;

@@ -50,8 +50,13 @@ and notes, group them into 3-15 active workstreams: ongoing efforts the user is 
 (projects, hiring loops, vendor evaluations, support escalations, etc.).
 
 Stickiness: the \"Existing workstreams (active)\" section lists workstream ids already in the \
-database. When new items naturally extend one of those, REUSE its id verbatim. Spawn a new \
-workstream only when no existing one is a clean fit.
+database. STRONGLY prefer attaching new items to an existing workstream when there is any \
+reasonable fit — REUSE its id verbatim. Spawn a new workstream only when no existing one fits at \
+all (genuinely different project, people, scope). Do NOT create near-duplicate workstreams that \
+differ only in phrasing from an existing one. When an existing workstream has no signals attached \
+yet (only title + summary, no \"Notes:\" line populated by recent activity), it is a user-created \
+umbrella waiting to collect evidence: pull matching emails/events/notes into it instead of \
+spawning a new sibling.
 
 Some existing workstreams may carry an indented \"Notes:\" line — these are user-authored ground truth. \
 Treat them as authoritative: prefer them when reconciling new evidence, never write a summary that \
