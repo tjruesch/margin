@@ -6,6 +6,8 @@
 //! state, no caching. The synthesizer composes these into the
 //! end-to-end cluster pass.
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
@@ -735,6 +737,36 @@ fn attach_external_participants(
         }
     }
     Ok(())
+}
+
+/// Bulk fetch open action texts grouped by workstream id (#101). Used
+/// by the synthesizer prompt to render each workstream's current open
+/// actions so the model can dedupe against them on the next pass
+/// instead of re-emitting near-identical TODOs. Returns texts only
+/// (not full WorkstreamAction rows) — the prompt only displays them.
+/// Ordered by created_ms ASC so the prompt shows actions in stable
+/// chronological order; the caller caps per-workstream count.
+pub fn list_open_action_texts_grouped(
+    conn: &Connection,
+) -> rusqlite::Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT wa.workstream_id, wa.text \
+         FROM workstream_actions wa \
+         JOIN workstreams w ON w.id = wa.workstream_id \
+         WHERE wa.done = 0 AND w.status IN ('active', 'archived') \
+         ORDER BY wa.workstream_id, wa.created_ms ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let id: String = r.get(0)?;
+        let text: String = r.get(1)?;
+        Ok((id, text))
+    })?;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let (id, text) = row?;
+        out.entry(id).or_default().push(text);
+    }
+    Ok(out)
 }
 
 fn list_actions_for(

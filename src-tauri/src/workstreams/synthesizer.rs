@@ -84,6 +84,14 @@ Set \"owner_label\" to a team label (e.g. \"T1\") from the \"Team\" section when
 clearly assigns the work to that person; omit or leave null when the owner is ambiguous or is the \
 user themselves.
 
+Dedup against existing open actions: each existing workstream may list its open actions under \
+\"Open actions (already tracked)\". Treat that list as the source of truth — do NOT emit a new \
+action when an existing one already covers the same concrete TODO, even if your phrasing would \
+differ (e.g. existing \"Follow up with Kern & Sohn on Bridge onboarding\" already covers a new \
+\"Follow up with katharina@kern-sohn.com on Bridge intro next steps\"). When in doubt, omit; the \
+user can always add or edit actions manually. Several recent items about the same effort should \
+contribute AT MOST one new action, not one per source.
+
 Hierarchy: the \"Existing workstreams (active)\" section may show parents at the top level with \
 children indented underneath (rendered with a \"↳\" marker). When a NEW workstream cleanly extends \
 an umbrella effort already in the list (e.g. \"ELAN AI Bridge\" with sub-threads like \"Talgo demo\" \
@@ -185,7 +193,7 @@ async fn run_cluster_pass(
     // source declares its own window+cap (see `signals::Signal`); the
     // synthesizer just iterates the registry.
     let registry = signals::registry();
-    let (existing_active, existing_archived, mut snapshots, team) = {
+    let (existing_active, existing_archived, mut snapshots, team, open_actions_by_ws) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         // Pull both active and archived (snoozed excluded — they're
         // hidden from synthesis) and partition into separate sections
@@ -215,7 +223,12 @@ async fn run_cluster_pass(
             snapshots.push((src.kind(), items));
         }
         let team = team::list_team_members_raw(&c).unwrap_or_default();
-        (active, archived, snapshots, team)
+        // Existing open actions per workstream — fed into the prompt so
+        // the LLM can dedupe against them instead of re-emitting near
+        // duplicates every pass (#101).
+        let open_actions = persist::list_open_action_texts_grouped(&c)
+            .unwrap_or_default();
+        (active, archived, snapshots, team, open_actions)
     };
     let team_by_id: std::collections::HashMap<String, String> = team
         .iter()
@@ -246,6 +259,7 @@ async fn run_cluster_pass(
         &snapshots,
         registry,
         &team_by_id,
+        &open_actions_by_ws,
     );
     let items_clustered = total_items as u32;
 
@@ -481,6 +495,7 @@ fn build_user_message(
     snapshots: &[(&'static str, Vec<SnapshotItem>)],
     registry: &SignalRegistry,
     team_by_id: &std::collections::HashMap<String, String>,
+    open_actions_by_ws: &std::collections::HashMap<String, Vec<String>>,
 ) -> (String, LabelMaps) {
     let mut s = String::new();
     s.push_str("# Existing workstreams (active)\n\n");
@@ -502,10 +517,22 @@ fn build_user_message(
             if w.parent_workstream_id.is_some() {
                 continue;
             }
-            format_existing_workstream_entry(&mut s, w, team_by_id, false);
+            format_existing_workstream_entry(
+                &mut s,
+                w,
+                team_by_id,
+                open_actions_by_ws.get(&w.id),
+                false,
+            );
             if let Some(children) = children_by_parent.get(w.id.as_str()) {
                 for child in children {
-                    format_existing_workstream_entry(&mut s, child, team_by_id, true);
+                    format_existing_workstream_entry(
+                        &mut s,
+                        child,
+                        team_by_id,
+                        open_actions_by_ws.get(&child.id),
+                        true,
+                    );
                 }
             }
         }
@@ -617,10 +644,19 @@ fn collapse_ws(s: &str) -> String {
 /// with a "↳" marker so Claude sees the parent → child structure (#89).
 /// The same per-row continuation lines (Owner / Members / Notes) are
 /// emitted for both, just under a deeper indent for children.
+/// Max open actions rendered per workstream in the prompt (#101).
+/// Keeps token usage bounded while giving the LLM enough context to
+/// dedupe against most real-world workstreams.
+const OPEN_ACTIONS_PER_WORKSTREAM_CAP: usize = 12;
+/// Per-line cap for an open action's text in the prompt. Long action
+/// bodies get a trailing ellipsis.
+const OPEN_ACTION_LINE_CAP: usize = 200;
+
 fn format_existing_workstream_entry(
     s: &mut String,
     w: &Workstream,
     team_by_id: &std::collections::HashMap<String, String>,
+    open_actions: Option<&Vec<String>>,
     is_child: bool,
 ) {
     let head_prefix = if is_child { "   ↳ " } else { "" };
@@ -662,6 +698,25 @@ fn format_existing_workstream_entry(
         s.push_str(&format!(
             "{cont_prefix}Notes (user-authored, ground truth): {truncated}\n"
         ));
+    }
+    // Existing open actions — rendered so the LLM can skip near
+    // duplicates instead of re-emitting them every pass (#101).
+    if let Some(actions) = open_actions {
+        if !actions.is_empty() {
+            s.push_str(&format!("{cont_prefix}Open actions (already tracked):\n"));
+            let shown = actions.iter().take(OPEN_ACTIONS_PER_WORKSTREAM_CAP);
+            for a in shown {
+                let collapsed = collapse_ws(a);
+                let truncated = truncate_chars(&collapsed, OPEN_ACTION_LINE_CAP);
+                s.push_str(&format!("{cont_prefix}  - {truncated}\n"));
+            }
+            if actions.len() > OPEN_ACTIONS_PER_WORKSTREAM_CAP {
+                s.push_str(&format!(
+                    "{cont_prefix}  (+{} more not shown)\n",
+                    actions.len() - OPEN_ACTIONS_PER_WORKSTREAM_CAP
+                ));
+            }
+        }
     }
 }
 
@@ -1244,7 +1299,7 @@ mod tests {
             ("note", vec![make_note()]),
         ];
         let team: HashMap<String, String> = HashMap::new();
-        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team);
+        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team, &HashMap::new());
 
         let expected = concat!(
             "# Existing workstreams (active)\n\n",
@@ -1291,7 +1346,7 @@ mod tests {
             ("note", vec![]),
         ];
         let team: HashMap<String, String> = HashMap::new();
-        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team);
+        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team, &HashMap::new());
         assert!(prompt.contains("\n# Recent emails (last 14 days)\n\n(none)\n"));
         assert!(prompt.contains("\n# Recent calendar events (window: -14d .. +14d)\n\n(none)\n"));
         assert!(prompt.contains("\n# Recent notes (last 30 days)\n\n(none)\n"));
