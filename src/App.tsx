@@ -2040,7 +2040,7 @@ export default function App() {
             synthInFlight={synthInFlight}
             synthMessage={synthMessage}
             onRefreshWorkstreams={() => void triggerSynthesize()}
-            onWorkstreamCreated={() => void refreshWorkstreams()}
+            onWorkstreamsChanged={() => void refreshWorkstreams()}
           />
         )}
       </main>

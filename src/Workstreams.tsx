@@ -69,16 +69,18 @@ export function WorkstreamsView({
   synthInFlight,
   synthMessage,
   onOpenNote,
-  onCreated,
+  onChanged,
 }: {
   workstreams: Workstream[];
   loading: boolean;
   synthInFlight: boolean;
   synthMessage: string | null;
   onOpenNote: (path: string) => void;
-  /** Fires after a manual create succeeds (#101). Parent uses it to
-   *  refetch the list so the new card appears without a synth pass. */
-  onCreated: () => void;
+  /** Fires after any workstream mutation (manual create, archive,
+   *  snooze, reactivate, reparent, change owner). Parent refetches the
+   *  list so the change shows up immediately without a synth pass.
+   *  (#101) */
+  onChanged: () => void;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
@@ -167,6 +169,7 @@ export function WorkstreamsView({
         onBack={() => setSelectedId(null)}
         onNavigateTo={(id) => setSelectedId(id)}
         onOpenNote={onOpenNote}
+        onChanged={onChanged}
         teamMembers={teamMembers}
         teamById={teamById}
         allWorkstreams={workstreams}
@@ -210,7 +213,7 @@ export function WorkstreamsView({
           onCancel={() => setComposerOpen(false)}
           onCreated={(id) => {
             setComposerOpen(false);
-            onCreated();
+            onChanged();
             // Open the new workstream's detail so the user can add
             // notes / set owner before the next synth pass runs.
             setSelectedId(id);
@@ -234,27 +237,19 @@ export function WorkstreamsView({
         </p>
       ) : (
         <div className="workstream-list">
-          {renderHierarchical(
-            filteredActive,
-            (w) => (
-              <WorkstreamCard
-                key={w.id}
-                workstream={w}
-                nowMs={nowMs}
-                onClick={() => setSelectedId(w.id)}
-                teamById={teamById}
-                nested={w.parent_workstream_id != null}
-                childCount={childCounts.get(w.id) ?? 0}
-              />
-            ),
-            (w) => (
-              <WorkstreamChildRow
-                key={w.id}
-                workstream={w}
-                onClick={() => setSelectedId(w.id)}
-              />
-            ),
-          )}
+          {renderHierarchical(filteredActive, (w, kids) => (
+            <WorkstreamCard
+              key={w.id}
+              workstream={w}
+              nowMs={nowMs}
+              onClick={() => setSelectedId(w.id)}
+              teamById={teamById}
+              nested={w.parent_workstream_id != null}
+              childCount={childCounts.get(w.id) ?? 0}
+              children={kids}
+              onChildClick={(id) => setSelectedId(id)}
+            />
+          ))}
         </div>
       )}
 
@@ -421,21 +416,16 @@ function applyMemberFilter<T extends Workstream>(
 }
 
 /**
- * Render a flat workstreams list with children visually nested under
- * their parent (#89). Order: top-level workstreams (no parent or whose
- * parent isn't in the slice) in input order; each parent immediately
- * followed by its children in input order. Orphan children — whose
- * parent was filtered out — render at the top level so the filter
- * still surfaces them.
- *
- * Two callbacks: full card for top-level / orphan rows, slim child
- * row for children rendered under a visible parent (#101). The slim
- * variant keeps umbrellas readable without dominating the list.
+ * Render a flat workstreams list with each parent's direct children
+ * embedded inside its card (#101). Top-level workstreams (no parent or
+ * whose parent isn't in the slice) render via `renderRoot`, which
+ * receives the resolved children array. Orphan children — whose parent
+ * was filtered out — surface at the top level with no embedded list of
+ * their own (the 2-level cap means they don't have grandchildren).
  */
 function renderHierarchical(
   workstreams: Workstream[],
-  renderRoot: (w: Workstream) => React.ReactNode,
-  renderChild: (w: Workstream) => React.ReactNode,
+  renderRoot: (w: Workstream, children: Workstream[]) => React.ReactNode,
 ): React.ReactNode[] {
   const ids = new Set(workstreams.map((w) => w.id));
   const childrenByParent = new Map<string, Workstream[]>();
@@ -450,45 +440,21 @@ function renderHierarchical(
   for (const w of workstreams) {
     // Skip children that will render under a visible parent.
     if (w.parent_workstream_id && ids.has(w.parent_workstream_id)) continue;
-    out.push(renderRoot(w));
-    const children = childrenByParent.get(w.id);
-    if (children) {
-      for (const child of children) out.push(renderChild(child));
-    }
+    out.push(renderRoot(w, childrenByParent.get(w.id) ?? []));
   }
   return out;
-}
-
-/// Slim child row used for nested workstreams (#101). One line with
-/// title and a chev — full card chrome would dwarf the parent. Click
-/// navigates into the child's detail view.
-function WorkstreamChildRow({
-  workstream,
-  onClick,
-}: {
-  workstream: Workstream;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className="workstream-child-row"
-      onClick={onClick}
-      title={`Open ${workstream.title}`}
-    >
-      <span className="workstream-child-row-marker" aria-hidden>
-        ↳
-      </span>
-      <span className="workstream-child-row-title">{workstream.title}</span>
-      <IconChevRight size={12} sw={1.7} />
-    </button>
-  );
 }
 
 /// Max member chips rendered on the card before overflow collapses
 /// into a `+N` pill. Owner always shows when present; the cap covers
 /// owner + non-owner members combined.
 const CARD_CHIP_CAP = 4;
+
+/// Max embedded child rows rendered inside the parent card before the
+/// remainder collapses to a "+N more" line (#101).
+const CARD_CHILD_PREVIEW_CAP = 3;
+/// Max participant avatars per embedded child row.
+const CHILD_ROW_AVATAR_CAP = 3;
 
 function WorkstreamCard({
   workstream: w,
@@ -497,6 +463,8 @@ function WorkstreamCard({
   teamById,
   nested = false,
   childCount = 0,
+  children = [],
+  onChildClick,
 }: {
   workstream: Workstream;
   nowMs: number;
@@ -509,6 +477,13 @@ function WorkstreamCard({
    *  parent. Surfaces as "N sub-workstreams" in the count line so an
    *  umbrella with no direct signals still reads as non-empty (#101). */
   childCount?: number;
+  /** Direct children rendered inline at the bottom of the card (#101).
+   *  Visible cap is `CARD_CHILD_PREVIEW_CAP`; the rest collapses to a
+   *  "+N more" line. */
+  children?: Workstream[];
+  /** Click handler for an embedded child row. Required when `children`
+   *  is non-empty so each row routes into the child's detail. */
+  onChildClick?: (id: string) => void;
 }) {
   const isReopened = w.reopened_at_ms != null && w.status === "active";
 
@@ -534,11 +509,22 @@ function WorkstreamCard({
   const visible = ordered.slice(0, CARD_CHIP_CAP);
   const overflow = ordered.length - visible.length;
 
+  const visibleChildren = children.slice(0, CARD_CHILD_PREVIEW_CAP);
+  const hiddenChildCount = children.length - visibleChildren.length;
   return (
-    <button
-      type="button"
+    <div
       className={"workstream-card" + (nested ? " nested" : "")}
+      role="button"
+      tabIndex={0}
       onClick={onClick}
+      onKeyDown={(e) => {
+        // Only the wrapper handles Enter/Space — nested buttons stop
+        // their own keydown bubbling, so child rows don't double-fire.
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
     >
       <div className="workstream-card-head">
         <span className="workstream-card-title">
@@ -628,6 +614,109 @@ function WorkstreamCard({
       ) : null}
       <p className="workstream-card-summary">{w.summary}</p>
       <div className="workstream-card-counts">{countLine(w, childCount)}</div>
+      {visibleChildren.length > 0 && (
+        <div className="workstream-card-children">
+          {visibleChildren.map((c) => (
+            <EmbeddedChildRow
+              key={c.id}
+              workstream={c}
+              teamById={teamById}
+              onClick={() => onChildClick?.(c.id)}
+            />
+          ))}
+          {hiddenChildCount > 0 && (
+            <div className="workstream-card-children-more">
+              …{hiddenChildCount} more
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/// Embedded child row rendered inside the parent WorkstreamCard (#101).
+/// Compact: indent marker, title, up to a few initials avatars, and an
+/// "+N external" pill. Clicking jumps to the child's detail view.
+function EmbeddedChildRow({
+  workstream: w,
+  teamById,
+  onClick,
+}: {
+  workstream: Workstream;
+  teamById: Map<string, TeamMember>;
+  onClick: () => void;
+}) {
+  // Resolve people: owner first, then other members. Same ordering as
+  // the parent card, but only the first `CHILD_ROW_AVATAR_CAP` get
+  // rendered to keep the row slim.
+  const resolved: TeamMember[] = [];
+  const seen = new Set<string>();
+  if (w.owner_member_id) {
+    const m = teamById.get(w.owner_member_id);
+    if (m) {
+      resolved.push(m);
+      seen.add(m.id);
+    }
+  }
+  for (const id of w.members) {
+    if (seen.has(id)) continue;
+    const m = teamById.get(id);
+    if (m) {
+      resolved.push(m);
+      seen.add(m.id);
+    }
+  }
+  const visibleAvatars = resolved.slice(0, CHILD_ROW_AVATAR_CAP);
+  const overflow = resolved.length - visibleAvatars.length;
+  const externalCount = w.external_participants.length;
+  return (
+    <button
+      type="button"
+      className="workstream-card-child"
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
+      onKeyDown={(e) => {
+        // Stop the parent's keydown handler from also navigating.
+        if (e.key === "Enter" || e.key === " ") e.stopPropagation();
+      }}
+      title={`Open ${w.title}`}
+    >
+      <span className="workstream-card-child-marker" aria-hidden>
+        ↳
+      </span>
+      <span className="workstream-card-child-title">{w.title}</span>
+      <span className="workstream-card-child-people">
+        {visibleAvatars.map((m) => (
+          <span
+            key={m.id}
+            className="workstream-card-child-avatar"
+            style={{ background: avatarColor(m.display_name) }}
+            title={m.display_name}
+          >
+            {initialsFromName(m.display_name)}
+          </span>
+        ))}
+        {overflow > 0 && (
+          <span
+            className="workstream-card-child-overflow"
+            title={`${overflow} more`}
+          >
+            +{overflow}
+          </span>
+        )}
+        {externalCount > 0 && (
+          <span
+            className="workstream-card-child-externals"
+            title={`${externalCount} external participant${externalCount === 1 ? "" : "s"}`}
+          >
+            +{externalCount} external
+          </span>
+        )}
+      </span>
+      <IconChevRight size={12} sw={1.7} />
     </button>
   );
 }
@@ -699,26 +788,18 @@ function ArchivedSection({
           <p className="home-empty">No archived workstreams match this filter.</p>
         ) : (
           <div className="workstream-archived-list">
-            {renderHierarchical(
-              filtered,
-              (w) => (
-                <WorkstreamCard
-                  key={w.id}
-                  workstream={w}
-                  nowMs={nowMs}
-                  onClick={() => onSelect(w.id)}
-                  teamById={teamById}
-                  nested={w.parent_workstream_id != null}
-                />
-              ),
-              (w) => (
-                <WorkstreamChildRow
-                  key={w.id}
-                  workstream={w}
-                  onClick={() => onSelect(w.id)}
-                />
-              ),
-            )}
+            {renderHierarchical(filtered, (w, kids) => (
+              <WorkstreamCard
+                key={w.id}
+                workstream={w}
+                nowMs={nowMs}
+                onClick={() => onSelect(w.id)}
+                teamById={teamById}
+                nested={w.parent_workstream_id != null}
+                children={kids}
+                onChildClick={(id) => onSelect(id)}
+              />
+            ))}
           </div>
         )
       ) : null}
@@ -750,6 +831,7 @@ function WorkstreamDetailView({
   onBack,
   onNavigateTo,
   onOpenNote,
+  onChanged,
   teamMembers,
   teamById,
   allWorkstreams,
@@ -761,6 +843,9 @@ function WorkstreamDetailView({
    *  card clicks (#89). */
   onNavigateTo: (id: string) => void;
   onOpenNote: (path: string) => void;
+  /** Fired after any status / parent / owner change so the list view
+   *  refetches and reflects the mutation immediately (#101). */
+  onChanged: () => void;
   teamMembers: TeamMember[];
   teamById: Map<string, TeamMember>;
   /** All active workstreams in the current list — used by the parent
@@ -909,6 +994,9 @@ function WorkstreamDetailView({
     async (status: WorkstreamStatus) => {
       try {
         await setWorkstreamStatus(id, status);
+        // Notify the list so the card drops off (archive/snooze) or
+        // gets repainted with the new state (#101).
+        onChanged();
         if (status !== "active") {
           // Archived/snoozed workstreams drop off the list, so go back.
           onBack();
@@ -920,7 +1008,7 @@ function WorkstreamDetailView({
         await reload();
       }
     },
-    [id, onBack, reload],
+    [id, onBack, onChanged, reload],
   );
 
   const onOpenEvent = useCallback(
@@ -982,6 +1070,8 @@ function WorkstreamDetailView({
     setDetail((d) => (d ? { ...d, owner_member_id: ownerId } : d));
     try {
       await setWorkstreamOwner(detail.id, ownerId);
+      // List view's owner chip + member-filter reflect the new owner.
+      onChanged();
     } catch (e) {
       console.error("[workstreams] setWorkstreamOwner failed", e);
       setDetail((d) => (d ? { ...d, owner_member_id: prev } : d));
@@ -993,6 +1083,8 @@ function WorkstreamDetailView({
     setDetail((d) => (d ? { ...d, parent_workstream_id: parentId } : d));
     try {
       await setWorkstreamParent(detail.id, parentId);
+      // Hierarchy in the list view needs to repaint immediately.
+      onChanged();
     } catch (e) {
       console.error("[workstreams] setWorkstreamParent failed", e);
       // Revert + surface the backend error string to the user.
@@ -1174,7 +1266,11 @@ function WorkstreamDetailView({
       <NotesSection notes={detail.notes} onOpenNote={onOpenNote} />
 
       {detail.children.length > 0 ? (
-        <ChildrenSection items={detail.children} onSelect={onNavigateTo} />
+        <ChildrenSection
+          items={detail.children}
+          teamById={teamById}
+          onSelect={onNavigateTo}
+        />
       ) : null}
     </div>
   );
@@ -1189,19 +1285,22 @@ function WorkstreamDetailView({
  */
 function ChildrenSection({
   items,
+  teamById,
   onSelect,
 }: {
   items: Workstream[];
+  teamById: Map<string, TeamMember>;
   onSelect: (id: string) => void;
 }) {
   return (
     <section className="workstream-children-section">
       <h3 className="workstream-section-title">Children ({items.length})</h3>
-      <div className="workstream-child-list">
+      <div className="workstream-card-children workstream-card-children-flush">
         {items.map((c) => (
-          <WorkstreamChildRow
+          <EmbeddedChildRow
             key={c.id}
             workstream={c}
+            teamById={teamById}
             onClick={() => onSelect(c.id)}
           />
         ))}

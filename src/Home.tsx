@@ -94,10 +94,11 @@ type Props = {
   synthMessage: string | null;
   /** Force a synthesis pass via `synthesize_workstreams(true)`. */
   onRefreshWorkstreams: () => void;
-  /** Callback fired by WorkstreamsView after a manual create lands so
-   *  App.tsx can refetch the list (#101). No synth pass — that's the
-   *  user's call to make via Refresh. */
-  onWorkstreamCreated: () => void;
+  /** Callback fired by WorkstreamsView whenever a workstream is
+   *  created, archived, snoozed, reparented, or has its owner changed.
+   *  App.tsx refetches the list so the list view reflects the change
+   *  without a synth pass. (#101) */
+  onWorkstreamsChanged: () => void;
 };
 
 type NavId =
@@ -309,7 +310,7 @@ export function Home({
   synthInFlight,
   synthMessage,
   onRefreshWorkstreams,
-  onWorkstreamCreated,
+  onWorkstreamsChanged,
 }: Props) {
   const [nav, setNav] = useState<NavId>(
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
@@ -604,7 +605,7 @@ export function Home({
             synthInFlight={synthInFlight}
             synthMessage={synthMessage}
             onOpenNote={onOpen}
-            onCreated={onWorkstreamCreated}
+            onChanged={onWorkstreamsChanged}
           />
         ) : nav === "actions" ? (
           <ActionsFeed

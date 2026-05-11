@@ -5080,24 +5080,30 @@ input.nh-title {
 .workstream-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
 }
-/* Slim child-row container (#101) — used for nested workstreams under
-   a parent card and in the detail-view Children section. Tighter gap
-   than the full-card list so children read as a sub-list, not as
-   independent items. */
-.workstream-child-list {
+/* Embedded children inside a parent WorkstreamCard (#101). Slim rows
+   with marker, title, member avatars, and an external pill. The list
+   sits under the card's count line with a thin divider above. */
+.workstream-card-children {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 0.5px solid var(--home-line);
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
-.workstream-child-row {
+.workstream-card-children-flush {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+.workstream-card-child {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: calc(100% - 24px);
-  margin-left: 24px;
-  padding: 6px 10px;
+  width: 100%;
+  padding: 5px 8px;
   background: transparent;
   border: none;
   border-radius: 6px;
@@ -5107,26 +5113,66 @@ input.nh-title {
   cursor: pointer;
   transition: background 80ms ease;
 }
-.workstream-child-row:hover {
+.workstream-card-child:hover {
   background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
-.workstream-child-row-marker {
+.workstream-card-child-marker {
   flex-shrink: 0;
   color: var(--fg-muted);
   font-size: 12.5px;
   line-height: 1;
 }
-.workstream-child-row-title {
+.workstream-card-child-title {
   flex: 1;
   font-size: 13px;
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
-.workstream-child-row svg {
+.workstream-card-child-people {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.workstream-card-child-avatar {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9.5px;
+  font-weight: 600;
+  color: #fff;
+  line-height: 1;
+  letter-spacing: 0;
+}
+.workstream-card-child-overflow {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--fg-muted);
+  padding: 0 4px;
+}
+.workstream-card-child-externals {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--fg-muted);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--fg) 6%, transparent);
+}
+.workstream-card-child svg {
   flex-shrink: 0;
   color: var(--fg-muted);
+}
+.workstream-card-children-more {
+  padding: 4px 8px 2px;
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  font-style: italic;
 }
 .workstream-card {
   position: relative;
