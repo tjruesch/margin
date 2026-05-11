@@ -34,6 +34,7 @@ import {
   IconSettings,
   IconSidebar,
   IconStar,
+  IconTrash,
   IconUser,
 } from "./icons";
 
@@ -65,6 +66,9 @@ type Props = {
   actions: ActionListItem[];
   /** Flip an action item's done state. Optimistic upstream. */
   onToggleAction: (id: string, nextDone: boolean) => void;
+  /** Permanently remove an action item's checkbox line from its source
+   *  note (#100). Optimistic upstream. */
+  onDeleteAction: (id: string) => void;
   /** Append a quick todo to the catch-all Inbox note. `dueToken` is the
    *  optional payload after `@` (e.g. `2026-05-15` or `2026-05-15 09:00`);
    *  Rust resolves any relative form during write_note. */
@@ -289,6 +293,7 @@ export function Home({
   onDuplicateRow,
   actions,
   onToggleAction,
+  onDeleteAction,
   onAddInboxTodo,
   editor,
   members,
@@ -468,6 +473,19 @@ export function Home({
     }
   };
 
+  // Switch to the Workstreams view and surface the detail for `id`
+  // (#100). Mirrors the SearchPalette's `onOpenWorkstream` path —
+  // setNav then dispatch a microtask later so WorkstreamsView is
+  // mounted in time to receive the event.
+  const openWorkstream = (id: string) => {
+    setNav("workstreams");
+    queueMicrotask(() => {
+      window.dispatchEvent(
+        new CustomEvent("margin:open-workstream", { detail: id }),
+      );
+    });
+  };
+
   return (
     <div className={"home" + (sidebarOpen ? "" : " home-collapsed")}>
       <SearchPalette
@@ -570,6 +588,7 @@ export function Home({
           <TeamView
             editor={editor}
             onOpenNote={onOpen}
+            onOpenWorkstream={openWorkstream}
             onToggleAction={onToggleAction}
             onReassignAction={onReassignAction}
           />
@@ -585,7 +604,9 @@ export function Home({
           <ActionsFeed
             actions={actions}
             onToggle={onToggleAction}
+            onDelete={onDeleteAction}
             onOpenNote={onOpen}
+            onOpenWorkstream={openWorkstream}
             onAddInboxTodo={onAddInboxTodo}
             members={members}
             onReassign={onReassignAction}
@@ -597,6 +618,7 @@ export function Home({
                 items={actions}
                 onToggle={onToggleAction}
                 onOpenNote={onOpen}
+                onOpenWorkstream={openWorkstream}
                 onViewAll={() => setNav("actions")}
                 members={members}
                 onReassign={onReassignAction}
@@ -1034,6 +1056,7 @@ function ActionItemsTeaser({
   items,
   onToggle,
   onOpenNote,
+  onOpenWorkstream,
   onViewAll,
   members,
   onReassign,
@@ -1041,6 +1064,7 @@ function ActionItemsTeaser({
   items: ActionListItem[];
   onToggle: (id: string, nextDone: boolean) => void;
   onOpenNote: (path: string) => void;
+  onOpenWorkstream: (id: string) => void;
   onViewAll: () => void;
   members: TeamMember[];
   onReassign: (actionId: string, memberId: string | null) => void;
@@ -1077,6 +1101,7 @@ function ActionItemsTeaser({
             it={it}
             onToggle={onToggle}
             onOpenNote={onOpenNote}
+            onOpenWorkstream={onOpenWorkstream}
             members={members}
             onReassign={onReassign}
           />
@@ -1098,13 +1123,23 @@ export const BUCKET_ORDER = [
 export function ActionRow({
   it,
   onToggle,
+  onDelete,
   onOpenNote,
+  onOpenWorkstream,
   members,
   onReassign,
 }: {
   it: ActionListItem;
   onToggle: (id: string, nextDone: boolean) => void;
+  /** When provided, a hover-revealed trash button is rendered (#100).
+   *  The actions page wires this through; per-note teasers and Team
+   *  reuse the row without delete. */
+  onDelete?: (id: string) => void;
   onOpenNote: (path: string) => void;
+  /** Optional — routes workstream-sourced rows to the Workstreams
+   *  detail view (#100). When omitted, workstream rows still render
+   *  but the click handler short-circuits. */
+  onOpenWorkstream?: (id: string) => void;
   members: TeamMember[];
   onReassign: (actionId: string, memberId: string | null) => void;
 }) {
@@ -1115,16 +1150,26 @@ export function ActionRow({
   const displayText = it.assignee_id
     ? stripLeadingOwnerPrefix(it.text)
     : it.text;
+  const isWorkstream = it.source === "workstream";
+  const openTarget = () => {
+    if (isWorkstream) {
+      if (it.workstream_id && onOpenWorkstream) {
+        onOpenWorkstream(it.workstream_id);
+      }
+    } else if (it.note_path) {
+      onOpenNote(it.note_path);
+    }
+  };
   return (
     <div
       className="home-action-row"
       role="button"
       tabIndex={0}
-      onClick={() => onOpenNote(it.note_path)}
+      onClick={openTarget}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onOpenNote(it.note_path);
+          openTarget();
         }
       }}
       title={`Open ${it.note_title}`}
@@ -1151,6 +1196,20 @@ export function ActionRow({
         members={members}
         onPick={(memberId) => onReassign(it.id, memberId)}
       />
+      {onDelete && (
+        <button
+          type="button"
+          className="home-action-delete"
+          aria-label="Delete action item"
+          title="Delete"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDelete(it.id);
+          }}
+        >
+          <IconTrash size={14} sw={1.7} />
+        </button>
+      )}
     </div>
   );
 }
@@ -1270,14 +1329,18 @@ function InboxComposerForm({
 function ActionsFeed({
   actions,
   onToggle,
+  onDelete,
   onOpenNote,
+  onOpenWorkstream,
   onAddInboxTodo,
   members,
   onReassign,
 }: {
   actions: ActionListItem[];
   onToggle: (id: string, nextDone: boolean) => void;
+  onDelete: (id: string) => void;
   onOpenNote: (path: string) => void;
+  onOpenWorkstream: (id: string) => void;
   onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
   members: TeamMember[];
   onReassign: (actionId: string, memberId: string | null) => void;
@@ -1355,7 +1418,9 @@ function ActionsFeed({
                   key={it.id}
                   it={it}
                   onToggle={onToggle}
+                  onDelete={onDelete}
                   onOpenNote={onOpenNote}
+                  onOpenWorkstream={onOpenWorkstream}
                   members={members}
                   onReassign={onReassign}
                 />
@@ -1377,7 +1442,9 @@ function ActionsFeed({
                 key={it.id}
                 it={it}
                 onToggle={onToggle}
+                onDelete={onDelete}
                 onOpenNote={onOpenNote}
+                onOpenWorkstream={onOpenWorkstream}
                 members={members}
                 onReassign={onReassign}
               />

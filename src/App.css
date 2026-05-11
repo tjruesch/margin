@@ -2008,6 +2008,30 @@ select.settings-input {
   background: var(--home-card-hover);
   box-shadow: 0 2px 8px color-mix(in srgb, var(--fg) 4%, transparent);
 }
+.home-action-delete {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  margin-top: -1px;
+  border-radius: 6px;
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+}
+.home-action-row:hover .home-action-delete,
+.home-action-delete:focus-visible {
+  opacity: 1;
+}
+.home-action-delete:hover {
+  background: color-mix(in srgb, #e5484d 14%, transparent);
+  color: #e5484d;
+}
 .home-checkbox {
   width: 20px;
   height: 20px;

@@ -36,11 +36,14 @@ const EMPTY_ACTIONS: ActionListItem[] = [];
 export function TeamView({
   editor,
   onOpenNote,
+  onOpenWorkstream,
   onToggleAction,
   onReassignAction,
 }: {
   editor: EditorSettings;
   onOpenNote: (path: string) => void;
+  /** Routes workstream-sourced rows to the Workstreams view (#100). */
+  onOpenWorkstream: (id: string) => void;
   onToggleAction: (id: string, nextDone: boolean) => void;
   onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
@@ -96,6 +99,7 @@ export function TeamView({
         editor={editor}
         onBack={() => setSelectedId(null)}
         onOpenNote={onOpenNote}
+        onOpenWorkstream={onOpenWorkstream}
         onToggleAction={onToggleAction}
         onReassignAction={onReassignAction}
         onUpdated={(next) => {
@@ -302,6 +306,7 @@ function TeamDetail({
   onUpdated,
   onDeleted,
   onOpenNote,
+  onOpenWorkstream,
   onToggleAction,
   onReassignAction,
 }: {
@@ -312,6 +317,7 @@ function TeamDetail({
   onUpdated: (next: TeamMember) => void;
   onDeleted: () => void;
   onOpenNote: (path: string) => void;
+  onOpenWorkstream: (id: string) => void;
   onToggleAction: (id: string, nextDone: boolean) => void;
   onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
@@ -540,6 +546,7 @@ function TeamDetail({
           member={member}
           members={members}
           onOpenNote={onOpenNote}
+          onOpenWorkstream={onOpenWorkstream}
           onToggleAction={onToggleAction}
           onReassignAction={onReassignAction}
         />
@@ -623,12 +630,14 @@ function TasksTab({
   member,
   members,
   onOpenNote,
+  onOpenWorkstream,
   onToggleAction,
   onReassignAction,
 }: {
   member: TeamMember;
   members: TeamMember[];
   onOpenNote: (path: string) => void;
+  onOpenWorkstream: (id: string) => void;
   onToggleAction: (id: string, nextDone: boolean) => void;
   onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
@@ -797,6 +806,7 @@ function TasksTab({
                       it={it}
                       onToggle={toggleLocal}
                       onOpenNote={onOpenNote}
+                      onOpenWorkstream={onOpenWorkstream}
                       members={members}
                       onReassign={(id, memberId) => void reassignLocal(id, memberId)}
                     />
@@ -820,6 +830,7 @@ function TasksTab({
                     it={it}
                     onToggle={toggleLocal}
                     onOpenNote={onOpenNote}
+                    onOpenWorkstream={onOpenWorkstream}
                     members={members}
                     onReassign={(id, memberId) => void reassignLocal(id, memberId)}
                   />
@@ -840,6 +851,7 @@ function TasksTab({
                     it={it}
                     onToggle={toggleLocal}
                     onOpenNote={onOpenNote}
+                    onOpenWorkstream={onOpenWorkstream}
                     members={members}
                     onReassign={(id, memberId) => void reassignLocal(id, memberId)}
                   />

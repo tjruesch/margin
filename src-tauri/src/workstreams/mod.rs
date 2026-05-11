@@ -119,6 +119,11 @@ pub struct WorkstreamAction {
     pub source_id: String,
     pub done: bool,
     pub created_ms: i64,
+    /// Optional team_members.id when the synthesizer assigned an owner
+    /// or the user manually reassigned via set_workstream_action_assignee
+    /// (#100). Surfaces in the Action items page via the unified
+    /// list_actions UNION.
+    pub assignee_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

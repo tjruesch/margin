@@ -1919,6 +1919,7 @@ mod tests {
             source_id: "msg".into(),
             done,
             created_ms: 0,
+            assignee_id: None,
         }
     }
 

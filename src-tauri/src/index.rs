@@ -51,7 +51,8 @@ const SCHEMA_V17: &str = include_str!("migrations/017_typed_aliases.sql");
 const SCHEMA_V18: &str = include_str!("migrations/018_workstream_links.sql");
 const SCHEMA_V19: &str = include_str!("migrations/019_workstream_parent.sql");
 const SCHEMA_V20: &str = include_str!("migrations/020_workstream_link_summary.sql");
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_V21: &str = include_str!("migrations/021_workstream_action_assignee.sql");
+const SCHEMA_VERSION: i64 = 21;
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
@@ -174,6 +175,10 @@ fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V20)?;
         version = 20;
     }
+    if version == 20 {
+        conn.execute_batch(SCHEMA_V21)?;
+        version = 21;
+    }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
@@ -255,48 +260,73 @@ pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>
         .collect())
 }
 
-/// Action items across all non-archived owned notes, scoped to open /
-/// done / all. JOINs with `notes` so the result rows carry the source
-/// note's title for direct display in the actions feed. Archived notes
-/// are excluded from `Open` view since their actions are out of sight
-/// (mirrors the `Active` notes scope).
+/// Action items unified across two sources (#100):
+///  - `actions` (note-backed markdown checkboxes on non-archived notes)
+///  - `workstream_actions` on active workstreams
+///
+/// Each row carries a `source` discriminator so the UI can route click-
+/// through, delete, and assignee writes through the right IPC path.
+/// Archived notes / non-active workstreams are excluded from `Open`
+/// view since their actions are out of sight.
 pub fn list_actions(
     conn: &Connection,
     scope: ActionScope,
     assignee_id: Option<&str>,
 ) -> Result<Vec<ActionListItem>> {
-    let where_done = match scope {
+    let where_done_note = match scope {
         ActionScope::Open => "AND a.done = 0",
         ActionScope::Done => "AND a.done = 1",
         ActionScope::All => "",
     };
+    let where_done_ws = match scope {
+        ActionScope::Open => "AND wa.done = 0",
+        ActionScope::Done => "AND wa.done = 1",
+        ActionScope::All => "",
+    };
     // Always bind ?1 (assignee_id, NULL when no filter); the SQL
-    // `(?1 IS NULL OR a.assignee_id = ?1)` short-circuits to "no
-    // filter" when ?1 is NULL. Avoids the lifetime gymnastics of
-    // building a dynamic params vec.
+    // `(?1 IS NULL OR <col> = ?1)` short-circuits to "no filter" when
+    // ?1 is NULL. Avoids the lifetime gymnastics of building a dynamic
+    // params vec.
     let sql = format!(
-        "SELECT a.id, a.note_path, n.title, a.text, a.done, a.line, a.created_ms, a.due_ms, \
-                a.assignee_id, t.display_name \
-         FROM actions a \
-         JOIN notes n ON n.note_path = a.note_path \
-         LEFT JOIN team_members t ON t.id = a.assignee_id \
-         WHERE n.archived = 0 {where_done} \
-           AND (?1 IS NULL OR a.assignee_id = ?1) \
-         ORDER BY (a.due_ms IS NULL), a.due_ms ASC, n.modified_ms DESC, a.line ASC"
+        "SELECT * FROM ( \
+            SELECT 'note' AS source, a.id AS id, a.note_path AS note_path, n.title AS title, \
+                   NULL AS workstream_id, a.text AS text, a.done AS done, a.line AS line, \
+                   a.created_ms AS created_ms, a.due_ms AS due_ms, a.assignee_id AS assignee_id, \
+                   t.display_name AS display_name, n.modified_ms AS order_ms \
+              FROM actions a \
+              JOIN notes n ON n.note_path = a.note_path \
+              LEFT JOIN team_members t ON t.id = a.assignee_id \
+             WHERE n.archived = 0 {where_done_note} \
+               AND (?1 IS NULL OR a.assignee_id = ?1) \
+            UNION ALL \
+            SELECT 'workstream' AS source, wa.id AS id, '' AS note_path, w.title AS title, \
+                   wa.workstream_id AS workstream_id, wa.text AS text, wa.done AS done, \
+                   0 AS line, wa.created_ms AS created_ms, wa.due_ms AS due_ms, \
+                   wa.assignee_id AS assignee_id, t.display_name AS display_name, \
+                   w.last_activity_ms AS order_ms \
+              FROM workstream_actions wa \
+              JOIN workstreams w ON w.id = wa.workstream_id \
+              LEFT JOIN team_members t ON t.id = wa.assignee_id \
+             WHERE w.status = 'active' {where_done_ws} \
+               AND (?1 IS NULL OR wa.assignee_id = ?1) \
+         ) \
+         ORDER BY (due_ms IS NULL), due_ms ASC, order_ms DESC, line ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![assignee_id], |r| {
         Ok(ActionListItem {
-            id: r.get(0)?,
-            note_path: r.get(1)?,
-            note_title: r.get(2)?,
-            text: r.get(3)?,
-            done: r.get::<_, i64>(4)? != 0,
-            line: r.get(5)?,
-            created_ms: r.get(6)?,
-            due_ms: r.get(7)?,
-            assignee_id: r.get(8)?,
-            assignee_display_name: r.get(9)?,
+            source: r.get(0)?,
+            id: r.get(1)?,
+            note_path: r.get(2)?,
+            note_title: r.get(3)?,
+            workstream_id: r.get(4)?,
+            text: r.get(5)?,
+            done: r.get::<_, i64>(6)? != 0,
+            line: r.get(7)?,
+            created_ms: r.get(8)?,
+            due_ms: r.get(9)?,
+            assignee_id: r.get(10)?,
+            assignee_display_name: r.get(11)?,
         })
     })?;
     let mut out = Vec::new();

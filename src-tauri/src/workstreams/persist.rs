@@ -49,6 +49,9 @@ pub struct SynthesizedAction {
     pub due_ms: Option<i64>,
     pub source_kind: String,
     pub source_id: String,
+    /// Resolved team_members.id when the synthesizer picked an
+    /// `owner_label` (#100). None means unowned/user-owned.
+    pub assignee_id: Option<String>,
 }
 
 // ----- meta key/value ------------------------------------------------------
@@ -739,7 +742,7 @@ fn list_actions_for(
     workstream_id: &str,
 ) -> rusqlite::Result<Vec<WorkstreamAction>> {
     let mut stmt = conn.prepare(
-        "SELECT id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms \
+        "SELECT id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms, assignee_id \
          FROM workstream_actions WHERE workstream_id = ?1 \
          ORDER BY done ASC, created_ms DESC",
     )?;
@@ -753,6 +756,7 @@ fn list_actions_for(
             source_id: r.get(5)?,
             done: r.get::<_, i64>(6)? != 0,
             created_ms: r.get(7)?,
+            assignee_id: r.get(8)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -855,13 +859,16 @@ pub fn write_workstream(
         }
     }
 
-    // Actions: upsert by hashed id. ON CONFLICT preserves `done` and
-    // `created_ms` (the user's state); refreshes everything else.
+    // Actions: upsert by hashed id. ON CONFLICT preserves `done`,
+    // `created_ms`, AND `assignee_id` (all three are user-mutable state);
+    // refreshes everything else. assignee_id is stamped on insert from
+    // the synthesizer's owner resolution; on update we keep whatever's
+    // there so a user reassignment survives the next cluster pass.
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO workstream_actions(\
-                id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7) \
+                id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms, assignee_id\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
              ON CONFLICT(id) DO UPDATE SET \
                 text = excluded.text, \
                 due_ms = excluded.due_ms, \
@@ -886,6 +893,7 @@ pub fn write_workstream(
                 a.source_kind,
                 a.source_id,
                 now_ms,
+                a.assignee_id,
             ])?;
             if pre_existed_action == 0 {
                 counts.actions_added += 1;
@@ -986,6 +994,36 @@ pub fn set_action_done(
     conn.execute(
         "UPDATE workstream_actions SET done = ?2 WHERE id = ?1",
         params![action_id, done as i64],
+    )?;
+    Ok(())
+}
+
+/// Reassign a workstream action to a different team member, or
+/// unassign with NULL (#100). User-authored override; preserved across
+/// re-synthesis because the upsert ON CONFLICT clause does not touch
+/// `assignee_id`.
+pub fn set_action_assignee(
+    conn: &Connection,
+    action_id: &str,
+    assignee_id: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE workstream_actions SET assignee_id = ?2 WHERE id = ?1",
+        params![action_id, assignee_id],
+    )?;
+    Ok(())
+}
+
+/// Permanently delete a workstream action (#100). The synthesizer
+/// content-hashes ids over (workstream_id, text), so re-synthesis of
+/// the same text + workstream pair will recreate it — same trade-off
+/// as `done`, which is preserved on conflict. Users who want a deleted
+/// item to stay deleted can rephrase the source or archive the
+/// workstream.
+pub fn delete_action(conn: &Connection, action_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM workstream_actions WHERE id = ?1",
+        params![action_id],
     )?;
     Ok(())
 }
@@ -1264,6 +1302,8 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("../migrations/020_workstream_link_summary.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../migrations/021_workstream_action_assignee.sql"))
+            .unwrap();
         conn
     }
 
@@ -1316,6 +1356,7 @@ mod tests {
             due_ms: None,
             source_kind: source_kind.to_string(),
             source_id: source_id.to_string(),
+            assignee_id: None,
         }
     }
 
@@ -1452,6 +1493,129 @@ mod tests {
             detail.actions[0].done,
             "done flag must survive a re-sync of the same action text"
         );
+    }
+
+    #[test]
+    fn write_workstream_round_trips_action_assignee() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_team_member(&conn, "tm_alice");
+
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws1"),
+                "WS",
+                &["mg:test::m1"],
+                &[],
+                &[],
+                vec![SynthesizedAction {
+                    text: "Send recap".into(),
+                    due_ms: None,
+                    source_kind: "email".into(),
+                    source_id: "mg:test::m1".into(),
+                    assignee_id: Some("tm_alice".into()),
+                }],
+            ),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        assert_eq!(detail.actions.len(), 1);
+        assert_eq!(detail.actions[0].assignee_id.as_deref(), Some("tm_alice"));
+    }
+
+    #[test]
+    fn write_workstream_preserves_user_assignee_on_resync() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+        seed_team_member(&conn, "tm_alice");
+        seed_team_member(&conn, "tm_bob");
+
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws1"),
+                "WS",
+                &["mg:test::m1"],
+                &[],
+                &[],
+                vec![SynthesizedAction {
+                    text: "Send recap".into(),
+                    due_ms: None,
+                    source_kind: "email".into(),
+                    source_id: "mg:test::m1".into(),
+                    assignee_id: Some("tm_alice".into()),
+                }],
+            ),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // User reassigns to Bob.
+        let aid = action_id("ws1", "Send recap");
+        set_action_assignee(&conn, &aid, Some("tm_bob")).unwrap();
+
+        // Synthesizer re-emits Alice for the same action text.
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws1"),
+                "WS",
+                &["mg:test::m1"],
+                &[],
+                &[],
+                vec![SynthesizedAction {
+                    text: "Send recap".into(),
+                    due_ms: None,
+                    source_kind: "email".into(),
+                    source_id: "mg:test::m1".into(),
+                    assignee_id: Some("tm_alice".into()),
+                }],
+            ),
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // The user's override must survive — ON CONFLICT does not
+        // touch assignee_id.
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        assert_eq!(detail.actions[0].assignee_id.as_deref(), Some("tm_bob"));
+    }
+
+    #[test]
+    fn delete_action_removes_row() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+
+        let tx = conn.transaction().unwrap();
+        write_workstream(
+            &tx,
+            &make_ws(
+                Some("ws1"),
+                "WS",
+                &["mg:test::m1"],
+                &[],
+                &[],
+                vec![make_action("Send recap", "email", "mg:test::m1")],
+            ),
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let aid = action_id("ws1", "Send recap");
+        delete_action(&conn, &aid).unwrap();
+
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        assert!(detail.actions.is_empty(), "delete_action must remove the row");
     }
 
     #[test]

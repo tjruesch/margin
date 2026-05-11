@@ -71,7 +71,13 @@ Titles: short, specific, proper-noun-leaning (\"Hyundai POC review\", \"Q3 sourc
 Summaries: 1-3 sentences. State what's happening and what's next, not what it is in the abstract.
 
 Action items: extract concrete TODOs the user owes (or owns) per workstream. Each must reference \
-a source by its label. Skip items that are already done.
+a source by its label. Skip items that are already done. Do NOT emit an item whose only content is \
+attending, joining, or being present at a meeting/call/event (e.g. \"Attend the Talgo demo\", \
+\"Join the kickoff call\", \"Be at standup on Friday\"). Mere participation is not an action item — \
+emit one only when there is a concrete deliverable, decision, or follow-up the user must produce. \
+Set \"owner_label\" to a team label (e.g. \"T1\") from the \"Team\" section when the source \
+clearly assigns the work to that person; omit or leave null when the owner is ambiguous or is the \
+user themselves.
 
 Hierarchy: the \"Existing workstreams (active)\" section may show parents at the top level with \
 children indented underneath (rendered with a \"↳\" marker). When a NEW workstream cleanly extends \
@@ -93,7 +99,7 @@ Schema:
     \"summary\": \"...\",
     \"members\": { \"emails\": [\"M1\", \"M2\"], \"events\": [\"E3\"], \"notes\": [\"N1\"] },
     \"actions\": [
-      { \"text\": \"...\", \"due_ms\": null, \"source_kind\": \"email\", \"source_label\": \"M2\" }
+      { \"text\": \"...\", \"due_ms\": null, \"source_kind\": \"email\", \"source_label\": \"M2\", \"owner_label\": \"T1\" }
     ]
   }
 ]";
@@ -446,7 +452,9 @@ async fn call_anthropic(api_key: &str, model: &str, user_message: &str) -> Resul
 /// Maps from Claude-facing labels (M1, E1, N1, …) back to canonical
 /// IDs, keyed by source `kind` ("email", "event", "note", …). Built
 /// from the registry so adding a new source extends this map by one
-/// entry without any synthesizer-side surgery.
+/// entry without any synthesizer-side surgery. The synthetic kind
+/// `"team"` carries team-member labels (T1, T2, …) used for action
+/// `owner_label` resolution.
 struct LabelMaps {
     by_kind: HashMap<&'static str, HashMap<String, String>>,
 }
@@ -522,6 +530,22 @@ fn build_user_message(
     }
 
     let mut maps = LabelMaps::empty();
+
+    // Team section. Labels T1, T2, … resolve to team_members.id so the
+    // LLM can assign an `owner_label` per action. Sorted by display
+    // name for stable labels across runs.
+    if !team_by_id.is_empty() {
+        let mut team_pairs: Vec<(&String, &String)> = team_by_id.iter().collect();
+        team_pairs.sort_by(|a, b| a.1.cmp(b.1));
+        s.push_str("\n# Team\n\n");
+        let team_map = maps.by_kind.entry("team").or_default();
+        for (i, (id, name)) in team_pairs.iter().enumerate() {
+            let label = format!("T{}", i + 1);
+            team_map.insert(label.clone(), (*id).clone());
+            s.push_str(&format!("[{label}] {name}\n"));
+        }
+    }
+
     let mut prefixes: Vec<&'static str> = Vec::new();
     // One section per registered source, in registry order. Adding a
     // 4th source (e.g. GitHub) is a pure-add — no churn here.
@@ -708,6 +732,12 @@ struct RawAction {
     source_kind: Option<String>,
     #[serde(default)]
     source_label: Option<String>,
+    /// Optional team label (T1, T2, …) the LLM picked for the action's
+    /// owner. Resolved at parse time via label_maps.by_kind["team"];
+    /// unknown labels are dropped silently with a log line. None means
+    /// "no owner / the user themselves" — surfaces as NULL assignee.
+    #[serde(default)]
+    owner_label: Option<String>,
 }
 
 fn parse_synthesizer_response(
@@ -784,6 +814,12 @@ fn parse_synthesizer_response(
                     Some(t) if !t.is_empty() => t.to_string(),
                     _ => return None,
                 };
+                if is_mere_participation(&text) {
+                    eprintln!(
+                        "[workstreams] dropping participation-only action: {text}"
+                    );
+                    return None;
+                }
                 let kind = a.source_kind.unwrap_or_default();
                 let label = a.source_label.unwrap_or_default();
                 let source_id = label_maps.lookup(&kind, &label).cloned();
@@ -796,11 +832,26 @@ fn parse_synthesizer_response(
                         return None;
                     }
                 };
+                let assignee_id = a
+                    .owner_label
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "null")
+                    .and_then(|label| {
+                        let resolved = label_maps.lookup("team", label).cloned();
+                        if resolved.is_none() {
+                            eprintln!(
+                                "[workstreams] dropping unknown owner_label {label} for action: {text}"
+                            );
+                        }
+                        resolved
+                    });
                 Some(SynthesizedAction {
                     text,
                     due_ms: a.due_ms,
                     source_kind: kind,
                     source_id,
+                    assignee_id,
                 })
             })
             .collect();
@@ -818,6 +869,36 @@ fn parse_synthesizer_response(
         });
     }
     out
+}
+
+/// Safety net for the LLM ignoring the "no mere participation" rule
+/// in the prompt: drops items whose entire content is just attending
+/// or joining a meeting/call/event. Matches phrasings like
+/// "Attend the demo", "Join standup Friday", "Be present at kickoff",
+/// "Show up to the review". Anything with a comma, semicolon, or
+/// follow-up verb after the participation phrase escapes the filter —
+/// those are no longer "merely" participation.
+fn is_mere_participation(text: &str) -> bool {
+    let s = text.trim().trim_end_matches(['.', '!', '?']).to_lowercase();
+    if s.contains(',') || s.contains(';') || s.contains(" and ") {
+        return false;
+    }
+    const LEAD: &[&str] = &[
+        "attend",
+        "join",
+        "be at",
+        "be present at",
+        "be present for",
+        "be on",
+        "go to",
+        "show up to",
+        "show up for",
+        "participate in",
+        "sit in on",
+        "dial in to",
+        "dial into",
+    ];
+    LEAD.iter().any(|p| s.starts_with(p))
 }
 
 fn map_labels(
@@ -903,7 +984,77 @@ mod tests {
         let mut notes = HashMap::new();
         notes.insert("N1".to_string(), "/notes/a.md".to_string());
         by_kind.insert("note", notes);
+        let mut team = HashMap::new();
+        team.insert("T1".to_string(), "tm_alice".to_string());
+        team.insert("T2".to_string(), "tm_bob".to_string());
+        by_kind.insert("team", team);
         LabelMaps { by_kind }
+    }
+
+    #[test]
+    fn parse_synthesizer_response_resolves_owner_label() {
+        let raw = r#"[
+            {
+                "title": "WS",
+                "summary": "",
+                "members": { "emails": ["M1"], "events": [], "notes": [] },
+                "actions": [
+                    { "text": "Send recap", "source_kind": "email", "source_label": "M1", "owner_label": "T1" },
+                    { "text": "Other", "source_kind": "email", "source_label": "M1", "owner_label": "T99" },
+                    { "text": "Unowned", "source_kind": "email", "source_label": "M1" }
+                ]
+            }
+        ]"#;
+        let parsed = parse_synthesizer_response(raw, &label_maps());
+        assert_eq!(parsed.len(), 1);
+        let actions = &parsed[0].actions;
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[0].assignee_id.as_deref(), Some("tm_alice"));
+        assert!(
+            actions[1].assignee_id.is_none(),
+            "unknown owner_label resolves to None instead of dropping the action",
+        );
+        assert!(actions[2].assignee_id.is_none());
+    }
+
+    #[test]
+    fn parse_synthesizer_response_drops_mere_participation() {
+        let raw = r#"[
+            {
+                "title": "WS",
+                "summary": "",
+                "members": { "emails": ["M1"], "events": ["E1"], "notes": [] },
+                "actions": [
+                    { "text": "Attend the Talgo demo", "source_kind": "event", "source_label": "E1" },
+                    { "text": "Join the kickoff call", "source_kind": "event", "source_label": "E1" },
+                    { "text": "Send recap after the demo", "source_kind": "event", "source_label": "E1" },
+                    { "text": "Attend the demo and present slides", "source_kind": "event", "source_label": "E1" }
+                ]
+            }
+        ]"#;
+        let parsed = parse_synthesizer_response(raw, &label_maps());
+        assert_eq!(parsed.len(), 1);
+        let texts: Vec<&str> = parsed[0]
+            .actions
+            .iter()
+            .map(|a| a.text.as_str())
+            .collect();
+        assert!(
+            !texts.iter().any(|t| *t == "Attend the Talgo demo"),
+            "pure participation must be filtered",
+        );
+        assert!(
+            !texts.iter().any(|t| *t == "Join the kickoff call"),
+            "pure participation must be filtered",
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Send recap after the demo"),
+            "non-participation actions must survive",
+        );
+        assert!(
+            texts.iter().any(|t| *t == "Attend the demo and present slides"),
+            "items with a follow-up clause escape the filter",
+        );
     }
 
     #[test]

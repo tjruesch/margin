@@ -57,20 +57,34 @@ pub enum NoteScope {
 #[derive(Serialize)]
 pub struct ActionListItem {
     pub id: String,
+    /// Source discriminator: `"note"` for markdown-checkbox-backed
+    /// actions, `"workstream"` for synthesizer-emitted actions on
+    /// workstreams (#100). Drives row click-through, delete dispatch,
+    /// and assignee write routing on the frontend.
+    pub source: String,
+    /// Source note path for note-backed actions; empty string for
+    /// workstream-backed actions (no underlying file).
     pub note_path: String,
+    /// Display title — note title for note-backed, workstream title for
+    /// workstream-backed.
     pub note_title: String,
+    /// Workstream id when source == "workstream"; None otherwise.
+    /// Routes the row click to the workstream detail view.
+    pub workstream_id: Option<String>,
     pub text: String,
     pub done: bool,
+    /// 1-based source-line for note-backed; 0 for workstream-backed
+    /// (no markdown line).
     pub line: i64,
     pub created_ms: i64,
-    /// Absolute due-date timestamp (Unix ms) parsed from a trailing
-    /// `@YYYY-MM-DD[ HH:MM]` token on the action line. `None` means the
-    /// action has no due date.
+    /// Absolute due-date timestamp (Unix ms). For note-backed actions,
+    /// parsed from a trailing `@YYYY-MM-DD[ HH:MM]` token; for workstream
+    /// actions, set by the synthesizer.
     pub due_ms: Option<i64>,
-    /// `team_members.id` when the leading `Owner — ` segment in `text`
-    /// matched exactly one team member (#49). `None` when the action has
-    /// no owner candidate, the candidate didn't match any member, or
-    /// the candidate matched multiple members ambiguously.
+    /// `team_members.id` when the action has a resolved owner. Note-
+    /// backed: matched the leading `Owner — ` segment (#49). Workstream-
+    /// backed: stamped by the synthesizer or manually set via
+    /// set_workstream_action_assignee (#100).
     pub assignee_id: Option<String>,
     /// Canonical display name from `team_members`, joined for render so
     /// the frontend can surface an avatar chip without a second
@@ -704,6 +718,70 @@ pub fn set_action_assignee(
         return Ok(());
     }
     lines[idx] = rewritten;
+    let new_body = lines.join("\n");
+
+    let map = yaml.map(parse_frontmatter).unwrap_or_default();
+    let merged = write_with_frontmatter(&map, &new_body);
+    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
+    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
+    touch_index(&conn, Path::new(&note_path), false);
+    Ok(())
+}
+
+/// Delete an action item from its source note (#100). Mirrors
+/// `set_action_done`'s look-up-by-id, cached-line + hash-fallback line
+/// locator, then removes the line from the body and writes the file
+/// back. The next reindex pass drops the row from the actions table
+/// because the line is no longer present.
+#[tauri::command]
+pub fn delete_action(
+    id: String,
+    guard: tauri::State<'_, crate::WriteGuard>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let (note_path, cached_line, want_text) = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT note_path, line, text FROM actions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| e.to_string())?
+    };
+
+    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
+    let (yaml, body) = split_frontmatter(&raw);
+    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
+    let want_hash = action_text_hash(&want_text);
+
+    let mut target_idx: Option<usize> = None;
+    if cached_line >= 1 && cached_line <= lines.len() {
+        if let Some((line_text, _, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
+            if action_text_hash(&line_text) == want_hash {
+                target_idx = Some(cached_line - 1);
+            }
+        }
+    }
+    if target_idx.is_none() {
+        for (i, line) in lines.iter().enumerate() {
+            if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
+                if action_text_hash(&line_text) == want_hash {
+                    target_idx = Some(i);
+                    break;
+                }
+            }
+        }
+    }
+    let idx = target_idx.ok_or_else(|| {
+        "Action not found in note (index may be stale; reload to refresh)".to_string()
+    })?;
+    lines.remove(idx);
     let new_body = lines.join("\n");
 
     let map = yaml.map(parse_frontmatter).unwrap_or_default();

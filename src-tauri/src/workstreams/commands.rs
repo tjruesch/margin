@@ -43,6 +43,26 @@ pub fn set_workstream_action_done(
 }
 
 #[tauri::command]
+pub fn set_workstream_action_assignee(
+    action_id: String,
+    member_id: Option<String>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::set_action_assignee(&c, &action_id, member_id.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_workstream_action(
+    action_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::delete_action(&c, &action_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn set_workstream_status(
     id: String,
     status: String,

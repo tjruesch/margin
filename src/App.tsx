@@ -48,6 +48,10 @@ import {
   setFavorite as setFavoriteFile,
   setActionAssignee,
   setActionDone,
+  deleteAction,
+  setWorkstreamActionAssignee,
+  setWorkstreamActionDone,
+  deleteWorkstreamAction,
   setMeetingAttendees,
   getMeetingAttendees,
   setNoteTags,
@@ -382,6 +386,12 @@ export default function App() {
   useEffect(() => {
     pathRef.current = path;
   }, [path]);
+  // Mirror actions in a ref so dispatch callbacks can look up a row's
+  // source without re-creating on every actions change (#100).
+  const actionsRef = useRef<ActionListItem[]>([]);
+  useEffect(() => {
+    actionsRef.current = actions;
+  }, [actions]);
   useEffect(() => {
     savedRef.current = savedContent;
   }, [savedContent]);
@@ -1601,13 +1611,19 @@ export default function App() {
   );
 
   const onToggleAction = useCallback(async (id: string, nextDone: boolean) => {
+    const target = actionsRef.current.find((a) => a.id === id);
+    const isWorkstream = target?.source === "workstream";
     setActions((curr) =>
       curr.map((a) => (a.id === id ? { ...a, done: nextDone } : a)),
     );
     try {
-      await setActionDone(id, nextDone);
+      if (isWorkstream) {
+        await setWorkstreamActionDone(id, nextDone);
+      } else {
+        await setActionDone(id, nextDone);
+      }
     } catch (err) {
-      console.error("setActionDone failed:", err);
+      console.error("toggle action failed:", err);
       alert("Could not update the task. See console for details.");
       setActions((curr) =>
         curr.map((a) => (a.id === id ? { ...a, done: !nextDone } : a)),
@@ -1615,11 +1631,51 @@ export default function App() {
     }
   }, []);
 
+  // Delete an action item (#100). Confirms first, optimistically drops
+  // the row from local state, then writes through to Rust dispatching
+  // by source. On error, refetches to restore the authoritative list.
+  const onDeleteAction = useCallback(async (id: string) => {
+    const target = actionsRef.current.find((a) => a.id === id);
+    const isWorkstream = target?.source === "workstream";
+    const ok = await ask(
+      isWorkstream
+        ? "This action item will be removed from its workstream."
+        : "This action item will be removed from its source note.",
+      {
+        title: "Delete action item?",
+        kind: "warning",
+        okLabel: "Delete",
+        cancelLabel: "Cancel",
+      },
+    );
+    if (!ok) return;
+    setActions((curr) => curr.filter((a) => a.id !== id));
+    try {
+      if (isWorkstream) {
+        await deleteWorkstreamAction(id);
+      } else {
+        await deleteAction(id);
+      }
+    } catch (err) {
+      console.error("deleteAction failed:", err);
+      alert("Could not delete the action item. See console for details.");
+      try {
+        const fresh = await listActions("open");
+        setActions(fresh);
+      } catch {}
+    }
+  }, []);
+
   // Slice of actions belonging to the currently-open note (#53). The
   // Editor uses this to decorate inline checkbox lines with the
   // assignee chip. Empty when no note is open.
   const noteActions = useMemo(
-    () => (path ? actions.filter((a) => a.note_path === path) : []),
+    () =>
+      path
+        ? actions.filter(
+            (a) => a.source === "note" && a.note_path === path,
+          )
+        : [],
     [actions, path],
   );
 
@@ -1662,6 +1718,8 @@ export default function App() {
   // On error, refetch to restore authoritative state.
   const onReassignAction = useCallback(
     async (actionId: string, memberId: string | null) => {
+      const target = actionsRef.current.find((a) => a.id === actionId);
+      const isWorkstream = target?.source === "workstream";
       const newName =
         memberId === null
           ? null
@@ -1674,7 +1732,11 @@ export default function App() {
         ),
       );
       try {
-        await setActionAssignee(actionId, memberId);
+        if (isWorkstream) {
+          await setWorkstreamActionAssignee(actionId, memberId);
+        } else {
+          await setActionAssignee(actionId, memberId);
+        }
         const fresh = await listActions("open");
         setActions(fresh);
       } catch (err) {
@@ -1966,6 +2028,7 @@ export default function App() {
             onDuplicateRow={(p) => void onDuplicateNote(p)}
             actions={actions}
             onToggleAction={(id, next) => void onToggleAction(id, next)}
+            onDeleteAction={(id) => void onDeleteAction(id)}
             onAddInboxTodo={onAddInboxTodo}
             editor={{ tabSize, useTabs, softWrap, fontSize }}
             members={members}

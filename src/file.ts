@@ -138,17 +138,26 @@ export type ActionScope = "open" | "done" | "all";
 
 export type ActionListItem = {
   id: string;
+  /** Source discriminator (#100). `"note"` for markdown-checkbox-backed
+   *  actions; `"workstream"` for synthesizer-emitted actions. Drives
+   *  click-through routing and chooses which IPC handles toggle/
+   *  delete/assignee writes. */
+  source: "note" | "workstream";
+  /** Source note path for note-backed; empty string for workstream-backed. */
   note_path: string;
+  /** Display title — note title or workstream title. */
   note_title: string;
+  /** Set when source === "workstream"; routes row click to the
+   *  Workstreams view. `null` otherwise. */
+  workstream_id: string | null;
   text: string;
   done: boolean;
   line: number;
   created_ms: number;
-  /** Absolute due-date timestamp (Unix ms) parsed from a trailing
-   *  `@YYYY-MM-DD[ HH:MM]` token. `null` means the action has no due date. */
+  /** Absolute due-date timestamp (Unix ms). For note-backed actions,
+   *  parsed from a trailing `@YYYY-MM-DD[ HH:MM]` token. */
   due_ms: number | null;
-  /** team_members.id when the leading "Owner — " segment in the action's
-   *  text matched exactly one team member (#49), else `null`. */
+  /** team_members.id when the action has a resolved owner. */
   assignee_id: string | null;
   /** Canonical display name from team_members, joined for render so the
    *  frontend can show an avatar chip without a second IPC round-trip. */
@@ -164,6 +173,10 @@ export async function listActions(
 
 export async function setActionDone(id: string, done: boolean): Promise<void> {
   await invoke<void>("set_action_done", { id, done });
+}
+
+export async function deleteAction(id: string): Promise<void> {
+  await invoke<void>("delete_action", { id });
 }
 
 export async function notesDir(): Promise<string> {
@@ -661,6 +674,17 @@ export async function setWorkstreamActionDone(
   done: boolean,
 ): Promise<void> {
   await invoke<void>("set_workstream_action_done", { actionId, done });
+}
+
+export async function setWorkstreamActionAssignee(
+  actionId: string,
+  memberId: string | null,
+): Promise<void> {
+  await invoke<void>("set_workstream_action_assignee", { actionId, memberId });
+}
+
+export async function deleteWorkstreamAction(actionId: string): Promise<void> {
+  await invoke<void>("delete_workstream_action", { actionId });
 }
 
 export async function setWorkstreamStatus(
