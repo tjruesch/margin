@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::time::UNIX_EPOCH;
 
 use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
@@ -53,11 +54,61 @@ const SCHEMA_V19: &str = include_str!("migrations/019_workstream_parent.sql");
 const SCHEMA_V20: &str = include_str!("migrations/020_workstream_link_summary.sql");
 const SCHEMA_V21: &str = include_str!("migrations/021_workstream_action_assignee.sql");
 const SCHEMA_V22: &str = include_str!("migrations/022_events_edges.sql");
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_V23: &str = include_str!("migrations/023_embeddings.sql");
+const SCHEMA_VERSION: i64 = 23;
+
+/// Register the sqlite-vec extension as an "auto extension" so every
+/// future `Connection::open*` in this process loads `vec0` (#104).
+/// Idempotent via `Once`; safe to call repeatedly.
+fn ensure_sqlite_vec_auto_extension() {
+    static VEC_INIT: Once = Once::new();
+    VEC_INIT.call_once(|| unsafe {
+        // sqlite-vec exposes its init as `extern "C" fn()` — the C ABI
+        // underneath actually takes (sqlite3*, char**, sqlite3_api_routines*)
+        // and returns int. We transmute the fn-pointer to the shape
+        // sqlite3_auto_extension expects.
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
+/// Load vec0 into the given connection. For new connections this is
+/// covered by the auto-extension, but the in-memory `Connection::open`
+/// done by some test helpers happens before any auto-extension call.
+/// Calling this on an already-loaded connection is a cheap no-op.
+pub(crate) fn ensure_vec_loaded_on(conn: &Connection) -> Result<()> {
+    ensure_sqlite_vec_auto_extension();
+    // Probe: does this connection already know `vec_version()`? If yes,
+    // the auto-extension caught it on open and we're done.
+    let probe: rusqlite::Result<String> =
+        conn.query_row("SELECT vec_version()", [], |r| r.get(0));
+    if probe.is_ok() {
+        return Ok(());
+    }
+    // Otherwise the connection pre-dates auto-extension registration.
+    // Invoke the init function directly via FFI on this conn's handle.
+    type ExtInit = unsafe extern "C" fn(
+        *mut rusqlite::ffi::sqlite3,
+        *mut *mut std::os::raw::c_char,
+        *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::os::raw::c_int;
+    unsafe {
+        let entry: ExtInit =
+            std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+        let mut err: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let rc = entry(conn.handle(), &mut err, std::ptr::null());
+        if rc != 0 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+    }
+    Ok(())
+}
 
 /// Open the index DB at `db_path` (creating it if absent) and apply any
 /// pending migrations.
 pub fn open_or_init(db_path: &Path) -> Result<Connection> {
+    ensure_sqlite_vec_auto_extension();
     if let Some(parent) = db_path.parent() {
         if !parent.exists() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -71,6 +122,8 @@ pub fn open_or_init(db_path: &Path) -> Result<Connection> {
 }
 
 pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
+    // Ensure vec0 is available before SCHEMA_V23's CREATE VIRTUAL TABLE.
+    ensure_vec_loaded_on(conn)?;
     // `meta` doesn't exist on a fresh DB — `query_row` returns
     // QueryReturnedNoRows in that case (mapped to None via `optional`),
     // but the table-missing error is a different shape and would surface
@@ -183,6 +236,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 21 {
         conn.execute_batch(SCHEMA_V22)?;
         version = 22;
+    }
+    if version == 22 {
+        conn.execute_batch(SCHEMA_V23)?;
+        version = 23;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.

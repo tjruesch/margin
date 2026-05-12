@@ -7,13 +7,17 @@ import {
   deleteAnthropicApiKey,
   deleteConnector,
   deleteFirecrawlApiKey,
+  deleteVoyageApiKey,
+  forceReindexEmbeddings,
   hasAnthropicApiKey,
   hasFirecrawlApiKey,
+  hasVoyageApiKey,
   listConnectors,
   listOAuthProviders,
   type OAuthProviderInfo,
   setAnthropicApiKey,
   setFirecrawlApiKey,
+  setVoyageApiKey,
   startOAuthConnector,
 } from "./file";
 import {
@@ -526,9 +530,39 @@ function AISection({ ai, onChange }: AISectionProps) {
   const [firecrawlSaving, setFirecrawlSaving] = useState<boolean>(false);
   const [firecrawlError, setFirecrawlError] = useState<string | null>(null);
 
+  const [hasVoyageKey, setHasVoyageKey] = useState<boolean>(false);
+  const [voyageDraft, setVoyageDraft] = useState<string>("");
+  const [voyageSaving, setVoyageSaving] = useState<boolean>(false);
+  const [voyageError, setVoyageError] = useState<string | null>(null);
+  const [embedStatus, setEmbedStatus] = useState<{
+    state: string;
+    done: number;
+    remaining: number;
+    errored: number;
+  } | null>(null);
+
   useEffect(() => {
     void hasAnthropicApiKey().then(setHasKey);
     void hasFirecrawlApiKey().then(setHasFirecrawlKey);
+    void hasVoyageApiKey().then(setHasVoyageKey);
+    // Tail the embedding worker's status events for the progress pill (#104).
+    let unlisten: (() => void) | null = null;
+    void import("@tauri-apps/api/event").then(({ listen }) => {
+      void listen("embed-status", (e) => {
+        const p = e.payload as {
+          state: string;
+          done: number;
+          remaining: number;
+          errored: number;
+        };
+        setEmbedStatus(p);
+      }).then((un) => {
+        unlisten = un;
+      });
+    });
+    return () => {
+      if (unlisten) unlisten();
+    };
   }, []);
 
   const onSaveKey = async () => {
@@ -603,6 +637,47 @@ function AISection({ ai, onChange }: AISectionProps) {
       setFirecrawlError(typeof e === "string" ? e : "Failed to remove key");
     } finally {
       setFirecrawlSaving(false);
+    }
+  };
+
+  const onSaveVoyage = async () => {
+    const value = voyageDraft.trim();
+    if (!value) return;
+    setVoyageSaving(true);
+    setVoyageError(null);
+    try {
+      await setVoyageApiKey(value);
+      setVoyageDraft("");
+      setHasVoyageKey(true);
+      // Kick off a backfill pass so the user sees immediate progress.
+      void forceReindexEmbeddings();
+    } catch (e) {
+      setVoyageError(typeof e === "string" ? e : "Failed to save key");
+    } finally {
+      setVoyageSaving(false);
+    }
+  };
+
+  const onRemoveVoyage = async () => {
+    const ok = await ask(
+      "This will clear the Voyage API key from your keychain. Semantic search will stop indexing new content; existing embeddings remain queryable.",
+      {
+        title: "Remove Voyage key?",
+        kind: "warning",
+        okLabel: "Remove",
+        cancelLabel: "Cancel",
+      },
+    );
+    if (!ok) return;
+    setVoyageSaving(true);
+    setVoyageError(null);
+    try {
+      await deleteVoyageApiKey();
+      setHasVoyageKey(false);
+    } catch (e) {
+      setVoyageError(typeof e === "string" ? e : "Failed to remove key");
+    } finally {
+      setVoyageSaving(false);
     }
   };
 
@@ -694,6 +769,68 @@ function AISection({ ai, onChange }: AISectionProps) {
           {firecrawlError && (
             <div className="settings-error">{firecrawlError}</div>
           )}
+        </div>
+      </div>
+
+      <div className="settings-row">
+        <div className="settings-row-label">Voyage API key</div>
+        <div className="settings-row-control settings-row-control--col">
+          <div className="settings-actions">
+            <input
+              type="password"
+              className="settings-input"
+              placeholder={
+                hasVoyageKey ? "•••••••• (saved in Keychain)" : "pa-…"
+              }
+              value={voyageDraft}
+              onChange={(e) => setVoyageDraft(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              className="ghost"
+              onClick={() => void onSaveVoyage()}
+              disabled={voyageSaving || !voyageDraft.trim()}
+            >
+              Save
+            </button>
+            {hasVoyageKey && (
+              <button
+                className="ghost"
+                onClick={() => void onRemoveVoyage()}
+                disabled={voyageSaving}
+              >
+                Remove
+              </button>
+            )}
+          </div>
+          <div className="settings-row-control">
+            <span
+              className={"settings-status " + (hasVoyageKey ? "ok" : "muted")}
+            >
+              {hasVoyageKey ? "Configured" : "Not configured"}
+            </span>
+            <span className="settings-hint">
+              Stored in macOS Keychain. Powers semantic retrieval across
+              notes, emails, meetings, and workstreams. Get a key at
+              voyageai.com.
+            </span>
+          </div>
+          {embedStatus && (
+            <div className="settings-row-control">
+              <span className="settings-hint">
+                Embedding index:{" "}
+                {embedStatus.state === "syncing"
+                  ? `syncing ${embedStatus.done}/${embedStatus.done + embedStatus.remaining}…`
+                  : embedStatus.state === "idle"
+                    ? `idle (${embedStatus.done} indexed this pass${embedStatus.errored ? `, ${embedStatus.errored} errored` : ""})`
+                    : embedStatus.state === "needs_key"
+                      ? "waiting for API key"
+                      : embedStatus.state}
+              </span>
+            </div>
+          )}
+          {voyageError && <div className="settings-error">{voyageError}</div>}
         </div>
       </div>
 

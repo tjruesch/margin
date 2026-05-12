@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 const SERVICE: &str = "com.margin.app";
 const ACCOUNT: &str = "anthropic-api-key";
 const FIRECRAWL_ACCOUNT: &str = "firecrawl-api-key";
+const VOYAGE_ACCOUNT: &str = "voyage-api-key";
 
 fn entry() -> Result<Entry, String> {
     Entry::new(SERVICE, ACCOUNT).map_err(|e| e.to_string())
@@ -104,6 +105,41 @@ pub fn has_firecrawl_api_key() -> bool {
 #[allow(dead_code)]
 pub fn read_firecrawl_api_key() -> Result<String, String> {
     firecrawl_entry()?.get_password().map_err(|e| e.to_string())
+}
+
+// ----- Voyage AI API key (#104) ----------------------------------------
+
+fn voyage_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, VOYAGE_ACCOUNT).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_voyage_api_key(key: String) -> Result<(), String> {
+    voyage_entry()?.set_password(&key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_voyage_api_key() -> Result<(), String> {
+    match voyage_entry()?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub fn has_voyage_api_key() -> bool {
+    let e = match voyage_entry() {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    matches!(e.get_password(), Ok(_))
+}
+
+/// Internal accessor for the embeddings worker. Never via IPC.
+#[allow(dead_code)]
+pub fn read_voyage_api_key() -> Result<String, String> {
+    voyage_entry()?.get_password().map_err(|e| e.to_string())
 }
 
 // ----- Per-connector OAuth tokens (#60) ---------------------------------

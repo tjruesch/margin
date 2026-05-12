@@ -45,6 +45,8 @@ screencapturekit = { version = "1.5", features = ["macos_14_0"] }
 sherpa-onnx = "1.13"
 window-vibrancy = "0.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+zerocopy = "0.7"
 whoami = "1"
 unicode-normalization = "0.1"
 async-trait = "0.1"

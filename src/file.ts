@@ -61,6 +61,24 @@ export async function deleteFirecrawlApiKey(): Promise<void> {
   await invoke<void>("delete_firecrawl_api_key");
 }
 
+export async function hasVoyageApiKey(): Promise<boolean> {
+  return invoke<boolean>("has_voyage_api_key");
+}
+
+export async function setVoyageApiKey(key: string): Promise<void> {
+  await invoke<void>("set_voyage_api_key", { key });
+}
+
+export async function deleteVoyageApiKey(): Promise<void> {
+  await invoke<void>("delete_voyage_api_key");
+}
+
+/// Force one immediate pass of the embedding worker (#104). Used by
+/// Settings to trigger backfill after the user pastes a Voyage key.
+export async function forceReindexEmbeddings(): Promise<void> {
+  await invoke<void>("force_reindex_embeddings");
+}
+
 // --- Notes (bundle abstraction) ------------------------------------------
 
 export type NoteRef = { id: string; note_path: string };

@@ -694,6 +694,34 @@ fn tool_definitions() -> serde_json::Value {
             }
         },
         {
+            "name": "search_similar",
+            "description": "Search the user's content semantically (via the Voyage embedding index, #104). Use this for questions like 'what was I working on around X', 'who said anything about Y last month', 'remind me what we decided about Z' — where keyword search would miss the answer because the user's wording differs from the original. Returns up to `limit` hits across notes, emails, calendar events, action items, and workstreams, ranked by cosine similarity to the query.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language query."
+                    },
+                    "kinds": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["note","email","event","action","workstream"]
+                        },
+                        "description": "Optional. Restrict results to a subset of entity kinds."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Max hits to return. Default 10."
+                    }
+                },
+                "required": ["query"]
+            }
+        },
+        {
             "name": "read_edges",
             "description": "Retrieve the 1-hop graph neighborhood of a node. Returns every edge whose source OR target is the given node, with the relationship kind, confidence, and the other side's display label. Use to discover relationships ('who attended this meeting', 'what does this person own', 'who is mentioned in this note', 'which workstreams include this email'). The graph is populated by the deterministic edge synthesizer (#103); current edge kinds are AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED, ATTENDED, INCLUDES, OWNS.",
             "input_schema": {
@@ -993,6 +1021,13 @@ fn dispatch_tool(
     // every other tool uses. Handle it before the `n` validation.
     if name == "read_edges" {
         return dispatch_read_edges(app, input);
+    }
+    // search_similar — natural-language query + optional filters (#104).
+    // Also non-`n`-indexed; dispatched via block_on so we keep the
+    // tool-dispatch surface synchronous (called from inside the streaming
+    // loop which is already on a Tokio runtime).
+    if name == "search_similar" {
+        return dispatch_search_similar(app, input);
     }
 
     let n = match input.get("n").and_then(|v| v.as_u64()) {
@@ -1316,6 +1351,75 @@ fn dispatch_read_edges(app: &AppHandle, input: &serde_json::Value) -> ToolResult
     ToolResult {
         content: out,
         is_error: false,
+    }
+}
+
+/// Semantic retrieval entry point for the assistant (#104). Calls into
+/// `embeddings::retrieve`, formats hits as markdown for the model to
+/// quote from. Synchronously wraps the async helper via `block_on`
+/// inside Tauri's runtime — the dispatch_tool surface is sync to keep
+/// the streaming-loop bookkeeping simple.
+fn dispatch_search_similar(app: &AppHandle, input: &serde_json::Value) -> ToolResult {
+    let query = match input.get("query").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => {
+            return ToolResult {
+                content: "search_similar: missing or empty `query`.".into(),
+                is_error: true,
+            };
+        }
+    };
+    let kinds: Option<Vec<String>> = input.get("kinds").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|el| el.as_str().map(|s| s.to_string()))
+            .collect()
+    });
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 50) as usize)
+        .unwrap_or(10);
+
+    let opts = crate::embeddings::RetrieveOpts { kinds, limit };
+    let app_clone = app.clone();
+    let query_for_call = query.clone();
+    let result = tauri::async_runtime::block_on(async move {
+        crate::embeddings::retrieve(&app_clone, &query_for_call, opts).await
+    });
+
+    match result {
+        Ok(hits) => {
+            if hits.is_empty() {
+                return ToolResult {
+                    content: format!(
+                        "No semantic hits for \"{query}\". The embedding index may not have caught up to recent content yet (worker ticks every 15s)."
+                    ),
+                    is_error: false,
+                };
+            }
+            let mut out = format!(
+                "# Top {} semantic hits for \"{query}\"\n\n",
+                hits.len()
+            );
+            for (i, h) in hits.iter().enumerate() {
+                out.push_str(&format!(
+                    "{idx}. [{kind}] {preview}  _(distance {dist:.3}, id `{id}`)_\n",
+                    idx = i + 1,
+                    kind = h.ref_kind,
+                    preview = h.preview,
+                    dist = h.distance,
+                    id = h.ref_id
+                ));
+            }
+            ToolResult {
+                content: out,
+                is_error: false,
+            }
+        }
+        Err(e) => ToolResult {
+            content: format!("search_similar failed: {e}"),
+            is_error: true,
+        },
     }
 }
 

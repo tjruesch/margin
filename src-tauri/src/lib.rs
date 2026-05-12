@@ -6,6 +6,7 @@ mod connectors;
 mod dates;
 mod diarize;
 mod edges;
+mod embeddings;
 mod index;
 mod keychain;
 mod notes;
@@ -637,6 +638,11 @@ pub fn run() {
                 }
             });
 
+            // Embeddings polling worker (#104). Ticks every 15s; idle
+            // when no rows are stale. Bails until a Voyage API key is
+            // configured (emits `embed-status: needs_key`).
+            embeddings::start_worker(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -653,6 +659,10 @@ pub fn run() {
             keychain::set_firecrawl_api_key,
             keychain::delete_firecrawl_api_key,
             keychain::has_firecrawl_api_key,
+            keychain::set_voyage_api_key,
+            keychain::delete_voyage_api_key,
+            keychain::has_voyage_api_key,
+            embeddings::commands::force_reindex_embeddings,
             start_meeting_recording,
             stop_meeting_recording,
             start_voice_recording,
