@@ -269,8 +269,31 @@ fn run_replied_to_pass(conn: &mut Connection, report: &mut EdgeSynthReport) -> R
             [],
         )
         .map_err(|e| e.to_string())?;
+    // Teams messages: same shape — adjacency within chat_id, ordered
+    // by sent_at_ms. Confidence 0.7. If Graph's `replyToId` is set,
+    // future passes can also emit a 1.0 edge directly (separate path).
+    let n_teams = tx
+        .execute(
+            "WITH ordered AS ( \
+                SELECT id, sent_at_ms, \
+                       LAG(id) OVER w AS prev_id \
+                FROM teams_messages \
+                WINDOW w AS (PARTITION BY chat_id ORDER BY sent_at_ms ASC) \
+             ) \
+             INSERT INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, \
+                                confidence, evidence, first_seen_ms, last_seen_ms) \
+             SELECT 'teams_message', id, 'teams_message', prev_id, 'REPLIED_TO', \
+                    0.7, '[]', sent_at_ms, sent_at_ms \
+             FROM ordered WHERE prev_id IS NOT NULL \
+             ON CONFLICT(src_kind, src_id, tgt_kind, tgt_id, edge_kind) \
+             DO UPDATE SET \
+                confidence   = max(edges.confidence, excluded.confidence), \
+                last_seen_ms = max(edges.last_seen_ms, excluded.last_seen_ms)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
-    bump(report, "REPLIED_TO", n);
+    bump(report, "REPLIED_TO", n + n_teams);
     Ok(())
 }
 
@@ -455,6 +478,36 @@ fn run_mentioned_pass(
         rows.filter_map(|r| r.ok()).collect()
     };
 
+    // Teams messages: same 90-day cutoff as emails. Body source:
+    // body_preview first (already plaintext), else strip body_html.
+    let teams_rows: Vec<(String, Option<String>, Option<String>, Option<String>, i64)> = {
+        let cutoff = now_ms.saturating_sub(90 * 24 * 3600 * 1000);
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.id, t.body_html, t.body_preview, t.chat_topic, t.sent_at_ms \
+                 FROM teams_messages t \
+                 LEFT JOIN ( \
+                    SELECT src_id, max(last_seen_ms) AS last_ms \
+                    FROM edges WHERE src_kind = 'teams_message' AND edge_kind = 'MENTIONED' \
+                    GROUP BY src_id \
+                 ) ed ON ed.src_id = t.id \
+                 WHERE t.sent_at_ms >= ?1 AND (ed.last_ms IS NULL OR t.modified_ms > ed.last_ms)",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![cutoff], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
     // Email scanning uses body_preview when body_html is absent;
     // when present, naively strip HTML tags. v1: only scan emails
     // received in the last 90 days to bound the work.
@@ -534,6 +587,33 @@ fn run_mentioned_pass(
                      ON CONFLICT(src_kind, src_id, tgt_kind, tgt_id, edge_kind) DO UPDATE SET \
                         last_seen_ms = max(edges.last_seen_ms, excluded.last_seen_ms)",
                     params![email_id, member_id, sent_at_ms],
+                )
+                .map_err(|e| e.to_string())?;
+            touched += n as u32;
+        }
+    }
+
+    // Teams messages — same pattern as emails. Topic + body fed to
+    // the matcher; chat topic is short but often contains names so
+    // it's worth including.
+    for (msg_id, body_html, body_preview, chat_topic, sent_at_ms) in &teams_rows {
+        let body = body_html
+            .as_deref()
+            .map(strip_html_tags)
+            .or_else(|| body_preview.clone())
+            .unwrap_or_default();
+        let topic = chat_topic.clone().unwrap_or_default();
+        let haystack = format!("{topic}\n{body}");
+        let mentions = matcher.find_member_mentions(&haystack);
+        for member_id in mentions {
+            let n = tx
+                .execute(
+                    "INSERT INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, \
+                                        confidence, evidence, first_seen_ms, last_seen_ms) \
+                     VALUES ('teams_message', ?1, 'person', ?2, 'MENTIONED', 0.8, '[]', ?3, ?3) \
+                     ON CONFLICT(src_kind, src_id, tgt_kind, tgt_id, edge_kind) DO UPDATE SET \
+                        last_seen_ms = max(edges.last_seen_ms, excluded.last_seen_ms)",
+                    params![msg_id, member_id, sent_at_ms],
                 )
                 .map_err(|e| e.to_string())?;
             touched += n as u32;
@@ -759,6 +839,52 @@ mod tests {
             .unwrap();
         assert_eq!(src, "msg-2");
         assert_eq!(tgt, "msg-1");
+    }
+
+    fn seed_teams_message(conn: &Connection, id: &str, chat: &str, sent_at: i64, body: &str) {
+        // FK on teams_messages.connector_id → connectors(id). Seed one
+        // if not already present.
+        conn.execute(
+            "INSERT OR IGNORE INTO connectors(id, kind, display_name, enabled, config_json, created_ms, updated_ms) \
+             VALUES ('microsoft_graph:test@x.io', 'microsoft_graph', 'Test', 1, '{}', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO teams_messages(\
+                id, connector_id, external_id, chat_id, chat_kind, chat_topic, \
+                sent_at_ms, from_aad_id, from_email, from_name, \
+                body_html, body_preview, reply_to_id, modified_ms, raw_etag\
+             ) VALUES (?1, 'microsoft_graph:test@x.io', ?1, ?2, 'oneOnOne', NULL, \
+                       ?3, 'aad-1', 'alice@x.io', 'Alice', NULL, ?4, NULL, ?3, NULL)",
+            rusqlite::params![id, chat, sent_at, body],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn replied_to_within_teams_chat() {
+        let mut conn = open_db();
+        seed_self_and_teammate(&conn);
+        seed_teams_message(&conn, "msg-1", "chat-x", 1_000, "hi");
+        seed_teams_message(&conn, "msg-2", "chat-x", 2_000, "hello back");
+        seed_teams_message(&conn, "msg-3", "chat-x", 3_000, "see you");
+        // Different chat — must not cross.
+        seed_teams_message(&conn, "other-1", "chat-y", 4_000, "elsewhere");
+
+        let mut report = EdgeSynthReport::default();
+        run_replied_to_pass(&mut conn, &mut report).unwrap();
+
+        // 3 messages in chat-x → 2 REPLIED_TO edges. chat-y has only
+        // one message → no edge.
+        let teams_edges: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM edges WHERE src_kind = 'teams_message' AND edge_kind = 'REPLIED_TO'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(teams_edges, 2);
     }
 
     #[test]

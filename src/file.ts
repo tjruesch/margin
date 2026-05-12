@@ -654,10 +654,33 @@ export type WorkstreamDetail = Workstream & {
   notes: WorkstreamNoteRef[];
   actions: WorkstreamAction[];
   links: WorkstreamLink[];
+  /** Teams chat messages attached to this workstream via the
+   *  `workstream_signals` pivot (kind='teams_message'). Recency-desc.
+   *  Empty when the workstream has no Teams signal. (#105) */
+  teams_messages: TeamsMessage[];
   /** Direct children when this workstream is a parent (#89). Empty for
    *  leaves and standalones. Lean `Workstream` shape — counts and
    *  members already populated. Ordered by last_activity_ms desc. */
   children: Workstream[];
+};
+
+export type TeamsMessage = {
+  id: string;
+  connector_id: string;
+  external_id: string;
+  chat_id: string;
+  /** "oneOnOne" | "group" | "meeting" */
+  chat_kind: string;
+  chat_topic: string | null;
+  sent_at_ms: number;
+  from_aad_id: string | null;
+  from_email: string | null;
+  from_name: string | null;
+  body_html: string | null;
+  body_preview: string | null;
+  reply_to_id: string | null;
+  modified_ms: number;
+  raw_etag: string | null;
 };
 
 export type ClusterReport = {

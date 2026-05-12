@@ -124,6 +124,27 @@ pub fn preview_for(conn: &Connection, ref_kind: &str, ref_id: &str) -> String {
             .optional()
             .unwrap_or(None)
             .unwrap_or_else(|| ref_id.to_string()),
+        "teams_message" => {
+            // Prefer chat_topic; fall back to a body-preview snippet so
+            // the AI ask result is human-readable.
+            let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+                .query_row(
+                    "SELECT chat_topic, from_name, body_preview FROM teams_messages WHERE id = ?1",
+                    params![ref_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .unwrap_or(None);
+            match row {
+                Some((Some(topic), _, body)) if !topic.is_empty() => {
+                    format!("{topic} — {}", body.unwrap_or_default())
+                }
+                Some((_, Some(from), Some(body))) => format!("{from}: {body}"),
+                Some((_, Some(from), None)) => from,
+                Some((_, None, Some(body))) => body,
+                _ => ref_id.to_string(),
+            }
+        }
         _ => ref_id.to_string(),
     };
     truncate_chars(&raw, 100)
@@ -262,6 +283,38 @@ pub fn collect_work(conn: &Connection, model: &str) -> rusqlite::Result<Vec<Work
         }
         items.push(WorkItem {
             ref_kind: "action".into(),
+            ref_id: id,
+            source_hash: sha256_hex(&text),
+            text,
+        });
+    }
+
+    // ---- teams messages (#105) ----
+    let teams_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.chat_topic, t.body_html, t.body_preview FROM teams_messages t \
+             LEFT JOIN embeddings e \
+               ON e.ref_kind = 'teams_message' AND e.ref_id = t.id AND e.model = ?1 \
+             WHERE e.indexed_ms IS NULL OR t.modified_ms > e.indexed_ms",
+        )?;
+        let rows = stmt.query_map(params![model], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for (id, topic, body_html, body_preview) in teams_rows {
+        let body = body_html
+            .as_deref()
+            .map(strip_html)
+            .or(body_preview)
+            .unwrap_or_default();
+        let header = topic.unwrap_or_else(|| "Teams message".to_string());
+        let text = truncate_chars(&format!("{header}\n{body}"), SOURCE_CHAR_CAP);
+        if text.trim().is_empty() {
+            continue;
+        }
+        items.push(WorkItem {
+            ref_kind: "teams_message".into(),
             ref_id: id,
             source_hash: sha256_hex(&text),
             text,

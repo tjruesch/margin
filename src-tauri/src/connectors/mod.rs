@@ -34,6 +34,7 @@ pub mod oauth;
 pub mod providers;
 pub mod registry;
 pub mod runner;
+pub mod teams;
 
 pub use registry::ConnectorRegistry;
 

@@ -1263,6 +1263,8 @@ function WorkstreamDetailView({
         onOpenEvent={onOpenEvent}
       />
 
+      <MessagesSection messages={detail.teams_messages} />
+
       <NotesSection notes={detail.notes} onOpenNote={onOpenNote} />
 
       {detail.children.length > 0 ? (
@@ -2498,6 +2500,75 @@ function EmailBodyPanel({
     <p className="workstream-email-loading">
       {fallbackPreview ?? "(no body)"}
     </p>
+  );
+}
+
+/// Compact rendering of Teams messages attached to a workstream
+/// (#105). Each row shows the chat topic/sender, time, and body
+/// preview. Clicking expands to show the full HTML body inline —
+/// unlike emails, Teams messages ship with body_html attached so no
+/// lazy fetch is needed.
+function MessagesSection({
+  messages,
+}: {
+  messages: import("./file").TeamsMessage[];
+}) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  if (messages.length === 0) return null;
+  const toggle = (id: string) =>
+    setExpanded((p) => ({ ...p, [id]: !p[id] }));
+  return (
+    <section className="workstream-section">
+      <h2 className="workstream-section-title">
+        Teams messages ({messages.length})
+      </h2>
+      <ul className="workstream-emails">
+        {messages.map((m) => {
+          const open = !!expanded[m.id];
+          const date = formatShortDate(m.sent_at_ms);
+          // Title preference: chat_topic > sender name > "Teams chat"
+          const label =
+            m.chat_topic && m.chat_topic.length > 0
+              ? m.chat_topic
+              : m.from_name || m.from_email || "Teams chat";
+          const fromLine = m.from_name || m.from_email || "(unknown)";
+          return (
+            <li key={m.id} className="workstream-email">
+              <button
+                type="button"
+                className="workstream-email-row"
+                onClick={() => toggle(m.id)}
+                aria-expanded={open}
+              >
+                <span className="workstream-email-date">{date}</span>
+                <span className="workstream-email-from">{fromLine}</span>
+                <span className="workstream-email-subject">
+                  {label}
+                  {m.body_preview ? ` — ${m.body_preview}` : ""}
+                </span>
+                <span className="workstream-email-chev">{open ? "▾" : "▸"}</span>
+              </button>
+              {open && (
+                <div className="workstream-email-body">
+                  {m.body_html ? (
+                    <div
+                      // Teams body_html is sanitized on the Graph side; we
+                      // render as-is. Same risk profile as the EmailsSection
+                      // body render (no user input is interpolated client-side).
+                      dangerouslySetInnerHTML={{ __html: m.body_html }}
+                    />
+                  ) : (
+                    <p className="workstream-email-loading">
+                      {m.body_preview ?? "(no body)"}
+                    </p>
+                  )}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 

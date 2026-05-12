@@ -275,6 +275,7 @@ pub fn get_workstream_detail(
     let mut emails: Vec<email::EmailMessage> = Vec::new();
     let mut events: Vec<calendar::CalendarEvent> = Vec::new();
     let mut notes: Vec<NoteRef> = Vec::new();
+    let mut teams_messages: Vec<crate::connectors::teams::TeamsMessage> = Vec::new();
     let by_kind = super::signals::load_and_hydrate_for_workstream(conn, id)?;
     for (_kind, hydrated) in by_kind {
         for h in hydrated {
@@ -282,6 +283,7 @@ pub fn get_workstream_detail(
                 super::signals::HydratedSignal::Email(m) => emails.push(m),
                 super::signals::HydratedSignal::Event(e) => events.push(e),
                 super::signals::HydratedSignal::Note(n) => notes.push(n),
+                super::signals::HydratedSignal::TeamsMessage(t) => teams_messages.push(t),
             }
         }
     }
@@ -297,6 +299,7 @@ pub fn get_workstream_detail(
         notes,
         actions,
         links,
+        teams_messages,
         children,
     }))
 }

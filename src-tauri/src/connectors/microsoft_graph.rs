@@ -131,11 +131,33 @@ impl Connector for MicrosoftGraphConnector {
             }
         };
 
+        // ---- Teams half (#105) -------------------------------------------
+        // Best-effort. Silent skip on ReauthNeeded — that's the
+        // expected path for existing users who haven't reconnected
+        // since `Chat.Read` was added to the provider scopes. Mail
+        // + calendar already succeeded, so the connector overall is
+        // healthy; the user will see a Reconnect prompt the next time
+        // they look at Settings only if mail/calendar separately
+        // started failing, but Teams alone failing is non-fatal.
+        let teams_report = match self.sync_teams(&ctx, &resolver).await {
+            Ok(report) => report,
+            Err(ConnectorError::ReauthNeeded(msg)) => {
+                eprintln!(
+                    "[microsoft_graph] Teams sync skipped — reauth needed (probably missing Chat.Read scope): {msg}"
+                );
+                super::teams::UpsertReport::default()
+            }
+            Err(e) => {
+                eprintln!("[microsoft_graph] Teams sync failed (non-fatal): {e}");
+                super::teams::UpsertReport::default()
+            }
+        };
+
         Ok(SyncReport {
-            added: calendar_report.added + mail_report.added,
-            updated: calendar_report.updated + mail_report.updated,
+            added: calendar_report.added + mail_report.added + teams_report.added,
+            updated: calendar_report.updated + mail_report.updated + teams_report.updated,
             removed: calendar_report.removed,
-            skipped: mail_report.skipped,
+            skipped: mail_report.skipped + teams_report.skipped,
         })
     }
 
@@ -184,7 +206,118 @@ impl MicrosoftGraphConnector {
         };
         Ok(report)
     }
+
+    /// Sync Teams 1:1 + group + meeting chat messages (#105). Two-step
+    /// fetch: list the user's chats, then per chat pull recent messages.
+    /// Channel chats are excluded. Returns aggregate upsert counts.
+    async fn sync_teams(
+        &self,
+        ctx: &SyncCtx<'_>,
+        resolver: &AttendeeResolver<'_>,
+    ) -> Result<super::teams::UpsertReport, ConnectorError> {
+        let chats = with_valid_token(ctx.app, &self.id, &self.kind, |access| async move {
+            fetch_teams_chats(&access).await
+        })
+        .await?;
+
+        let self_email = self.self_email().map(|s| s.to_string());
+        let now = current_unix_ms();
+        let cutoff_ms = now - TEAMS_LOOKBACK_MS;
+        let mut total = super::teams::UpsertReport::default();
+
+        for chat in chats {
+            // Skip channels — v1 scope.
+            if chat
+                .chat_type
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("channel"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let chat_id = chat.id.clone();
+            let chat_kind = chat.chat_type.clone().unwrap_or_else(|| "group".to_string());
+            let chat_topic = chat.topic.clone();
+
+            // Persist chat membership for this chat.
+            let members: Vec<super::teams::TeamsChatMember> = chat
+                .members
+                .iter()
+                .map(|m| map_chat_member(&chat_id, m, resolver, self_email.as_deref()))
+                .collect();
+            {
+                let mut conn = ctx
+                    .conn
+                    .lock()
+                    .map_err(|e| ConnectorError::Other(format!("conn lock: {e}")))?;
+                super::teams::upsert_chat_members(&mut conn, &chat_id, &members)
+                    .map_err(|e| ConnectorError::Other(format!("upsert chat members: {e}")))?;
+            }
+
+            // Fetch + map messages.
+            let raw_messages =
+                match with_valid_token(ctx.app, &self.id, &self.kind, |access| {
+                    let chat_id = chat_id.clone();
+                    async move { fetch_teams_chat_messages(&access, &chat_id).await }
+                })
+                .await
+                {
+                    Ok(v) => v,
+                    Err(ConnectorError::Network(e)) => {
+                        eprintln!("[microsoft_graph] teams messages for {chat_id} failed: {e}");
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+
+            let messages: Vec<super::teams::TeamsMessage> = raw_messages
+                .into_iter()
+                .filter_map(|raw| {
+                    if raw.message_type.as_deref() != Some("message") {
+                        return None; // skip system events
+                    }
+                    let sent_at_ms = parse_iso8601_ms(raw.created_date_time.as_deref()?)?;
+                    if sent_at_ms < cutoff_ms {
+                        return None;
+                    }
+                    Some(map_teams_message(
+                        &self.id,
+                        &chat_id,
+                        &chat_kind,
+                        chat_topic.as_deref(),
+                        sent_at_ms,
+                        raw,
+                        &members,
+                    ))
+                })
+                .collect();
+
+            if messages.is_empty() {
+                continue;
+            }
+
+            let report = {
+                let mut conn = ctx
+                    .conn
+                    .lock()
+                    .map_err(|e| ConnectorError::Other(format!("conn lock: {e}")))?;
+                super::teams::upsert_messages(&mut conn, &messages)
+                    .map_err(|e| ConnectorError::Other(format!("upsert teams messages: {e}")))?
+            };
+            total.added += report.added;
+            total.updated += report.updated;
+            total.skipped += report.skipped;
+        }
+        Ok(total)
+    }
 }
+
+/// Teams: only sync messages from the last 90 days. Older history is
+/// excluded for both cost (Graph paging) and embedding-quota reasons.
+const TEAMS_LOOKBACK_MS: i64 = 90 * 24 * 3600 * 1000;
+const TEAMS_CHATS_PAGE_SIZE: u32 = 50;
+const TEAMS_MSGS_PAGE_SIZE: u32 = 50;
+const TEAMS_MAX_PAGES: usize = 4;
 
 /// Lazy-fetch a single message body via Graph. Public so the
 /// `get_email_body` Tauri command can call it.
@@ -229,6 +362,297 @@ pub fn register(registry: &ConnectorRegistry) {
             Ok(Arc::new(MicrosoftGraphConnector::new(row)) as Arc<dyn Connector>)
         }),
     );
+}
+
+// ----- Teams Graph layer (#105) ------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RawTeamsChat {
+    id: String,
+    #[serde(rename = "chatType", default)]
+    chat_type: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
+    #[serde(default)]
+    members: Vec<RawTeamsChatMember>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTeamsChatMember {
+    #[serde(rename = "userId", default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphChatsPage {
+    value: Vec<RawTeamsChat>,
+    #[serde(rename = "@odata.nextLink", default)]
+    next_link: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTeamsMessage {
+    id: String,
+    #[serde(rename = "messageType", default)]
+    message_type: Option<String>,
+    #[serde(rename = "createdDateTime", default)]
+    created_date_time: Option<String>,
+    #[serde(rename = "lastModifiedDateTime", default)]
+    last_modified_date_time: Option<String>,
+    #[serde(default)]
+    from: Option<RawTeamsFromWrapper>,
+    #[serde(default)]
+    body: Option<RawTeamsBody>,
+    #[serde(rename = "replyToId", default)]
+    reply_to_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTeamsFromWrapper {
+    #[serde(default)]
+    user: Option<RawTeamsUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTeamsUser {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTeamsBody {
+    #[serde(default)]
+    #[serde(rename = "contentType")]
+    content_type: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphChatMessagesPage {
+    value: Vec<RawTeamsMessage>,
+    #[serde(rename = "@odata.nextLink", default)]
+    next_link: Option<String>,
+}
+
+async fn fetch_teams_chats(
+    access_token: &str,
+) -> Result<Vec<RawTeamsChat>, ConnectorError> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| ConnectorError::Network(format!("client init: {e}")))?;
+
+    let mut url = format!(
+        "https://graph.microsoft.com/v1.0/me/chats?$top={TEAMS_CHATS_PAGE_SIZE}&$expand=members"
+    );
+    let mut all: Vec<RawTeamsChat> = Vec::new();
+    let mut pages = 0usize;
+
+    loop {
+        let resp = client
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| ConnectorError::Network(format!("graph GET chats: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_status(status, retry_after, body));
+        }
+        let page: GraphChatsPage = resp
+            .json()
+            .await
+            .map_err(|e| ConnectorError::Other(format!("graph chats parse: {e}")))?;
+        all.extend(page.value);
+        pages += 1;
+        if pages >= TEAMS_MAX_PAGES {
+            break;
+        }
+        match page.next_link {
+            Some(next) if !next.is_empty() => url = next,
+            _ => break,
+        }
+    }
+    Ok(all)
+}
+
+async fn fetch_teams_chat_messages(
+    access_token: &str,
+    chat_id: &str,
+) -> Result<Vec<RawTeamsMessage>, ConnectorError> {
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|e| ConnectorError::Network(format!("client init: {e}")))?;
+
+    let encoded = percent_encode_path(chat_id);
+    let mut url = format!(
+        "https://graph.microsoft.com/v1.0/me/chats/{encoded}/messages?$top={TEAMS_MSGS_PAGE_SIZE}"
+    );
+    let mut all: Vec<RawTeamsMessage> = Vec::new();
+    let mut pages = 0usize;
+
+    loop {
+        let resp = client
+            .get(&url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|e| ConnectorError::Network(format!("graph GET chat messages: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(resp.headers());
+            let body = resp.text().await.unwrap_or_default();
+            return Err(map_status(status, retry_after, body));
+        }
+        let page: GraphChatMessagesPage = resp
+            .json()
+            .await
+            .map_err(|e| ConnectorError::Other(format!("graph chat msgs parse: {e}")))?;
+        all.extend(page.value);
+        pages += 1;
+        if pages >= TEAMS_MAX_PAGES {
+            break;
+        }
+        match page.next_link {
+            Some(next) if !next.is_empty() => url = next,
+            _ => break,
+        }
+    }
+    Ok(all)
+}
+
+fn map_chat_member(
+    chat_id: &str,
+    raw: &RawTeamsChatMember,
+    resolver: &AttendeeResolver<'_>,
+    self_email: Option<&str>,
+) -> super::teams::TeamsChatMember {
+    let email = raw.email.as_deref().map(str::to_lowercase);
+    let team_member_id = email.as_deref().and_then(|e| {
+        resolver
+            .resolve_attendee(e, raw.display_name.as_deref())
+            .map(|s| s.to_string())
+    });
+    let is_self = match (email.as_deref(), self_email) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    };
+    super::teams::TeamsChatMember {
+        chat_id: chat_id.to_string(),
+        aad_id: raw.user_id.clone().unwrap_or_default(),
+        email,
+        display_name: raw.display_name.clone(),
+        team_member_id,
+        is_self,
+    }
+}
+
+fn map_teams_message(
+    connector_id: &str,
+    chat_id: &str,
+    chat_kind: &str,
+    chat_topic: Option<&str>,
+    sent_at_ms: i64,
+    raw: RawTeamsMessage,
+    members: &[super::teams::TeamsChatMember],
+) -> super::teams::TeamsMessage {
+    let modified_ms = raw
+        .last_modified_date_time
+        .as_deref()
+        .and_then(parse_iso8601_ms)
+        .unwrap_or(sent_at_ms);
+    let from_user = raw.from.as_ref().and_then(|f| f.user.as_ref());
+    let from_aad_id = from_user.and_then(|u| u.id.clone());
+    let from_name = from_user.and_then(|u| u.display_name.clone());
+    // Resolve from_email via the chat-members snapshot we already have.
+    let from_email = from_aad_id
+        .as_deref()
+        .and_then(|aad| members.iter().find(|m| m.aad_id == aad))
+        .and_then(|m| m.email.clone());
+    let body_html = raw
+        .body
+        .as_ref()
+        .filter(|b| b.content_type.as_deref().unwrap_or("html") == "html")
+        .and_then(|b| b.content.clone());
+    let body_preview = raw
+        .body
+        .as_ref()
+        .and_then(|b| b.content.as_deref())
+        .map(|s| strip_html_for_preview(s))
+        .filter(|s| !s.is_empty());
+
+    let id = format!("{}::teams::{}", connector_id, raw.id);
+    super::teams::TeamsMessage {
+        id,
+        connector_id: connector_id.to_string(),
+        external_id: raw.id,
+        chat_id: chat_id.to_string(),
+        chat_kind: chat_kind.to_string(),
+        chat_topic: chat_topic.map(str::to_string),
+        sent_at_ms,
+        from_aad_id,
+        from_email,
+        from_name,
+        body_html,
+        body_preview,
+        reply_to_id: raw.reply_to_id,
+        modified_ms,
+        raw_etag: None,
+    }
+}
+
+/// Quick-and-dirty HTML strip for body_preview generation when Graph
+/// returns HTML content. Not a full parser — collapses tags + extra
+/// whitespace, truncates at 240 chars (matches Graph's typical preview).
+fn strip_html_for_preview(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    let mut prev_space = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                if !prev_space {
+                    out.push(' ');
+                    prev_space = true;
+                }
+            }
+            _ if !in_tag => {
+                if c.is_whitespace() {
+                    if !prev_space {
+                        out.push(' ');
+                        prev_space = true;
+                    }
+                } else {
+                    out.push(c);
+                    prev_space = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.chars().count() <= 240 {
+        trimmed.to_string()
+    } else {
+        let cut: String = trimmed.chars().take(237).collect();
+        format!("{cut}…")
+    }
+}
+
+fn parse_iso8601_ms(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.timestamp_millis())
 }
 
 // ----- Graph API client --------------------------------------------------

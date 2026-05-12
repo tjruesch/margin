@@ -707,7 +707,7 @@ fn tool_definitions() -> serde_json::Value {
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["note","email","event","action","workstream"]
+                            "enum": ["note","email","event","action","workstream","teams_message"]
                         },
                         "description": "Optional. Restrict results to a subset of entity kinds."
                     },
@@ -2345,6 +2345,7 @@ mod tests {
             }],
             actions: vec![make_action("Reply to invoice", false), make_action("Send quote", true)],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2397,6 +2398,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2457,6 +2459,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2498,6 +2501,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2555,6 +2559,7 @@ mod tests {
                     summary: None,
                 },
             ],
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2604,6 +2609,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2661,6 +2667,7 @@ mod tests {
                     summary: None,
                 },
             ],
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2694,6 +2701,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2711,6 +2719,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2753,6 +2762,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: vec![
                 make_child("ws_talgo", "Talgo demo", "Vendor evaluation.", 1),
                 make_child("ws_comptia", "CompTIA setup", "Onboarding.", 0),
@@ -2795,6 +2805,7 @@ mod tests {
             notes: vec![],
             actions: vec![],
             links: Vec::new(),
+            teams_messages: Vec::new(),
             children: Vec::new(),
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();

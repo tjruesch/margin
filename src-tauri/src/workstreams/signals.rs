@@ -36,6 +36,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::NoteRef;
 use crate::connectors::calendar::{self, CalendarEvent};
 use crate::connectors::email::{self, EmailMessage};
+use crate::connectors::teams::{self, TeamsMessage};
 use crate::index;
 
 /// One hydrated item, polymorphic over the registered kinds. The
@@ -49,6 +50,7 @@ pub enum HydratedSignal {
     Email(EmailMessage),
     Event(CalendarEvent),
     Note(NoteRef),
+    TeamsMessage(TeamsMessage),
 }
 
 /// One snapshot item from a source. `id` is the canonical id stored in
@@ -66,6 +68,7 @@ pub enum SnapshotPayload {
     Email(EmailMessage),
     Event(CalendarEvent),
     Note(NoteRef),
+    TeamsMessage(TeamsMessage),
 }
 
 /// Per-source time window for snapshotting. `back_ms` and
@@ -413,6 +416,117 @@ impl Signal for NoteSignal {
     }
 }
 
+pub struct TeamsMessageSignal;
+
+/// Teams messages: 14d back, label prefix "C" for "chat". Cap of 300
+/// keeps the synthesizer prompt manageable for chatty accounts —
+/// short messages don't add much per-token signal so the cap is
+/// lower than email's 500.
+const TEAMS_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
+const TEAMS_CAP: usize = 300;
+
+impl Signal for TeamsMessageSignal {
+    fn kind(&self) -> &'static str {
+        "teams_message"
+    }
+    fn label_prefix(&self) -> &'static str {
+        "C"
+    }
+    fn prompt_section_title(&self) -> &'static str {
+        "Recent Teams messages (last 14 days)"
+    }
+    fn default_window(&self) -> SignalWindow {
+        SignalWindow {
+            back_ms: TEAMS_WINDOW_BACK_MS,
+            forward_ms: 0,
+        }
+    }
+    fn default_cap(&self) -> usize {
+        TEAMS_CAP
+    }
+    fn snapshot(
+        &self,
+        conn: &Connection,
+        now_ms: i64,
+        window: SignalWindow,
+        cap: usize,
+    ) -> rusqlite::Result<Vec<SnapshotItem>> {
+        let messages = teams::list_messages_in_range(
+            conn,
+            now_ms - window.back_ms,
+            now_ms + window.forward_ms,
+            cap,
+        )?;
+        Ok(messages
+            .into_iter()
+            .map(|m| SnapshotItem {
+                id: m.id.clone(),
+                payload: SnapshotPayload::TeamsMessage(m),
+            })
+            .collect())
+    }
+    fn format(&self, label: &str, item: &SnapshotItem) -> String {
+        let m = match &item.payload {
+            SnapshotPayload::TeamsMessage(m) => m,
+            _ => return String::new(),
+        };
+        let date = format_iso_date(m.sent_at_ms);
+        let chat = m
+            .chat_topic
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| match m.chat_kind.as_str() {
+                "oneOnOne" => "DM",
+                "group" => "Group chat",
+                "meeting" => "Meeting chat",
+                _ => "Chat",
+            });
+        let from = m
+            .from_name
+            .as_deref()
+            .or(m.from_email.as_deref())
+            .unwrap_or("(unknown sender)");
+        let body_raw: String = m
+            .body_preview
+            .clone()
+            .or_else(|| m.body_html.as_deref().map(strip_html))
+            .unwrap_or_default();
+        let body = collapse_inline(&body_raw);
+        format!("[{label}] {date} — {chat} — {from}: {body}\n")
+    }
+    fn hydrate(
+        &self,
+        conn: &Connection,
+        item_ids: &[String],
+    ) -> rusqlite::Result<Vec<HydratedSignal>> {
+        let mut messages = teams::get_message_details_batch(conn, item_ids)?;
+        messages.sort_by(|a, b| b.sent_at_ms.cmp(&a.sent_at_ms));
+        Ok(messages
+            .into_iter()
+            .map(HydratedSignal::TeamsMessage)
+            .collect())
+    }
+}
+
+/// Inline-collapse for Teams previews — strips newlines + tabs to a
+/// single space so the prompt line stays one line.
+fn collapse_inline(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 // ----- Render helpers -----------------------------------------------------
 
 fn email_body_excerpt(m: &EmailMessage) -> String {
@@ -511,6 +625,7 @@ impl SignalRegistry {
             Box::new(EmailSignal),
             Box::new(EventSignal),
             Box::new(NoteSignal),
+            Box::new(TeamsMessageSignal),
         ];
         Self::from_sources(sources)
     }
@@ -814,12 +929,12 @@ mod tests {
         let reg = SignalRegistry::default_with_builtins();
         let kinds: Vec<&'static str> =
             reg.iter_in_prompt_order().map(|s| s.kind()).collect();
-        assert_eq!(kinds, vec!["email", "event", "note"]);
+        assert_eq!(kinds, vec!["email", "event", "note", "teams_message"]);
         let prefixes: Vec<&'static str> = reg
             .iter_in_prompt_order()
             .map(|s| s.label_prefix())
             .collect();
-        assert_eq!(prefixes, vec!["M", "E", "N"]);
+        assert_eq!(prefixes, vec!["M", "E", "N", "C"]);
     }
 
     #[test]

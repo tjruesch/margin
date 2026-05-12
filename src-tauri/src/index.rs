@@ -55,7 +55,8 @@ const SCHEMA_V20: &str = include_str!("migrations/020_workstream_link_summary.sq
 const SCHEMA_V21: &str = include_str!("migrations/021_workstream_action_assignee.sql");
 const SCHEMA_V22: &str = include_str!("migrations/022_events_edges.sql");
 const SCHEMA_V23: &str = include_str!("migrations/023_embeddings.sql");
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_V24: &str = include_str!("migrations/024_teams.sql");
+const SCHEMA_VERSION: i64 = 24;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -240,6 +241,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 22 {
         conn.execute_batch(SCHEMA_V23)?;
         version = 23;
+    }
+    if version == 23 {
+        conn.execute_batch(SCHEMA_V24)?;
+        version = 24;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.

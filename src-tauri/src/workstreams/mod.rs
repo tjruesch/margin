@@ -175,6 +175,10 @@ pub struct WorkstreamDetail {
     pub notes: Vec<NoteRef>,
     pub actions: Vec<WorkstreamAction>,
     pub links: Vec<WorkstreamLink>,
+    /// Teams chat messages attached to this workstream via the
+    /// `workstream_signals` pivot (kind='teams_message'). Recency-desc
+    /// like emails. Empty for workstreams without chat signal. (#105)
+    pub teams_messages: Vec<crate::connectors::teams::TeamsMessage>,
     /// Direct children when this workstream is a parent (#89). Lean
     /// `Workstream` shape — counts + members already populated, no
     /// emails/events/notes/actions hydration. Empty for leaves and
