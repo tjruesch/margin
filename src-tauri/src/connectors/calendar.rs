@@ -89,6 +89,16 @@ pub fn upsert_window(
 
     let incoming: HashSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
 
+    // Self team_member id — cached once per upsert pass for events
+    // emission (#106). NULL when there's no `is_self` row.
+    let self_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+
     let mut report = UpsertReport::default();
     for ev in events {
         let pre_existed = existing.contains(&ev.id);
@@ -96,6 +106,22 @@ pub fn upsert_window(
         if pre_existed {
             report.updated += 1;
         } else {
+            // Live event emission (#106). Actor = self (the calendar is
+            // the user's own; per-attendee ATTENDED edges live in the
+            // edges table separately).
+            let payload = serde_json::json!({
+                "title": ev.title,
+                "all_day": ev.all_day,
+            });
+            crate::events::emit(
+                &tx,
+                ev.start_ms,
+                "meeting",
+                self_id.as_deref(),
+                "event",
+                &ev.id,
+                &payload,
+            )?;
             report.added += 1;
         }
     }
@@ -363,8 +389,20 @@ mod tests {
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE team_members (id TEXT PRIMARY KEY);
+             CREATE TABLE team_members (id TEXT PRIMARY KEY, is_self INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE connectors (id TEXT PRIMARY KEY);
+             -- Minimal `events` stub for #106 live emission. Real schema
+             -- lives in migration 022; this fixture skips that ladder.
+             CREATE TABLE events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 ts_ms INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 actor_id TEXT,
+                 ref_kind TEXT,
+                 ref_id TEXT,
+                 payload TEXT,
+                 created_ms INTEGER NOT NULL
+             );
              INSERT INTO connectors(id) VALUES ('mg:test');",
         )
         .unwrap();
@@ -373,6 +411,36 @@ mod tests {
         conn.execute_batch(include_str!("../migrations/010_event_note_link.sql"))
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn upsert_window_emits_meeting_event() {
+        let mut conn = open_test_db();
+        let event = make_event("e1", 1_000, &[]);
+        let r = upsert_window(&mut conn, "mg:test", &[event.clone()], 0, 10_000).unwrap();
+        assert_eq!(r.added, 1);
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ref_kind = 'event' AND kind = 'meeting'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Re-upsert the same event: no new emission.
+        let r2 = upsert_window(&mut conn, "mg:test", &[event], 0, 10_000).unwrap();
+        assert_eq!(r2.added, 0);
+        assert_eq!(r2.updated, 1);
+        let n2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ref_kind = 'event'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n2, 1);
     }
 
     fn make_event(id: &str, start_ms: i64, attendee_emails: &[&str]) -> CalendarEvent {

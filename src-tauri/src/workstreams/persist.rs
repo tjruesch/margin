@@ -894,6 +894,16 @@ pub fn write_workstream(
         }
     }
 
+    // Self team_member id for events.actor_id fallback when an action
+    // has no explicit assignee (#106).
+    let self_id_for_events: Option<String> = tx
+        .query_row(
+            "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+
     // Actions: upsert by hashed id. ON CONFLICT preserves `done`,
     // `created_ms`, AND `assignee_id` (all three are user-mutable state);
     // refreshes everything else. assignee_id is stamped on insert from
@@ -931,6 +941,24 @@ pub fn write_workstream(
                 a.assignee_id,
             ])?;
             if pre_existed_action == 0 {
+                // Live action_created event (#106).
+                let actor = a
+                    .assignee_id
+                    .as_deref()
+                    .or(self_id_for_events.as_deref());
+                let payload = serde_json::json!({
+                    "text": a.text,
+                    "workstream_id": id,
+                });
+                crate::events::emit(
+                    tx,
+                    now_ms,
+                    "action_created",
+                    actor,
+                    "action",
+                    &aid,
+                    &payload,
+                )?;
                 counts.actions_added += 1;
             } else {
                 counts.actions_updated += 1;
@@ -1061,10 +1089,52 @@ pub fn set_action_done(
     action_id: &str,
     done: bool,
 ) -> rusqlite::Result<()> {
+    let was_done: i64 = conn
+        .query_row(
+            "SELECT done FROM workstream_actions WHERE id = ?1",
+            params![action_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     conn.execute(
         "UPDATE workstream_actions SET done = ?2 WHERE id = ?1",
         params![action_id, done as i64],
     )?;
+    // Live action_completed event on a 0→1 transition (#106). Skipped
+    // when undoing (1→0) or when state didn't change.
+    if done && was_done == 0 {
+        let (text, assignee_id): (String, Option<String>) = conn
+            .query_row(
+                "SELECT text, assignee_id FROM workstream_actions WHERE id = ?1",
+                params![action_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap_or_default();
+        let self_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        let actor = assignee_id.as_deref().or(self_id.as_deref());
+        // The events insert isn't atomic with the UPDATE above —
+        // worst-case desync: action is done in the table but no event
+        // row. Acceptable for v1; downstream consumers won't see a
+        // dropped completion as anything worse than missing telemetry.
+        let payload = serde_json::json!({ "text": text });
+        let tx = conn.unchecked_transaction()?;
+        crate::events::emit(
+            &tx,
+            crate::events::current_unix_ms(),
+            "action_completed",
+            actor,
+            "action",
+            action_id,
+            &payload,
+        )?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -1328,12 +1398,14 @@ mod tests {
              INSERT INTO meta(key, value) VALUES ('schema_version', '11');
              CREATE TABLE team_members (
                  id      TEXT PRIMARY KEY,
-                 aliases TEXT NOT NULL DEFAULT '[]'
+                 aliases TEXT NOT NULL DEFAULT '[]',
+                 is_self INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE connectors (id TEXT PRIMARY KEY);
              INSERT INTO connectors(id) VALUES ('mg:test');
              CREATE TABLE notes (
                  note_path  TEXT PRIMARY KEY,
+                 bundle_id  TEXT NOT NULL DEFAULT '',
                  title      TEXT NOT NULL,
                  modified_ms INTEGER NOT NULL
              );",
@@ -1373,6 +1445,29 @@ mod tests {
         conn.execute_batch(include_str!("../migrations/020_workstream_link_summary.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../migrations/021_workstream_action_assignee.sql"))
+            .unwrap();
+        // The 022 backfill references the `actions` table (note-backed
+        // todos). The persist test fixture skips the notes-side ladder
+        // and lacks that table — seed a minimal stub before running 022
+        // so its `SELECT FROM actions` produces zero rows instead of
+        // erroring.
+        conn.execute_batch(
+            "CREATE TABLE actions (
+                 id          TEXT PRIMARY KEY,
+                 note_path   TEXT NOT NULL,
+                 line        INTEGER NOT NULL,
+                 text        TEXT NOT NULL,
+                 done        INTEGER NOT NULL DEFAULT 0,
+                 created_ms  INTEGER NOT NULL,
+                 due_ms      INTEGER,
+                 assignee_id TEXT
+             );",
+        )
+        .unwrap();
+        // #106 events table — needed by live emission in write_workstream
+        // and set_action_done. Backfill block produces zero rows against
+        // this fresh fixture (no source data); safe.
+        conn.execute_batch(include_str!("../migrations/022_events_edges.sql"))
             .unwrap();
         conn
     }

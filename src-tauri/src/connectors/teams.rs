@@ -14,7 +14,7 @@
 //! always populated at sync time; preserved across upserts via
 //! `COALESCE(excluded.body_html, teams_messages.body_html)`.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -79,6 +79,35 @@ pub fn upsert_messages(
         if pre_existed != 0 {
             report.updated += 1;
         } else {
+            // Live event emission (#106). Actor resolution: the chat
+            // membership table is upserted *before* messages by
+            // microsoft_graph::sync_teams, so the team_member_id is
+            // already populated when we get here.
+            let actor_id: Option<String> = match &m.from_aad_id {
+                Some(aad) => tx
+                    .query_row(
+                        "SELECT team_member_id FROM teams_chat_members \
+                         WHERE chat_id = ?1 AND aad_id = ?2",
+                        params![&m.chat_id, aad],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten(),
+                None => None,
+            };
+            let payload = serde_json::json!({
+                "chat_kind": m.chat_kind,
+                "chat_topic": m.chat_topic,
+            });
+            crate::events::emit(
+                &tx,
+                m.sent_at_ms,
+                "message_sent",
+                actor_id.as_deref(),
+                "teams_message",
+                &m.id,
+                &payload,
+            )?;
             report.added += 1;
         }
     }
@@ -272,6 +301,37 @@ mod tests {
             modified_ms: sent_at,
             raw_etag: None,
         }
+    }
+
+    #[test]
+    fn upsert_messages_emits_event_per_new_row() {
+        let mut conn = open_db();
+        let m = sample_message(
+            "microsoft_graph:test@x.io::teams::evt1",
+            "chat-1",
+            1_000,
+            "hi",
+        );
+        upsert_messages(&mut conn, &[m.clone()]).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ref_kind = 'teams_message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+
+        // Re-upsert same row: no new event.
+        upsert_messages(&mut conn, &[m]).unwrap();
+        let n2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ref_kind = 'teams_message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n2, 1);
     }
 
     #[test]

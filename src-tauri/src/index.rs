@@ -1323,6 +1323,33 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
 }
 
 fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<()> {
+    // Snapshot pre-state for live event emission (#106). Both used
+    // after the writes below to diff against the new state.
+    let note_pre_existed: bool = tx
+        .query_row(
+            "SELECT 1 FROM notes WHERE note_path = ?1",
+            params![note_path],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some();
+    let prior_actions: HashMap<String, bool> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, done FROM actions WHERE note_path = ?1",
+        )?;
+        let rows = stmt.query_map(params![note_path], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let self_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+
     tx.execute(
         "INSERT INTO notes(note_path, bundle_id, title, modified_ms, duration_ms, preview, body_size, archived, favorite) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
@@ -1346,6 +1373,27 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
             p.archived as i64,
             p.favorite as i64,
         ],
+    )?;
+
+    // Emit the note event before tags/FTS/actions — keeps the events
+    // table chronologically consistent with the note table.
+    let note_kind = if note_pre_existed {
+        "note_modified"
+    } else {
+        "note_created"
+    };
+    let note_payload = serde_json::json!({
+        "title": p.title,
+        "bundle_id": p.bundle_id,
+    });
+    crate::events::emit(
+        tx,
+        p.modified_ms,
+        note_kind,
+        self_id.as_deref(),
+        "note",
+        note_path,
+        &note_payload,
     )?;
 
     tx.execute("DELETE FROM tags WHERE note_path = ?1", params![note_path])?;
@@ -1382,8 +1430,12 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
     let resolver = crate::team::OwnerResolver::from_members(&team_members);
 
     tx.execute("DELETE FROM actions WHERE note_path = ?1", params![note_path])?;
+    let now_ms = current_unix_ms();
+    // Track per-id `(done, text, assignee_id)` for the post-pass event
+    // diff. Collected during insertion to avoid a second pass over
+    // `p.actions` + `resolver`.
+    let mut post_actions: Vec<(String, bool, String, Option<String>)> = Vec::new();
     {
-        let now_ms = current_unix_ms();
         let mut stmt = tx.prepare_cached(
             "INSERT INTO actions(id, note_path, line, text, done, created_ms, due_ms, assignee_id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(id) DO NOTHING",
@@ -1402,8 +1454,43 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
                 a.done as i64,
                 now_ms,
                 a.due_ms,
-                assignee_id,
+                assignee_id.clone(),
             ])?;
+            post_actions.push((id, a.done, a.text.clone(), assignee_id));
+        }
+    }
+
+    // Live action events (#106). Diff the post-state against the
+    // pre-state captured at the top of this function.
+    for (id, done, text, assignee_id) in &post_actions {
+        let was_present = prior_actions.contains_key(id);
+        let was_done = prior_actions.get(id).copied().unwrap_or(false);
+        let actor = assignee_id.as_deref().or(self_id.as_deref());
+        let payload = serde_json::json!({
+            "text": text,
+            "note_path": note_path,
+        });
+        if !was_present {
+            crate::events::emit(
+                tx,
+                now_ms,
+                "action_created",
+                actor,
+                "action",
+                id,
+                &payload,
+            )?;
+        }
+        if *done && !was_done {
+            crate::events::emit(
+                tx,
+                now_ms,
+                "action_completed",
+                actor,
+                "action",
+                id,
+                &payload,
+            )?;
         }
     }
     Ok(())
@@ -2285,5 +2372,121 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0))
             .unwrap();
         assert_eq!(edges, 0);
+    }
+
+    // ----- #106 live event emission ----------------------------------------
+
+    fn mk_indexable(title: &str, body: &str, actions: Vec<ParsedAction>, modified_ms: i64) -> Indexable {
+        Indexable {
+            bundle_id: "b1".into(),
+            title: title.into(),
+            modified_ms,
+            duration_ms: None,
+            preview: String::new(),
+            body_size: body.len() as i64,
+            archived: false,
+            favorite: false,
+            actions,
+            tags: vec![],
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn upsert_in_tx_emits_note_created_then_note_modified() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&conn).unwrap();
+        // Self for actor_id is not required (column is nullable).
+
+        let p1 = mk_indexable("First", "hello", vec![], 100);
+        let tx = conn.transaction().unwrap();
+        upsert_in_tx(&tx, "/n/a/note.md", &p1).unwrap();
+        tx.commit().unwrap();
+        let created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'note_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 1);
+
+        // Re-upsert (simulates a save) → note_modified.
+        let p2 = mk_indexable("First v2", "hello again", vec![], 200);
+        let tx = conn.transaction().unwrap();
+        upsert_in_tx(&tx, "/n/a/note.md", &p2).unwrap();
+        tx.commit().unwrap();
+        let modified: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'note_modified'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(modified, 1);
+    }
+
+    #[test]
+    fn action_completed_fires_on_done_flip() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_migrations(&conn).unwrap();
+
+        // Insert with an open action.
+        let p1 = mk_indexable(
+            "T",
+            "- [ ] task",
+            vec![ParsedAction {
+                line: 1,
+                text: "task".into(),
+                done: false,
+                due_ms: None,
+                owner_candidate: None,
+            }],
+            100,
+        );
+        let tx = conn.transaction().unwrap();
+        upsert_in_tx(&tx, "/n/a/note.md", &p1).unwrap();
+        tx.commit().unwrap();
+        let created: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'action_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 1);
+        let completed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'action_completed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed, 0);
+
+        // Re-upsert with done=true → action_completed event.
+        let p2 = mk_indexable(
+            "T",
+            "- [x] task",
+            vec![ParsedAction {
+                line: 1,
+                text: "task".into(),
+                done: true,
+                due_ms: None,
+                owner_candidate: None,
+            }],
+            200,
+        );
+        let tx = conn.transaction().unwrap();
+        upsert_in_tx(&tx, "/n/a/note.md", &p2).unwrap();
+        tx.commit().unwrap();
+        let completed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'action_completed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed, 1);
     }
 }

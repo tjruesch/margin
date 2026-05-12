@@ -17,7 +17,7 @@
 //! Tauri command, persisted, and preserved across re-syncs via
 //! `COALESCE(excluded.body_html, email_messages.body_html)` on UPSERT.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +91,43 @@ pub fn upsert_messages(
         if pre_existed != 0 {
             report.updated += 1;
         } else {
+            // Live event emission (#106) — only on first insert. Sender
+            // resolution via team_member_aliases mirrors the #102 backfill.
+            let sender_id: Option<String> = tx
+                .query_row(
+                    "SELECT m.id FROM team_members m \
+                     JOIN team_member_aliases a ON a.member_id = m.id \
+                     WHERE a.kind = 'email' AND lower(a.value) = lower(?1) LIMIT 1",
+                    params![&msg.from_email],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?;
+            let kind = match &sender_id {
+                Some(id) => {
+                    let is_self: i64 = tx
+                        .query_row(
+                            "SELECT is_self FROM team_members WHERE id = ?1",
+                            params![id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    if is_self != 0 { "email_sent" } else { "email_received" }
+                }
+                None => "email_received",
+            };
+            let payload = serde_json::json!({
+                "thread_id": msg.thread_id,
+                "subject": msg.subject,
+            });
+            crate::events::emit(
+                &tx,
+                msg.sent_at_ms,
+                kind,
+                sender_id.as_deref(),
+                "email",
+                &msg.id,
+                &payload,
+            )?;
             report.added += 1;
         }
     }
@@ -398,8 +435,27 @@ mod tests {
             "PRAGMA foreign_keys = ON;
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta(key, value) VALUES ('schema_version', '10');
-             CREATE TABLE team_members (id TEXT PRIMARY KEY);
+             CREATE TABLE team_members (id TEXT PRIMARY KEY, is_self INTEGER NOT NULL DEFAULT 0);
              CREATE TABLE connectors (id TEXT PRIMARY KEY);
+             CREATE TABLE team_member_aliases (
+                 member_id TEXT NOT NULL,
+                 kind      TEXT NOT NULL,
+                 value     TEXT NOT NULL,
+                 PRIMARY KEY (member_id, kind, value)
+             );
+             -- Minimal `events` stub for #106 live emission. Real schema
+             -- in migration 022; this fixture skips that ladder so we
+             -- drop a compatible no-FK stub here.
+             CREATE TABLE events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 ts_ms INTEGER NOT NULL,
+                 kind TEXT NOT NULL,
+                 actor_id TEXT,
+                 ref_kind TEXT,
+                 ref_id TEXT,
+                 payload TEXT,
+                 created_ms INTEGER NOT NULL
+             );
              INSERT INTO connectors(id) VALUES ('mg:test');
              INSERT INTO team_members(id) VALUES ('tm:heike');",
         )
@@ -407,6 +463,37 @@ mod tests {
         conn.execute_batch(include_str!("../migrations/011_email.sql"))
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn upsert_messages_emits_event_per_new_row() {
+        let mut conn = open_test_db();
+        let msg1 = make_msg("m1", "t1", 1_000, vec![]);
+        let msg2 = make_msg("m2", "t1", 2_000, vec![]);
+        let r = upsert_messages(&mut conn, "mg:test", &[msg1.clone(), msg2.clone()]).unwrap();
+        assert_eq!(r.added, 2);
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ref_kind = 'email'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+
+        // Re-upsert: no new events.
+        let r2 = upsert_messages(&mut conn, "mg:test", &[msg1, msg2]).unwrap();
+        assert_eq!(r2.added, 0);
+        assert_eq!(r2.updated, 2);
+        let n2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE ref_kind = 'email'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n2, 2, "re-upsert must not duplicate event rows");
     }
 
     fn make_msg(

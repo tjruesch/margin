@@ -7,6 +7,7 @@ mod dates;
 mod diarize;
 mod edges;
 mod embeddings;
+mod events;
 mod index;
 mod keychain;
 mod notes;
