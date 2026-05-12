@@ -829,7 +829,9 @@ function AISection({ ai, onChange }: AISectionProps) {
                       ? `idle (${embedStatus.done} indexed this pass${embedStatus.errored ? `, ${embedStatus.errored} errored` : ""})`
                       : embedStatus.state === "needs_key"
                         ? "waiting for API key"
-                        : embedStatus.state}
+                        : embedStatus.state === "rate_limited"
+                          ? "rate-limited — backing off"
+                          : embedStatus.state}
                 </span>
               </div>
               {embedStatus.message && (

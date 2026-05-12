@@ -3,7 +3,7 @@
 //! that's never been embedded), batches into Voyage's 128-input cap,
 //! upserts results into `embeddings` + `embeddings_vec`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -30,6 +30,17 @@ const BATCH_SIZE: usize = 128;
 /// blocking. `RunGuard` resets the flag on drop, so a panic inside
 /// the pass doesn't permanently wedge the worker.
 static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Unix-ms timestamp until which the worker stays idle after a 429
+/// from Voyage. Set when a batch fails with "rate limited", then
+/// checked at the top of each tick. Without this, the 15s polling
+/// loop would slam the API with the same backlog endlessly when the
+/// user's account is on Voyage's free-tier limits (3 RPM / 10K TPM
+/// without a payment method on file). Cleared back to 0 by a manual
+/// `force_reindex_embeddings` IPC.
+static RATE_LIMIT_BACKOFF_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
+
+const RATE_LIMIT_BACKOFF_MS: i64 = 5 * 60 * 1000; // 5 min
 
 struct RunGuard;
 impl Drop for RunGuard {
@@ -75,6 +86,13 @@ pub fn start(app: AppHandle) {
     });
 }
 
+/// Clear any active rate-limit backoff. Called by the manual reindex
+/// IPC so the user can retry immediately after adding a payment method
+/// without waiting for the backoff window to elapse.
+pub fn clear_backoff() {
+    RATE_LIMIT_BACKOFF_UNTIL_MS.store(0, Ordering::Release);
+}
+
 /// One synchronous pass: enumerate stale items, embed them in batches,
 /// upsert. Public so the `force_reindex` IPC can drive it on-demand.
 pub async fn run_once(app: &AppHandle) -> Result<(), String> {
@@ -107,6 +125,29 @@ pub async fn run_once(app: &AppHandle) -> Result<(), String> {
 /// Pass logic factored out from `run_once` so tests can inject a fake
 /// `Embedder` without touching the keychain.
 pub async fn run_pass(app: &AppHandle, embedder: &dyn Embedder) -> Result<(), String> {
+    // Backoff guard: when Voyage 429s, we set a "don't try until T"
+    // timestamp. Bail early so the worker doesn't burn ticks (or the
+    // API's IP-level rate limit) hammering a known-failing endpoint.
+    let now = current_unix_ms();
+    let backoff_until = RATE_LIMIT_BACKOFF_UNTIL_MS.load(Ordering::Acquire);
+    if now < backoff_until {
+        let remaining = (backoff_until - now) / 1000;
+        emit(
+            app,
+            StatusEvent {
+                state: "rate_limited".into(),
+                done: 0,
+                remaining: 0,
+                errored: 0,
+                message: Some(format!(
+                    "Voyage rate-limited; backing off for ~{remaining}s. \
+                     If this persists, add a payment method at https://dashboard.voyageai.com/."
+                )),
+            },
+        );
+        return Ok(());
+    }
+
     let conn_state = app.state::<Mutex<Connection>>();
 
     // Phase 1: collect work + skip unchanged-hash rows (under the lock).
@@ -155,18 +196,28 @@ pub async fn run_pass(app: &AppHandle, embedder: &dyn Embedder) -> Result<(), St
             Ok(v) => v,
             Err(e) => {
                 eprintln!("[embeddings] batch failed: {e}");
+                let is_rate_limit = e.contains("rate limit");
                 errored += chunk.len() as u32;
                 last_error = Some(e.clone());
                 emit(
                     app,
                     StatusEvent {
-                        state: "syncing".into(),
+                        state: if is_rate_limit { "rate_limited" } else { "syncing" }
+                            .into(),
                         done,
                         remaining: total - done - errored,
                         errored,
                         message: Some(e),
                     },
                 );
+                if is_rate_limit {
+                    // No point continuing the pass — subsequent batches
+                    // will hit the same limit. Park future ticks for a
+                    // few minutes so we stop hammering.
+                    let until = current_unix_ms() + RATE_LIMIT_BACKOFF_MS;
+                    RATE_LIMIT_BACKOFF_UNTIL_MS.store(until, Ordering::Release);
+                    break;
+                }
                 continue;
             }
         };

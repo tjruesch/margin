@@ -156,6 +156,7 @@ fn run_includes_pass(conn: &mut Connection, report: &mut EdgeSynthReport) -> Res
              SELECT 'workstream', s.workstream_id, s.kind, s.item_id, 'INCLUDES', \
                     1.0, '[]', s.added_ms, s.added_ms \
              FROM workstream_signals s \
+             WHERE true \
              ON CONFLICT(src_kind, src_id, tgt_kind, tgt_id, edge_kind) DO UPDATE SET \
                 last_seen_ms = max(edges.last_seen_ms, excluded.last_seen_ms)",
             [],
