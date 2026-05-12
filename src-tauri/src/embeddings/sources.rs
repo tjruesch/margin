@@ -69,7 +69,7 @@ pub fn preview_for(conn: &Connection, ref_kind: &str, ref_id: &str) -> String {
         "note" => {
             let title: Option<String> = conn
                 .query_row(
-                    "SELECT title FROM notes WHERE note_path = ?1",
+                    "SELECT title FROM notes WHERE id = ?1",
                     params![ref_id],
                     |r| r.get(0),
                 )
@@ -145,30 +145,32 @@ pub fn preview_for(conn: &Connection, ref_kind: &str, ref_id: &str) -> String {
 pub fn collect_work(conn: &Connection, model: &str) -> rusqlite::Result<Vec<WorkItem>> {
     let mut items: Vec<WorkItem> = Vec::new();
 
-    // ---- notes ----
-    let note_rows: Vec<(String, String)> = {
+    // ---- notes (#112: body now lives in the DB) ----
+    let note_rows: Vec<(String, String, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT n.note_path, n.title FROM notes n \
+            "SELECT n.id, n.title, n.body_md FROM notes n \
              LEFT JOIN embeddings e \
-               ON e.ref_kind = 'note' AND e.ref_id = n.note_path AND e.model = ?1 \
+               ON e.ref_kind = 'note' AND e.ref_id = n.id AND e.model = ?1 \
              WHERE e.indexed_ms IS NULL OR n.modified_ms > e.indexed_ms",
         )?;
-        let rows = stmt.query_map(params![model], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(params![model], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
         rows.filter_map(|r| r.ok()).collect()
     };
-    for (path, title) in note_rows {
-        let body = read_note_body(&path);
-        let text = if body.is_empty() {
+    for (id, title, body) in note_rows {
+        let body_capped = truncate_chars(&body, SOURCE_CHAR_CAP);
+        let text = if body_capped.is_empty() {
             title.clone()
         } else {
-            truncate_chars(&format!("{title}\n{body}"), SOURCE_CHAR_CAP)
+            truncate_chars(&format!("{title}\n{body_capped}"), SOURCE_CHAR_CAP)
         };
         if text.trim().is_empty() {
             continue;
         }
         items.push(WorkItem {
             ref_kind: "note".into(),
-            ref_id: path,
+            ref_id: id,
             source_hash: sha256_hex(&text),
             text,
         });

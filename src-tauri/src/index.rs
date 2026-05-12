@@ -20,15 +20,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
-use std::time::UNIX_EPOCH;
 
 use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 use serde::Serialize;
 
 use crate::notes::{
-    action_id, bundle_dir_for_in, extract_preview, parse_actions, parse_frontmatter,
-    read_archived, read_favorite, read_tags, split_frontmatter, ActionListItem, ActionScope,
-    NoteListItem, NoteScope, ParsedAction, NOTE_FILENAME, TRANSCRIPT_FILENAME,
+    action_id, extract_preview, parse_actions, ActionListItem, ActionScope, NoteListItem,
+    NoteScope, ParsedAction, NOTE_FILENAME, TRANSCRIPT_FILENAME,
 };
 use crate::paths;
 
@@ -57,7 +55,8 @@ const SCHEMA_V22: &str = include_str!("migrations/022_events_edges.sql");
 const SCHEMA_V23: &str = include_str!("migrations/023_embeddings.sql");
 const SCHEMA_V24: &str = include_str!("migrations/024_teams.sql");
 const SCHEMA_V25: &str = include_str!("migrations/025_unify_actions.sql");
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_V26: &str = include_str!("migrations/026_notes_to_db.sql");
+const SCHEMA_VERSION: i64 = 26;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -251,6 +250,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V25)?;
         version = 25;
     }
+    if version == 25 {
+        conn.execute_batch(SCHEMA_V26)?;
+        version = 26;
+    }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
@@ -258,27 +261,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Re-read `note_path` from disk and refresh its row + tag rows + FTS row.
-pub fn upsert(conn: &mut Connection, note_path: &Path) -> Result<()> {
-    upsert_in(conn, note_path, &paths::notes_dir())
-}
-
-fn upsert_in(conn: &mut Connection, note_path: &Path, notes_dir: &Path) -> Result<()> {
-    let parsed = match read_indexable(note_path, notes_dir) {
-        Some(p) => p,
-        None => return Ok(()), // missing or not an owned note — nothing to index
-    };
-    let path_str = note_path.to_string_lossy().into_owned();
-    let tx = conn.transaction()?;
-    upsert_in_tx(&tx, &path_str, &parsed)?;
-    tx.commit()
-}
-
 /// Drop a note (and its tags + FTS rows) from the index. No-op if absent.
-pub fn remove(conn: &mut Connection, note_path: &Path) -> Result<()> {
-    let path_str = note_path.to_string_lossy().into_owned();
+pub fn remove(conn: &mut Connection, note_id: &str) -> Result<()> {
     let tx = conn.transaction()?;
-    remove_in_tx(&tx, &path_str)?;
+    remove_in_tx(&tx, note_id)?;
     tx.commit()
 }
 
@@ -296,7 +282,7 @@ pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>
         NoteScope::All => "",
     };
     let sql = format!(
-        "SELECT n.note_path, n.title, n.modified_ms, n.duration_ms, n.preview, n.favorite \
+        "SELECT n.id, n.title, n.modified_ms, n.duration_ms, n.preview, n.favorite \
          FROM notes n {where_clause} ORDER BY n.modified_ms DESC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -362,7 +348,7 @@ pub fn list_actions(
     // expect: archiving a note hides its actions; archiving a
     // workstream hides the actions pinned to it.
     let sql = format!(
-        "SELECT a.id, a.origin_kind, a.origin_note_path, a.origin_line, \
+        "SELECT a.id, a.origin_kind, a.origin_note_id, a.origin_line, \
                 a.origin_synth_kind, a.origin_synth_id, \
                 a.workstream_id, a.text, a.done, a.due_ms, \
                 a.assignee_id, a.created_ms, \
@@ -371,11 +357,11 @@ pub fn list_actions(
                 t.display_name AS assignee_display_name, \
                 COALESCE(n.modified_ms, w.last_activity_ms, a.created_ms) AS order_ms \
            FROM actions a \
-           LEFT JOIN notes        n ON n.note_path = a.origin_note_path \
+           LEFT JOIN notes        n ON n.id        = a.origin_note_id \
            LEFT JOIN workstreams  w ON w.id        = a.workstream_id \
            LEFT JOIN team_members t ON t.id        = a.assignee_id \
-          WHERE (a.origin_note_path IS NULL OR n.archived = 0) \
-            AND (a.workstream_id    IS NULL OR w.status   = 'active') \
+          WHERE (a.origin_note_id IS NULL OR n.archived = 0) \
+            AND (a.workstream_id  IS NULL OR w.status   = 'active') \
             {where_done} \
             AND (?1 IS NULL OR a.assignee_id   = ?1) \
             AND (?2 IS NULL OR a.workstream_id = ?2) \
@@ -467,11 +453,11 @@ pub fn search_notes(
     // mtime / bundle_id (the FTS row's `title` is duplicated for ranking
     // purposes; `notes.title` is the source-of-truth).
     let fts_sql = "\
-        SELECT n.note_path, n.bundle_id, n.title, n.modified_ms, \
+        SELECT n.id, n.bundle_id, n.title, n.modified_ms, \
                snippet(notes_fts, 2, ?2, ?3, '…', 12) AS body_snip, \
                bm25(notes_fts) AS score \
         FROM notes_fts \
-        JOIN notes n ON n.note_path = notes_fts.note_path \
+        JOIN notes n ON n.id = notes_fts.note_id \
         WHERE notes_fts MATCH ?1 AND n.archived = 0 \
         ORDER BY score ASC \
         LIMIT ?4";
@@ -523,7 +509,7 @@ pub fn search_notes(
     if hits.len() < cap {
         let archived_paths: std::collections::HashSet<String> = {
             let mut stmt = conn
-                .prepare("SELECT note_path FROM notes WHERE archived = 1")?;
+                .prepare("SELECT id FROM notes WHERE archived = 1")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             let mut set = std::collections::HashSet::new();
             for r in rows {
@@ -533,7 +519,7 @@ pub fn search_notes(
         };
         let titles_by_path: HashMap<String, (String, String, i64)> = {
             let mut stmt = conn.prepare(
-                "SELECT note_path, bundle_id, title, modified_ms FROM notes \
+                "SELECT id, bundle_id, title, modified_ms FROM notes \
                  WHERE archived = 0",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -594,7 +580,7 @@ pub struct DirectoryEntry {
 /// into the retrieved set.
 pub fn list_directory(conn: &Connection, limit: usize) -> Result<Vec<DirectoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT note_path, bundle_id, title, modified_ms, preview \
+        "SELECT id, bundle_id, title, modified_ms, preview \
          FROM notes WHERE archived = 0 \
          ORDER BY modified_ms DESC LIMIT ?1",
     )?;
@@ -653,11 +639,11 @@ pub fn retrieve_for_ask(
         std::collections::HashSet::new();
 
     let fts_sql = "\
-        SELECT n.note_path, n.bundle_id, n.title, n.modified_ms, \
+        SELECT n.id, n.bundle_id, n.title, n.modified_ms, \
                snippet(notes_fts, 2, ?2, ?3, '…', 16) AS body_snip, \
                bm25(notes_fts) AS score \
         FROM notes_fts \
-        JOIN notes n ON n.note_path = notes_fts.note_path \
+        JOIN notes n ON n.id = notes_fts.note_id \
         WHERE notes_fts MATCH ?1 AND n.archived = 0 \
         ORDER BY score ASC \
         LIMIT ?4";
@@ -714,7 +700,7 @@ pub fn retrieve_for_ask(
     if hits.len() < cap {
         let archived_paths: std::collections::HashSet<String> = {
             let mut stmt = conn
-                .prepare("SELECT note_path FROM notes WHERE archived = 1")?;
+                .prepare("SELECT id FROM notes WHERE archived = 1")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             let mut set = std::collections::HashSet::new();
             for r in rows {
@@ -724,7 +710,7 @@ pub fn retrieve_for_ask(
         };
         let titles_by_path: HashMap<String, (String, String, i64)> = {
             let mut stmt = conn.prepare(
-                "SELECT note_path, bundle_id, title, modified_ms FROM notes \
+                "SELECT id, bundle_id, title, modified_ms FROM notes \
                  WHERE archived = 0",
             )?;
             let rows = stmt.query_map([], |r| {
@@ -804,7 +790,7 @@ const STOPWORDS: &[&str] = &[
 
 fn recent_notes(conn: &Connection, limit: usize) -> Result<Vec<SearchHit>> {
     let mut stmt = conn.prepare(
-        "SELECT note_path, bundle_id, title, modified_ms, preview \
+        "SELECT id, bundle_id, title, modified_ms, preview \
          FROM notes WHERE archived = 0 \
          ORDER BY modified_ms DESC LIMIT ?1",
     )?;
@@ -1114,101 +1100,6 @@ fn char_offset_forward(suffix: &str, n_chars: usize) -> usize {
         .unwrap_or(suffix.len())
 }
 
-#[derive(Default)]
-pub struct ReconcileReport {
-    pub upserted: usize,
-    pub removed: usize,
-    pub skipped: usize,
-}
-
-/// Walk `notes_dir`, compute the diff against the index, and apply only
-/// the necessary changes. Cheap-checks first via `(count, max(mtime))`.
-pub fn reconcile(conn: &mut Connection, notes_dir: &Path) -> Result<ReconcileReport> {
-    let disk = scan_disk(notes_dir);
-    let (db_count, db_max_mtime): (i64, i64) = conn
-        .query_row(
-            "SELECT COUNT(*), COALESCE(MAX(modified_ms), 0) FROM notes",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap_or((0, 0));
-
-    // Migrations set `body_size = -1` on rows that need a forced re-read
-    // (e.g. when a parser change means the cached `text` is stale). Skip
-    // the global count+max-mtime shortcut whenever any such sentinel
-    // exists, otherwise the migration's intent gets bypassed and the new
-    // parser never runs against unchanged files.
-    let pending_resync: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM notes WHERE body_size < 0",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    let disk_max_mtime = disk.iter().map(|d| d.modified_ms).max().unwrap_or(0);
-    if pending_resync == 0
-        && db_count as usize == disk.len()
-        && db_max_mtime == disk_max_mtime
-    {
-        return Ok(ReconcileReport {
-            skipped: disk.len(),
-            ..Default::default()
-        });
-    }
-
-    // Index existing rows by path for diff.
-    let mut existing: HashMap<String, (i64, i64)> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT note_path, modified_ms, body_size FROM notes")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
-        })?;
-        for row in rows {
-            let (p, m, s) = row?;
-            existing.insert(p, (m, s));
-        }
-    }
-
-    let mut report = ReconcileReport::default();
-    let tx = conn.transaction()?;
-
-    let disk_paths: Vec<String> = disk
-        .iter()
-        .map(|d| d.note_path.to_string_lossy().into_owned())
-        .collect();
-    let disk_set: std::collections::HashSet<&str> =
-        disk_paths.iter().map(|s| s.as_str()).collect();
-
-    for (path, (_, _)) in existing.iter() {
-        if !disk_set.contains(path.as_str()) {
-            remove_in_tx(&tx, path)?;
-            report.removed += 1;
-        }
-    }
-
-    for (i, entry) in disk.iter().enumerate() {
-        let path_str = &disk_paths[i];
-        let needs_upsert = match existing.get(path_str) {
-            None => true,
-            Some((m, s)) => *m != entry.modified_ms || *s != entry.body_size,
-        };
-        if !needs_upsert {
-            report.skipped += 1;
-            continue;
-        }
-        let parsed = match read_indexable(&entry.note_path, notes_dir) {
-            Some(p) => p,
-            None => continue,
-        };
-        upsert_in_tx(&tx, path_str, &parsed)?;
-        report.upserted += 1;
-    }
-
-    tx.commit()?;
-    Ok(report)
-}
-
 // ---------- internals -----------------------------------------------------
 
 struct NoteRow {
@@ -1220,78 +1111,33 @@ struct NoteRow {
     favorite: bool,
 }
 
-struct DiskEntry {
-    note_path: PathBuf,
+/// Pre-parsed view of a note's body for the upsert path (#112). Built
+/// either from a `write_note` IPC call (body comes from the user) or
+/// from the one-time disk-to-DB body backfill at boot (body comes
+/// from the legacy `<bundle>/note.md` file).
+pub(crate) struct Indexable {
+    pub(crate) bundle_id: String,
+    pub(crate) title: String,
+    pub(crate) modified_ms: i64,
+    pub(crate) duration_ms: Option<u64>,
+    pub(crate) preview: String,
+    pub(crate) body_size: i64,
+    pub(crate) actions: Vec<ParsedAction>,
+    pub(crate) body: String,
+}
+
+/// Build an `Indexable` from an in-memory `body_md` string. Title is
+/// derived from the first `# Heading` line; actions parsed from
+/// `- [ ]` lines. Duration is best-effort hydrated from
+/// `<notes_dir>/<note_id>/transcript.json` when present — audio/
+/// transcripts still live on disk after #112.
+pub(crate) fn parse_indexable_from_body(
+    bundle_id: &str,
+    body_md: &str,
     modified_ms: i64,
-    body_size: i64,
-}
-
-struct Indexable {
-    bundle_id: String,
-    title: String,
-    modified_ms: i64,
-    duration_ms: Option<u64>,
-    preview: String,
-    body_size: i64,
-    archived: bool,
-    favorite: bool,
-    tags: Vec<String>,
-    actions: Vec<ParsedAction>,
-    body: String,
-}
-
-fn scan_disk(notes_dir: &Path) -> Vec<DiskEntry> {
-    let mut out = Vec::new();
-    let read_dir = match fs::read_dir(notes_dir) {
-        Ok(r) => r,
-        Err(_) => return out,
-    };
-    for entry in read_dir.flatten() {
-        let bundle = entry.path();
-        if !bundle.is_dir() {
-            continue;
-        }
-        let note_path = bundle.join(NOTE_FILENAME);
-        let meta = match fs::metadata(&note_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let modified_ms = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let body_size = meta.len() as i64;
-        out.push(DiskEntry {
-            note_path,
-            modified_ms,
-            body_size,
-        });
-    }
-    out
-}
-
-fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
-    let bundle_dir = bundle_dir_for_in(note_path, notes_dir)?;
-    let bundle_id = bundle_dir.file_name()?.to_string_lossy().into_owned();
-    let meta = fs::metadata(note_path).ok()?;
-    let modified_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let body_size = meta.len() as i64;
-
-    let raw = fs::read_to_string(note_path).ok()?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let frontmatter = yaml.map(parse_frontmatter).unwrap_or_default();
-    let tags = read_tags(&frontmatter);
-    let archived = read_archived(&frontmatter);
-    let favorite = read_favorite(&frontmatter);
-    let actions = parse_actions(body);
-    let title = body
+) -> Indexable {
+    let actions = parse_actions(body_md);
+    let title = body_md
         .lines()
         .find_map(|l| {
             l.trim_start()
@@ -1300,8 +1146,12 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
                 .filter(|t| !t.is_empty())
         })
         .unwrap_or_else(|| "Untitled note".to_string());
+    let preview = extract_preview(body_md);
+    let body_size = body_md.len() as i64;
 
-    let transcript_path = bundle_dir.join(TRANSCRIPT_FILENAME);
+    let transcript_path = paths::notes_dir()
+        .join(bundle_id)
+        .join(TRANSCRIPT_FILENAME);
     let duration_ms = if transcript_path.exists() {
         fs::read_to_string(&transcript_path)
             .ok()
@@ -1311,30 +1161,38 @@ fn read_indexable(note_path: &Path, notes_dir: &Path) -> Option<Indexable> {
         None
     };
 
-    let preview = extract_preview(body);
-
-    Some(Indexable {
-        bundle_id,
+    Indexable {
+        bundle_id: bundle_id.to_string(),
         title,
         modified_ms,
         duration_ms,
         preview,
         body_size,
-        archived,
-        favorite,
-        tags,
         actions,
-        body: body.to_string(),
-    })
+        body: body_md.to_string(),
+    }
 }
 
-fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<()> {
-    // Snapshot pre-state for live event emission (#106). Both used
-    // after the writes below to diff against the new state.
+/// Refresh the row for `note_id` (#112). UPDATEs the row in place,
+/// re-derives title from the body, refreshes FTS, reparses
+/// `- [ ]` lines into the unified `actions` table, and emits
+/// `note_modified`/`action_created`/`action_completed` events — all
+/// inside the supplied transaction.
+///
+/// `archived`/`favorite`/`tags` are *not* touched here. Those have
+/// their own DB-only IPCs (`set_archived` / `set_favorite` /
+/// `set_note_tags`). Use this on the body-change path only.
+pub(crate) fn upsert_in_tx(
+    tx: &Transaction<'_>,
+    note_id: &str,
+    p: &Indexable,
+) -> Result<()> {
+    // Snapshot pre-state for live event emission (#106) and the
+    // action-diff that follows.
     let note_pre_existed: bool = tx
         .query_row(
-            "SELECT 1 FROM notes WHERE note_path = ?1",
-            params![note_path],
+            "SELECT 1 FROM notes WHERE id = ?1",
+            params![note_id],
             |r| r.get::<_, i64>(0),
         )
         .optional()?
@@ -1342,9 +1200,9 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
     let prior_actions: HashMap<String, bool> = {
         let mut stmt = tx.prepare(
             "SELECT id, done FROM actions \
-              WHERE origin_kind = 'note' AND origin_note_path = ?1",
+              WHERE origin_kind = 'note' AND origin_note_id = ?1",
         )?;
-        let rows = stmt.query_map(params![note_path], |r| {
+        let rows = stmt.query_map(params![note_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
         })?;
         rows.filter_map(|r| r.ok()).collect()
@@ -1357,33 +1215,34 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
         )
         .optional()?;
 
+    // INSERT-on-create / UPDATE-body-only on existing. archived/
+    // favorite live on their own IPCs and aren't refreshed here.
     tx.execute(
-        "INSERT INTO notes(note_path, bundle_id, title, modified_ms, duration_ms, preview, body_size, archived, favorite) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-         ON CONFLICT(note_path) DO UPDATE SET \
+        "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
+                           duration_ms, preview, body_size, created_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?5) \
+         ON CONFLICT(id) DO UPDATE SET \
             bundle_id = excluded.bundle_id, \
             title = excluded.title, \
+            body_md = excluded.body_md, \
             modified_ms = excluded.modified_ms, \
             duration_ms = excluded.duration_ms, \
             preview = excluded.preview, \
-            body_size = excluded.body_size, \
-            archived = excluded.archived, \
-            favorite = excluded.favorite",
+            body_size = excluded.body_size",
         params![
-            note_path,
+            note_id,
             p.bundle_id,
             p.title,
+            p.body,
             p.modified_ms,
             p.duration_ms.map(|v| v as i64),
             p.preview,
             p.body_size,
-            p.archived as i64,
-            p.favorite as i64,
         ],
     )?;
 
     // Emit the note event before tags/FTS/actions — keeps the events
-    // table chronologically consistent with the note table.
+    // table chronologically consistent with the notes table.
     let note_kind = if note_pre_existed {
         "note_modified"
     } else {
@@ -1399,60 +1258,40 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
         note_kind,
         self_id.as_deref(),
         "note",
-        note_path,
+        note_id,
         &note_payload,
     )?;
 
-    tx.execute("DELETE FROM tags WHERE note_path = ?1", params![note_path])?;
-    {
-        let mut stmt =
-            tx.prepare_cached("INSERT INTO tags(note_path, tag) VALUES (?1, ?2)")?;
-        for tag in &p.tags {
-            stmt.execute(params![note_path, tag])?;
-        }
-    }
-
+    // FTS: rewrite the row from the new body_md.
     tx.execute(
-        "DELETE FROM notes_fts WHERE note_path = ?1",
-        params![note_path],
+        "DELETE FROM notes_fts WHERE note_id = ?1",
+        params![note_id],
     )?;
     tx.execute(
-        "INSERT INTO notes_fts(note_path, title, body) VALUES (?1, ?2, ?3)",
-        params![note_path, p.title, p.body],
+        "INSERT INTO notes_fts(note_id, title, body) VALUES (?1, ?2, ?3)",
+        params![note_id, p.title, p.body],
     )?;
 
-    // Actions: replace wholesale. Two open checkboxes with identical
-    // text in one note collapse to one row via the PRIMARY KEY (id is
-    // <bundle>:<hash(text)>). Documented as the v1 trade-off.
-    //
-    // Owner resolution (#49) runs in this same pass: build the
-    // `OwnerResolver` once from the current team_members snapshot, then
-    // resolve each action's `owner_candidate` to a member id when
-    // unambiguous. Ambiguous and unmatched candidates leave assignee_id
-    // NULL.
+    // Actions: replace wholesale (note-origin rows for this note
+    // only). Synth-origin rows attached via workstream_id survive
+    // because the DELETE is scoped by origin_kind + origin_note_id.
     let team_members = crate::team::list_team_members_raw(tx).unwrap_or_else(|e| {
         eprintln!("[index] list_team_members_raw failed: {e}");
         Vec::new()
     });
     let resolver = crate::team::OwnerResolver::from_members(&team_members);
 
-    // Wholesale-replace only the note-origin rows for this path; never
-    // touch synth-origin rows that may have attached to this note via
-    // workstream_id (#111).
     tx.execute(
         "DELETE FROM actions \
-          WHERE origin_kind = 'note' AND origin_note_path = ?1",
-        params![note_path],
+          WHERE origin_kind = 'note' AND origin_note_id = ?1",
+        params![note_id],
     )?;
     let now_ms = current_unix_ms();
-    // Track per-id `(done, text, assignee_id)` for the post-pass event
-    // diff. Collected during insertion to avoid a second pass over
-    // `p.actions` + `resolver`.
     let mut post_actions: Vec<(String, bool, String, Option<String>)> = Vec::new();
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO actions \
-                (id, origin_kind, origin_note_path, origin_line, text, done, \
+                (id, origin_kind, origin_note_id, origin_line, text, done, \
                  created_ms, due_ms, assignee_id) \
              VALUES (?1, 'note', ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
              ON CONFLICT(id) DO NOTHING",
@@ -1465,7 +1304,7 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
                 .and_then(|c| resolver.resolve(c));
             stmt.execute(params![
                 id,
-                note_path,
+                note_id,
                 a.line as i64,
                 a.text,
                 a.done as i64,
@@ -1485,7 +1324,7 @@ fn upsert_in_tx(tx: &Transaction<'_>, note_path: &str, p: &Indexable) -> Result<
         let actor = assignee_id.as_deref().or(self_id.as_deref());
         let payload = serde_json::json!({
             "text": text,
-            "note_path": note_path,
+            "note_id": note_id,
         });
         if !was_present {
             crate::events::emit(
@@ -1521,19 +1360,19 @@ fn current_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn remove_in_tx(tx: &Transaction<'_>, note_path: &str) -> Result<()> {
-    // FK ON DELETE CASCADE handles `tags`; FTS is a virtual table so we
-    // delete its row explicitly.
+pub(crate) fn remove_in_tx(tx: &Transaction<'_>, note_id: &str) -> Result<()> {
+    // FK ON DELETE CASCADE handles `tags`/`actions`/`meeting_attendees`;
+    // FTS is a virtual table so we delete its row explicitly.
     tx.execute(
-        "DELETE FROM notes_fts WHERE note_path = ?1",
-        params![note_path],
+        "DELETE FROM notes_fts WHERE note_id = ?1",
+        params![note_id],
     )?;
-    tx.execute("DELETE FROM notes WHERE note_path = ?1", params![note_path])?;
+    tx.execute("DELETE FROM notes WHERE id = ?1", params![note_id])?;
     Ok(())
 }
 
 fn load_tags_grouped(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
-    let mut stmt = conn.prepare("SELECT note_path, tag FROM tags ORDER BY note_path, tag")?;
+    let mut stmt = conn.prepare("SELECT note_id, tag FROM tags ORDER BY note_id, tag")?;
     let rows = stmt.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })?;
@@ -1606,16 +1445,18 @@ mod tests {
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
 
-        // archived + favorite columns exist and default to 0.
+        // archived + favorite columns exist and default to 0. After
+        // #112 the PK is `id` (= the legacy bundle_id) and body_md is
+        // a column on the table.
         conn.execute(
-            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
-             VALUES ('/x/abc/note.md', 'abc', 't', 1, 0)",
+            "INSERT INTO notes(id, bundle_id, title, modified_ms, body_size) \
+             VALUES ('abc', 'abc', 't', 1, 0)",
             [],
         )
         .unwrap();
         let (archived, favorite): (i64, i64) = conn
             .query_row(
-                "SELECT archived, favorite FROM notes WHERE note_path='/x/abc/note.md'",
+                "SELECT archived, favorite FROM notes WHERE id='abc'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1640,14 +1481,14 @@ mod tests {
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
         conn.execute(
-            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
-             VALUES ('/x/zzz/note.md', 'zzz', 't', 1, 0)",
+            "INSERT INTO notes(id, bundle_id, title, modified_ms, body_size) \
+             VALUES ('zzz', 'zzz', 't', 1, 0)",
             [],
         )
         .unwrap();
         let favorite: i64 = conn
             .query_row(
-                "SELECT favorite FROM notes WHERE note_path='/x/zzz/note.md'",
+                "SELECT favorite FROM notes WHERE id='zzz'",
                 [],
                 |r| r.get(0),
             )
@@ -1662,7 +1503,8 @@ mod tests {
         conn.execute_batch(SCHEMA_V2).unwrap();
         conn.execute_batch(SCHEMA_V3).unwrap();
         conn.execute_batch(SCHEMA_V4).unwrap();
-        // Insert a pre-v5 actions row to confirm ALTERs don't disturb it.
+        // Pre-v5 schema: `notes.note_path` is still the PK here. The
+        // 026 migration renames it to `id` later in the chain.
         conn.execute(
             "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
              VALUES ('/x/dd/note.md', 'dd', 't', 1, 0)",
@@ -1697,9 +1539,11 @@ mod tests {
         assert!(due_ms.is_none());
 
         // body_size = -1 sentinel applied to all notes so reconcile re-reads.
+        // After #112 the PK is `id` (set to the legacy bundle_id) but the
+        // sentinel value persists through the migration.
         let bs: i64 = conn
             .query_row(
-                "SELECT body_size FROM notes WHERE note_path='/x/dd/note.md'",
+                "SELECT body_size FROM notes WHERE id='dd'",
                 [],
                 |r| r.get(0),
             )
@@ -1724,317 +1568,9 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
     }
 
-    #[test]
-    fn upsert_indexes_a_note() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = write_bundle(
-            &notes,
-            "abc",
-            "---\ntags:\n  - work\n  - urgent\n---\n# Hello\n\nSome body text.\n",
-        );
-        let mut conn = fresh_conn();
-        upsert_in(&mut conn, &note, &notes).unwrap();
-
-        let items = list_all(&conn, NoteScope::Active).unwrap();
-        assert_eq!(items.len(), 1);
-        let item = &items[0];
-        assert_eq!(item.title, "Hello");
-        assert_eq!(item.preview, "Some body text.");
-        let mut got = item.tags.clone();
-        got.sort();
-        assert_eq!(got, vec!["urgent".to_string(), "work".to_string()]);
-
-        let fts_count: i64 = conn
-            .query_row("SELECT count(*) FROM notes_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(fts_count, 1);
-    }
-
-    #[test]
-    fn reconcile_indexes_fresh_disk() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        write_bundle(&notes, "aaa", "# A\n\nFirst note.\n");
-        write_bundle(&notes, "bbb", "---\ntags: [todo]\n---\n# B\n\nSecond.\n");
-        let mut conn = fresh_conn();
-        let report = reconcile(&mut conn, &notes).unwrap();
-        assert_eq!(report.upserted, 2);
-        assert_eq!(report.removed, 0);
-        let items = list_all(&conn, NoteScope::Active).unwrap();
-        assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn reconcile_noop_when_consistent() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        write_bundle(&notes, "aaa", "# A\n\nbody\n");
-        let mut conn = fresh_conn();
-        reconcile(&mut conn, &notes).unwrap();
-        let report = reconcile(&mut conn, &notes).unwrap();
-        assert_eq!(report.upserted, 0);
-        assert_eq!(report.removed, 0);
-        assert_eq!(report.skipped, 1);
-    }
-
-    #[test]
-    fn reconcile_removes_orphans() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = write_bundle(&notes, "aaa", "# A\n\nbody\n");
-        let mut conn = fresh_conn();
-        reconcile(&mut conn, &notes).unwrap();
-        assert_eq!(list_all(&conn, NoteScope::Active).unwrap().len(), 1);
-
-        // Remove the bundle directory and reconcile.
-        fs::remove_dir_all(note.parent().unwrap()).unwrap();
-        let report = reconcile(&mut conn, &notes).unwrap();
-        assert_eq!(report.removed, 1);
-        assert_eq!(list_all(&conn, NoteScope::Active).unwrap().len(), 0);
-    }
-
-    #[test]
-    fn upsert_replaces_existing() {
-        let mut conn = fresh_conn();
-        let path = "/fake/notes/xyz/note.md".to_string();
-        let mut p = Indexable {
-            bundle_id: "xyz".into(),
-            title: "First".into(),
-            modified_ms: 1,
-            duration_ms: None,
-            preview: "v1".into(),
-            body_size: 1,
-            archived: false,
-            favorite: false,
-            actions: vec![],
-            tags: vec!["a".into()],
-            body: "v1".into(),
-        };
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, &path, &p).unwrap();
-        tx.commit().unwrap();
-
-        p.title = "Second".into();
-        p.tags = vec!["b".into(), "c".into()];
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, &path, &p).unwrap();
-        tx.commit().unwrap();
-
-        let items = list_all(&conn, NoteScope::Active).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].title, "Second");
-        assert_eq!(items[0].tags, vec!["b".to_string(), "c".to_string()]);
-    }
-
-    #[test]
-    fn remove_deletes_cascade() {
-        let mut conn = fresh_conn();
-        let path = "/fake/notes/xyz/note.md".to_string();
-        let p = Indexable {
-            bundle_id: "xyz".into(),
-            title: "T".into(),
-            modified_ms: 1,
-            duration_ms: None,
-            preview: "p".into(),
-            body_size: 1,
-            archived: false,
-            favorite: false,
-            actions: vec![],
-            tags: vec!["a".into(), "b".into()],
-            body: "body".into(),
-        };
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, &path, &p).unwrap();
-        tx.commit().unwrap();
-
-        let tx = conn.transaction().unwrap();
-        remove_in_tx(&tx, &path).unwrap();
-        tx.commit().unwrap();
-
-        let n: i64 = conn
-            .query_row("SELECT count(*) FROM notes", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 0);
-        let t: i64 = conn
-            .query_row("SELECT count(*) FROM tags", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(t, 0);
-        let f: i64 = conn
-            .query_row("SELECT count(*) FROM notes_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(f, 0);
-    }
-
-    #[test]
-    fn list_all_filters_by_scope() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        write_bundle(&notes, "act1", "# A\n\nactive one\n");
-        write_bundle(
-            &notes,
-            "arc1",
-            "---\narchived: true\n---\n# Z\n\narchived one\n",
-        );
-        write_bundle(&notes, "act2", "# B\n\nanother active\n");
-        let mut conn = fresh_conn();
-        reconcile(&mut conn, &notes).unwrap();
-
-        let active = list_all(&conn, NoteScope::Active).unwrap();
-        let archived = list_all(&conn, NoteScope::Archived).unwrap();
-        let all = list_all(&conn, NoteScope::All).unwrap();
-        assert_eq!(active.len(), 2);
-        assert_eq!(archived.len(), 1);
-        assert_eq!(archived[0].title, "Z");
-        assert_eq!(all.len(), 3);
-    }
-
-    #[test]
-    fn upsert_indexes_favorite_flag() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = write_bundle(
-            &notes,
-            "abc",
-            "---\nfavorite: true\n---\n# Hi\n\nbody\n",
-        );
-        let mut conn = fresh_conn();
-        upsert_in(&mut conn, &note, &notes).unwrap();
-        let favorite: i64 = conn
-            .query_row(
-                "SELECT favorite FROM notes WHERE bundle_id='abc'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(favorite, 1);
-        let items = list_all(&conn, NoteScope::Favorites).unwrap();
-        assert_eq!(items.len(), 1);
-        assert!(items[0].favorite);
-    }
-
-    #[test]
-    fn list_all_filters_by_favorites_scope() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        write_bundle(&notes, "plain", "# Plain\n");
-        write_bundle(
-            &notes,
-            "fav1",
-            "---\nfavorite: true\n---\n# Fav One\n",
-        );
-        write_bundle(
-            &notes,
-            "fav-arc",
-            "---\nfavorite: true\narchived: true\n---\n# Hidden\n",
-        );
-        let mut conn = fresh_conn();
-        reconcile(&mut conn, &notes).unwrap();
-
-        let active = list_all(&conn, NoteScope::Active).unwrap();
-        let favorites = list_all(&conn, NoteScope::Favorites).unwrap();
-        let archived = list_all(&conn, NoteScope::Archived).unwrap();
-        assert_eq!(active.len(), 2, "plain + fav1 (fav-arc archived out)");
-        assert_eq!(favorites.len(), 1, "fav1 only — archived favorites hidden");
-        assert_eq!(favorites[0].title, "Fav One");
-        assert_eq!(archived.len(), 1);
-    }
-
-    #[test]
-    fn upsert_indexes_actions() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = write_bundle(
-            &notes,
-            "actbundle",
-            "# Plan\n\n- [ ] open one\n- [x] done one\n",
-        );
-        let mut conn = fresh_conn();
-        upsert_in(&mut conn, &note, &notes).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
-        let opens: Vec<ActionListItem> = list_actions(&conn, ActionScope::Open, None, None).unwrap();
-        assert_eq!(opens.len(), 1);
-        assert_eq!(opens[0].text, "open one");
-        let done: Vec<ActionListItem> = list_actions(&conn, ActionScope::Done, None, None).unwrap();
-        assert_eq!(done.len(), 1);
-        assert_eq!(done[0].text, "done one");
-    }
-
-    #[test]
-    fn upsert_indexes_actions_with_due_ms() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = write_bundle(
-            &notes,
-            "due-bundle",
-            "# Plan\n\n- [ ] Pay invoice @2026-06-01\n- [ ] No date here\n",
-        );
-        let mut conn = fresh_conn();
-        upsert_in(&mut conn, &note, &notes).unwrap();
-        let opens = list_actions(&conn, ActionScope::Open, None, None).unwrap();
-        assert_eq!(opens.len(), 2);
-        // Sort: dated row leads (ORDER BY due_ms IS NULL), then by due_ms ASC.
-        assert_eq!(opens[0].text, "Pay invoice");
-        assert!(opens[0].due_ms.is_some());
-        assert_eq!(opens[1].text, "No date here");
-        assert!(opens[1].due_ms.is_none());
-    }
-
-    #[test]
-    fn upsert_replaces_actions_on_rewrite() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = write_bundle(&notes, "rewrite", "# T\n\n- [ ] alpha\n");
-        let mut conn = fresh_conn();
-        upsert_in(&mut conn, &note, &notes).unwrap();
-        // Rewrite with a different action text.
-        std::fs::write(&note, "# T\n\n- [ ] beta\n").unwrap();
-        upsert_in(&mut conn, &note, &notes).unwrap();
-        let opens = list_actions(&conn, ActionScope::Open, None, None).unwrap();
-        assert_eq!(opens.len(), 1);
-        assert_eq!(opens[0].text, "beta");
-    }
-
-    #[test]
-    fn list_actions_excludes_archived_note() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        write_bundle(&notes, "active", "# A\n\n- [ ] visible\n");
-        write_bundle(
-            &notes,
-            "arc",
-            "---\narchived: true\n---\n# Z\n\n- [ ] hidden\n",
-        );
-        let mut conn = fresh_conn();
-        reconcile(&mut conn, &notes).unwrap();
-        let opens = list_actions(&conn, ActionScope::Open, None, None).unwrap();
-        assert_eq!(opens.len(), 1);
-        assert_eq!(opens[0].text, "visible");
-    }
-
-    #[test]
-    fn upsert_indexes_archived_flag() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = write_bundle(
-            &notes,
-            "abc",
-            "---\narchived: true\n---\n# Hi\n\nbody\n",
-        );
-        let mut conn = fresh_conn();
-        upsert_in(&mut conn, &note, &notes).unwrap();
-        let archived: i64 = conn
-            .query_row(
-                "SELECT archived FROM notes WHERE bundle_id='abc'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(archived, 1);
-    }
+    // The pre-#112 disk-reading reconcile + path-based upsert tests
+    // were removed when notes moved into SQLite. Their semantics live
+    // on in the new `write_note_atomic_tx` / migration tests below.
 
     #[test]
     fn list_all_returns_newest_first() {
@@ -2046,21 +1582,64 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: 0,
-            archived: false,
-            favorite: false,
             actions: vec![],
-            tags: vec![],
             body: String::new(),
         };
         let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "/n/old/note.md", &mk("old", 100)).unwrap();
-        upsert_in_tx(&tx, "/n/mid/note.md", &mk("mid", 500)).unwrap();
-        upsert_in_tx(&tx, "/n/new/note.md", &mk("new", 900)).unwrap();
+        upsert_in_tx(&tx, "old", &mk("old", 100)).unwrap();
+        upsert_in_tx(&tx, "mid", &mk("mid", 500)).unwrap();
+        upsert_in_tx(&tx, "new", &mk("new", 900)).unwrap();
         tx.commit().unwrap();
 
         let items = list_all(&conn, NoteScope::Active).unwrap();
         let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, vec!["new", "mid", "old"]);
+    }
+
+    #[test]
+    fn list_actions_excludes_archived_note() {
+        let mut conn = fresh_conn();
+        let tx = conn.transaction().unwrap();
+        let p = Indexable {
+            bundle_id: "active".into(),
+            title: "A".into(),
+            modified_ms: 100,
+            duration_ms: None,
+            preview: String::new(),
+            body_size: 0,
+            actions: vec![ParsedAction {
+                line: 3,
+                text: "visible".into(),
+                done: false,
+                due_ms: None,
+                owner_candidate: None,
+            }],
+            body: "# A\n\n- [ ] visible\n".into(),
+        };
+        upsert_in_tx(&tx, "active", &p).unwrap();
+        let p2 = Indexable {
+            bundle_id: "arc".into(),
+            title: "Z".into(),
+            modified_ms: 100,
+            duration_ms: None,
+            preview: String::new(),
+            body_size: 0,
+            actions: vec![ParsedAction {
+                line: 3,
+                text: "hidden".into(),
+                done: false,
+                due_ms: None,
+                owner_candidate: None,
+            }],
+            body: "# Z\n\n- [ ] hidden\n".into(),
+        };
+        upsert_in_tx(&tx, "arc", &p2).unwrap();
+        tx.execute("UPDATE notes SET archived = 1 WHERE id = 'arc'", []).unwrap();
+        tx.commit().unwrap();
+
+        let opens = list_actions(&conn, ActionScope::Open, None, None).unwrap();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(opens[0].text, "visible");
     }
 
     // ----- events + edges backfill (#102) -----------------------------------
@@ -2131,22 +1710,22 @@ mod tests {
         .unwrap();
     }
 
-    fn seed_note_row(conn: &Connection, path: &str, modified: i64) {
+    fn seed_note_row(conn: &Connection, note_id: &str, modified: i64) {
         conn.execute(
-            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
-             VALUES (?1, 'b', 'Title', ?2, 0)",
-            rusqlite::params![path, modified],
+            "INSERT INTO notes(id, bundle_id, title, modified_ms, body_size) \
+             VALUES (?1, ?1, 'Title', ?2, 0)",
+            rusqlite::params![note_id, modified],
         )
         .unwrap();
     }
 
-    fn seed_action(conn: &Connection, id: &str, note_path: &str, assignee: Option<&str>) {
+    fn seed_action(conn: &Connection, id: &str, note_id: &str, assignee: Option<&str>) {
         conn.execute(
             "INSERT INTO actions(\
-                id, origin_kind, origin_note_path, origin_line, \
+                id, origin_kind, origin_note_id, origin_line, \
                 text, done, created_ms, assignee_id\
              ) VALUES (?1, 'note', ?2, 1, 'task', 0, 100, ?3)",
-            rusqlite::params![id, note_path, assignee],
+            rusqlite::params![id, note_id, assignee],
         )
         .unwrap();
     }
@@ -2196,9 +1775,9 @@ mod tests {
         // One calendar event with one resolved attendee.
         seed_event_with_attendee(&conn, "mg:test::evt-1", "tm_bob", 4_000);
         // One note.
-        seed_note_row(&conn, "/n/x/note.md", 5_000);
+        seed_note_row(&conn, "x", 5_000);
         // One note-backed action with an assignee.
-        seed_action(&conn, "a-1", "/n/x/note.md", Some("tm_bob"));
+        seed_action(&conn, "a-1", "x", Some("tm_bob"));
         // One workstream + one signal + one workstream-action with assignee.
         seed_workstream(&conn, "ws_1");
         seed_workstream_signal(&conn, "ws_1", "email", "mg:test::msg-1");
@@ -2326,13 +1905,13 @@ mod tests {
             SELECT
               n.modified_ms, 'note_modified',
               (SELECT id FROM team_members WHERE is_self = 1 LIMIT 1),
-              'note', n.note_path,
+              'note', n.id,
               json_object('title', n.title, 'bundle_id', n.bundle_id),
               n.modified_ms
             FROM notes n;
 
-            -- Unified action_created backfill (#111): one INSERT for
-            -- both note- and synth-origin rows. Payload carries
+            -- Unified action_created backfill (#111/#112): one INSERT
+            -- for both note- and synth-origin rows. Payload carries
             -- whichever origin field is populated.
             INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms)
             SELECT
@@ -2341,7 +1920,7 @@ mod tests {
               'action', a.id,
               json_object(
                 'text', a.text,
-                'note_path', a.origin_note_path,
+                'note_id', a.origin_note_id,
                 'workstream_id', a.workstream_id
               ),
               a.created_ms
@@ -2398,10 +1977,7 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: body.len() as i64,
-            archived: false,
-            favorite: false,
             actions,
-            tags: vec![],
             body: body.into(),
         }
     }
@@ -2414,7 +1990,7 @@ mod tests {
 
         let p1 = mk_indexable("First", "hello", vec![], 100);
         let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "/n/a/note.md", &p1).unwrap();
+        upsert_in_tx(&tx, "a", &p1).unwrap();
         tx.commit().unwrap();
         let created: i64 = conn
             .query_row(
@@ -2428,7 +2004,7 @@ mod tests {
         // Re-upsert (simulates a save) → note_modified.
         let p2 = mk_indexable("First v2", "hello again", vec![], 200);
         let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "/n/a/note.md", &p2).unwrap();
+        upsert_in_tx(&tx, "a", &p2).unwrap();
         tx.commit().unwrap();
         let modified: i64 = conn
             .query_row(
@@ -2459,7 +2035,7 @@ mod tests {
             100,
         );
         let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "/n/a/note.md", &p1).unwrap();
+        upsert_in_tx(&tx, "a", &p1).unwrap();
         tx.commit().unwrap();
         let created: i64 = conn
             .query_row(
@@ -2492,7 +2068,7 @@ mod tests {
             200,
         );
         let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "/n/a/note.md", &p2).unwrap();
+        upsert_in_tx(&tx, "a", &p2).unwrap();
         tx.commit().unwrap();
         let completed: i64 = conn
             .query_row(
@@ -2542,12 +2118,12 @@ mod tests {
         seed_workstream_action(&conn, "wsa_a", "ws_a", None);
         seed_workstream_action(&conn, "wsa_b", "ws_b", None);
         // A floating note-origin row pinned to ws_a.
-        seed_note_row(&conn, "/n/n/note.md", 100);
+        seed_note_row(&conn, "n", 100);
         conn.execute(
             "INSERT INTO actions \
-                (id, origin_kind, origin_note_path, origin_line, text, done, \
+                (id, origin_kind, origin_note_id, origin_line, text, done, \
                  created_ms, workstream_id) \
-             VALUES ('n:1', 'note', '/n/n/note.md', 1, 'task', 0, 100, 'ws_a')",
+             VALUES ('n:1', 'note', 'n', 1, 'task', 0, 100, 'ws_a')",
             [],
         )
         .unwrap();
@@ -2587,7 +2163,7 @@ mod tests {
             100,
         );
         let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "/n/a/note.md", &p).unwrap();
+        upsert_in_tx(&tx, "a", &p).unwrap();
         tx.commit().unwrap();
 
         let synth_count: i64 = conn
@@ -2602,7 +2178,7 @@ mod tests {
         let note_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM actions \
-                  WHERE origin_kind = 'note' AND origin_note_path = '/n/a/note.md'",
+                  WHERE origin_kind = 'note' AND origin_note_id = 'a'",
                 [],
                 |r| r.get(0),
             )

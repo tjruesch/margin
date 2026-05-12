@@ -92,8 +92,8 @@ fn collect_due(app: &AppHandle, now_ms: i64) -> Result<Vec<DueRow>, String> {
     let conn = conn_state.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT a.id, a.note_path, n.title, a.text \
-             FROM actions a JOIN notes n ON n.note_path = a.note_path \
+            "SELECT a.id, a.origin_note_id, n.title, a.text \
+             FROM actions a JOIN notes n ON n.id = a.origin_note_id \
              WHERE a.done = 0 AND a.due_ms IS NOT NULL \
                AND a.due_ms <= ?1 AND a.reminder_sent_ms IS NULL \
                AND n.archived = 0",

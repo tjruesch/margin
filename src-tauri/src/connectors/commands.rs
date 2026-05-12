@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -216,22 +216,18 @@ pub fn get_event_details(
     super::calendar::get_event_details(&c, &event_id).map_err(|e| e.to_string())
 }
 
-/// Click handler for the "Coming up" strip (#62). Returns a path to a
-/// note bundle that "belongs" to this calendar event:
-///   - If the event already has a `linked_note_path` AND the file still
-///     exists on disk, return that path.
-///   - Otherwise, create a fresh bundle, write a starter body with
-///     calendar metadata in frontmatter, persist meeting attendees in
-///     the team module, and store the path on the event row for next
-///     time.
+/// Click handler for the "Coming up" strip (#62, #112). Returns the
+/// `note_id` of the note belonging to this calendar event:
+///   - If the event already has a `linked_note_id` and the row still
+///     exists in `notes`, return that id.
+///   - Otherwise, create a fresh `notes` row with a starter body
+///     (calendar metadata at the top of body_md), persist meeting
+///     attendees, link the event row, and return the new id.
 #[tauri::command]
 pub fn open_or_create_event_note(
     event_id: String,
     conn: tauri::State<'_, Mutex<Connection>>,
 ) -> Result<String, String> {
-    use std::fs;
-    use std::path::Path;
-
     let event = {
         let c = conn.lock().map_err(|e| e.to_string())?;
         super::calendar::get_event_details(&c, &event_id)
@@ -239,72 +235,77 @@ pub fn open_or_create_event_note(
             .ok_or_else(|| format!("event {event_id} not found"))?
     };
 
-    // Reuse the linked bundle if it still exists on disk.
-    if let Some(path) = &event.linked_note_path {
-        if Path::new(path).exists() {
-            return Ok(path.clone());
+    // Reuse the linked note row if it still exists.
+    if let Some(linked_id) = &event.linked_note_id {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        let exists: bool = c
+            .query_row(
+                "SELECT 1 FROM notes WHERE id = ?1",
+                rusqlite::params![linked_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .is_some();
+        if exists {
+            return Ok(linked_id.clone());
         }
     }
 
-    // Create a fresh bundle. Mirrors notes::create_note's body — we
-    // can't call that directly because it's a Tauri command; the
-    // create-dir + write-file + index touch is small enough to
-    // duplicate.
-    let id = uuid::Uuid::new_v4().to_string();
-    let dir = crate::paths::notes_dir().join(&id);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let note_path = dir.join(crate::notes::NOTE_FILENAME);
-
-    // Compose starter body with frontmatter. AI ask (#64) will key off
-    // `calendar_event_id` to join the note back to its event in
-    // future contextual prompts.
+    // Create a fresh note row. The body carries a frontmatter-style
+    // metadata block + title heading so AI ask can join back via
+    // `calendar_event_id` in future prompts (#64). After #112 body_md
+    // is opaque markdown text to the runtime; the YAML at the top
+    // survives as content.
+    let new_id = uuid::Uuid::new_v4().to_string();
     let body = format_event_note_body(&event);
-    fs::write(&note_path, body).map_err(|e| e.to_string())?;
+    let title = event.title.clone();
+    let now = current_unix_ms();
 
-    let note_path_str = note_path.to_string_lossy().into_owned();
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
+                           preview, body_size, created_ms) \
+         VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+        rusqlite::params![
+            new_id,
+            title,
+            body,
+            now,
+            crate::notes::extract_preview(&body),
+            body.len() as i64,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO notes_fts(note_id, title, body) VALUES (?1, ?2, ?3)",
+        rusqlite::params![new_id, title, body],
+    )
+    .map_err(|e| e.to_string())?;
 
-    // Persist attendees + the link in one lock window.
-    {
-        let mut c = conn.lock().map_err(|e| e.to_string())?;
-        // Index the new bundle so it shows up in list_notes / search
-        // immediately.
-        if let Err(e) = crate::index::upsert(&mut c, &note_path) {
-            eprintln!("[connectors] index upsert for new event note failed: {e}");
-        }
-        // Save attendees that resolved to known team_members. Mirrors
-        // team::set_meeting_attendees inline (the latter is a Tauri
-        // command and awkward to call from here).
-        let member_ids: Vec<String> = event
-            .attendees
-            .iter()
-            .filter_map(|a| a.team_member_id.clone())
-            .collect();
-        if !member_ids.is_empty() {
-            let tx = c.transaction().map_err(|e| e.to_string())?;
-            tx.execute(
-                "DELETE FROM meeting_attendees WHERE note_path = ?1",
-                rusqlite::params![&note_path_str],
+    let member_ids: Vec<String> = event
+        .attendees
+        .iter()
+        .filter_map(|a| a.team_member_id.clone())
+        .collect();
+    if !member_ids.is_empty() {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO meeting_attendees(note_id, member_id) VALUES (?1, ?2) \
+                 ON CONFLICT(note_id, member_id) DO NOTHING",
             )
             .map_err(|e| e.to_string())?;
-            {
-                let mut stmt = tx
-                    .prepare(
-                        "INSERT INTO meeting_attendees(note_path, member_id) VALUES (?1, ?2) \
-                         ON CONFLICT(note_path, member_id) DO NOTHING",
-                    )
-                    .map_err(|e| e.to_string())?;
-                for member_id in &member_ids {
-                    stmt.execute(rusqlite::params![&note_path_str, member_id])
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            tx.commit().map_err(|e| e.to_string())?;
+        for member_id in &member_ids {
+            stmt.execute(rusqlite::params![new_id, member_id])
+                .map_err(|e| e.to_string())?;
         }
-        super::calendar::set_linked_note_path(&c, &event.id, &note_path_str)
-            .map_err(|e| e.to_string())?;
     }
+    tx.commit().map_err(|e| e.to_string())?;
+    super::calendar::set_linked_note_id(&c, &event.id, &new_id)
+        .map_err(|e| e.to_string())?;
 
-    Ok(note_path_str)
+    Ok(new_id)
 }
 
 fn format_event_note_body(event: &super::calendar::CalendarEvent) -> String {

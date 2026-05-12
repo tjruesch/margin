@@ -10,8 +10,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_yml::Mapping;
 
@@ -110,157 +110,148 @@ pub enum ActionScope {
     All,
 }
 
-fn new_note_ref(id: String, note_path: PathBuf) -> NoteRef {
+fn new_note_ref(id: String) -> NoteRef {
     NoteRef {
+        // After #112 the `note_path`-named field carries the note id,
+        // not a filesystem path. Keeping the field name is a known
+        // legacy debt; values are bundle-id-shaped throughout.
+        note_path: id.clone(),
         id,
-        note_path: note_path.to_string_lossy().into_owned(),
     }
 }
 
-/// Returns the canonical `~/.margin/notes/` path, exposed to JS so the
-/// frontend can determine `isOwned` from a path.
-#[tauri::command]
-pub fn notes_dir() -> String {
-    paths::notes_dir().to_string_lossy().into_owned()
+fn current_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// Create a new owned bundle and return the path to the empty `note.md`.
+/// Reserved id for the catch-all "Inbox" note that holds quick
+/// todos created without a source note. Stable across sessions so the
+/// frontend can find-or-create with a single call.
+pub const INBOX_BUNDLE_ID: &str = "inbox";
+
+/// Create a new note row and return its id (#112). No disk write
+/// happens at create time — the per-note bundle directory under
+/// `~/.margin/notes/<id>/` is only created when audio recording
+/// starts and needs a place for `audio.wav`.
 #[tauri::command]
 pub fn create_note(
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<NoteRef, String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let dir = paths::notes_dir().join(&id);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let note_path = dir.join(NOTE_FILENAME);
-    fs::write(&note_path, "").map_err(|e| e.to_string())?;
-    touch_index(&conn, &note_path, false);
-    Ok(new_note_ref(id, note_path))
+    let now = current_unix_ms();
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    c.execute(
+        "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
+                           preview, body_size, created_ms) \
+         VALUES (?1, ?1, 'Untitled note', '', ?2, '', 0, ?2)",
+        rusqlite::params![id, now],
+    )
+    .map_err(|e| e.to_string())?;
+    c.execute(
+        "INSERT INTO notes_fts(note_id, title, body) VALUES (?1, 'Untitled note', '')",
+        rusqlite::params![id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(new_note_ref(id))
 }
 
-/// Reserved bundle id for the catch-all "Inbox" note that holds quick
-/// todos created without a source note. Stable across sessions so the
-/// frontend can find-or-create with a single call.
-pub const INBOX_BUNDLE_ID: &str = "inbox";
-
-/// Find-or-create the Inbox bundle and return its NoteRef. Quick todos
+/// Find-or-create the Inbox note and return its NoteRef. Quick todos
 /// from the Action items page get appended to this note's body via the
-/// normal `write_note` round-trip.
+/// normal `write_note` round-trip (#112).
 #[tauri::command]
 pub fn ensure_inbox_note(
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<NoteRef, String> {
-    let dir = paths::notes_dir().join(INBOX_BUNDLE_ID);
-    let note_path = dir.join(NOTE_FILENAME);
-    if !note_path.exists() {
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        fs::write(&note_path, "# Inbox\n").map_err(|e| e.to_string())?;
-        touch_index(&conn, &note_path, false);
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let exists: bool = c
+        .query_row(
+            "SELECT 1 FROM notes WHERE id = ?1",
+            rusqlite::params![INBOX_BUNDLE_ID],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if !exists {
+        let now = current_unix_ms();
+        c.execute(
+            "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
+                               preview, body_size, created_ms) \
+             VALUES (?1, ?1, 'Inbox', '# Inbox\n', ?2, '', 8, ?2)",
+            rusqlite::params![INBOX_BUNDLE_ID, now],
+        )
+        .map_err(|e| e.to_string())?;
+        c.execute(
+            "INSERT INTO notes_fts(note_id, title, body) \
+             VALUES (?1, 'Inbox', '# Inbox\n')",
+            rusqlite::params![INBOX_BUNDLE_ID],
+        )
+        .map_err(|e| e.to_string())?;
     }
-    Ok(new_note_ref(INBOX_BUNDLE_ID.to_string(), note_path))
+    Ok(new_note_ref(INBOX_BUNDLE_ID.to_string()))
 }
 
-/// Promote an external markdown file to an owned note by copying it into
-/// a fresh bundle. The original file is left in place.
-#[tauri::command]
-pub fn convert_external(
-    source_path: String,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<NoteRef, String> {
-    let src = PathBuf::from(&source_path);
-    if !src.is_file() {
-        return Err("Source file not found".into());
-    }
-    if src.extension().and_then(|s| s.to_str()) != Some("md") {
-        return Err("Only markdown (.md) files can be converted".into());
-    }
-    if is_under_notes_dir(&src) {
-        return Err("This file is already a Margin note".into());
-    }
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let dir = paths::notes_dir().join(&id);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let note_path = dir.join(NOTE_FILENAME);
-    fs::copy(&src, &note_path).map_err(|e| e.to_string())?;
-    touch_index(&conn, &note_path, false);
-    Ok(new_note_ref(id, note_path))
-}
-
-/// Clone an owned note into a fresh bundle. Title and tags carry over;
+/// Clone a note into a new row (#112). Title and tags carry over;
 /// `archived` and `favorite` flags are stripped (they're state, not
-/// content — duplicating shouldn't bury the clone in Archive). The
-/// audio.wav / transcript.json sidecars are intentionally not copied
-/// since a duplicate is for editorial work, not a bit-for-bit clone of
-/// a recording. Title-suffix convention: verbatim, matching macOS
-/// Notes / Bear (no "(copy)").
+/// content). Audio/transcript sidecars are intentionally not copied.
 #[tauri::command]
 pub fn duplicate_note(
     note_path: String,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<NoteRef, String> {
-    let src = PathBuf::from(&note_path);
-    if !is_owned_note_in(&src, &paths::notes_dir()) {
-        return Err("Refusing to duplicate: not an owned note path".into());
-    }
-    if !src.is_file() {
-        return Err("Source note not found".into());
-    }
-    let raw = fs::read_to_string(&src).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
-    set_bool_key(&mut map, "archived", false);
-    set_bool_key(&mut map, "favorite", false);
-    let merged = write_with_frontmatter(&map, body);
+    // The `note_path` parameter name survives from the pre-#112 IPC
+    // shape; the value flowing through is the source note's id.
+    let src_id = note_path;
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let (title, body_md): (String, String) = c
+        .query_row(
+            "SELECT title, body_md FROM notes WHERE id = ?1",
+            rusqlite::params![src_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| format!("source note not found: {e}"))?;
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let dir = paths::notes_dir().join(&id);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let dest = dir.join(NOTE_FILENAME);
-    fs::write(&dest, merged).map_err(|e| e.to_string())?;
-    touch_index(&conn, &dest, false);
-    Ok(new_note_ref(id, dest))
+    let new_id = uuid::Uuid::new_v4().to_string();
+    let now = current_unix_ms();
+    let body_size = body_md.len() as i64;
+    c.execute(
+        "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
+                           preview, body_size, created_ms) \
+         VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+        rusqlite::params![
+            new_id,
+            title,
+            body_md,
+            now,
+            extract_preview(&body_md),
+            body_size,
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    c.execute(
+        "INSERT INTO notes_fts(note_id, title, body) VALUES (?1, ?2, ?3)",
+        rusqlite::params![new_id, title, body_md],
+    )
+    .map_err(|e| e.to_string())?;
+    // Tags carry over verbatim.
+    c.execute(
+        "INSERT INTO tags(note_id, tag) \
+         SELECT ?1, tag FROM tags WHERE note_id = ?2",
+        rusqlite::params![new_id, src_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(new_note_ref(new_id))
 }
 
-/// True iff `path` is `~/.margin/notes/<uuid>/note.md`.
-#[tauri::command]
-pub fn is_owned_note(path: String) -> bool {
-    is_owned_note_in(Path::new(&path), &paths::notes_dir())
-}
-
-pub(crate) fn is_owned_note_in(path: &Path, notes_dir: &Path) -> bool {
-    if path.file_name().and_then(|s| s.to_str()) != Some(NOTE_FILENAME) {
-        return false;
-    }
-    match path.parent().and_then(|p| p.parent()) {
-        Some(gp) => gp == notes_dir,
-        None => false,
-    }
-}
-
-fn is_under_notes_dir(path: &Path) -> bool {
-    let notes = paths::notes_dir();
-    path.canonicalize()
-        .ok()
-        .zip(notes.canonicalize().ok())
-        .map(|(p, n)| p.starts_with(n))
-        .unwrap_or(false)
-}
-
-/// Given any path, return the bundle directory if it lives under
-/// `~/.margin/notes/<uuid>/...`. Used to resolve where audio.wav and
-/// transcript.json should live for the active note.
-pub fn bundle_dir_for(note_path: &Path) -> Option<PathBuf> {
-    bundle_dir_for_in(note_path, &paths::notes_dir())
-}
-
-pub(crate) fn bundle_dir_for_in(note_path: &Path, notes_dir: &Path) -> Option<PathBuf> {
-    let parent = note_path.parent()?;
-    if parent.parent()? == notes_dir {
-        Some(parent.to_path_buf())
-    } else {
-        None
-    }
+/// Per-note bundle directory under `~/.margin/notes/<id>/`. The
+/// directory hosts audio/transcript sidecars; after #112 the
+/// markdown body lives in the DB instead.
+pub fn bundle_dir_for(note_id: &str) -> PathBuf {
+    paths::notes_dir().join(note_id)
 }
 
 /// Return all owned notes, newest-first by `modified_ms`. Default scope
@@ -317,18 +308,21 @@ pub struct NoteMeta {
     pub modified_ms: i64,
 }
 
-/// Read mtime for a single note path. Used by the note header's date chip.
-/// Cheaper than calling `list_notes` and filtering on the JS side.
+/// Read `modified_ms` for a single note (#112). DB-only.
 #[tauri::command]
-pub fn note_meta(note_path: String) -> Result<NoteMeta, String> {
-    let p = PathBuf::from(&note_path);
-    let meta = fs::metadata(&p).map_err(|e| e.to_string())?;
-    let modified_ms = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+pub fn note_meta(
+    note_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<NoteMeta, String> {
+    let note_id = note_path;
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let modified_ms: i64 = c
+        .query_row(
+            "SELECT modified_ms FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("note not found: {e}"))?;
     Ok(NoteMeta { modified_ms })
 }
 
@@ -450,41 +444,67 @@ fn write_with_frontmatter(map: &Mapping, body: &str) -> String {
     format!("---\n{yaml}---\n{body}")
 }
 
-/// Parse a note from disk into body + tags + archived + extras. Used by
-/// the editor flow so the textarea never sees the YAML.
+/// Load a note's body + flags + tags from the DB (#112). The
+/// `frontmatter_extras` field survives in the type for compatibility
+/// with the pre-#112 editor; values are always an empty mapping after
+/// the migration (free-form YAML keys aren't preserved post-#112).
 #[tauri::command]
-pub fn read_note(note_path: String) -> Result<NoteContent, String> {
-    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
-    let tags = read_tags(&map);
-    let archived = read_archived(&map);
-    let favorite = read_favorite(&map);
-    map.remove(serde_yml::Value::String("tags".into()));
-    map.remove(serde_yml::Value::String("archived".into()));
-    map.remove(serde_yml::Value::String("favorite".into()));
+pub fn read_note(
+    note_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<NoteContent, String> {
+    let note_id = note_path;
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let (body, archived, favorite): (String, bool, bool) = c
+        .query_row(
+            "SELECT body_md, archived, favorite FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? != 0,
+                    r.get::<_, i64>(2)? != 0,
+                ))
+            },
+        )
+        .map_err(|e| format!("note not found: {e}"))?;
+    let mut stmt = c
+        .prepare("SELECT tag FROM tags WHERE note_id = ?1 ORDER BY tag")
+        .map_err(|e| e.to_string())?;
+    let tags: Vec<String> = stmt
+        .query_map(rusqlite::params![note_id], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
     Ok(NoteContent {
-        body: body.to_string(),
+        body,
         tags,
         archived,
         favorite,
-        frontmatter_extras: map,
+        frontmatter_extras: Mapping::new(),
     })
 }
 
-/// Result envelope for `write_note`. `rewritten_body` is `Some` when the
-/// Rust side rewrote relative due-date tokens (`@today`, `@tomorrow`,
-/// `@<weekday>`) to their absolute `@YYYY-MM-DD` forms — the frontend
-/// uses it to swap the editor's in-memory text so it stays in sync with
-/// disk.
+/// Result envelope for `write_note`. `rewritten_body` is `Some` when
+/// the Rust side rewrote relative due-date tokens (`@today`,
+/// `@tomorrow`, `@<weekday>`) to their absolute `@YYYY-MM-DD` forms
+/// — the frontend uses it to swap the editor's in-memory text so it
+/// stays in sync with the persisted body.
 #[derive(Serialize)]
 pub struct WriteNoteResult {
     pub rewritten_body: Option<String>,
 }
 
-/// Write a note by merging tags + extras into a frontmatter block above
-/// the body. The caller must pass back any `frontmatter_extras` it got
-/// from `read_note` so unknown keys round-trip unchanged.
+/// Persist a note body and refresh derived state in one transaction
+/// (#112). Re-derives title from `body`, refreshes FTS, reparses
+/// `- [ ]` lines into the unified `actions` table, emits
+/// `note_modified` and `action_*` events — all atomically.
+///
+/// `tags` / `archived` / `favorite` are NOT touched here; those
+/// surfaces have their own DB-only IPCs (`set_note_tags` /
+/// `set_archived` / `set_favorite`). The pre-#112 `write_note` IPC
+/// took all of them in one call; we kept the parameter list compatible
+/// so existing frontend wiring doesn't have to branch.
 #[tauri::command]
 pub fn write_note(
     note_path: String,
@@ -493,9 +513,11 @@ pub fn write_note(
     archived: bool,
     favorite: bool,
     frontmatter_extras: Mapping,
-    guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<WriteNoteResult, String> {
+    let _ = frontmatter_extras; // dropped after #112; see read_note
+    let note_id = note_path;
+
     let today = chrono::Local::now().date_naive();
     let (final_body, rewritten_body) = match rewrite_relative_due_tokens(&body, today) {
         Some(new_body) => {
@@ -505,26 +527,37 @@ pub fn write_note(
         None => (body, None),
     };
 
+    let now = current_unix_ms();
     let normalized = normalize_tags(tags);
-    let mut map = frontmatter_extras;
-    if !normalized.is_empty() {
-        let seq: Vec<serde_yml::Value> = normalized
-            .into_iter()
-            .map(serde_yml::Value::String)
-            .collect();
-        map.insert(
-            serde_yml::Value::String("tags".into()),
-            serde_yml::Value::Sequence(seq),
-        );
-    } else {
-        map.remove(serde_yml::Value::String("tags".into()));
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    {
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        // Body + derived columns + FTS + actions in one go.
+        let parsed = crate::index::parse_indexable_from_body(&note_id, &final_body, now);
+        crate::index::upsert_in_tx(&tx, &note_id, &parsed).map_err(|e| e.to_string())?;
+        // Flag + tag side-effects share the same transaction so a
+        // crash mid-write rolls back the whole save.
+        tx.execute(
+            "UPDATE notes SET archived = ?2, favorite = ?3 WHERE id = ?1",
+            rusqlite::params![note_id, archived as i64, favorite as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM tags WHERE note_id = ?1",
+            rusqlite::params![note_id],
+        )
+        .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT INTO tags(note_id, tag) VALUES (?1, ?2)")
+                .map_err(|e| e.to_string())?;
+            for tag in &normalized {
+                stmt.execute(rusqlite::params![note_id, tag])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
     }
-    set_bool_key(&mut map, "archived", archived);
-    set_bool_key(&mut map, "favorite", favorite);
-    let merged = write_with_frontmatter(&map, &final_body);
-    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
-    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
-    touch_index(&conn, Path::new(&note_path), false);
     Ok(WriteNoteResult { rewritten_body })
 }
 
@@ -539,58 +572,58 @@ fn set_bool_key(map: &mut Mapping, key: &str, value: bool) {
     }
 }
 
-/// Convenience for header chip mutations: read → replace tags → write.
-/// Doesn't touch the body, so an in-flight editor buffer isn't disturbed.
+/// Replace the tag set for a note (#112). DB-only — the body is
+/// not touched, so an in-flight editor buffer survives.
 #[tauri::command]
 pub fn set_note_tags(
     note_path: String,
     tags: Vec<String>,
-    guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
+    let note_id = note_path;
     let normalized = normalize_tags(tags);
-    if normalized.is_empty() {
-        map.remove(serde_yml::Value::String("tags".into()));
-    } else {
-        let seq: Vec<serde_yml::Value> = normalized
-            .into_iter()
-            .map(serde_yml::Value::String)
-            .collect();
-        map.insert(
-            serde_yml::Value::String("tags".into()),
-            serde_yml::Value::Sequence(seq),
-        );
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM tags WHERE note_id = ?1",
+        rusqlite::params![note_id],
+    )
+    .map_err(|e| e.to_string())?;
+    {
+        let mut stmt = tx
+            .prepare_cached("INSERT INTO tags(note_id, tag) VALUES (?1, ?2)")
+            .map_err(|e| e.to_string())?;
+        for tag in &normalized {
+            stmt.execute(rusqlite::params![note_id, tag])
+                .map_err(|e| e.to_string())?;
+        }
     }
-    let merged = write_with_frontmatter(&map, body);
-    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
-    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
-    touch_index(&conn, Path::new(&note_path), false);
-    Ok(())
+    tx.commit().map_err(|e| e.to_string())
 }
 
-/// Flip the archived flag on a note's frontmatter. Doesn't disturb the
-/// body, tags, or any other frontmatter — same surgical pattern as
-/// `set_note_tags`.
+/// Flip the archived flag on a note (#112). DB-only.
 #[tauri::command]
 pub fn set_archived(
     note_path: String,
     archived: bool,
-    guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    set_bool_in_frontmatter(&note_path, "archived", archived, &guard, &conn)
+    let note_id = note_path;
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE notes SET archived = ?2 WHERE id = ?1",
+        rusqlite::params![note_id, archived as i64],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
-/// Read just the dispatch fields for an action: its origin_kind plus
-/// the markdown-round-trip locator (note_path/line/text/assignee_id).
-/// For synth-origin rows the locator fields are NULL on disk; callers
-/// must dispatch on `origin_kind` before assuming the markdown path.
+/// Read just the dispatch fields for an action: origin_kind +
+/// origin_note_id + origin_line + text + assignee_id. For synth-
+/// origin rows the note locator fields are NULL.
 struct ActionDispatch {
     origin_kind: String,
-    origin_note_path: Option<String>,
+    origin_note_id: Option<String>,
     origin_line: Option<usize>,
     text: String,
     assignee_id: Option<String>,
@@ -601,13 +634,13 @@ fn load_action_dispatch(
     id: &str,
 ) -> Result<ActionDispatch, String> {
     conn.query_row(
-        "SELECT origin_kind, origin_note_path, origin_line, text, assignee_id \
+        "SELECT origin_kind, origin_note_id, origin_line, text, assignee_id \
            FROM actions WHERE id = ?1",
         rusqlite::params![id],
         |r| {
             Ok(ActionDispatch {
                 origin_kind: r.get::<_, String>(0)?,
-                origin_note_path: r.get::<_, Option<String>>(1)?,
+                origin_note_id: r.get::<_, Option<String>>(1)?,
                 origin_line: r
                     .get::<_, Option<i64>>(2)?
                     .map(|n| n as usize),
@@ -629,11 +662,87 @@ fn load_action_dispatch(
 ///   - everything else (`'synth'`, future `'inbox'`): pure DB write
 ///     against the `actions` table; emits `action_completed` on a 0→1
 ///     transition.
+/// Locate the action's line in `body_md`. Tries the cached line
+/// index first, then falls back to a full hash scan. Returns the
+/// 0-based line index when found.
+fn locate_action_line(
+    body_md: &str,
+    cached_line: usize,
+    want_text: &str,
+) -> Option<usize> {
+    let lines: Vec<&str> = body_md.split('\n').collect();
+    let want_hash = action_text_hash(want_text);
+    if cached_line >= 1 && cached_line <= lines.len() {
+        if let Some((line_text, _, _)) =
+            parse_action_line(lines[cached_line - 1].trim_start())
+        {
+            if action_text_hash(&line_text) == want_hash {
+                return Some(cached_line - 1);
+            }
+        }
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
+            if action_text_hash(&line_text) == want_hash {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Mutate the body of a note-origin action by `mutate` and write the
+/// new body back atomically through `upsert_in_tx`. Common scaffold
+/// for `set_action_done` / `set_action_assignee` / `delete_action`.
+///
+/// `mutate` returns `Ok(Some(new_line))` to replace the line,
+/// `Ok(None)` to delete it, or `Err` to abort.
+fn mutate_note_action_body<F>(
+    note_id: &str,
+    cached_line: usize,
+    want_text: &str,
+    conn: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+    mutate: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Result<Option<String>, String>,
+{
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    let body: String = c
+        .query_row(
+            "SELECT body_md FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|e| format!("note not found: {e}"))?;
+    let idx = locate_action_line(&body, cached_line, want_text).ok_or_else(|| {
+        "Action not found in note (index may be stale; reload to refresh)".to_string()
+    })?;
+    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
+    match mutate(&lines[idx])? {
+        Some(new_line) => {
+            if new_line == lines[idx] {
+                return Ok(());
+            }
+            lines[idx] = new_line;
+        }
+        None => {
+            lines.remove(idx);
+        }
+    }
+    let new_body = lines.join("\n");
+    let now = current_unix_ms();
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    let parsed = crate::index::parse_indexable_from_body(note_id, &new_body, now);
+    crate::index::upsert_in_tx(&tx, note_id, &parsed).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_action_done(
     id: String,
     done: bool,
-    guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
     let dispatch = {
@@ -647,47 +756,17 @@ pub fn set_action_done(
             .map_err(|e| e.to_string());
     }
 
-    let note_path = dispatch.origin_note_path.ok_or_else(|| {
-        "note-origin action has no origin_note_path (corrupt row)".to_string()
+    let note_id = dispatch.origin_note_id.ok_or_else(|| {
+        "note-origin action has no origin_note_id (corrupt row)".to_string()
     })?;
     let cached_line = dispatch.origin_line.unwrap_or(0);
-    let want_text = dispatch.text;
-
-    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
-    let want_hash = action_text_hash(&want_text);
-
-    let mut target_idx: Option<usize> = None;
-    if cached_line >= 1 && cached_line <= lines.len() {
-        if let Some((line_text, _, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
-            if action_text_hash(&line_text) == want_hash {
-                target_idx = Some(cached_line - 1);
-            }
-        }
-    }
-    if target_idx.is_none() {
-        for (i, line) in lines.iter().enumerate() {
-            if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
-                if action_text_hash(&line_text) == want_hash {
-                    target_idx = Some(i);
-                    break;
-                }
-            }
-        }
-    }
-    let idx = target_idx.ok_or_else(|| {
-        "Action not found in note (index may be stale; reload to refresh)".to_string()
-    })?;
-    lines[idx] = toggle_checkbox_marker(&lines[idx], done);
-    let new_body = lines.join("\n");
-
-    let map = yaml.map(parse_frontmatter).unwrap_or_default();
-    let merged = write_with_frontmatter(&map, &new_body);
-    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
-    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
-    touch_index(&conn, Path::new(&note_path), false);
-    Ok(())
+    mutate_note_action_body(
+        &note_id,
+        cached_line,
+        &dispatch.text,
+        &conn,
+        |line| Ok(Some(toggle_checkbox_marker(line, done))),
+    )
 }
 
 /// Reassign an action item to a different team member, or unassign
@@ -700,7 +779,6 @@ pub fn set_action_done(
 pub fn set_action_assignee(
     action_id: String,
     member_id: Option<String>,
-    guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
     let dispatch = {
@@ -722,11 +800,10 @@ pub fn set_action_assignee(
         .map_err(|e| e.to_string());
     }
 
-    let note_path = dispatch.origin_note_path.ok_or_else(|| {
-        "note-origin action has no origin_note_path (corrupt row)".to_string()
+    let note_id = dispatch.origin_note_id.ok_or_else(|| {
+        "note-origin action has no origin_note_id (corrupt row)".to_string()
     })?;
     let cached_line = dispatch.origin_line.unwrap_or(0);
-    let want_text = dispatch.text;
 
     // Resolve the new member's canonical display name (if assigning).
     // None member_id = unassign.
@@ -742,59 +819,20 @@ pub fn set_action_assignee(
         None
     };
 
-    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
-    let want_hash = action_text_hash(&want_text);
-
-    // Locate the source line — cached index first, then hash scan.
-    let mut target_idx: Option<usize> = None;
-    if cached_line >= 1 && cached_line <= lines.len() {
-        if let Some((line_text, _, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
-            if action_text_hash(&line_text) == want_hash {
-                target_idx = Some(cached_line - 1);
-            }
-        }
-    }
-    if target_idx.is_none() {
-        for (i, line) in lines.iter().enumerate() {
-            if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
-                if action_text_hash(&line_text) == want_hash {
-                    target_idx = Some(i);
-                    break;
-                }
-            }
-        }
-    }
-    let idx = target_idx.ok_or_else(|| {
-        "Action not found in note (index may be stale; reload to refresh)".to_string()
-    })?;
-
-    let rewritten = rewrite_action_owner(&lines[idx], new_owner_name.as_deref())
-        .ok_or_else(|| "action line is not a recognizable checkbox".to_string())?;
-    if rewritten == lines[idx] {
-        // Nothing to write — the line was already in the desired form.
-        return Ok(());
-    }
-    lines[idx] = rewritten;
-    let new_body = lines.join("\n");
-
-    let map = yaml.map(parse_frontmatter).unwrap_or_default();
-    let merged = write_with_frontmatter(&map, &new_body);
-    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
-    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
-    touch_index(&conn, Path::new(&note_path), false);
-    Ok(())
+    mutate_note_action_body(&note_id, cached_line, &dispatch.text, &conn, |line| {
+        rewrite_action_owner(line, new_owner_name.as_deref())
+            .map(Some)
+            .ok_or_else(|| "action line is not a recognizable checkbox".to_string())
+    })
 }
 
-/// Delete an action item (#111). Note-origin rows are removed by
-/// dropping the corresponding `- [ ]` line from the source markdown
-/// and letting the next reindex pass cull the row. Synth-origin rows
-/// are deleted directly from the `actions` table.
+/// Delete an action item (#111). Note-origin rows drop the literal
+/// `- [ ]` line from `body_md` and let `upsert_in_tx` cull the row on
+/// the next reparse. Synth-origin rows are deleted directly from the
+/// `actions` table.
 #[tauri::command]
 pub fn delete_action(
     id: String,
-    guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
     let dispatch = {
@@ -808,47 +846,12 @@ pub fn delete_action(
             .map_err(|e| e.to_string());
     }
 
-    let note_path = dispatch.origin_note_path.ok_or_else(|| {
-        "note-origin action has no origin_note_path (corrupt row)".to_string()
+    let note_id = dispatch.origin_note_id.ok_or_else(|| {
+        "note-origin action has no origin_note_id (corrupt row)".to_string()
     })?;
     let cached_line = dispatch.origin_line.unwrap_or(0);
-    let want_text = dispatch.text;
 
-    let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
-    let want_hash = action_text_hash(&want_text);
-
-    let mut target_idx: Option<usize> = None;
-    if cached_line >= 1 && cached_line <= lines.len() {
-        if let Some((line_text, _, _)) = parse_action_line(lines[cached_line - 1].trim_start()) {
-            if action_text_hash(&line_text) == want_hash {
-                target_idx = Some(cached_line - 1);
-            }
-        }
-    }
-    if target_idx.is_none() {
-        for (i, line) in lines.iter().enumerate() {
-            if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
-                if action_text_hash(&line_text) == want_hash {
-                    target_idx = Some(i);
-                    break;
-                }
-            }
-        }
-    }
-    let idx = target_idx.ok_or_else(|| {
-        "Action not found in note (index may be stale; reload to refresh)".to_string()
-    })?;
-    lines.remove(idx);
-    let new_body = lines.join("\n");
-
-    let map = yaml.map(parse_frontmatter).unwrap_or_default();
-    let merged = write_with_frontmatter(&map, &new_body);
-    fs::write(&note_path, merged).map_err(|e| e.to_string())?;
-    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
-    touch_index(&conn, Path::new(&note_path), false);
-    Ok(())
+    mutate_note_action_body(&note_id, cached_line, &dispatch.text, &conn, |_| Ok(None))
 }
 
 /// Attach an action to a workstream (or clear the attachment when
@@ -893,33 +896,20 @@ fn toggle_checkbox_marker(line: &str, done: bool) -> String {
     line.to_string()
 }
 
-/// Flip the favorite flag on a note's frontmatter. Surgical, same shape
-/// as `set_archived`.
+/// Flip the favorite flag on a note (#112). DB-only.
 #[tauri::command]
 pub fn set_favorite(
     note_path: String,
     favorite: bool,
-    guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    set_bool_in_frontmatter(&note_path, "favorite", favorite, &guard, &conn)
-}
-
-fn set_bool_in_frontmatter(
-    note_path: &str,
-    key: &str,
-    value: bool,
-    guard: &tauri::State<'_, crate::WriteGuard>,
-    conn: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let raw = fs::read_to_string(note_path).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let mut map = yaml.map(parse_frontmatter).unwrap_or_default();
-    set_bool_key(&mut map, key, value);
-    let merged = write_with_frontmatter(&map, body);
-    fs::write(note_path, merged).map_err(|e| e.to_string())?;
-    *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
-    touch_index(conn, Path::new(note_path), false);
+    let note_id = note_path;
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE notes SET favorite = ?2 WHERE id = ?1",
+        rusqlite::params![note_id, favorite as i64],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1448,85 +1438,243 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     out
 }
 
-/// Remove `audio.wav` and `transcript.json` from the bundle. Leaves
-/// `note.md` intact (the user might still want their hand-notes minus
-/// the recording).
+/// Remove `audio.wav` and `transcript.json` from the bundle (#112).
+/// The note row's `body_md` is untouched; only the on-disk sidecars
+/// get cleaned. `duration_ms` is also zeroed since the recording is
+/// gone.
 #[tauri::command]
 pub fn discard_recording(
     note_path: String,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    let p = PathBuf::from(&note_path);
-    let dir = bundle_dir_for(&p).ok_or("Not an owned note")?;
+    let note_id = note_path; // legacy field name; value is a note id
+    let dir = bundle_dir_for(&note_id);
     for name in [AUDIO_FILENAME, TRANSCRIPT_FILENAME] {
         let path = dir.join(name);
         if path.exists() {
             fs::remove_file(&path).map_err(|e| e.to_string())?;
         }
     }
-    // duration_ms cleared from the indexed row.
-    touch_index(&conn, &p, false);
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    c.execute(
+        "UPDATE notes SET duration_ms = NULL WHERE id = ?1",
+        rusqlite::params![note_id],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/// Delete an owned note bundle entirely (note.md, audio.wav,
-/// transcript.json, anything else under the bundle dir). Hard delete —
-/// recoverability is the Archive feature's job (#17).
-///
-/// Refuses non-owned paths, so a path that slips through the IPC layer
-/// can't ask us to nuke arbitrary directories.
+/// Delete a note row + its on-disk audio/transcript sidecars (#112).
+/// FK ON DELETE CASCADE handles tags / actions / meeting_attendees;
+/// the FTS row is dropped explicitly inside the transaction.
 #[tauri::command]
 pub fn delete_note(
     note_path: String,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    let p = PathBuf::from(&note_path);
-    delete_note_in(&p, &paths::notes_dir())?;
-    touch_index(&conn, &p, true);
+    let note_id = note_path;
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    crate::index::remove(&mut c, &note_id).map_err(|e| e.to_string())?;
+    // Clean up audio/transcript siblings best-effort. Empty bundle
+    // directories left behind are harmless (re-recording will
+    // recreate the dir).
+    let dir = bundle_dir_for(&note_id);
+    if dir.is_dir() {
+        let _ = fs::remove_dir_all(&dir);
+    }
     Ok(())
 }
 
-fn delete_note_in(p: &Path, notes_dir: &Path) -> Result<(), String> {
-    if !is_owned_note_in(p, notes_dir) {
-        return Err("Refusing to delete: not an owned note path".into());
+/// One-time disk → DB body backfill (#112). Reads every legacy
+/// `~/.margin/notes/<id>/note.md` and populates the corresponding
+/// `notes.body_md` column, then renames the legacy notes folder to
+/// `notes-archive-pre-v26/` and recreates an empty `notes_dir` for
+/// future audio/transcript sidecars.
+///
+/// Idempotent: gated by the `notes_body_backfill_done` meta flag set
+/// to `'0'` by migration 026 and flipped to `'1'` here on success.
+pub fn body_backfill_if_pending(
+    conn: &mut rusqlite::Connection,
+    notes_dir: &Path,
+) -> Result<(), String> {
+    let done: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'notes_body_backfill_done'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "1".to_string());
+    if done == "1" {
+        return Ok(());
     }
-    let dir = bundle_dir_for_in(p, notes_dir).ok_or("Could not resolve bundle directory")?;
-    if !dir.is_dir() {
-        return Err("Bundle directory missing".into());
-    }
-    fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(())
-}
 
-/// Refresh the index for `note_path`. `removed=true` drops the row;
-/// otherwise re-reads the file and upserts. Failures are logged so a
-/// transient SQLite error doesn't surface as an IPC error to the user —
-/// the next watcher event or boot reconcile heals.
-fn touch_index(
-    conn_state: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-    note_path: &Path,
-    removed: bool,
-) {
-    let mut c = match conn_state.lock() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("index lock poisoned: {e}");
-            return;
+    let ids: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM notes")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let now = current_unix_ms();
+    for id in &ids {
+        let file = notes_dir.join(id).join(NOTE_FILENAME);
+        let raw = match fs::read_to_string(&file) {
+            Ok(s) => s,
+            Err(_) => continue, // missing file — leave body_md=''
+        };
+        let (yaml, body) = split_frontmatter(&raw);
+        // Frontmatter `archived` / `favorite` / `tags` already mirror
+        // into columns via the pre-#112 indexer; we read them here and
+        // patch the columns to match disk state, then write the body.
+        // Other YAML keys (`frontmatter_extras`) are intentionally
+        // dropped — documented breaking change.
+        let map = yaml.map(parse_frontmatter).unwrap_or_default();
+        let archived = read_archived(&map);
+        let favorite = read_favorite(&map);
+        let tags = read_tags(&map);
+        let modified_ms: i64 = tx
+            .query_row(
+                "SELECT modified_ms FROM notes WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(now);
+        let parsed = crate::index::parse_indexable_from_body(id, body, modified_ms);
+        crate::index::upsert_in_tx(&tx, id, &parsed)
+            .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE notes SET archived = ?2, favorite = ?3 WHERE id = ?1",
+            rusqlite::params![id, archived as i64, favorite as i64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM tags WHERE note_id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT INTO tags(note_id, tag) VALUES (?1, ?2)")
+                .map_err(|e| e.to_string())?;
+            for tag in &tags {
+                stmt.execute(rusqlite::params![id, tag])
+                    .map_err(|e| e.to_string())?;
+            }
         }
-    };
-    let result = if removed {
-        crate::index::remove(&mut c, note_path)
-    } else {
-        crate::index::upsert(&mut c, note_path)
-    };
-    if let Err(e) = result {
-        eprintln!("index touch failed for {note_path:?}: {e}");
     }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // Move the legacy notes folder out of the way and recreate an
+    // empty one for audio/transcript siblings.
+    let archive = notes_dir.with_file_name("notes-archive-pre-v26");
+    if notes_dir.exists() && !archive.exists() {
+        if let Err(e) = fs::rename(notes_dir, &archive) {
+            eprintln!("[notes] archive rename failed: {e}");
+        }
+    }
+    fs::create_dir_all(notes_dir).ok();
+    // Carry audio/transcript siblings over so playback still works.
+    if let Ok(entries) = fs::read_dir(&archive) {
+        for entry in entries.flatten() {
+            let from = entry.path();
+            if !from.is_dir() {
+                continue;
+            }
+            let id = entry.file_name();
+            let to = notes_dir.join(&id);
+            fs::create_dir_all(&to).ok();
+            for name in [AUDIO_FILENAME, TRANSCRIPT_FILENAME, TRANSCRIPT_PARTIAL_FILENAME] {
+                let f = from.join(name);
+                if f.exists() {
+                    let _ = fs::rename(&f, to.join(name));
+                }
+            }
+        }
+    }
+
+    conn.execute(
+        "UPDATE meta SET value = '1' WHERE key = 'notes_body_backfill_done'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Export every note in the DB to `dir_path/<bundle_id>/note.md`
+/// using the legacy frontmatter format (#112). Round-trippable: the
+/// resulting tree can be re-read by the migration's
+/// `split_frontmatter` / `parse_frontmatter` helpers. Returns the
+/// count of files written.
+#[tauri::command]
+pub fn export_notes(
+    dir_path: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<usize, String> {
+    let root = PathBuf::from(&dir_path);
+    if !root.is_dir() {
+        fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    }
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = c
+        .prepare(
+            "SELECT id, bundle_id, body_md, archived, favorite FROM notes",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<(String, String, String, bool, bool)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)? != 0,
+                r.get::<_, i64>(4)? != 0,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut written = 0usize;
+    for (id, bundle_id, body_md, archived, favorite) in rows {
+        let mut stmt = c
+            .prepare("SELECT tag FROM tags WHERE note_id = ?1 ORDER BY tag")
+            .map_err(|e| e.to_string())?;
+        let tags: Vec<String> = stmt
+            .query_map(rusqlite::params![id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut map = Mapping::new();
+        if !tags.is_empty() {
+            let seq: Vec<serde_yml::Value> =
+                tags.into_iter().map(serde_yml::Value::String).collect();
+            map.insert(
+                serde_yml::Value::String("tags".into()),
+                serde_yml::Value::Sequence(seq),
+            );
+        }
+        set_bool_key(&mut map, "archived", archived);
+        set_bool_key(&mut map, "favorite", favorite);
+        let merged = write_with_frontmatter(&map, &body_md);
+
+        let bundle_dir = root.join(&bundle_id);
+        fs::create_dir_all(&bundle_dir).map_err(|e| e.to_string())?;
+        let target = bundle_dir.join(NOTE_FILENAME);
+        fs::write(&target, merged).map_err(|e| e.to_string())?;
+        written += 1;
+    }
+    Ok(written)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
     use tempfile::TempDir;
 
     fn make_bundle(notes_dir: &Path, id: &str) -> PathBuf {
@@ -1536,6 +1684,148 @@ mod tests {
         fs::write(&note, "# hi\n").unwrap();
         note
     }
+
+    /// Open a DB at the latest schema version and seed a single empty
+    /// note row so the body backfill / export tests have a target.
+    fn fresh_db_with_note(note_id: &str) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::index::apply_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
+                               preview, body_size, created_ms) \
+             VALUES (?1, ?1, 'Untitled', '', 1000, '', 0, 1000)",
+            rusqlite::params![note_id],
+        )
+        .unwrap();
+        // Clear the backfill flag so the test can drive it.
+        conn.execute(
+            "UPDATE meta SET value = '0' WHERE key = 'notes_body_backfill_done'",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn body_backfill_reads_disk_and_flags_meta() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let bundle = notes.join("abc");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(
+            bundle.join(NOTE_FILENAME),
+            "---\ntags: [work]\nfavorite: true\n---\n# Plan\n\n- [ ] task\n",
+        )
+        .unwrap();
+
+        let mut conn = fresh_db_with_note("abc");
+        body_backfill_if_pending(&mut conn, &notes).unwrap();
+
+        let body: String = conn
+            .query_row(
+                "SELECT body_md FROM notes WHERE id = 'abc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(body.contains("# Plan"));
+        assert!(body.contains("- [ ] task"));
+        // Frontmatter is stripped — body_md is just the markdown body.
+        assert!(!body.contains("tags:"));
+
+        let favorite: i64 = conn
+            .query_row(
+                "SELECT favorite FROM notes WHERE id = 'abc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(favorite, 1);
+
+        let tags: Vec<String> = conn
+            .prepare("SELECT tag FROM tags WHERE note_id = 'abc'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(tags, vec!["work".to_string()]);
+
+        let actions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE origin_note_id = 'abc'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(actions, 1);
+
+        let flag: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'notes_body_backfill_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, "1");
+    }
+
+    #[test]
+    fn body_backfill_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let mut conn = fresh_db_with_note("xyz");
+        // First run.
+        body_backfill_if_pending(&mut conn, &notes).unwrap();
+        // Mutate the row, then re-run. The flag is now '1', so the
+        // second pass must be a no-op and leave the row alone.
+        conn.execute(
+            "UPDATE notes SET body_md = 'manual' WHERE id = 'xyz'",
+            [],
+        )
+        .unwrap();
+        body_backfill_if_pending(&mut conn, &notes).unwrap();
+        let body: String = conn
+            .query_row(
+                "SELECT body_md FROM notes WHERE id = 'xyz'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(body, "manual");
+    }
+
+    #[test]
+    fn body_backfill_moves_audio_transcript_siblings() {
+        let tmp = TempDir::new().unwrap();
+        let notes = tmp.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let bundle = notes.join("mtg");
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join(NOTE_FILENAME), "# Meeting\n").unwrap();
+        fs::write(bundle.join(AUDIO_FILENAME), b"wav-data").unwrap();
+        fs::write(bundle.join(TRANSCRIPT_FILENAME), b"{}").unwrap();
+
+        let mut conn = fresh_db_with_note("mtg");
+        body_backfill_if_pending(&mut conn, &notes).unwrap();
+
+        // Legacy folder renamed; audio/transcript moved into the new
+        // empty notes_dir/<id>/ layout so the audio playback path
+        // keeps working.
+        let archive = notes.with_file_name("notes-archive-pre-v26");
+        assert!(archive.exists(), "archive folder must exist");
+        assert!(
+            notes.join("mtg").join(AUDIO_FILENAME).exists(),
+            "audio.wav must land under the new notes_dir/<id>/"
+        );
+        assert!(
+            notes.join("mtg").join(TRANSCRIPT_FILENAME).exists(),
+            "transcript.json must land under the new notes_dir/<id>/"
+        );
+    }
+
 
     #[test]
     fn read_archived_default_false() {
@@ -1715,58 +2005,10 @@ mod tests {
         assert!(read_favorite(&map));
     }
 
-    #[test]
-    fn rejects_path_with_wrong_filename() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let bundle = notes.join("abc");
-        fs::create_dir_all(&bundle).unwrap();
-        let bogus = bundle.join("audio.wav");
-        fs::write(&bogus, b"").unwrap();
-        assert!(delete_note_in(&bogus, &notes).is_err());
-        assert!(bundle.exists(), "bundle must remain after rejection");
-    }
-
-    #[test]
-    fn rejects_path_outside_notes_dir() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().join("notes");
-        fs::create_dir_all(&notes).unwrap();
-        let elsewhere = tmp.path().join("elsewhere").join("xyz");
-        fs::create_dir_all(&elsewhere).unwrap();
-        let stray = elsewhere.join(NOTE_FILENAME);
-        fs::write(&stray, b"").unwrap();
-        assert!(delete_note_in(&stray, &notes).is_err());
-        assert!(stray.exists(), "stray file must remain after rejection");
-    }
-
-    #[test]
-    fn rejects_path_with_no_grandparent() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let lone = PathBuf::from(NOTE_FILENAME);
-        assert!(delete_note_in(&lone, &notes).is_err());
-    }
-
-    #[test]
-    fn deletes_owned_bundle() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        let note = make_bundle(&notes, "11111111-1111-1111-1111-111111111111");
-        let bundle = note.parent().unwrap().to_path_buf();
-        assert!(bundle.exists());
-        delete_note_in(&note, &notes).unwrap();
-        assert!(!bundle.exists(), "bundle dir should be gone");
-    }
-
-    #[test]
-    fn errors_when_bundle_already_missing() {
-        let tmp = TempDir::new().unwrap();
-        let notes = tmp.path().to_path_buf();
-        fs::create_dir_all(&notes).unwrap();
-        let phantom = notes.join("ghost").join(NOTE_FILENAME);
-        assert!(delete_note_in(&phantom, &notes).is_err());
-    }
+    // The pre-#112 `delete_note_in` path-validation tests are gone:
+    // delete_note now operates on a `note_id` against the DB. The
+    // FK CASCADE in migration 026 handles the dependent-rows cleanup
+    // and there's no filesystem path to validate anymore.
 
     // ---------- #49 owner extraction ----------------------------------
 

@@ -908,7 +908,7 @@ pub(crate) fn map_event(
         // Connector never sets the link — only the user does, via the
         // "Coming up" strip click handler. `upsert_event` preserves
         // any existing value across re-syncs.
-        linked_note_path: None,
+        linked_note_id: None,
         attendees,
     }
 }

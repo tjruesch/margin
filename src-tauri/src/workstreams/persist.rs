@@ -940,7 +940,7 @@ pub fn write_workstream(
                     .query_row(
                         "SELECT id FROM actions \
                           WHERE origin_kind = 'note' \
-                            AND origin_note_path = ?1 \
+                            AND origin_note_id = ?1 \
                             AND lower(trim(text)) = lower(trim(?2)) \
                           LIMIT 1",
                         params![a.source_id, a.text],
@@ -1061,7 +1061,7 @@ fn compute_last_activity(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT MAX(modified_ms) FROM notes WHERE note_path IN ({placeholders})"
+            "SELECT MAX(modified_ms) FROM notes WHERE id IN ({placeholders})"
         );
         let mut stmt = tx.prepare(&sql)?;
         let p: Vec<&dyn rusqlite::ToSql> = record
@@ -1250,7 +1250,7 @@ pub fn set_status(conn: &Connection, id: &str, status: &str) -> rusqlite::Result
 /// Set or clear a workstream's owner (#81). Pass `None` to unassign.
 /// `write_workstream` deliberately doesn't touch this column, so
 /// owner survives re-clusters — same pattern as `user_notes` and
-/// `linked_note_path`.
+/// `linked_note_id`.
 pub fn set_owner(
     conn: &Connection,
     id: &str,
@@ -1446,11 +1446,26 @@ mod tests {
              CREATE TABLE connectors (id TEXT PRIMARY KEY);
              INSERT INTO connectors(id) VALUES ('mg:test');
              CREATE TABLE notes (
-                 note_path   TEXT PRIMARY KEY,
-                 bundle_id   TEXT NOT NULL DEFAULT '',
-                 title       TEXT NOT NULL,
-                 modified_ms INTEGER NOT NULL,
-                 archived    INTEGER NOT NULL DEFAULT 0
+                 note_path    TEXT PRIMARY KEY,
+                 bundle_id    TEXT NOT NULL DEFAULT '',
+                 title        TEXT NOT NULL,
+                 modified_ms  INTEGER NOT NULL,
+                 duration_ms  INTEGER,
+                 preview      TEXT NOT NULL DEFAULT '',
+                 body_size    INTEGER NOT NULL DEFAULT 0,
+                 archived     INTEGER NOT NULL DEFAULT 0,
+                 favorite     INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE tags (
+                 note_path TEXT NOT NULL REFERENCES notes(note_path) ON DELETE CASCADE,
+                 tag       TEXT NOT NULL,
+                 PRIMARY KEY (note_path, tag)
+             );
+             CREATE TABLE meeting_attendees (
+                 note_path     TEXT NOT NULL REFERENCES notes(note_path) ON DELETE CASCADE,
+                 member_id     TEXT NOT NULL REFERENCES team_members(id) ON DELETE CASCADE,
+                 speaker_index INTEGER,
+                 PRIMARY KEY (note_path, member_id)
              );",
         )
         .unwrap();
@@ -1513,13 +1528,42 @@ mod tests {
         // this fresh fixture (no source data); safe.
         conn.execute_batch(include_str!("../migrations/022_events_edges.sql"))
             .unwrap();
-        // 023 (embeddings) references the sqlite-vec extension; skip
-        // here — the persist tests don't exercise embeddings.
+        // 023 (embeddings) references the sqlite-vec extension which
+        // can't load in this fixture. Stub the embeddings table so the
+        // v26 UPDATE embeddings WHERE ref_kind = 'note' clause doesn't
+        // fail with "no such table".
+        conn.execute_batch(
+            "CREATE TABLE embeddings (
+                rowid       INTEGER PRIMARY KEY AUTOINCREMENT,
+                ref_kind    TEXT NOT NULL,
+                ref_id      TEXT NOT NULL,
+                model       TEXT NOT NULL,
+                source_hash TEXT NOT NULL,
+                indexed_ms  INTEGER NOT NULL,
+                UNIQUE (ref_kind, ref_id, model)
+            );",
+        )
+        .unwrap();
         // 024 (teams_messages) is unrelated to actions; skip.
         // 025 (#111) collapses workstream_actions into the unified
         // actions table. Without it, the persist write path's
         // INSERT INTO actions blows up.
         conn.execute_batch(include_str!("../migrations/025_unify_actions.sql"))
+            .unwrap();
+        // The notes_fts virtual table is created in 001 normally; we
+        // bypass 001 here, so seed a minimal one matching the v26
+        // shape so migration 026's DROP/CREATE cycle works.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE notes_fts USING fts5(\
+                note_path UNINDEXED, title, body, \
+                tokenize = 'porter unicode61'\
+             );",
+        )
+        .unwrap();
+        // 026 (#112) moves notes into the DB. Renames column FKs from
+        // note_path → note_id; required for persist tests that exercise
+        // get_workstream_detail's JOIN onto notes.
+        conn.execute_batch(include_str!("../migrations/026_notes_to_db.sql"))
             .unwrap();
         conn
     }
@@ -1546,8 +1590,9 @@ mod tests {
     }
 
     fn seed_note(conn: &Connection, path: &str, modified: i64) {
+        // After #112 the `note_path` parameter holds a note id.
         conn.execute(
-            "INSERT INTO notes(note_path, title, modified_ms) VALUES (?1, ?2, ?3)",
+            "INSERT INTO notes(id, bundle_id, title, modified_ms) VALUES (?1, ?1, ?2, ?3)",
             params![path, "Note", modified],
         )
         .unwrap();
@@ -3084,13 +3129,13 @@ mod tests {
 
     // Seed a note-origin row in the unified actions table for the
     // dedup tests below.
-    fn seed_note_action(conn: &Connection, id: &str, note_path: &str, text: &str) {
+    fn seed_note_action(conn: &Connection, id: &str, note_id: &str, text: &str) {
         conn.execute(
             "INSERT INTO actions \
-                (id, origin_kind, origin_note_path, origin_line, text, \
+                (id, origin_kind, origin_note_id, origin_line, text, \
                  done, created_ms) \
              VALUES (?1, 'note', ?2, 1, ?3, 0, 100)",
-            params![id, note_path, text],
+            params![id, note_id, text],
         )
         .unwrap();
     }

@@ -299,7 +299,7 @@ pub async fn start(
         sources.push(AskSource {
             kind: AskSourceKind::Event,
             label: format!("E{}", i + 1),
-            note_path: e.linked_note_path.clone(),
+            note_path: e.linked_note_id.clone(),
             bundle_id: None,
             event_id: Some(e.id.clone()),
             workstream_id: None,
@@ -1463,7 +1463,7 @@ fn resolve_edge_labels(
                 "person",
             ),
             "event" => ("SELECT id, title FROM calendar_events WHERE id = ?1", "event"),
-            "note" => ("SELECT note_path, title FROM notes WHERE note_path = ?1", "note"),
+            "note" => ("SELECT id, title FROM notes WHERE id = ?1", "note"),
             "email" => (
                 "SELECT id, subject FROM email_messages WHERE id = ?1",
                 "email",
@@ -1810,7 +1810,7 @@ fn dispatch_read_event_details(
     s.push_str(&format!(
         "Linked note: {}\n",
         event
-            .linked_note_path
+            .linked_note_id
             .as_deref()
             .unwrap_or("(none yet)")
     ));

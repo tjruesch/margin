@@ -394,9 +394,9 @@ impl Signal for NoteSignal {
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT n.note_path, COALESCE(n.title, ''), COALESCE(n.modified_ms, 0) \
+            "SELECT n.id, COALESCE(n.title, ''), COALESCE(n.modified_ms, 0) \
              FROM notes n \
-             WHERE n.note_path IN ({placeholders}) \
+             WHERE n.id IN ({placeholders}) \
              ORDER BY n.modified_ms DESC"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -748,8 +748,9 @@ mod tests {
              CREATE TABLE connectors (id TEXT PRIMARY KEY);
              INSERT INTO connectors(id) VALUES ('mg:test');
              CREATE TABLE notes (
-                 note_path  TEXT PRIMARY KEY,
-                 title      TEXT NOT NULL,
+                 id          TEXT PRIMARY KEY,
+                 bundle_id   TEXT NOT NULL DEFAULT '',
+                 title       TEXT NOT NULL,
                  modified_ms INTEGER NOT NULL
              );",
         )
@@ -758,6 +759,15 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("../migrations/010_event_note_link.sql"))
             .unwrap();
+        // #112 renamed linked_note_path → linked_note_id on
+        // calendar_events. Apply just that column rename here so the
+        // event-signal hydrator's SELECT works.
+        conn.execute_batch(
+            "ALTER TABLE calendar_events ADD COLUMN linked_note_id TEXT;\
+             DROP INDEX IF EXISTS idx_events_linked_note;\
+             ALTER TABLE calendar_events DROP COLUMN linked_note_path;",
+        )
+        .unwrap();
         conn.execute_batch(include_str!("../migrations/011_email.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../migrations/012_workstreams.sql"))
@@ -796,10 +806,11 @@ mod tests {
         .unwrap();
     }
 
-    fn seed_note(conn: &Connection, path: &str, modified: i64) {
+    fn seed_note(conn: &Connection, note_id: &str, modified: i64) {
+        // After #112 the path param holds a note id.
         conn.execute(
-            "INSERT INTO notes(note_path, title, modified_ms) VALUES (?1, ?2, ?3)",
-            params![path, "Note", modified],
+            "INSERT INTO notes(id, bundle_id, title, modified_ms) VALUES (?1, ?1, ?2, ?3)",
+            params![note_id, "Note", modified],
         )
         .unwrap();
     }
@@ -1008,7 +1019,7 @@ mod tests {
             status: None,
             raw_etag: None,
             modified_ms: 1_700_000_000_000,
-            linked_note_path: None,
+            linked_note_id: None,
             attendees: vec![calendar::CalendarAttendee {
                 email: "bob@x.io".into(),
                 display_name: None,

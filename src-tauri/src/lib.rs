@@ -22,12 +22,9 @@ mod transcribe;
 mod voice;
 mod workstreams;
 
-use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, RecommendedCache};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
 use tauri::menu::{
     AboutMetadata, CheckMenuItem, CheckMenuItemBuilder, Menu, MenuBuilder, MenuEvent,
     MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
@@ -226,121 +223,17 @@ async fn stop_voice_recording(
     }
 }
 
-#[derive(Serialize, Clone)]
-struct FileContents {
-    path: String,
-    content: String,
-}
-
 struct ViewModeItems {
     edit: CheckMenuItem<Wry>,
     preview: CheckMenuItem<Wry>,
 }
 
-struct WatcherState {
-    debouncer: Option<Debouncer<RecommendedWatcher, RecommendedCache>>,
-    target: Option<PathBuf>,
-}
-
-pub struct WriteGuard {
-    pub last_write: Mutex<Option<Instant>>,
-}
-
-/// Recursive watcher over `~/.margin/notes/` that keeps the SQLite index
-/// in sync with on-disk state. Distinct from `WatcherState`, which is
-/// per-open-file and surfaces `external-change`/`external-delete` to the
-/// editor.
-struct NotesIndexWatcher(Mutex<Debouncer<RecommendedWatcher, RecommendedCache>>);
-
-#[tauri::command]
-fn read_file(path: String) -> Result<FileContents, String> {
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    Ok(FileContents { path, content })
-}
-
-#[tauri::command]
-fn write_file(
-    path: String,
-    content: String,
-    guard: State<'_, WriteGuard>,
-) -> Result<(), String> {
-    std::fs::write(&path, content).map_err(|e| e.to_string())?;
-    *guard
-        .last_write
-        .lock()
-        .map_err(|e| e.to_string())? = Some(Instant::now());
-    Ok(())
-}
-
-#[tauri::command]
-fn watch_file(
-    app: AppHandle,
-    state: State<'_, Mutex<WatcherState>>,
-    path: String,
-) -> Result<(), String> {
-    let target = PathBuf::from(&path);
-    let parent = target
-        .parent()
-        .ok_or("file has no parent directory")?
-        .to_path_buf();
-    let target_cb = target.clone();
-    let path_cb = path.clone();
-    let app_cb = app.clone();
-
-    let mut deb = new_debouncer(
-        Duration::from_millis(200),
-        None,
-        move |res: DebounceEventResult| {
-            let Ok(events) = res else { return };
-            for ev in events {
-                if !ev.paths.iter().any(|p| p == &target_cb) {
-                    continue;
-                }
-                // Suppress events caused by our own write_file calls.
-                let guard = app_cb.state::<WriteGuard>();
-                if let Ok(g) = guard.last_write.lock() {
-                    if let Some(t) = *g {
-                        if t.elapsed() < Duration::from_millis(500) {
-                            continue;
-                        }
-                    }
-                }
-                use notify::EventKind::*;
-                match ev.kind {
-                    Remove(_) => {
-                        let _ = app_cb.emit("external-delete", &path_cb);
-                    }
-                    Modify(_) | Create(_) | Any => {
-                        let _ = app_cb.emit("external-change", &path_cb);
-                    }
-                    _ => {}
-                }
-            }
-        },
-    )
-    .map_err(|e| e.to_string())?;
-
-    deb.watch(&parent, RecursiveMode::NonRecursive)
-        .map_err(|e| e.to_string())?;
-
-    let mut s = state.lock().map_err(|e| e.to_string())?;
-    s.debouncer = Some(deb); // dropping the previous Debouncer stops its watch
-    s.target = Some(target);
-    Ok(())
-}
-
-#[tauri::command]
-fn unwatch_file(state: State<'_, Mutex<WatcherState>>) -> Result<(), String> {
-    let mut s = state.lock().map_err(|e| e.to_string())?;
-    s.debouncer = None;
-    s.target = None;
-    Ok(())
-}
-
-#[tauri::command]
-fn file_exists(path: String) -> bool {
-    Path::new(&path).is_file()
-}
+// The filesystem watcher infrastructure (#112) was removed: notes
+// live in the DB now, so there's no on-disk state to monitor.
+// `WatcherState` / `WriteGuard` / `NotesIndexWatcher` and the
+// `watch_file` / `unwatch_file` / `read_file` / `write_file` IPCs
+// all went with it. The audio/transcript sidecars still live on
+// disk but are written exclusively by Margin's own audio worker.
 
 /// Returns the path passed via "Open With…" at cold start, if any.
 /// macOS passes it as argv[1]. Frontend calls this once on mount.
@@ -505,23 +398,23 @@ pub fn run() {
         })
         .setup(|app| {
             paths::init().map_err(|e| e.to_string())?;
-            app.manage(Mutex::new(WatcherState {
-                debouncer: None,
-                target: None,
-            }));
-            app.manage(WriteGuard {
-                last_write: Mutex::new(None),
-            });
             app.manage(Mutex::new(AudioState { recording: None }));
             app.manage(Mutex::new(VoiceState { recording: None }));
 
-            // Open the SQLite index, run migrations, and reconcile against
-            // disk. Reconcile is fast on the happy path (a single
-            // count+max_mtime check); only diverging state triggers reads.
+            // Open the SQLite index and apply migrations. After #112
+            // notes live in the DB; the filesystem reconcile pass is
+            // gone. The one-time disk → DB body backfill runs once
+            // (gated by the `notes_body_backfill_done` meta flag) to
+            // populate `notes.body_md` for users upgrading from a v25
+            // install, then renames the legacy notes folder to
+            // `notes-archive-pre-v26/`.
             let mut conn = index::open_or_init(&paths::index_db_path())
                 .map_err(|e| format!("open index db: {e}"))?;
-            if let Err(e) = index::reconcile(&mut conn, &paths::notes_dir()) {
-                eprintln!("index reconcile failed at boot: {e}");
+            if let Err(e) = notes::body_backfill_if_pending(
+                &mut conn,
+                &paths::notes_dir(),
+            ) {
+                eprintln!("notes body backfill failed at boot: {e}");
             }
             if let Err(e) = team::bootstrap_self_if_missing(&mut conn) {
                 eprintln!("team bootstrap failed at boot: {e}");
@@ -544,65 +437,9 @@ pub fn run() {
 
             app.manage(Mutex::new(conn));
 
-            // Recursive watcher over `~/.margin/notes/`. Keeps the index
-            // in sync when notes are touched outside the editor (external
-            // edits, finder moves, sync clients). Distinct from the
-            // per-file watcher above, which surfaces external-change to
-            // the open editor.
-            let app_handle = app.handle().clone();
-            let notes_dir = paths::notes_dir();
-            let deb = new_debouncer(
-                Duration::from_millis(300),
-                None,
-                move |res: DebounceEventResult| {
-                    let Ok(events) = res else { return };
-                    let conn_state = app_handle.state::<Mutex<rusqlite::Connection>>();
-                    let mut conn = match conn_state.lock() {
-                        Ok(c) => c,
-                        Err(_) => return,
-                    };
-                    let notes_root = paths::notes_dir();
-                    for ev in events {
-                        for path in &ev.paths {
-                            if path.file_name().and_then(|s| s.to_str())
-                                != Some(notes::NOTE_FILENAME)
-                            {
-                                continue;
-                            }
-                            use notify::EventKind::*;
-                            match ev.kind {
-                                Remove(_) => {
-                                    if let Err(e) = index::remove(&mut conn, path) {
-                                        eprintln!("index remove failed: {e}");
-                                    }
-                                }
-                                Modify(_) | Create(_) | Any => {
-                                    if path.exists() {
-                                        if let Err(e) = index::upsert(&mut conn, path) {
-                                            eprintln!("index upsert failed: {e}");
-                                        }
-                                    } else if let Err(e) = index::remove(&mut conn, path) {
-                                        eprintln!("index remove failed: {e}");
-                                    }
-                                }
-                                _ => {
-                                    let _ = notes_root;
-                                }
-                            }
-                        }
-                    }
-                },
-            )
-            .map_err(|e| format!("notes-dir watcher: {e}"))?;
-            app.manage(NotesIndexWatcher(Mutex::new(deb)));
-            // Begin watching the notes dir recursively.
-            {
-                let watcher_state = app.state::<NotesIndexWatcher>();
-                let mut guard = watcher_state.0.lock().map_err(|e| e.to_string())?;
-                guard
-                    .watch(&notes_dir, RecursiveMode::Recursive)
-                    .map_err(|e| format!("watch notes dir: {e}"))?;
-            }
+            // The recursive notes-dir file watcher used to live here.
+            // After #112 it's gone: notes are the DB's responsibility
+            // and the `write_note` IPC is the only writer.
 
             // macOS Liquid Glass / NSVisualEffectView under the window so
             // the sidebar can show real desktop blur. Failure is purely
@@ -648,13 +485,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            read_file,
-            write_file,
-            file_exists,
             initial_file,
             set_mode_check,
-            watch_file,
-            unwatch_file,
             keychain::set_anthropic_api_key,
             keychain::delete_anthropic_api_key,
             keychain::has_anthropic_api_key,
@@ -672,13 +504,11 @@ pub fn run() {
             ask_notes_start,
             transcribe::transcribe,
             reconcile::reconcile_notes,
-            notes::notes_dir,
             notes::create_note,
             notes::ensure_inbox_note,
-            notes::convert_external,
             notes::duplicate_note,
-            notes::is_owned_note,
             notes::list_notes,
+            notes::export_notes,
             notes::search_notes,
             notes::note_meta,
             notes::discard_recording,

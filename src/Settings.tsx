@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ask } from "@tauri-apps/plugin-dialog";
+import { ask, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   type ConnectorInfo,
@@ -8,6 +8,7 @@ import {
   deleteConnector,
   deleteFirecrawlApiKey,
   deleteVoyageApiKey,
+  exportNotes,
   forceReindexEmbeddings,
   hasAnthropicApiKey,
   hasFirecrawlApiKey,
@@ -38,7 +39,13 @@ import type {
 import { loadGlossary } from "./settingsStore";
 import { THEMES, darkThemes, getTheme, lightThemes, type Theme } from "./themes";
 
-type Section = "appearance" | "ai" | "connectors" | "editor" | "shortcuts";
+type Section =
+  | "appearance"
+  | "ai"
+  | "connectors"
+  | "editor"
+  | "shortcuts"
+  | "data";
 
 export type EditorPrefs = {
   tabSize: number;
@@ -69,6 +76,7 @@ const SECTIONS: {
   { id: "connectors", label: "Connectors", icon: <IconLink size={14} sw={1.7} /> },
   { id: "editor", label: "Editor", icon: <IconEdit size={14} sw={1.7} /> },
   { id: "shortcuts", label: "Shortcuts", icon: <IconHome size={14} sw={1.7} /> },
+  { id: "data", label: "Data", icon: <IconSettings size={14} sw={1.7} /> },
 ];
 
 const SECTION_TITLE: Record<Section, string> = {
@@ -77,6 +85,7 @@ const SECTION_TITLE: Record<Section, string> = {
   connectors: "Connectors",
   editor: "Editor",
   shortcuts: "Shortcuts",
+  data: "Data",
 };
 
 export function Settings({
@@ -266,9 +275,65 @@ export function Settings({
             <p className="settings-placeholder">Keyboard shortcut customization coming soon.</p>
           </section>
         )}
+
+        {active === "data" && <DataSection />}
         </div>
       </main>
     </div>
+  );
+}
+
+/// Settings → Data. After #112 every note lives in SQLite; this
+/// section is the user-facing escape hatch — dump every row to disk
+/// as `<bundle_id>/note.md` files with frontmatter, round-trippable
+/// through the legacy reader.
+function DataSection() {
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
+
+  const onExport = async () => {
+    setStatus(null);
+    let target: string | null = null;
+    try {
+      const picked = await openDialog({ directory: true, multiple: false });
+      if (typeof picked === "string") target = picked;
+    } catch (e) {
+      console.error("[settings] export dir picker failed:", e);
+      return;
+    }
+    if (!target) return;
+    setBusy(true);
+    try {
+      const written = await exportNotes(target);
+      setStatus(`Exported ${written} note${written === 1 ? "" : "s"}.`);
+    } catch (e) {
+      console.error("[settings] exportNotes failed:", e);
+      setStatus(`Export failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Data</h2>
+      <p className="settings-section-desc">
+        Notes live in Margin&apos;s local database. Export anytime to get a
+        folder of plain Markdown files you can read in any editor, sync
+        through iCloud or Dropbox, or keep as a backup.
+      </p>
+      <div className="settings-row">
+        <button
+          type="button"
+          className="settings-btn"
+          onClick={onExport}
+          disabled={busy}
+        >
+          {busy ? "Exporting…" : "Export all notes…"}
+        </button>
+      </div>
+      {status && <p className="settings-helper">{status}</p>}
+    </section>
   );
 }
 

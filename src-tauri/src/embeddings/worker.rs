@@ -386,7 +386,7 @@ mod tests {
 
     fn seed_note(conn: &Connection, path: &str, title: &str, modified_ms: i64) {
         conn.execute(
-            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
+            "INSERT INTO notes(id, bundle_id, title, modified_ms, body_size) \
              VALUES (?1, 'b', ?2, ?3, 0)",
             params![path, title, modified_ms],
         )
@@ -509,7 +509,7 @@ mod tests {
 
         // Pretend the note got modified — same path, new title content.
         conn.execute(
-            "UPDATE notes SET title = 'Second', modified_ms = 2000 WHERE note_path = '/n/a/note.md'",
+            "UPDATE notes SET title = 'Second', modified_ms = 2000 WHERE id = '/n/a/note.md'",
             [],
         )
         .unwrap();

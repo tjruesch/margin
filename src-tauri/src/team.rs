@@ -478,7 +478,7 @@ pub fn set_meeting_attendees(
     let mut c = conn.lock().map_err(|e| e.to_string())?;
     let tx = c.transaction().map_err(|e| e.to_string())?;
     tx.execute(
-        "DELETE FROM meeting_attendees WHERE note_path = ?1",
+        "DELETE FROM meeting_attendees WHERE note_id = ?1",
         params![note_path],
     )
     .map_err(|e| e.to_string())?;
@@ -509,7 +509,7 @@ pub(crate) fn list_meeting_attendees(
     let sql = format!(
         "SELECT {} FROM team_members t \
          JOIN meeting_attendees a ON a.member_id = t.id \
-         WHERE a.note_path = ?1 \
+         WHERE a.note_id = ?1 \
          ORDER BY t.is_self DESC, t.display_name COLLATE NOCASE ASC",
         SELECT_MEMBER_COLS
             .split(", ")

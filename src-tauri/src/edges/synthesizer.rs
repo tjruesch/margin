@@ -218,7 +218,7 @@ fn run_authored_pass(conn: &mut Connection, report: &mut EdgeSynthReport) -> Res
             "INSERT INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, \
                                 confidence, evidence, first_seen_ms, last_seen_ms) \
              SELECT 'person', (SELECT id FROM team_members WHERE is_self = 1 LIMIT 1), \
-                    'note', n.note_path, 'AUTHORED', 1.0, '[]', \
+                    'note', n.id, 'AUTHORED', 1.0, '[]', \
                     n.modified_ms, n.modified_ms \
              FROM notes n \
              WHERE EXISTS (SELECT 1 FROM team_members WHERE is_self = 1) \
@@ -448,13 +448,13 @@ fn run_mentioned_pass(
     let note_rows: Vec<(String, String, i64)> = {
         let mut stmt = conn
             .prepare(
-                "SELECT n.note_path, n.title, n.modified_ms \
+                "SELECT n.id, n.title, n.modified_ms \
                  FROM notes n \
                  LEFT JOIN ( \
                     SELECT src_id, max(last_seen_ms) AS last_ms \
                     FROM edges WHERE src_kind = 'note' AND edge_kind = 'MENTIONED' \
                     GROUP BY src_id \
-                 ) e ON e.src_id = n.note_path \
+                 ) e ON e.src_id = n.id \
                  WHERE e.last_ms IS NULL OR n.modified_ms > e.last_ms",
             )
             .map_err(|e| e.to_string())?;
@@ -764,7 +764,7 @@ mod tests {
         std::fs::write(&path, body).unwrap();
         let path_str = path.to_string_lossy().to_string();
         conn.execute(
-            "INSERT INTO notes(note_path, bundle_id, title, modified_ms, body_size) \
+            "INSERT INTO notes(id, bundle_id, title, modified_ms, body_size) \
              VALUES (?1, 'b', ?2, 100, 0)",
             params![path_str, name],
         )

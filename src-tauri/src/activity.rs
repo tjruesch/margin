@@ -172,7 +172,7 @@ fn count_meetings_missing_note(
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM calendar_events \
          WHERE start_ms >= ?1 AND end_ms <= ?2 \
-           AND linked_note_path IS NULL \
+           AND linked_note_id IS NULL \
            AND (status IS NULL OR status != 'cancelled')",
         params![day_start_ms, now_ms],
         |r| r.get(0),
@@ -341,7 +341,7 @@ mod tests {
         seed_connector(conn);
         conn.execute(
             "INSERT INTO calendar_events(\
-                id, connector_id, external_id, title, start_ms, end_ms, all_day, modified_ms, linked_note_path\
+                id, connector_id, external_id, title, start_ms, end_ms, all_day, modified_ms, linked_note_id\
              ) VALUES (?1, 'mg:test', ?1, 'M', ?2, ?3, 0, ?2, ?4)",
             params![id, start_ms, end_ms, linked_note],
         )

@@ -95,8 +95,14 @@ pub fn start(
     whisper_model: Option<PathBuf>,
     glossary: Vec<String>,
 ) -> Result<Recording, String> {
-    let bundle_dir = notes::bundle_dir_for(&note_path)
-        .ok_or_else(|| "Recording requires an owned note (path under ~/.margin/notes/)".to_string())?;
+    // After #112 the recording target is identified by `note_id` (the
+    // bundle directory name); for backcompat the `note_path` field
+    // name carries the id through this module. Make sure the bundle
+    // dir exists on disk so the WAV writer + transcript files have a
+    // place to land.
+    let note_id_str = note_path.to_string_lossy().into_owned();
+    let bundle_dir = notes::bundle_dir_for(&note_id_str);
+    std::fs::create_dir_all(&bundle_dir).map_err(|e| e.to_string())?;
     let wav_path = bundle_dir.join(notes::AUDIO_FILENAME);
 
     // Channels carry 16 kHz mono f32 chunks from each source to the mixer.

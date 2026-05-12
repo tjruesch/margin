@@ -10,10 +10,7 @@
 //! we hop via `AppHandle::run_on_main_thread` before touching AppKit.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-
-use crate::notes::{is_owned_note_in, parse_frontmatter, split_frontmatter};
-use crate::paths;
+use std::path::PathBuf;
 
 const MAX_TITLE_LEN: usize = 80;
 
@@ -46,17 +43,21 @@ pub(crate) fn sanitize_filename(title: &str) -> String {
     format!("{truncated}.md")
 }
 
-/// Extract the body and a derived title from an owned note's path.
-/// Used to build the temp file the share sheet hands off.
-pub(crate) fn share_payload(note_path: &Path) -> Result<(String, String), String> {
-    if !is_owned_note_in(note_path, &paths::notes_dir()) {
-        return Err("Refusing to share: not an owned note path".into());
-    }
-    let raw = fs::read_to_string(note_path).map_err(|e| e.to_string())?;
-    let (yaml, body) = split_frontmatter(&raw);
-    let _ = yaml.map(parse_frontmatter); // parse but discard — frontmatter doesn't ship
-    let title = derive_title(body);
-    Ok((title, body.to_string()))
+/// Extract the body and a derived title for `note_id` from the DB.
+/// Used to build the temp file the share sheet hands off (#112).
+pub(crate) fn share_payload(
+    conn: &rusqlite::Connection,
+    note_id: &str,
+) -> Result<(String, String), String> {
+    let body: String = conn
+        .query_row(
+            "SELECT body_md FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("note not found: {e}"))?;
+    let title = derive_title(&body);
+    Ok((title, body))
 }
 
 fn derive_title(body: &str) -> String {
@@ -81,9 +82,17 @@ fn write_temp_payload(filename: &str, body: &str) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-pub async fn share_note(note_path: String, app: tauri::AppHandle) -> Result<(), String> {
-    let p = PathBuf::from(&note_path);
-    let (title, body) = share_payload(&p)?;
+pub async fn share_note(
+    note_path: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let note_id = note_path;
+    let (title, body) = {
+        let state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+        let c = state.lock().map_err(|e| e.to_string())?;
+        share_payload(&c, &note_id)?
+    };
     let filename = sanitize_filename(&title);
     let temp_path = write_temp_payload(&filename, &body)?;
     let temp_path_str = temp_path.to_string_lossy().into_owned();
@@ -185,22 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn share_payload_strips_frontmatter() {
+    fn share_payload_extracts_title_and_body() {
+        // After #112 share_payload reads body_md directly from the DB;
+        // there's no frontmatter to strip. Exercise just the title-
+        // extraction path with a representative body.
         let tmp = TempDir::new().unwrap();
-        // Place under a fake bundle layout so is_owned_note_in's
-        // structural check could in principle pass; here it's against
-        // the real notes_dir, so we just exercise the title/body
-        // extraction path with a path that already lives under
-        // ~/.margin/notes/. To keep this test hermetic, we instead
-        // call the helpers directly.
-        let raw = "---\ntags: [a]\narchived: true\n---\n# Title\n\nBody.\n";
-        let (yaml, body) = split_frontmatter(raw);
-        let _ = yaml; // exercised
-        assert_eq!(body, "# Title\n\nBody.\n");
+        let body = "# Title\n\nBody.\n";
         assert_eq!(derive_title(body), "Title");
-        // Just make sure write_temp_payload roundtrips.
-        let dir = tmp.path();
-        let target = dir.join(sanitize_filename("Title"));
+        let target = tmp.path().join(sanitize_filename("Title"));
         fs::write(&target, body).unwrap();
         let written = fs::read_to_string(&target).unwrap();
         assert_eq!(written, body);

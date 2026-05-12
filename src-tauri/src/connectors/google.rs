@@ -401,7 +401,7 @@ fn map_event(
         modified_ms,
         // User-set on first click of the "Coming up" strip; persisted
         // by `upsert_event`'s ON CONFLICT clause.
-        linked_note_path: None,
+        linked_note_id: None,
         attendees,
     }
 }

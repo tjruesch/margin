@@ -16,12 +16,26 @@ export async function pickFileToSave(suggestedName = "Untitled.md"): Promise<str
   return result ?? null;
 }
 
+// Filesystem-level IPCs (`readFile` / `writeFile` / `watchFile` /
+// `unwatchFile` / `fileExists`) were removed in #112. The stubs
+// below preserve the legacy call shape used by the editor's transcript
+// loader and a couple of vestigial code paths so the migration diff
+// stays focused on the architectural move. They are pure shims that
+// proxy disk reads via Tauri's plugin-fs where it still makes sense
+// (audio/transcript siblings).
+
 export async function readFile(path: string): Promise<FileContents> {
-  return invoke<FileContents>("read_file", { path });
+  // After #112 this is only used to read transcript.json sidecars from
+  // disk. The shim keeps existing call sites working without a wider
+  // refactor.
+  const { readTextFile } = await import("@tauri-apps/plugin-fs");
+  const content = await readTextFile(path);
+  return { path, content };
 }
 
 export async function writeFile(path: string, content: string): Promise<void> {
-  await invoke<void>("write_file", { path, content });
+  const { writeTextFile } = await import("@tauri-apps/plugin-fs");
+  await writeTextFile(path, content);
 }
 
 export async function getInitialFile(): Promise<string | null> {
@@ -29,12 +43,13 @@ export async function getInitialFile(): Promise<string | null> {
   return p ?? null;
 }
 
-export async function watchFile(path: string): Promise<void> {
-  await invoke<void>("watch_file", { path });
+export async function watchFile(_path: string): Promise<void> {
+  // No-op after #112: the per-file watcher was removed because the
+  // editor's source of truth is the DB row, not a disk file.
 }
 
 export async function unwatchFile(): Promise<void> {
-  await invoke<void>("unwatch_file");
+  // No-op (see watchFile).
 }
 
 export async function hasAnthropicApiKey(): Promise<boolean> {
@@ -223,31 +238,57 @@ export async function setActionWorkstream(
   await invoke<void>("set_action_workstream", { actionId, workstreamId });
 }
 
+/** Path to the on-disk audio/transcript root (#112). After the
+ *  notes-to-DB move this still serves the audio recording flow,
+ *  which writes `<notes_dir>/<note_id>/audio.wav`. The "is owned"
+ *  derivation is gone — every note in the DB is owned. */
 export async function notesDir(): Promise<string> {
-  return invoke<string>("notes_dir");
+  // notes_dir as an IPC was removed in #112. The frontend's only
+  // remaining need is to derive audio/transcript sibling paths,
+  // which the Rust side does itself via paths::notes_dir. Keep this
+  // wrapper returning the empty string so legacy callers don't blow
+  // up; the value isn't consulted for anything after #112.
+  return "";
+}
+
+/** Promote an external markdown file into a new DB-backed note.
+ *  Read the file, create a new note row with the body. The original
+ *  on-disk file is left untouched. */
+export async function convertExternal(sourcePath: string): Promise<NoteRef> {
+  const { readTextFile } = await import("@tauri-apps/plugin-fs");
+  const body = await readTextFile(sourcePath);
+  const ref = await createNote();
+  await writeNote(ref.id, body, [], false, false, {});
+  return ref;
+}
+
+/** Always true after #112 — every note the frontend can see lives
+ *  in the DB and is owned. Retained as a no-op shim for legacy
+ *  call sites that branch on "is this an owned note?". */
+export async function isOwnedNote(_path: string): Promise<boolean> {
+  return true;
 }
 
 export async function createNote(): Promise<NoteRef> {
   return invoke<NoteRef>("create_note");
 }
 
-/** Find-or-create the catch-all "Inbox" bundle that holds quick todos
- *  added from the Action items page. Stable bundle id so subsequent
- *  calls return the same NoteRef. */
+/** Find-or-create the catch-all "Inbox" note that holds quick todos
+ *  added from the Action items page. Stable id so subsequent calls
+ *  return the same NoteRef. */
 export async function ensureInboxNote(): Promise<NoteRef> {
   return invoke<NoteRef>("ensure_inbox_note");
-}
-
-export async function convertExternal(sourcePath: string): Promise<NoteRef> {
-  return invoke<NoteRef>("convert_external", { sourcePath });
 }
 
 export async function duplicateNote(notePath: string): Promise<NoteRef> {
   return invoke<NoteRef>("duplicate_note", { notePath });
 }
 
-export async function isOwnedNote(path: string): Promise<boolean> {
-  return invoke<boolean>("is_owned_note", { path });
+/** Export every note in the DB to `dirPath/<bundle_id>/note.md`
+ *  using the legacy frontmatter format (#112). Returns the count of
+ *  files written. */
+export async function exportNotes(dirPath: string): Promise<number> {
+  return invoke<number>("export_notes", { dirPath });
 }
 
 export type NoteScope = "active" | "archived" | "favorites" | "all";
