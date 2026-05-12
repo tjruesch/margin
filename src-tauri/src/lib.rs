@@ -1,3 +1,4 @@
+mod activity;
 mod anthropic;
 mod ask;
 mod audio;
@@ -725,7 +726,8 @@ pub fn run() {
             workstreams::commands::add_workstream_link,
             workstreams::commands::add_workstream_link_from_url,
             workstreams::commands::remove_workstream_link,
-            workstreams::commands::set_workstream_parent
+            workstreams::commands::set_workstream_parent,
+            activity::get_daily_activity
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

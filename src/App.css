@@ -4158,6 +4158,42 @@ input.nh-title {
   font-size: 12.5px;
 }
 
+.activity-popover {
+  width: 280px;
+  max-height: none;
+  padding: 14px 16px;
+}
+
+.activity-header {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--fg-muted);
+  margin-bottom: 10px;
+}
+
+.activity-rows {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.activity-row {
+  font-size: 13px;
+  color: var(--fg);
+  line-height: 1.4;
+}
+
+.activity-empty {
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  font-style: italic;
+  padding: 2px 0;
+}
+
 .notifications-group {
   display: flex;
   flex-direction: column;

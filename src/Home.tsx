@@ -12,6 +12,7 @@ import {
   openOrCreateEventNote,
   type TeamMember,
 } from "./file";
+import { ActivityPanel } from "./ActivityPanel";
 import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
 import { type NotificationRecord, unreadCount } from "./notifications";
@@ -33,6 +34,7 @@ import {
   IconSearch,
   IconSettings,
   IconSidebar,
+  IconSparkle,
   IconStar,
   IconTrash,
   IconUser,
@@ -316,6 +318,7 @@ export function Home({
     scope === "archived" ? "archive" : scope === "favorites" ? "favorites" : "home",
   );
   const [panelOpen, setPanelOpen] = useState(false);
+  const [activityOpen, setActivityOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const unreadBadge = useMemo(() => unreadCount(notifications), [notifications]);
 
@@ -544,6 +547,26 @@ export function Home({
           <div className="notifications-anchor">
             <button
               type="button"
+              className={"home-icon-btn" + (activityOpen ? " active" : "")}
+              title="Today's activity"
+              aria-label="Today's activity"
+              onClick={(e) => {
+                e.stopPropagation();
+                const opening = !activityOpen;
+                setActivityOpen(opening);
+                if (opening) setPanelOpen(false);
+              }}
+            >
+              <IconSparkle size={14} sw={1.6} />
+            </button>
+            <ActivityPanel
+              open={activityOpen}
+              onClose={() => setActivityOpen(false)}
+            />
+          </div>
+          <div className="notifications-anchor">
+            <button
+              type="button"
               className={"home-icon-btn" + (panelOpen ? " active" : "")}
               title="Notifications"
               aria-label="Notifications"
@@ -551,7 +574,10 @@ export function Home({
                 e.stopPropagation();
                 const opening = !panelOpen;
                 setPanelOpen(opening);
-                if (opening) onMarkAllNotificationsRead();
+                if (opening) {
+                  setActivityOpen(false);
+                  onMarkAllNotificationsRead();
+                }
               }}
             >
               <IconBell size={14} sw={1.6} />

@@ -997,3 +997,20 @@ export async function reconcileNotes(
     glossary,
   });
 }
+
+export type DailyActivitySummary = {
+  day_start_ms: number;
+  day_end_ms: number;
+  now_ms: number;
+  emails_today: number;
+  emails_actionable: number;
+  teams_messages_today: number;
+  meetings_held: number;
+  meetings_upcoming: number;
+  meetings_missing_note: number;
+  people_interacted: number;
+};
+
+export async function getDailyActivity(): Promise<DailyActivitySummary> {
+  return invoke<DailyActivitySummary>("get_daily_activity");
+}
