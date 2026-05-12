@@ -95,26 +95,15 @@ pub fn preview_for(conn: &Connection, ref_kind: &str, ref_id: &str) -> String {
             .optional()
             .unwrap_or(None)
             .unwrap_or_else(|| ref_id.to_string()),
-        "action" => {
-            let a: Option<String> = conn
-                .query_row(
-                    "SELECT text FROM actions WHERE id = ?1",
-                    params![ref_id],
-                    |r| r.get(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            a.or_else(|| {
-                conn.query_row(
-                    "SELECT text FROM workstream_actions WHERE id = ?1",
-                    params![ref_id],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()
-                .unwrap_or(None)
-            })
-            .unwrap_or_else(|| ref_id.to_string())
-        }
+        "action" => conn
+            .query_row(
+                "SELECT text FROM actions WHERE id = ?1",
+                params![ref_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap_or(None)
+            .unwrap_or_else(|| ref_id.to_string()),
         "workstream" => conn
             .query_row(
                 "SELECT title FROM workstreams WHERE id = ?1",
@@ -243,7 +232,7 @@ pub fn collect_work(conn: &Connection, model: &str) -> rusqlite::Result<Vec<Work
         });
     }
 
-    // ---- actions (note-backed) ----
+    // ---- actions (unified note + synth origins; #111) ----
     let action_rows: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT a.id, a.text FROM actions a \
@@ -255,29 +244,6 @@ pub fn collect_work(conn: &Connection, model: &str) -> rusqlite::Result<Vec<Work
         rows.filter_map(|r| r.ok()).collect()
     };
     for (id, text) in action_rows {
-        if text.trim().is_empty() {
-            continue;
-        }
-        items.push(WorkItem {
-            ref_kind: "action".into(),
-            ref_id: id,
-            source_hash: sha256_hex(&text),
-            text,
-        });
-    }
-
-    // ---- actions (workstream-backed) ----
-    let wsa_rows: Vec<(String, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT wa.id, wa.text FROM workstream_actions wa \
-             LEFT JOIN embeddings e \
-               ON e.ref_kind = 'action' AND e.ref_id = wa.id AND e.model = ?1 \
-             WHERE e.indexed_ms IS NULL",
-        )?;
-        let rows = stmt.query_map(params![model], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    for (id, text) in wsa_rows {
         if text.trim().is_empty() {
             continue;
         }

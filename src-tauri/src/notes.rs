@@ -54,37 +54,46 @@ pub enum NoteScope {
     All,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ActionListItem {
     pub id: String,
-    /// Source discriminator: `"note"` for markdown-checkbox-backed
-    /// actions, `"workstream"` for synthesizer-emitted actions on
-    /// workstreams (#100). Drives row click-through, delete dispatch,
-    /// and assignee write routing on the frontend.
-    pub source: String,
-    /// Source note path for note-backed actions; empty string for
-    /// workstream-backed actions (no underlying file).
-    pub note_path: String,
-    /// Display title — note title for note-backed, workstream title for
-    /// workstream-backed.
-    pub note_title: String,
-    /// Workstream id when source == "workstream"; None otherwise.
-    /// Routes the row click to the workstream detail view.
+    /// Origin discriminator (#111): `"note"` for markdown-checkbox-backed
+    /// rows, `"synth"` for synthesizer-emitted rows. Drives row click-
+    /// through and the per-origin write dispatch inside the unified
+    /// IPCs.
+    pub origin_kind: String,
+    /// Source note path for note-origin rows; `None` for synth rows
+    /// (no underlying file).
+    pub origin_note_path: Option<String>,
+    /// 1-based source-line for note-origin rows; `None` for synth rows.
+    pub origin_line: Option<i64>,
+    /// Note title when `origin_note_path` resolves, `None` otherwise.
+    pub note_title: Option<String>,
+    /// Synth source kind (`"email" | "event" | "note"`) when the
+    /// synthesizer paraphrased this row (#111). `None` for note-origin
+    /// rows. Powers the workstream detail's per-row "open source"
+    /// affordance and the AI ask prompt's "from {kind}" label.
+    pub origin_synth_kind: Option<String>,
+    /// Connector-qualified id of the synth source row. `None` for
+    /// note-origin rows.
+    pub origin_synth_id: Option<String>,
+    /// Direct workstream attachment id. Set by the synthesizer on a
+    /// `'synth'` row or by the user via `set_action_workstream` on any
+    /// origin (#111).
     pub workstream_id: Option<String>,
+    /// Workstream title joined from `workstream_id` for render.
+    pub workstream_title: Option<String>,
     pub text: String,
     pub done: bool,
-    /// 1-based source-line for note-backed; 0 for workstream-backed
-    /// (no markdown line).
-    pub line: i64,
     pub created_ms: i64,
-    /// Absolute due-date timestamp (Unix ms). For note-backed actions,
-    /// parsed from a trailing `@YYYY-MM-DD[ HH:MM]` token; for workstream
-    /// actions, set by the synthesizer.
+    /// Absolute due-date timestamp (Unix ms). For note-origin rows,
+    /// parsed from a trailing `@YYYY-MM-DD[ HH:MM]` token; for synth
+    /// rows, set by the synthesizer.
     pub due_ms: Option<i64>,
     /// `team_members.id` when the action has a resolved owner. Note-
-    /// backed: matched the leading `Owner — ` segment (#49). Workstream-
-    /// backed: stamped by the synthesizer or manually set via
-    /// set_workstream_action_assignee (#100).
+    /// origin: matched the leading `Owner — ` segment (#49). Synth:
+    /// stamped by the synthesizer or manually set via
+    /// `set_action_assignee` (#111).
     pub assignee_id: Option<String>,
     /// Canonical display name from `team_members`, joined for render so
     /// the frontend can surface an avatar chip without a second
@@ -282,19 +291,25 @@ pub fn search_notes(
         .map_err(|e| e.to_string())
 }
 
-/// Return action items across all non-archived owned notes, scoped to
-/// open / done / all. Default `Open`. Joins on the notes table for the
-/// source note's title. When `assignee_id` is set, the result is
-/// filtered to actions resolved to that team member (#50).
+/// Return action items from the unified `actions` table (#111), scoped
+/// by done-state, optional assignee, and optional workstream
+/// attachment. Default scope is `Open`. Joins surface the source note's
+/// or workstream's title for display without a second round-trip.
 #[tauri::command]
 pub fn list_actions(
     scope: Option<ActionScope>,
     assignee_id: Option<String>,
+    workstream_id: Option<String>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<Vec<ActionListItem>, String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
-    crate::index::list_actions(&c, scope.unwrap_or_default(), assignee_id.as_deref())
-        .map_err(|e| e.to_string())
+    crate::index::list_actions(
+        &c,
+        scope.unwrap_or_default(),
+        assignee_id.as_deref(),
+        workstream_id.as_deref(),
+    )
+    .map_err(|e| e.to_string())
 }
 
 #[derive(Serialize)]
@@ -569,11 +584,51 @@ pub fn set_archived(
     set_bool_in_frontmatter(&note_path, "archived", archived, &guard, &conn)
 }
 
-/// Toggle the done state of an action item by its derived id. Looks up
-/// the action's source note, finds the line (via cached line number
-/// first, then by re-scanning the body for the text-hash), flips the
-/// `[ ]`/`[x]` marker, and writes the file back through the existing
-/// frontmatter round-trip. Index refresh happens via `touch_index`.
+/// Read just the dispatch fields for an action: its origin_kind plus
+/// the markdown-round-trip locator (note_path/line/text/assignee_id).
+/// For synth-origin rows the locator fields are NULL on disk; callers
+/// must dispatch on `origin_kind` before assuming the markdown path.
+struct ActionDispatch {
+    origin_kind: String,
+    origin_note_path: Option<String>,
+    origin_line: Option<usize>,
+    text: String,
+    assignee_id: Option<String>,
+}
+
+fn load_action_dispatch(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<ActionDispatch, String> {
+    conn.query_row(
+        "SELECT origin_kind, origin_note_path, origin_line, text, assignee_id \
+           FROM actions WHERE id = ?1",
+        rusqlite::params![id],
+        |r| {
+            Ok(ActionDispatch {
+                origin_kind: r.get::<_, String>(0)?,
+                origin_note_path: r.get::<_, Option<String>>(1)?,
+                origin_line: r
+                    .get::<_, Option<i64>>(2)?
+                    .map(|n| n as usize),
+                text: r.get::<_, String>(3)?,
+                assignee_id: r.get::<_, Option<String>>(4)?,
+            })
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Toggle the done state of an action item by its derived id (#111).
+///
+/// Dispatches on `origin_kind`:
+///   - `'note'`: round-trip through the source markdown — find the line
+///     (cached index first, then text-hash scan), flip the
+///     `[ ]`/`[x]` marker, write the file back. `touch_index` queues
+///     a reindex which republishes the row via `upsert_in_tx`.
+///   - everything else (`'synth'`, future `'inbox'`): pure DB write
+///     against the `actions` table; emits `action_completed` on a 0→1
+///     transition.
 #[tauri::command]
 pub fn set_action_done(
     id: String,
@@ -581,21 +636,22 @@ pub fn set_action_done(
     guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    let (note_path, cached_line, want_text) = {
+    let dispatch = {
         let c = conn.lock().map_err(|e| e.to_string())?;
-        c.query_row(
-            "SELECT note_path, line, text FROM actions WHERE id = ?1",
-            rusqlite::params![id],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)? as usize,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(|e| e.to_string())?
+        load_action_dispatch(&c, &id)?
     };
+
+    if dispatch.origin_kind != "note" {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        return crate::workstreams::persist::set_action_done(&c, &id, done)
+            .map_err(|e| e.to_string());
+    }
+
+    let note_path = dispatch.origin_note_path.ok_or_else(|| {
+        "note-origin action has no origin_note_path (corrupt row)".to_string()
+    })?;
+    let cached_line = dispatch.origin_line.unwrap_or(0);
+    let want_text = dispatch.text;
 
     let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
     let (yaml, body) = split_frontmatter(&raw);
@@ -635,12 +691,11 @@ pub fn set_action_done(
 }
 
 /// Reassign an action item to a different team member, or unassign
-/// (#51). Mirrors `set_action_done`'s "look up by id, locate the line
-/// by cached index + hash, rewrite, write back" pattern. The body's
+/// (#51, #111). Note-origin rows write through the markdown — the
 /// leading `Owner — ` prefix is replaced/prepended/stripped via
 /// `rewrite_action_owner`; `assignee_id` is re-resolved on the next
-/// reindex pass via the existing `upsert_in_tx` path. No-op when the
-/// new assignee already matches the current one.
+/// reindex pass. Synth-origin rows write the column directly. No-op
+/// when the new assignee already matches the current one.
 #[tauri::command]
 pub fn set_action_assignee(
     action_id: String,
@@ -648,26 +703,30 @@ pub fn set_action_assignee(
     guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    let (note_path, cached_line, want_text, current_assignee) = {
+    let dispatch = {
         let c = conn.lock().map_err(|e| e.to_string())?;
-        c.query_row(
-            "SELECT note_path, line, text, assignee_id FROM actions WHERE id = ?1",
-            rusqlite::params![action_id],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)? as usize,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
-        .map_err(|e| e.to_string())?
+        load_action_dispatch(&c, &action_id)?
     };
 
-    if member_id == current_assignee {
+    if member_id == dispatch.assignee_id {
         return Ok(());
     }
+
+    if dispatch.origin_kind != "note" {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        return crate::workstreams::persist::set_action_assignee(
+            &c,
+            &action_id,
+            member_id.as_deref(),
+        )
+        .map_err(|e| e.to_string());
+    }
+
+    let note_path = dispatch.origin_note_path.ok_or_else(|| {
+        "note-origin action has no origin_note_path (corrupt row)".to_string()
+    })?;
+    let cached_line = dispatch.origin_line.unwrap_or(0);
+    let want_text = dispatch.text;
 
     // Resolve the new member's canonical display name (if assigning).
     // None member_id = unassign.
@@ -728,32 +787,32 @@ pub fn set_action_assignee(
     Ok(())
 }
 
-/// Delete an action item from its source note (#100). Mirrors
-/// `set_action_done`'s look-up-by-id, cached-line + hash-fallback line
-/// locator, then removes the line from the body and writes the file
-/// back. The next reindex pass drops the row from the actions table
-/// because the line is no longer present.
+/// Delete an action item (#111). Note-origin rows are removed by
+/// dropping the corresponding `- [ ]` line from the source markdown
+/// and letting the next reindex pass cull the row. Synth-origin rows
+/// are deleted directly from the `actions` table.
 #[tauri::command]
 pub fn delete_action(
     id: String,
     guard: tauri::State<'_, crate::WriteGuard>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<(), String> {
-    let (note_path, cached_line, want_text) = {
+    let dispatch = {
         let c = conn.lock().map_err(|e| e.to_string())?;
-        c.query_row(
-            "SELECT note_path, line, text FROM actions WHERE id = ?1",
-            rusqlite::params![id],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, i64>(1)? as usize,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .map_err(|e| e.to_string())?
+        load_action_dispatch(&c, &id)?
     };
+
+    if dispatch.origin_kind != "note" {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        return crate::workstreams::persist::delete_action(&c, &id)
+            .map_err(|e| e.to_string());
+    }
+
+    let note_path = dispatch.origin_note_path.ok_or_else(|| {
+        "note-origin action has no origin_note_path (corrupt row)".to_string()
+    })?;
+    let cached_line = dispatch.origin_line.unwrap_or(0);
+    let want_text = dispatch.text;
 
     let raw = fs::read_to_string(&note_path).map_err(|e| e.to_string())?;
     let (yaml, body) = split_frontmatter(&raw);
@@ -789,6 +848,31 @@ pub fn delete_action(
     fs::write(&note_path, merged).map_err(|e| e.to_string())?;
     *guard.last_write.lock().map_err(|e| e.to_string())? = Some(std::time::Instant::now());
     touch_index(&conn, Path::new(&note_path), false);
+    Ok(())
+}
+
+/// Attach an action to a workstream (or clear the attachment when
+/// `workstream_id` is `None`) (#111). Works for any `origin_kind` — a
+/// note-origin row keeps its markdown line untouched; only the
+/// `actions.workstream_id` column changes. The next synthesizer pass
+/// treats a non-null attachment as a fixed pin and does not re-cluster
+/// it.
+#[tauri::command]
+pub fn set_action_workstream(
+    action_id: String,
+    workstream_id: Option<String>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let changed = c
+        .execute(
+            "UPDATE actions SET workstream_id = ?2 WHERE id = ?1",
+            rusqlite::params![action_id, workstream_id],
+        )
+        .map_err(|e| e.to_string())?;
+    if changed == 0 {
+        return Err(format!("action not found: {action_id}"));
+    }
     Ok(())
 }
 

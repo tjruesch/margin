@@ -734,7 +734,7 @@ fn tool_definitions() -> serde_json::Value {
                     },
                     "node_id": {
                         "type": "string",
-                        "description": "Canonical id of the node. For person: team_members.id. For event: calendar_events.id. For note: note_path. For email: email_messages.id. For action: actions.id or workstream_actions.id. For workstream: workstreams.id."
+                        "description": "Canonical id of the node. For person: team_members.id. For event: calendar_events.id. For note: note_path. For email: email_messages.id. For action: actions.id. For workstream: workstreams.id."
                     }
                 },
                 "required": ["node_kind", "node_id"]
@@ -1440,7 +1440,7 @@ struct EdgeRow {
 /// - note → notes.title
 /// - email → email_messages.subject
 /// - workstream → workstreams.title
-/// - action → actions.text (or workstream_actions.text)
+/// - action → actions.text (unified table; #111)
 /// Missing rows fall back to the raw id at render time.
 fn resolve_edge_labels(
     conn: &rusqlite::Connection,
@@ -1473,7 +1473,7 @@ fn resolve_edge_labels(
                 "workstream",
             ),
             "action" => {
-                // Try `actions` first; fall back to `workstream_actions`.
+                // Unified actions table (#111).
                 if let Ok(mut stmt) =
                     conn.prepare("SELECT id, text FROM actions WHERE id = ?1")
                 {
@@ -1486,22 +1486,6 @@ fn resolve_edge_labels(
                             .or(Ok::<_, rusqlite::Error>(None))
                         {
                             out.insert(("action".into(), rid), trim_label(&txt));
-                        }
-                    }
-                }
-                if let Ok(mut stmt) =
-                    conn.prepare("SELECT id, text FROM workstream_actions WHERE id = ?1")
-                {
-                    for id in &ids {
-                        if let Ok(Some((rid, txt))) = stmt
-                            .query_row(rusqlite::params![id], |r| {
-                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                            })
-                            .map(Some)
-                            .or(Ok::<_, rusqlite::Error>(None))
-                        {
-                            out.entry(("action".into(), rid))
-                                .or_insert_with(|| trim_label(&txt));
                         }
                     }
                 }
@@ -1648,29 +1632,37 @@ fn format_workstream_detail(
         }
     }
 
-    // Actions: open first, then recently done.
+    // Actions: open first, then recently done. After #111 the
+    // workstream detail's action list is a `Vec<ActionListItem>`;
+    // "from {kind}" reads the synth source kind when present and
+    // falls back to the origin discriminator otherwise.
     if !detail.actions.is_empty() {
-        let open: Vec<&crate::workstreams::WorkstreamAction> =
+        let open: Vec<&crate::notes::ActionListItem> =
             detail.actions.iter().filter(|a| !a.done).collect();
-        let done: Vec<&crate::workstreams::WorkstreamAction> =
+        let done: Vec<&crate::notes::ActionListItem> =
             detail.actions.iter().filter(|a| a.done).collect();
         s.push_str(&format!(
             "\nActions ({open_n} open, {done_n} done):\n",
             open_n = open.len(),
             done_n = done.len()
         ));
+        let kind_label = |a: &crate::notes::ActionListItem| -> String {
+            a.origin_synth_kind
+                .clone()
+                .unwrap_or_else(|| a.origin_kind.clone())
+        };
         for a in &open {
             s.push_str(&format!(
                 "- [ ] {text} (from {kind})\n",
                 text = a.text.trim(),
-                kind = a.source_kind
+                kind = kind_label(a)
             ));
         }
         for a in done.iter().take(WORKSTREAM_DETAIL_TOP_N) {
             s.push_str(&format!(
                 "- [x] {text} (from {kind})\n",
                 text = a.text.trim(),
-                kind = a.source_kind
+                kind = kind_label(a)
             ));
         }
     }
@@ -2211,9 +2203,8 @@ fn format_date(modified_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workstreams::{
-        NoteRef, Workstream, WorkstreamAction, WorkstreamDetail,
-    };
+    use crate::notes::ActionListItem;
+    use crate::workstreams::{NoteRef, Workstream, WorkstreamDetail};
     use crate::connectors::email::EmailMessage;
 
     fn make_ws(id: &str, title: &str, summary: &str, last_activity: i64) -> Workstream {
@@ -2295,17 +2286,23 @@ mod tests {
         }
     }
 
-    fn make_action(text: &str, done: bool) -> WorkstreamAction {
-        WorkstreamAction {
+    fn make_action(text: &str, done: bool) -> ActionListItem {
+        ActionListItem {
             id: format!("wsa_{text}"),
-            workstream_id: "ws_x".into(),
+            origin_kind: "synth".into(),
+            origin_note_path: None,
+            origin_line: None,
+            origin_synth_kind: Some("email".into()),
+            origin_synth_id: Some("msg".into()),
+            workstream_id: Some("ws_x".into()),
+            workstream_title: None,
+            note_title: None,
             text: text.into(),
-            due_ms: None,
-            source_kind: "email".into(),
-            source_id: "msg".into(),
             done,
             created_ms: 0,
+            due_ms: None,
             assignee_id: None,
+            assignee_display_name: None,
         }
     }
 

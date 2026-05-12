@@ -156,23 +156,34 @@ export type ActionScope = "open" | "done" | "all";
 
 export type ActionListItem = {
   id: string;
-  /** Source discriminator (#100). `"note"` for markdown-checkbox-backed
-   *  actions; `"workstream"` for synthesizer-emitted actions. Drives
-   *  click-through routing and chooses which IPC handles toggle/
-   *  delete/assignee writes. */
-  source: "note" | "workstream";
-  /** Source note path for note-backed; empty string for workstream-backed. */
-  note_path: string;
-  /** Display title — note title or workstream title. */
-  note_title: string;
-  /** Set when source === "workstream"; routes row click to the
-   *  Workstreams view. `null` otherwise. */
+  /** Origin discriminator (#111). `"note"` for markdown-checkbox-backed
+   *  rows; `"synth"` for synthesizer-emitted rows. Drives click-
+   *  through routing; the unified write IPCs dispatch internally so
+   *  callers don't branch on this. */
+  origin_kind: "note" | "synth";
+  /** Source note path for note-origin rows; `null` for synth rows. */
+  origin_note_path: string | null;
+  /** 1-based source-line for note-origin rows; `null` for synth rows. */
+  origin_line: number | null;
+  /** Synth source kind ("email" | "event" | "note" | …) when the
+   *  synthesizer paraphrased this row; `null` for note-origin rows.
+   *  Drives the "open source" affordance on the workstream detail
+   *  page. */
+  origin_synth_kind: string | null;
+  /** Connector-qualified id of the synth source row; `null` for
+   *  note-origin rows. */
+  origin_synth_id: string | null;
+  /** Note title when `origin_note_path` resolves, `null` otherwise. */
+  note_title: string | null;
+  /** Direct workstream attachment id. Set by the synthesizer on a
+   *  synth row, or by the user via `setActionWorkstream` on any row. */
   workstream_id: string | null;
+  /** Workstream title joined from `workstream_id` for render. */
+  workstream_title: string | null;
   text: string;
   done: boolean;
-  line: number;
   created_ms: number;
-  /** Absolute due-date timestamp (Unix ms). For note-backed actions,
+  /** Absolute due-date timestamp (Unix ms). For note-origin rows,
    *  parsed from a trailing `@YYYY-MM-DD[ HH:MM]` token. */
   due_ms: number | null;
   /** team_members.id when the action has a resolved owner. */
@@ -185,8 +196,13 @@ export type ActionListItem = {
 export async function listActions(
   scope: ActionScope = "open",
   assigneeId?: string,
+  workstreamId?: string,
 ): Promise<ActionListItem[]> {
-  return invoke<ActionListItem[]>("list_actions", { scope, assigneeId });
+  return invoke<ActionListItem[]>("list_actions", {
+    scope,
+    assigneeId,
+    workstreamId,
+  });
 }
 
 export async function setActionDone(id: string, done: boolean): Promise<void> {
@@ -195,6 +211,16 @@ export async function setActionDone(id: string, done: boolean): Promise<void> {
 
 export async function deleteAction(id: string): Promise<void> {
   await invoke<void>("delete_action", { id });
+}
+
+/** Attach an action to a workstream, or clear the attachment with
+ *  `null` (#111). Works for any `origin_kind` — note-origin rows keep
+ *  their markdown line untouched; only the DB column changes. */
+export async function setActionWorkstream(
+  actionId: string,
+  workstreamId: string | null,
+): Promise<void> {
+  await invoke<void>("set_action_workstream", { actionId, workstreamId });
 }
 
 export async function notesDir(): Promise<string> {
@@ -590,20 +616,8 @@ export type ExternalParticipant = {
   count: number;
 };
 
-export type WorkstreamAction = {
-  id: string;
-  workstream_id: string;
-  text: string;
-  due_ms: number | null;
-  /** "email" | "event" | "note" */
-  source_kind: "email" | "event" | "note";
-  source_id: string;
-  done: boolean;
-  created_ms: number;
-  /** Optional team_members.id when the synthesizer stamped an owner
-   *  (#100) or the user reassigned via set_workstream_action_assignee. */
-  assignee_id: string | null;
-};
+// WorkstreamAction was removed in #111; the workstream detail view
+// now consumes `ActionListItem` rows from the unified actions feed.
 
 export type WorkstreamNoteRef = {
   note_path: string;
@@ -652,7 +666,9 @@ export type WorkstreamDetail = Workstream & {
   emails: EmailMessage[];
   events: CalendarEvent[];
   notes: WorkstreamNoteRef[];
-  actions: WorkstreamAction[];
+  /** Unified action items pinned to or originating from this
+   *  workstream (#111). Replaces the previous `WorkstreamAction[]`. */
+  actions: ActionListItem[];
   links: WorkstreamLink[];
   /** Teams chat messages attached to this workstream via the
    *  `workstream_signals` pivot (kind='teams_message'). Recency-desc.
@@ -728,23 +744,11 @@ export async function getWorkstreamDetails(id: string): Promise<WorkstreamDetail
   return invoke<WorkstreamDetail | null>("get_workstream_details", { id });
 }
 
-export async function setWorkstreamActionDone(
-  actionId: string,
-  done: boolean,
-): Promise<void> {
-  await invoke<void>("set_workstream_action_done", { actionId, done });
-}
-
-export async function setWorkstreamActionAssignee(
-  actionId: string,
-  memberId: string | null,
-): Promise<void> {
-  await invoke<void>("set_workstream_action_assignee", { actionId, memberId });
-}
-
-export async function deleteWorkstreamAction(actionId: string): Promise<void> {
-  await invoke<void>("delete_workstream_action", { actionId });
-}
+// setWorkstreamActionDone / setWorkstreamActionAssignee /
+// deleteWorkstreamAction were removed in #111. Callers should use the
+// unified `setActionDone` / `setActionAssignee` / `deleteAction`
+// wrappers — the backend dispatches on `origin_kind` to write to the
+// markdown file (note origins) or the DB (synth origins).
 
 export async function setWorkstreamStatus(
   id: string,

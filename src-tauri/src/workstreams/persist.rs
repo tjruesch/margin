@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ExternalParticipant, NoteRef, Workstream, WorkstreamAction, WorkstreamDetail, WorkstreamLink,
+    ExternalParticipant, NoteRef, Workstream, WorkstreamDetail, WorkstreamLink,
     WriteCounts,
 };
 use crate::connectors::calendar;
@@ -87,7 +87,7 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0) AS ec, \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0) AS evc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0) AS nc, \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0) AS ac, \
+                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0) AS ac, \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) AS lc, \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -137,7 +137,7 @@ pub fn list_workstreams_archived(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -192,7 +192,7 @@ pub fn list_workstreams_for_synthesis(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -317,7 +317,7 @@ pub fn list_children_of(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -491,7 +491,7 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_actions WHERE workstream_id = w.id AND done = 0), 0), \
+                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w WHERE w.id = ?1",
@@ -752,12 +752,15 @@ fn attach_external_participants(
 pub fn list_open_action_texts_grouped(
     conn: &Connection,
 ) -> rusqlite::Result<HashMap<String, Vec<String>>> {
+    // Unified actions table (#111): any row with a workstream_id
+    // contributes — note-origin rows that have been pinned to a
+    // workstream show up here too.
     let mut stmt = conn.prepare(
-        "SELECT wa.workstream_id, wa.text \
-         FROM workstream_actions wa \
-         JOIN workstreams w ON w.id = wa.workstream_id \
-         WHERE wa.done = 0 AND w.status IN ('active', 'archived') \
-         ORDER BY wa.workstream_id, wa.created_ms ASC",
+        "SELECT a.workstream_id, a.text \
+         FROM actions a \
+         JOIN workstreams w ON w.id = a.workstream_id \
+         WHERE a.done = 0 AND w.status IN ('active', 'archived') \
+         ORDER BY a.workstream_id, a.created_ms ASC",
     )?;
     let rows = stmt.query_map([], |r| {
         let id: String = r.get(0)?;
@@ -775,26 +778,18 @@ pub fn list_open_action_texts_grouped(
 fn list_actions_for(
     conn: &Connection,
     workstream_id: &str,
-) -> rusqlite::Result<Vec<WorkstreamAction>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms, assignee_id \
-         FROM workstream_actions WHERE workstream_id = ?1 \
-         ORDER BY done ASC, created_ms DESC",
-    )?;
-    let rows = stmt.query_map(params![workstream_id], |r| {
-        Ok(WorkstreamAction {
-            id: r.get(0)?,
-            workstream_id: r.get(1)?,
-            text: r.get(2)?,
-            due_ms: r.get(3)?,
-            source_kind: r.get(4)?,
-            source_id: r.get(5)?,
-            done: r.get::<_, i64>(6)? != 0,
-            created_ms: r.get(7)?,
-            assignee_id: r.get(8)?,
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>()
+) -> rusqlite::Result<Vec<crate::notes::ActionListItem>> {
+    // After the #111 unification the workstream detail's action list
+    // is just `list_actions` filtered by workstream_id with no
+    // done-scope (we want both open and done on the detail page).
+    // Surfacing through the unified type lets the WS detail page
+    // reuse the ActionRow / AssigneeChip stack on the frontend.
+    crate::index::list_actions(
+        conn,
+        crate::notes::ActionScope::All,
+        None,
+        Some(workstream_id),
+    )
 }
 
 // ----- Write helpers -------------------------------------------------------
@@ -904,27 +899,70 @@ pub fn write_workstream(
         )
         .optional()?;
 
-    // Actions: upsert by hashed id. ON CONFLICT preserves `done`,
-    // `created_ms`, AND `assignee_id` (all three are user-mutable state);
-    // refreshes everything else. assignee_id is stamped on insert from
-    // the synthesizer's owner resolution; on update we keep whatever's
-    // there so a user reassignment survives the next cluster pass.
+    // Actions: write into the unified `actions` table with
+    // origin_kind='synth' (#111). Two changes from the legacy
+    // workstream_actions path:
+    //
+    //   1. Dedup against the literal `- [ ]` line: when source_kind
+    //      is 'note' and the source note already carries a row with
+    //      identical normalized text, attach workstream_id to that
+    //      note-origin row instead of inserting a parallel 'synth'
+    //      row. Exact match only (lowercased + trimmed) — see the
+    //      design discussion in #111. Synth interpretations that
+    //      diverge from the literal line keep their own row.
+    //
+    //   2. ON CONFLICT for an existing 'synth' row preserves done,
+    //      created_ms, AND assignee_id (user-mutable state) and
+    //      refreshes the synthesizer metadata. assignee_id is stamped
+    //      on insert from the synthesizer's owner resolution; on
+    //      update we keep whatever's there so a user reassignment
+    //      survives the next cluster pass.
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO workstream_actions(\
-                id, workstream_id, text, due_ms, source_kind, source_id, done, created_ms, assignee_id\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
+            "INSERT INTO actions (\
+                id, origin_kind, origin_synth_kind, origin_synth_id, \
+                workstream_id, text, due_ms, done, created_ms, assignee_id\
+             ) VALUES (?1, 'synth', ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
              ON CONFLICT(id) DO UPDATE SET \
                 text = excluded.text, \
                 due_ms = excluded.due_ms, \
-                source_kind = excluded.source_kind, \
-                source_id = excluded.source_id",
+                origin_synth_kind = excluded.origin_synth_kind, \
+                origin_synth_id = excluded.origin_synth_id, \
+                workstream_id = excluded.workstream_id",
         )?;
         for a in &record.actions {
+            // Dedup branch: for note-sourced synth output, look for an
+            // existing note-origin row on the same note with matching
+            // text. If found, pin the workstream_id on that row and
+            // skip the synth insert entirely.
+            if a.source_kind == "note" {
+                let dedup_target: Option<String> = tx
+                    .query_row(
+                        "SELECT id FROM actions \
+                          WHERE origin_kind = 'note' \
+                            AND origin_note_path = ?1 \
+                            AND lower(trim(text)) = lower(trim(?2)) \
+                          LIMIT 1",
+                        params![a.source_id, a.text],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if let Some(existing_id) = dedup_target {
+                    tx.execute(
+                        "UPDATE actions SET workstream_id = ?2 \
+                           WHERE id = ?1 \
+                             AND (workstream_id IS NULL OR workstream_id != ?2)",
+                        params![existing_id, id],
+                    )?;
+                    counts.actions_updated += 1;
+                    continue;
+                }
+            }
+
             let aid = action_id(&id, &a.text);
             let pre_existed_action: i64 = tx
                 .query_row(
-                    "SELECT 1 FROM workstream_actions WHERE id = ?1",
+                    "SELECT 1 FROM actions WHERE id = ?1",
                     params![aid],
                     |r| r.get(0),
                 )
@@ -932,11 +970,11 @@ pub fn write_workstream(
                 .unwrap_or(0);
             stmt.execute(params![
                 aid,
+                a.source_kind,
+                a.source_id,
                 id,
                 a.text,
                 a.due_ms,
-                a.source_kind,
-                a.source_id,
                 now_ms,
                 a.assignee_id,
             ])?;
@@ -1084,6 +1122,10 @@ pub fn create_workstream(
     Ok(Ok(id))
 }
 
+/// DB-only write path for toggling done on a synth-origin (or other
+/// non-note) row in the unified `actions` table (#111). Used by the
+/// unified `set_action_done` IPC for non-note origins; note-origin
+/// rows round-trip through the markdown file instead.
 pub fn set_action_done(
     conn: &Connection,
     action_id: &str,
@@ -1091,13 +1133,13 @@ pub fn set_action_done(
 ) -> rusqlite::Result<()> {
     let was_done: i64 = conn
         .query_row(
-            "SELECT done FROM workstream_actions WHERE id = ?1",
+            "SELECT done FROM actions WHERE id = ?1",
             params![action_id],
             |r| r.get(0),
         )
         .unwrap_or(0);
     conn.execute(
-        "UPDATE workstream_actions SET done = ?2 WHERE id = ?1",
+        "UPDATE actions SET done = ?2 WHERE id = ?1",
         params![action_id, done as i64],
     )?;
     // Live action_completed event on a 0→1 transition (#106). Skipped
@@ -1105,7 +1147,7 @@ pub fn set_action_done(
     if done && was_done == 0 {
         let (text, assignee_id): (String, Option<String>) = conn
             .query_row(
-                "SELECT text, assignee_id FROM workstream_actions WHERE id = ?1",
+                "SELECT text, assignee_id FROM actions WHERE id = ?1",
                 params![action_id],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
             )
@@ -1138,31 +1180,30 @@ pub fn set_action_done(
     Ok(())
 }
 
-/// Reassign a workstream action to a different team member, or
-/// unassign with NULL (#100). User-authored override; preserved across
-/// re-synthesis because the upsert ON CONFLICT clause does not touch
-/// `assignee_id`.
+/// DB-only write path for reassigning a synth-origin row in the
+/// unified `actions` table (#111). User-authored override; preserved
+/// across re-synthesis because the upsert ON CONFLICT clause does not
+/// touch `assignee_id`.
 pub fn set_action_assignee(
     conn: &Connection,
     action_id: &str,
     assignee_id: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE workstream_actions SET assignee_id = ?2 WHERE id = ?1",
+        "UPDATE actions SET assignee_id = ?2 WHERE id = ?1",
         params![action_id, assignee_id],
     )?;
     Ok(())
 }
 
-/// Permanently delete a workstream action (#100). The synthesizer
-/// content-hashes ids over (workstream_id, text), so re-synthesis of
-/// the same text + workstream pair will recreate it — same trade-off
-/// as `done`, which is preserved on conflict. Users who want a deleted
-/// item to stay deleted can rephrase the source or archive the
-/// workstream.
+/// DB-only delete path for a synth-origin row in the unified
+/// `actions` table (#111). The synthesizer content-hashes ids over
+/// (workstream_id, text), so re-synthesis of the same text +
+/// workstream pair will recreate it — same trade-off as `done`,
+/// which is preserved on conflict.
 pub fn delete_action(conn: &Connection, action_id: &str) -> rusqlite::Result<()> {
     conn.execute(
-        "DELETE FROM workstream_actions WHERE id = ?1",
+        "DELETE FROM actions WHERE id = ?1",
         params![action_id],
     )?;
     Ok(())
@@ -1397,17 +1438,19 @@ mod tests {
              CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
              INSERT INTO meta(key, value) VALUES ('schema_version', '11');
              CREATE TABLE team_members (
-                 id      TEXT PRIMARY KEY,
-                 aliases TEXT NOT NULL DEFAULT '[]',
-                 is_self INTEGER NOT NULL DEFAULT 0
+                 id           TEXT PRIMARY KEY,
+                 display_name TEXT NOT NULL DEFAULT '',
+                 aliases      TEXT NOT NULL DEFAULT '[]',
+                 is_self      INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE connectors (id TEXT PRIMARY KEY);
              INSERT INTO connectors(id) VALUES ('mg:test');
              CREATE TABLE notes (
-                 note_path  TEXT PRIMARY KEY,
-                 bundle_id  TEXT NOT NULL DEFAULT '',
-                 title      TEXT NOT NULL,
-                 modified_ms INTEGER NOT NULL
+                 note_path   TEXT PRIMARY KEY,
+                 bundle_id   TEXT NOT NULL DEFAULT '',
+                 title       TEXT NOT NULL,
+                 modified_ms INTEGER NOT NULL,
+                 archived    INTEGER NOT NULL DEFAULT 0
              );",
         )
         .unwrap();
@@ -1453,14 +1496,15 @@ mod tests {
         // erroring.
         conn.execute_batch(
             "CREATE TABLE actions (
-                 id          TEXT PRIMARY KEY,
-                 note_path   TEXT NOT NULL,
-                 line        INTEGER NOT NULL,
-                 text        TEXT NOT NULL,
-                 done        INTEGER NOT NULL DEFAULT 0,
-                 created_ms  INTEGER NOT NULL,
-                 due_ms      INTEGER,
-                 assignee_id TEXT
+                 id               TEXT PRIMARY KEY,
+                 note_path        TEXT NOT NULL,
+                 line             INTEGER NOT NULL,
+                 text             TEXT NOT NULL,
+                 done             INTEGER NOT NULL DEFAULT 0,
+                 created_ms       INTEGER NOT NULL,
+                 due_ms           INTEGER,
+                 reminder_sent_ms INTEGER,
+                 assignee_id      TEXT
              );",
         )
         .unwrap();
@@ -1468,6 +1512,14 @@ mod tests {
         // and set_action_done. Backfill block produces zero rows against
         // this fresh fixture (no source data); safe.
         conn.execute_batch(include_str!("../migrations/022_events_edges.sql"))
+            .unwrap();
+        // 023 (embeddings) references the sqlite-vec extension; skip
+        // here — the persist tests don't exercise embeddings.
+        // 024 (teams_messages) is unrelated to actions; skip.
+        // 025 (#111) collapses workstream_actions into the unified
+        // actions table. Without it, the persist write path's
+        // INSERT INTO actions blows up.
+        conn.execute_batch(include_str!("../migrations/025_unify_actions.sql"))
             .unwrap();
         conn
     }
@@ -3028,5 +3080,124 @@ mod tests {
         let child = listed.iter().find(|w| w.id == "ws_c").unwrap();
         assert!(parent.parent_workstream_id.is_none());
         assert_eq!(child.parent_workstream_id.as_deref(), Some("ws_p"));
+    }
+
+    // Seed a note-origin row in the unified actions table for the
+    // dedup tests below.
+    fn seed_note_action(conn: &Connection, id: &str, note_path: &str, text: &str) {
+        conn.execute(
+            "INSERT INTO actions \
+                (id, origin_kind, origin_note_path, origin_line, text, \
+                 done, created_ms) \
+             VALUES (?1, 'note', ?2, 1, ?3, 0, 100)",
+            params![id, note_path, text],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn synth_dedup_attaches_workstream_to_existing_note_action() {
+        // When the synthesizer extracts an action whose source is a
+        // note that already carries the literal `- [ ]` line, skip
+        // emitting a parallel synth row and instead pin
+        // workstream_id on the existing note-origin row (#111).
+        let mut conn = open_test_db();
+        seed_note(&conn, "/n/a.md", 1_000);
+        seed_note_action(&conn, "n:1", "/n/a.md", "Send invoice");
+
+        let tx = conn.transaction().unwrap();
+        let ws = make_ws(
+            Some("ws_x"),
+            "X",
+            &[],
+            &[],
+            &["/n/a.md"],
+            vec![make_action("send invoice", "note", "/n/a.md")],
+        );
+        let counts = write_workstream(&tx, &ws, 2_000).unwrap();
+        tx.commit().unwrap();
+
+        // No new synth row should exist; the note row gets pinned.
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "synth must NOT emit a parallel row");
+        let pinned: Option<String> = conn
+            .query_row(
+                "SELECT workstream_id FROM actions WHERE id = 'n:1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pinned.as_deref(), Some("ws_x"));
+        assert_eq!(counts.actions_added, 0);
+        assert_eq!(counts.actions_updated, 1);
+    }
+
+    #[test]
+    fn synth_does_not_dedup_across_notes() {
+        // The dedup is scoped to the same `source_id` note. A synth
+        // row paraphrasing the same text from a *different* note must
+        // produce its own row.
+        let mut conn = open_test_db();
+        seed_note(&conn, "/n/a.md", 1_000);
+        seed_note(&conn, "/n/b.md", 1_000);
+        seed_note_action(&conn, "n:a", "/n/a.md", "Send invoice");
+
+        let tx = conn.transaction().unwrap();
+        let ws = make_ws(
+            Some("ws_x"),
+            "X",
+            &[],
+            &[],
+            &["/n/b.md"],
+            vec![make_action("Send invoice", "note", "/n/b.md")],
+        );
+        write_workstream(&tx, &ws, 2_000).unwrap();
+        tx.commit().unwrap();
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2);
+        // The original note row is untouched (still NULL workstream).
+        let na_ws: Option<String> = conn
+            .query_row(
+                "SELECT workstream_id FROM actions WHERE id = 'n:a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(na_ws, None);
+    }
+
+    #[test]
+    fn synth_does_not_dedup_when_source_kind_is_email() {
+        // The dedup branch only fires for source_kind='note'.
+        // Email/event synth rows always go in as their own rows.
+        let mut conn = open_test_db();
+        seed_email(&conn, "mg:test::m1", 1_000);
+
+        let tx = conn.transaction().unwrap();
+        let ws = make_ws(
+            Some("ws_x"),
+            "X",
+            &["mg:test::m1"],
+            &[],
+            &[],
+            vec![make_action("Reply to Anna", "email", "mg:test::m1")],
+        );
+        let counts = write_workstream(&tx, &ws, 2_000).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(counts.actions_added, 1);
+        let kind: String = conn
+            .query_row(
+                "SELECT origin_kind FROM actions LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "synth");
     }
 }

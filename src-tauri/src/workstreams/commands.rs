@@ -52,35 +52,12 @@ pub fn get_workstream_details(
     persist::get_workstream_detail(&c, &id).map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-pub fn set_workstream_action_done(
-    action_id: String,
-    done: bool,
-    conn: tauri::State<'_, Mutex<Connection>>,
-) -> Result<(), String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    persist::set_action_done(&c, &action_id, done).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn set_workstream_action_assignee(
-    action_id: String,
-    member_id: Option<String>,
-    conn: tauri::State<'_, Mutex<Connection>>,
-) -> Result<(), String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    persist::set_action_assignee(&c, &action_id, member_id.as_deref())
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn delete_workstream_action(
-    action_id: String,
-    conn: tauri::State<'_, Mutex<Connection>>,
-) -> Result<(), String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    persist::delete_action(&c, &action_id).map_err(|e| e.to_string())
-}
+// set_workstream_action_done / _assignee / delete_workstream_action
+// were removed in #111 — the unified `set_action_done` /
+// `set_action_assignee` / `delete_action` IPCs in `notes.rs` now
+// dispatch on origin_kind and handle both note- and synth-origin
+// rows. The DB-only write helpers in `persist` remain as the synth-
+// path implementation.
 
 #[tauri::command]
 pub fn set_workstream_status(

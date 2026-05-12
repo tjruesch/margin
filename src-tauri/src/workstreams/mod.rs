@@ -109,24 +109,6 @@ pub struct ExternalParticipant {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct WorkstreamAction {
-    pub id: String,
-    pub workstream_id: String,
-    pub text: String,
-    pub due_ms: Option<i64>,
-    /// "email" | "event" | "note"
-    pub source_kind: String,
-    pub source_id: String,
-    pub done: bool,
-    pub created_ms: i64,
-    /// Optional team_members.id when the synthesizer assigned an owner
-    /// or the user manually reassigned via set_workstream_action_assignee
-    /// (#100). Surfaces in the Action items page via the unified
-    /// list_actions UNION.
-    pub assignee_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct NoteRef {
     pub note_path: String,
     pub title: String,
@@ -173,7 +155,7 @@ pub struct WorkstreamDetail {
     pub emails: Vec<crate::connectors::email::EmailMessage>,
     pub events: Vec<crate::connectors::calendar::CalendarEvent>,
     pub notes: Vec<NoteRef>,
-    pub actions: Vec<WorkstreamAction>,
+    pub actions: Vec<crate::notes::ActionListItem>,
     pub links: Vec<WorkstreamLink>,
     /// Teams chat messages attached to this workstream via the
     /// `workstream_signals` pivot (kind='teams_message'). Recency-desc

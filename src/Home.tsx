@@ -11,7 +11,9 @@ import {
   type NoteListItem,
   openOrCreateEventNote,
   type TeamMember,
+  type Workstream,
 } from "./file";
+import { WorkstreamChip } from "./WorkstreamChip";
 import { ActivityPanel } from "./ActivityPanel";
 import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
@@ -27,6 +29,7 @@ import {
   IconCheck,
   IconChecklist,
   IconChevRight,
+  IconFileText,
   IconHome,
   IconMic,
   IconMore,
@@ -84,6 +87,11 @@ type Props = {
    *  Body-rewrites the source line; the upstream refetch picks up the
    *  new assignee_id via the resolver. */
   onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
+  /** Pin (or unpin with null) an action to a workstream (#111). */
+  onReattachActionWorkstream: (
+    actionId: string,
+    workstreamId: string | null,
+  ) => Promise<void>;
   /** In-app notification queue surfaced by the bell button (#37). */
   notifications: NotificationRecord[];
   /** Stamp `read_at` on every unread notification. Called when the
@@ -305,6 +313,7 @@ export function Home({
   editor,
   members,
   onReassignAction,
+  onReattachActionWorkstream,
   notifications,
   onMarkAllNotificationsRead,
   workstreams,
@@ -642,7 +651,9 @@ export function Home({
             onOpenWorkstream={openWorkstream}
             onAddInboxTodo={onAddInboxTodo}
             members={members}
+            workstreams={workstreams}
             onReassign={onReassignAction}
+            onReattachWorkstream={onReattachActionWorkstream}
           />
         ) : (
           <>
@@ -1158,6 +1169,131 @@ function ActionItemsTeaser({
   );
 }
 
+function ActionsFilterBar({
+  filter,
+  onChange,
+  members,
+  workstreams,
+  selfId,
+  counts,
+}: {
+  filter: ActionsFilter;
+  onChange: (next: ActionsFilter) => void;
+  members: TeamMember[];
+  workstreams: Workstream[];
+  selfId: string | null;
+  counts: { all: number; mine: number; unassigned: number };
+}) {
+  // Members excluding self for the per-person picker. Sorted by display
+  // name to keep the dropdown predictable across renders.
+  const others = useMemo(
+    () =>
+      [...members]
+        .filter((m) => m.id !== selfId)
+        .sort((a, b) => a.display_name.localeCompare(b.display_name)),
+    [members, selfId],
+  );
+
+  // Active workstreams alphabetized for the per-workstream picker.
+  const sortedWorkstreams = useMemo(
+    () =>
+      [...workstreams].sort((a, b) =>
+        a.title.localeCompare(b.title, undefined, { sensitivity: "base" }),
+      ),
+    [workstreams],
+  );
+
+  const memberSelected =
+    filter.kind === "member"
+      ? others.find((m) => m.id === filter.memberId)
+      : undefined;
+  const workstreamSelected =
+    filter.kind === "workstream"
+      ? sortedWorkstreams.find((w) => w.id === filter.workstreamId)
+      : undefined;
+
+  return (
+    <div className="actions-filter-bar">
+      <button
+        type="button"
+        className={
+          "home-filter-chip" + (filter.kind === "all" ? " active" : "")
+        }
+        onClick={() => onChange({ kind: "all" })}
+      >
+        All <span className="actions-filter-count">{counts.all}</span>
+      </button>
+      {selfId && (
+        <button
+          type="button"
+          className={
+            "home-filter-chip" + (filter.kind === "mine" ? " active" : "")
+          }
+          onClick={() => onChange({ kind: "mine" })}
+        >
+          Assigned to me{" "}
+          <span className="actions-filter-count">{counts.mine}</span>
+        </button>
+      )}
+      <button
+        type="button"
+        className={
+          "home-filter-chip" +
+          (filter.kind === "unassigned" ? " active" : "")
+        }
+        onClick={() => onChange({ kind: "unassigned" })}
+      >
+        Unassigned{" "}
+        <span className="actions-filter-count">{counts.unassigned}</span>
+      </button>
+      {others.length > 0 && (
+        <select
+          className={
+            "home-filter-chip actions-filter-select" +
+            (filter.kind === "member" ? " active" : "")
+          }
+          value={memberSelected?.id ?? ""}
+          onChange={(e) => {
+            const id = e.target.value;
+            if (id) onChange({ kind: "member", memberId: id });
+            else onChange({ kind: "all" });
+          }}
+          title="Filter by teammate"
+        >
+          <option value="">Teammate…</option>
+          {others.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.display_name}
+            </option>
+          ))}
+        </select>
+      )}
+      {sortedWorkstreams.length > 0 && (
+        <select
+          className={
+            "home-filter-chip actions-filter-select" +
+            (filter.kind === "workstream" ? " active" : "")
+          }
+          value={workstreamSelected?.id ?? ""}
+          onChange={(e) => {
+            const id = e.target.value;
+            if (id) onChange({ kind: "workstream", workstreamId: id });
+            else onChange({ kind: "all" });
+          }}
+          title="Filter by workstream"
+        >
+          <option value="">Workstream…</option>
+          {sortedWorkstreams.map((w) => (
+            <option key={w.id} value={w.id}>
+              {w.title}
+            </option>
+          ))}
+        </select>
+      )}
+    </div>
+  );
+}
+
 // Order in which due-buckets render. The string keys match the values
 // returned by `dueBucket` from dueLabel.ts; the labels are human copy.
 export const BUCKET_ORDER = [
@@ -1174,7 +1310,9 @@ export function ActionRow({
   onOpenNote,
   onOpenWorkstream,
   members,
+  workstreams,
   onReassign,
+  onReattachWorkstream,
 }: {
   it: ActionListItem;
   onToggle: (id: string, nextDone: boolean) => void;
@@ -1183,12 +1321,21 @@ export function ActionRow({
    *  reuse the row without delete. */
   onDelete?: (id: string) => void;
   onOpenNote: (path: string) => void;
-  /** Optional — routes workstream-sourced rows to the Workstreams
-   *  detail view (#100). When omitted, workstream rows still render
-   *  but the click handler short-circuits. */
+  /** Optional — routes synth-origin rows to the Workstreams detail
+   *  view. When omitted, synth rows still render but the click
+   *  handler short-circuits. */
   onOpenWorkstream?: (id: string) => void;
   members: TeamMember[];
+  /** Active workstreams for the attach chip (#111). When omitted the
+   *  workstream chip is hidden. */
+  workstreams?: Workstream[];
   onReassign: (actionId: string, memberId: string | null) => void;
+  /** Pin/unpin the action to a workstream (#111). When omitted the
+   *  chip is read-only (no popover affordance). */
+  onReattachWorkstream?: (
+    actionId: string,
+    workstreamId: string | null,
+  ) => void;
 }) {
   // When the action has a resolved assignee, hide the literal
   // `Owner — ` prefix in the displayed text — the chip already
@@ -1197,16 +1344,21 @@ export function ActionRow({
   const displayText = it.assignee_id
     ? stripLeadingOwnerPrefix(it.text)
     : it.text;
-  const isWorkstream = it.source === "workstream";
+  const isSynth = it.origin_kind === "synth";
   const openTarget = () => {
-    if (isWorkstream) {
+    // Origin drives the primary navigation target: note-origin rows
+    // open their source note; synth-origin rows open the attached
+    // workstream when present.
+    if (isSynth) {
       if (it.workstream_id && onOpenWorkstream) {
         onOpenWorkstream(it.workstream_id);
       }
-    } else if (it.note_path) {
-      onOpenNote(it.note_path);
+    } else if (it.origin_note_path) {
+      onOpenNote(it.origin_note_path);
     }
   };
+  const originTitle = isSynth ? it.workstream_title : it.note_title;
+  const titleAttr = originTitle ? `Open ${originTitle}` : undefined;
   return (
     <div
       className="home-action-row"
@@ -1219,7 +1371,7 @@ export function ActionRow({
           openTarget();
         }
       }}
-      title={`Open ${it.note_title}`}
+      title={titleAttr}
     >
       <button
         type="button"
@@ -1235,8 +1387,40 @@ export function ActionRow({
       </button>
       <div className="home-action-body">
         <div className={"home-action-text" + (it.done ? " done" : "")}>{displayText}</div>
+        {originTitle && (
+          <div className="home-action-origin">
+            {isSynth ? (
+              <IconBriefcase size={10} sw={1.7} />
+            ) : (
+              <IconFileText size={10} sw={1.7} />
+            )}
+            <span className="home-action-origin-label">
+              {isSynth ? "Workstream" : "Note"}
+            </span>
+            <span className="home-action-origin-sep">·</span>
+            <span className="home-action-origin-title">{originTitle}</span>
+            {/* Note-origin row pinned to a workstream: show both. */}
+            {!isSynth && it.workstream_title && (
+              <>
+                <span className="home-action-origin-sep">·</span>
+                <IconBriefcase size={10} sw={1.7} />
+                <span className="home-action-origin-title">
+                  {it.workstream_title}
+                </span>
+              </>
+            )}
+          </div>
+        )}
       </div>
       <DueChip dueMs={it.due_ms} />
+      {workstreams && onReattachWorkstream && (
+        <WorkstreamChip
+          workstreamId={it.workstream_id}
+          workstreamTitle={it.workstream_title}
+          workstreams={workstreams}
+          onPick={(wsId) => onReattachWorkstream(it.id, wsId)}
+        />
+      )}
       <AssigneeChip
         assigneeId={it.assignee_id}
         assigneeDisplayName={it.assignee_display_name}
@@ -1373,6 +1557,13 @@ function InboxComposerForm({
   );
 }
 
+type ActionsFilter =
+  | { kind: "all" }
+  | { kind: "mine" }
+  | { kind: "unassigned" }
+  | { kind: "member"; memberId: string }
+  | { kind: "workstream"; workstreamId: string };
+
 function ActionsFeed({
   actions,
   onToggle,
@@ -1381,7 +1572,9 @@ function ActionsFeed({
   onOpenWorkstream,
   onAddInboxTodo,
   members,
+  workstreams,
   onReassign,
+  onReattachWorkstream,
 }: {
   actions: ActionListItem[];
   onToggle: (id: string, nextDone: boolean) => void;
@@ -1390,9 +1583,15 @@ function ActionsFeed({
   onOpenWorkstream: (id: string) => void;
   onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
   members: TeamMember[];
+  workstreams: Workstream[];
   onReassign: (actionId: string, memberId: string | null) => void;
+  onReattachWorkstream: (
+    actionId: string,
+    workstreamId: string | null,
+  ) => void;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+  const [filter, setFilter] = useState<ActionsFilter>({ kind: "all" });
   // The "New todo" trigger lives in PageHeader (when nav === "actions");
   // we listen for its dispatched event and open the inline composer.
   useEffect(() => {
@@ -1401,6 +1600,44 @@ function ActionsFeed({
     return () =>
       window.removeEventListener("margin:open-actions-composer", onOpen);
   }, []);
+
+  const selfId = useMemo(
+    () => members.find((m) => m.is_self)?.id ?? null,
+    [members],
+  );
+
+  // Filter the action list client-side. The backend supports
+  // assignee_id and workstream_id filter params, but routing the
+  // predicate here keeps chip switches snappy and avoids extra IPC
+  // round-trips.
+  const filtered = useMemo(() => {
+    switch (filter.kind) {
+      case "all":
+        return actions;
+      case "mine":
+        return selfId
+          ? actions.filter((a) => a.assignee_id === selfId)
+          : [];
+      case "unassigned":
+        return actions.filter((a) => a.assignee_id == null);
+      case "member":
+        return actions.filter((a) => a.assignee_id === filter.memberId);
+      case "workstream":
+        return actions.filter((a) => a.workstream_id === filter.workstreamId);
+    }
+  }, [actions, filter, selfId]);
+
+  // Counts power the chip labels.
+  const counts = useMemo(() => {
+    let mine = 0;
+    let unassigned = 0;
+    for (const a of actions) {
+      if (a.assignee_id == null) unassigned++;
+      else if (a.assignee_id === selfId) mine++;
+    }
+    return { mine, unassigned, all: actions.length };
+  }, [actions, selfId]);
+
   // Split dated vs. undated, then bucket the dated half by urgency.
   // Backend already orders dated rows by `due_ms ASC`, so each bucket is
   // chronological without further sorting. Undated rows fall into one
@@ -1414,7 +1651,7 @@ function ActionsFeed({
       later: [],
     };
     const undatedRows: ActionListItem[] = [];
-    for (const a of actions) {
+    for (const a of filtered) {
       if (a.due_ms != null) {
         buckets[dueBucket(a.due_ms, now)].push(a);
       } else {
@@ -1422,7 +1659,7 @@ function ActionsFeed({
       }
     }
     return { byBucket: buckets, undated: undatedRows };
-  }, [actions]);
+  }, [filtered]);
 
   // Page-level "New todo" trigger lives in PageHeader (Home.tsx);
   // ActionsFeed renders only the composer form when open.
@@ -1432,6 +1669,17 @@ function ActionsFeed({
       onClose={() => setComposerOpen(false)}
     />
   ) : null;
+
+  const filterBar = (
+    <ActionsFilterBar
+      filter={filter}
+      onChange={setFilter}
+      members={members}
+      workstreams={workstreams}
+      selfId={selfId}
+      counts={counts}
+    />
+  );
 
   if (actions.length === 0) {
     return (
@@ -1446,9 +1694,29 @@ function ActionsFeed({
     );
   }
 
+  if (filtered.length === 0) {
+    return (
+      <section className="home-section">
+        {composer}
+        {filterBar}
+        <p className="home-empty">
+          No action items match this filter.{" "}
+          <button
+            type="button"
+            className="home-empty-link"
+            onClick={() => setFilter({ kind: "all" })}
+          >
+            Clear filter
+          </button>
+        </p>
+      </section>
+    );
+  }
+
   return (
     <section className="home-section">
       {composer}
+      {filterBar}
 
       {BUCKET_ORDER.map(({ key, label }) => {
         const items = byBucket[key];
@@ -1469,7 +1737,9 @@ function ActionsFeed({
                   onOpenNote={onOpenNote}
                   onOpenWorkstream={onOpenWorkstream}
                   members={members}
+                  workstreams={workstreams}
                   onReassign={onReassign}
+                  onReattachWorkstream={onReattachWorkstream}
                 />
               ))}
             </div>

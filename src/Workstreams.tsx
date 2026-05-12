@@ -15,11 +15,11 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
   AliasKind,
+  type ActionListItem,
   type EmailMessage,
   type ExternalParticipant,
   type TeamMember,
   type Workstream,
-  type WorkstreamAction,
   type WorkstreamDetail,
   type WorkstreamLink,
   type WorkstreamLinkSummarizedEvent,
@@ -27,6 +27,7 @@ import {
   addWorkstreamLinkFromUrl,
   createTeamMember,
   createWorkstream,
+  deleteAction,
   getEmailBody,
   getWorkstreamDetails,
   listArchivedWorkstreams,
@@ -34,9 +35,8 @@ import {
   markWorkstreamSeen,
   openOrCreateEventNote,
   removeWorkstreamLink,
-  setWorkstreamActionDone,
-  setWorkstreamActionAssignee,
-  deleteWorkstreamAction,
+  setActionAssignee,
+  setActionDone,
   setWorkstreamOwner,
   setWorkstreamParent,
   setWorkstreamStatus,
@@ -930,7 +930,8 @@ function WorkstreamDetailView({
         };
       });
       try {
-        await setWorkstreamActionDone(actionId, nextDone);
+        // Unified IPC dispatches on origin_kind backend-side (#111).
+        await setActionDone(actionId, nextDone);
       } catch (e) {
         console.error("[workstreams] toggle action failed", e);
         await reload();
@@ -953,7 +954,7 @@ function WorkstreamDetailView({
         };
       });
       try {
-        await setWorkstreamActionAssignee(actionId, memberId);
+        await setActionAssignee(actionId, memberId);
       } catch (e) {
         console.error("[workstreams] reassign action failed", e);
         await reload();
@@ -981,7 +982,7 @@ function WorkstreamDetailView({
         return { ...d, actions: d.actions.filter((a) => a.id !== actionId) };
       });
       try {
-        await deleteWorkstreamAction(actionId);
+        await deleteAction(actionId);
       } catch (e) {
         console.error("[workstreams] delete action failed", e);
         await reload();
@@ -1247,11 +1248,18 @@ function WorkstreamDetailView({
         onReassign={onReassignAction}
         onDelete={onDeleteAction}
         members={teamMembers}
-        onOpenSource={async (kind, sourceId) => {
-          if (kind === "note") {
-            onOpenNote(sourceId);
-          } else if (kind === "event") {
-            await onOpenEvent(sourceId);
+        onOpenSource={async (a) => {
+          // Note-origin rows always open their source markdown,
+          // regardless of any workstream pin. Synth rows route via the
+          // synth source kind/id.
+          if (a.origin_kind === "note" && a.origin_note_path) {
+            onOpenNote(a.origin_note_path);
+            return;
+          }
+          if (a.origin_synth_kind === "note" && a.origin_synth_id) {
+            onOpenNote(a.origin_synth_id);
+          } else if (a.origin_synth_kind === "event" && a.origin_synth_id) {
+            await onOpenEvent(a.origin_synth_id);
           }
         }}
       />
@@ -2292,46 +2300,49 @@ function ActionsSection({
   onOpenSource,
   members,
 }: {
-  actions: WorkstreamAction[];
+  actions: ActionListItem[];
   onToggle: (actionId: string, nextDone: boolean) => void | Promise<void>;
   onReassign: (actionId: string, memberId: string | null) => void | Promise<void>;
   onDelete: (actionId: string) => void | Promise<void>;
-  onOpenSource: (sourceKind: string, sourceId: string) => void | Promise<void>;
+  /** Route the row click to its source (#111). For note-origin rows
+   *  this opens the source note; for synth rows it dispatches by
+   *  origin_synth_kind to the email/event/note source. */
+  onOpenSource: (
+    a: ActionListItem,
+  ) => void | Promise<void>;
   members: TeamMember[];
 }) {
   if (actions.length === 0) return null;
-  const memberById = new Map(members.map((m) => [m.id, m] as const));
   return (
     <section className="workstream-section">
       <h2 className="workstream-section-title">Actions ({actions.length})</h2>
       <div className="home-actions">
         {actions.map((a) => {
-          const openable = a.source_kind === "note" || a.source_kind === "event";
-          const assigneeName = a.assignee_id
-            ? memberById.get(a.assignee_id)?.display_name ?? null
-            : null;
+          const sourceKind = a.origin_kind === "note"
+            ? "note"
+            : a.origin_synth_kind ?? "";
+          const openable =
+            a.origin_kind === "note" ||
+            sourceKind === "note" ||
+            sourceKind === "event";
           return (
             <div
               key={a.id}
               className="home-action-row"
               role={openable ? "button" : undefined}
               tabIndex={openable ? 0 : undefined}
-              onClick={
-                openable
-                  ? () => void onOpenSource(a.source_kind, a.source_id)
-                  : undefined
-              }
+              onClick={openable ? () => void onOpenSource(a) : undefined}
               onKeyDown={
                 openable
                   ? (e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        void onOpenSource(a.source_kind, a.source_id);
+                        void onOpenSource(a);
                       }
                     }
                   : undefined
               }
-              title={openable ? `Open ${a.source_kind} source` : undefined}
+              title={openable ? `Open ${sourceKind || "source"}` : undefined}
             >
               <button
                 type="button"
@@ -2352,16 +2363,18 @@ function ActionsSection({
               <DueChip dueMs={a.due_ms} />
               <AssigneeChip
                 assigneeId={a.assignee_id}
-                assigneeDisplayName={assigneeName}
+                assigneeDisplayName={a.assignee_display_name}
                 members={members}
                 onPick={(memberId) => void onReassign(a.id, memberId)}
               />
-              <span
-                className="workstream-action-source-chip"
-                title={`from ${a.source_kind}`}
-              >
-                from {a.source_kind}
-              </span>
+              {sourceKind && (
+                <span
+                  className="workstream-action-source-chip"
+                  title={`from ${sourceKind}`}
+                >
+                  from {sourceKind}
+                </span>
+              )}
               <button
                 type="button"
                 className="home-action-delete"

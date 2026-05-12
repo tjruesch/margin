@@ -48,10 +48,8 @@ import {
   setFavorite as setFavoriteFile,
   setActionAssignee,
   setActionDone,
+  setActionWorkstream,
   deleteAction,
-  setWorkstreamActionAssignee,
-  setWorkstreamActionDone,
-  deleteWorkstreamAction,
   setMeetingAttendees,
   getMeetingAttendees,
   setNoteTags,
@@ -1611,17 +1609,12 @@ export default function App() {
   );
 
   const onToggleAction = useCallback(async (id: string, nextDone: boolean) => {
-    const target = actionsRef.current.find((a) => a.id === id);
-    const isWorkstream = target?.source === "workstream";
     setActions((curr) =>
       curr.map((a) => (a.id === id ? { ...a, done: nextDone } : a)),
     );
     try {
-      if (isWorkstream) {
-        await setWorkstreamActionDone(id, nextDone);
-      } else {
-        await setActionDone(id, nextDone);
-      }
+      // Unified IPC dispatches on origin_kind backend-side (#111).
+      await setActionDone(id, nextDone);
     } catch (err) {
       console.error("toggle action failed:", err);
       alert("Could not update the task. See console for details.");
@@ -1631,14 +1624,15 @@ export default function App() {
     }
   }, []);
 
-  // Delete an action item (#100). Confirms first, optimistically drops
-  // the row from local state, then writes through to Rust dispatching
-  // by source. On error, refetches to restore the authoritative list.
+  // Delete an action item. Confirms first, optimistically drops the
+  // row from local state, then writes through to the unified
+  // `deleteAction` IPC which dispatches on origin_kind (#111). On
+  // error, refetches to restore the authoritative list.
   const onDeleteAction = useCallback(async (id: string) => {
     const target = actionsRef.current.find((a) => a.id === id);
-    const isWorkstream = target?.source === "workstream";
+    const isSynth = target?.origin_kind === "synth";
     const ok = await ask(
-      isWorkstream
+      isSynth
         ? "This action item will be removed from its workstream."
         : "This action item will be removed from its source note.",
       {
@@ -1651,11 +1645,7 @@ export default function App() {
     if (!ok) return;
     setActions((curr) => curr.filter((a) => a.id !== id));
     try {
-      if (isWorkstream) {
-        await deleteWorkstreamAction(id);
-      } else {
-        await deleteAction(id);
-      }
+      await deleteAction(id);
     } catch (err) {
       console.error("deleteAction failed:", err);
       alert("Could not delete the action item. See console for details.");
@@ -1673,7 +1663,7 @@ export default function App() {
     () =>
       path
         ? actions.filter(
-            (a) => a.source === "note" && a.note_path === path,
+            (a) => a.origin_kind === "note" && a.origin_note_path === path,
           )
         : [],
     [actions, path],
@@ -1718,8 +1708,6 @@ export default function App() {
   // On error, refetch to restore authoritative state.
   const onReassignAction = useCallback(
     async (actionId: string, memberId: string | null) => {
-      const target = actionsRef.current.find((a) => a.id === actionId);
-      const isWorkstream = target?.source === "workstream";
       const newName =
         memberId === null
           ? null
@@ -1732,11 +1720,8 @@ export default function App() {
         ),
       );
       try {
-        if (isWorkstream) {
-          await setWorkstreamActionAssignee(actionId, memberId);
-        } else {
-          await setActionAssignee(actionId, memberId);
-        }
+        // Unified IPC dispatches on origin_kind backend-side (#111).
+        await setActionAssignee(actionId, memberId);
         const fresh = await listActions("open");
         setActions(fresh);
       } catch (err) {
@@ -1749,6 +1734,39 @@ export default function App() {
       }
     },
     [members],
+  );
+
+  // Pin (or detach with null) an action to a workstream (#111). Pure
+  // DB write — markdown lines aren't touched. Optimistic local
+  // update, refetch on success to pick up the joined workstream_title;
+  // refetch on error to restore authoritative state.
+  const onReattachActionWorkstream = useCallback(
+    async (actionId: string, workstreamId: string | null) => {
+      const newTitle =
+        workstreamId === null
+          ? null
+          : workstreams.find((w) => w.id === workstreamId)?.title ?? null;
+      setActions((curr) =>
+        curr.map((a) =>
+          a.id === actionId
+            ? { ...a, workstream_id: workstreamId, workstream_title: newTitle }
+            : a,
+        ),
+      );
+      try {
+        await setActionWorkstream(actionId, workstreamId);
+        const fresh = await listActions("open");
+        setActions(fresh);
+      } catch (err) {
+        console.error("setActionWorkstream failed:", err);
+        alert("Could not update the workstream attachment.");
+        try {
+          const fresh = await listActions("open");
+          setActions(fresh);
+        } catch {}
+      }
+    },
+    [workstreams],
   );
 
   /** Open the macOS share sheet for the active note. The Rust side
@@ -2033,6 +2051,7 @@ export default function App() {
             editor={{ tabSize, useTabs, softWrap, fontSize }}
             members={members}
             onReassignAction={onReassignAction}
+            onReattachActionWorkstream={onReattachActionWorkstream}
             notifications={notifications}
             onMarkAllNotificationsRead={markNotificationsRead}
             workstreams={workstreams}

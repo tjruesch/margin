@@ -202,20 +202,12 @@ fn run_owns_pass(conn: &mut Connection, report: &mut EdgeSynthReport) -> Result<
             [],
         )
         .map_err(|e| e.to_string())?;
-    let n2 = tx
-        .execute(
-            "INSERT INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, \
-                                confidence, evidence, first_seen_ms, last_seen_ms) \
-             SELECT 'person', wa.assignee_id, 'action', wa.id, 'OWNS', \
-                    1.0, '[]', wa.created_ms, wa.created_ms \
-             FROM workstream_actions wa WHERE wa.assignee_id IS NOT NULL \
-             ON CONFLICT(src_kind, src_id, tgt_kind, tgt_id, edge_kind) DO UPDATE SET \
-                last_seen_ms = max(edges.last_seen_ms, excluded.last_seen_ms)",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
+    // Synth-backed actions used to live in `workstream_actions`; after
+    // #111 they share the unified `actions` table with note-backed
+    // rows, so the first INSERT above already covers both. No second
+    // pass needed.
     tx.commit().map_err(|e| e.to_string())?;
-    bump(report, "OWNS", n1 + n2);
+    bump(report, "OWNS", n1);
     Ok(())
 }
 
