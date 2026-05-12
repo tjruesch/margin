@@ -539,6 +539,7 @@ function AISection({ ai, onChange }: AISectionProps) {
     done: number;
     remaining: number;
     errored: number;
+    message: string | null;
   } | null>(null);
 
   useEffect(() => {
@@ -554,6 +555,7 @@ function AISection({ ai, onChange }: AISectionProps) {
           done: number;
           remaining: number;
           errored: number;
+          message: string | null;
         };
         setEmbedStatus(p);
       }).then((un) => {
@@ -817,18 +819,25 @@ function AISection({ ai, onChange }: AISectionProps) {
             </span>
           </div>
           {embedStatus && (
-            <div className="settings-row-control">
-              <span className="settings-hint">
-                Embedding index:{" "}
-                {embedStatus.state === "syncing"
-                  ? `syncing ${embedStatus.done}/${embedStatus.done + embedStatus.remaining}…`
-                  : embedStatus.state === "idle"
-                    ? `idle (${embedStatus.done} indexed this pass${embedStatus.errored ? `, ${embedStatus.errored} errored` : ""})`
-                    : embedStatus.state === "needs_key"
-                      ? "waiting for API key"
-                      : embedStatus.state}
-              </span>
-            </div>
+            <>
+              <div className="settings-row-control">
+                <span className="settings-hint">
+                  Embedding index:{" "}
+                  {embedStatus.state === "syncing"
+                    ? `syncing ${embedStatus.done}/${embedStatus.done + embedStatus.remaining}…`
+                    : embedStatus.state === "idle"
+                      ? `idle (${embedStatus.done} indexed this pass${embedStatus.errored ? `, ${embedStatus.errored} errored` : ""})`
+                      : embedStatus.state === "needs_key"
+                        ? "waiting for API key"
+                        : embedStatus.state}
+                </span>
+              </div>
+              {embedStatus.message && (
+                <div className="settings-error">
+                  Embedding worker: {embedStatus.message}
+                </div>
+              )}
+            </>
           )}
           {voyageError && <div className="settings-error">{voyageError}</div>}
         </div>

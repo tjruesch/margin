@@ -144,6 +144,7 @@ pub async fn run_pass(app: &AppHandle, embedder: &dyn Embedder) -> Result<(), St
 
     let mut done = 0u32;
     let mut errored = 0u32;
+    let mut last_error: Option<String> = None;
 
     // Phase 2: batched embedding + upsert. Sequential batches; lock is
     // re-acquired per batch so other writers aren't blocked for the
@@ -155,6 +156,7 @@ pub async fn run_pass(app: &AppHandle, embedder: &dyn Embedder) -> Result<(), St
             Err(e) => {
                 eprintln!("[embeddings] batch failed: {e}");
                 errored += chunk.len() as u32;
+                last_error = Some(e.clone());
                 emit(
                     app,
                     StatusEvent {
@@ -202,7 +204,10 @@ pub async fn run_pass(app: &AppHandle, embedder: &dyn Embedder) -> Result<(), St
             done,
             remaining: 0,
             errored,
-            message: None,
+            // Surface the last batch error so the Settings pill can
+            // show it — otherwise users see "527 errored" with no clue
+            // what went wrong. Cleared when the next pass succeeds.
+            message: last_error,
         },
     );
     Ok(())
