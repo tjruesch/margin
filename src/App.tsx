@@ -418,15 +418,12 @@ export default function App() {
     notesScopeRef.current = notesScope;
   }, [notesScope]);
 
-  /** True iff `p` lives under the owned-notes directory. Cheaper than the
-   *  Tauri `isOwnedNote` round-trip; safe to call before notesDir loads
-   *  (returns false in that brief window). */
-  const isOwnedPath = useCallback((p: string): boolean => {
-    const dir = notesDirRef.current;
-    if (!dir) return false;
-    const prefix = dir.endsWith("/") ? dir : dir + "/";
-    return p.startsWith(prefix);
-  }, []);
+  /** Post-#112 every note the editor opens is a DB-backed row, so
+   *  this is always `true`. Kept as a function for the legacy
+   *  callsites that branch on owned-vs-external; the external branch
+   *  is now unreachable but its code stays in place as documentation
+   *  until a follow-up sweep deletes it. */
+  const isOwnedPath = useCallback((_p: string): boolean => true, []);
 
   /** Re-scan owned notes from disk and update the shared state. The home
    *  feed and the note-header tag autocomplete both read from this.
