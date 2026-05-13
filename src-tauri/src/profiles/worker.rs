@@ -261,13 +261,35 @@ async fn recompute_one(
 
     let api_key = crate::keychain::read_anthropic_api_key()
         .map_err(|e| format!("key: {e}"))?;
-    let body = match super::prompt::call_anthropic(&api_key, &inputs).await {
+    let mut body = match super::prompt::call_anthropic(&api_key, &inputs).await {
         Ok(b) => b,
         Err(super::prompt::CallError::RateLimited) => {
             return Ok(RecomputeOutcome::RateLimited);
         }
         Err(super::prompt::CallError::Other(msg)) => return Err(msg),
     };
+
+    // Strip hallucinated obs_ids before persist (#114). The model may
+    // emit ids it wasn't given; only retain citations to observations
+    // we actually fed it. Dedup-preserving-order so the JSON is stable.
+    let allowed_ids: std::collections::HashSet<String> = inputs
+        .get("accepted_observations")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("obs_id").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let raw = std::mem::take(&mut body.evidence_observation_ids);
+    let before = raw.len();
+    body.evidence_observation_ids =
+        super::prompt::filter_evidence_ids(raw, &allowed_ids);
+    let dropped = before - body.evidence_observation_ids.len();
+    if dropped > 0 {
+        eprintln!("[profiles] dropped {dropped} hallucinated obs_ids for {person_id}");
+    }
 
     {
         let conn_state = app.state::<std::sync::Mutex<Connection>>();

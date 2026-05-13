@@ -103,6 +103,24 @@ pub fn source_hash(payload: &serde_json::Value) -> String {
 const EDGES_CAP: usize = 50;
 const EVENTS_CAP: usize = 200;
 const RETRIEVAL_CAP: usize = 20;
+/// Cap on accepted observations included in the worker prompt (#114).
+/// Most-recent-first by `created_ms`; older accepted observations are
+/// dropped silently when there are more than `ACCEPTED_OBSERVATIONS_CAP`.
+const ACCEPTED_OBSERVATIONS_CAP: usize = 50;
+
+/// Drop emitted `evidence_observation_ids` that weren't in the input
+/// set (model hallucinations), then dedup while preserving order
+/// (first occurrence wins). Empty input → empty output.
+pub(crate) fn filter_evidence_ids(
+    raw: Vec<String>,
+    allowed: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.into_iter()
+        .filter(|id| allowed.contains(id))
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
 
 /// Build the prompt-input payload for `person_id`. Pure data
 /// assembly: pulls the team_member row, edges centered on the
@@ -113,13 +131,21 @@ pub async fn build_prompt_inputs(
     app: &AppHandle,
     person_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let (member_block, edge_rows, event_rows) = {
+    let (member_block, edge_rows, event_rows, accepted_observations) = {
         let conn_state = app.state::<std::sync::Mutex<Connection>>();
         let c = conn_state.lock().map_err(|e| e.to_string())?;
+        let accepted = crate::observations::persist::list_by_member(
+            &c,
+            person_id,
+            Some(crate::observations::persist::ObservationStatus::Accepted),
+        )
+        .map_err(|e| format!("accepted observations: {e}"))?;
+        let projected = project_accepted_observations(accepted);
         (
             load_member(&c, person_id)?,
             load_edges(&c, person_id)?,
             load_events(&c, person_id)?,
+            projected,
         )
     };
     let display_name = member_block.display_name.clone();
@@ -163,9 +189,26 @@ pub async fn build_prompt_inputs(
         "edges": edge_rows,
         "events": event_rows,
         "retrieval_hits": retrieval_hits,
-        // Reserved for #52 v2.
-        "accepted_observations": serde_json::Value::Array(Vec::new()),
+        "accepted_observations": accepted_observations,
     }))
+}
+
+/// Project accepted-observation rows down to the three fields the worker
+/// prompt cares about. Most-recent-first (the input is already ordered by
+/// `created_ms DESC`); capped at `ACCEPTED_OBSERVATIONS_CAP`.
+pub(crate) fn project_accepted_observations(
+    rows: Vec<crate::observations::persist::ProfileObservation>,
+) -> Vec<serde_json::Value> {
+    rows.into_iter()
+        .take(ACCEPTED_OBSERVATIONS_CAP)
+        .map(|o| {
+            serde_json::json!({
+                "obs_id": o.id,
+                "body": o.body,
+                "created_ms": o.created_ms,
+            })
+        })
+        .collect()
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -303,8 +346,9 @@ pub enum CallError {
 }
 
 const SYSTEM_PROMPT: &str = "You synthesize a structured profile of a single person from \
-edges (graph signals), events (recent activity), and retrieval hits \
-(notes/messages mentioning them).\n\n\
+edges (graph signals), events (recent activity), retrieval hits \
+(notes/messages mentioning them), and previously-vetted accepted \
+observations.\n\n\
 Output **only** a single JSON object matching this schema. No prose, \
 no markdown fences, no keys outside the schema.\n\n\
 ```\n\
@@ -315,7 +359,7 @@ no markdown fences, no keys outside the schema.\n\n\
   \"working_hours_observed\":  {\"start_local\": string, \"end_local\": string}|null,\n\
   \"communication_style_notes\": string|null,       // one sentence, lower-cased except proper nouns\n\
   \"last_seen_active_ms\":     int|null,\n\
-  \"evidence_observation_ids\": []                  // always [] in v1\n\
+  \"evidence_observation_ids\": [string]            // obs_ids from accepted_observations that meaningfully shaped this snapshot; [] when none used\n\
 }\n\
 ```\n\n\
 Rules:\n\
@@ -324,7 +368,13 @@ Rules:\n\
 - `recent_focus` lists at most 5 workstream titles inferred from edges/events.\n\
 - `working_hours_observed` only when event ts_ms cluster cleanly into a window; otherwise null.\n\
 - `communication_style_notes` ONE concise sentence describing observed comms patterns. Skip when no clear signal.\n\
-- `last_seen_active_ms` = the most recent `events.ts_ms` for this person.";
+- `last_seen_active_ms` = the most recent `events.ts_ms` for this person.\n\
+\n\
+Accepted observations:\n\
+- The user message includes `accepted_observations[]`: previously-reviewed observations the user has explicitly vetted. Each is `{obs_id, body, created_ms}`.\n\
+- These are **ground truth**, not hypotheses — weight them more heavily than any single edge or event when they conflict.\n\
+- When an observation directly shapes a field (e.g. `role_observed`, `communication_style_notes`), include its `obs_id` in `evidence_observation_ids`.\n\
+- Cite only the obs_ids you actually used. Do not pad. Cite each obs_id at most once. Use obs_ids exactly as given — do not invent.";
 
 pub async fn call_anthropic(
     api_key: &str,
@@ -479,5 +529,145 @@ mod tests {
         let v1 = serde_json::json!({"a": 1});
         let v2 = serde_json::json!({"a": 2});
         assert_ne!(source_hash(&v1), source_hash(&v2));
+    }
+
+    // ---------- filter_evidence_ids (#114) -----------------------------
+
+    fn allow(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn filter_evidence_ids_drops_hallucinated() {
+        let allowed = allow(&["obs_a", "obs_b"]);
+        let got = filter_evidence_ids(
+            vec!["obs_a".into(), "obs_invented".into(), "obs_b".into()],
+            &allowed,
+        );
+        assert_eq!(got, vec!["obs_a", "obs_b"]);
+    }
+
+    #[test]
+    fn filter_evidence_ids_dedups_preserving_order() {
+        let allowed = allow(&["obs_a", "obs_b", "obs_c"]);
+        let got = filter_evidence_ids(
+            vec![
+                "obs_b".into(),
+                "obs_a".into(),
+                "obs_b".into(),
+                "obs_c".into(),
+                "obs_a".into(),
+            ],
+            &allowed,
+        );
+        assert_eq!(got, vec!["obs_b", "obs_a", "obs_c"]);
+    }
+
+    #[test]
+    fn filter_evidence_ids_empty_input_empty_output() {
+        let allowed = allow(&["obs_a"]);
+        assert!(filter_evidence_ids(Vec::new(), &allowed).is_empty());
+    }
+
+    #[test]
+    fn filter_evidence_ids_empty_allow_drops_everything() {
+        let allowed = std::collections::HashSet::new();
+        let got = filter_evidence_ids(vec!["obs_a".into(), "obs_b".into()], &allowed);
+        assert!(got.is_empty());
+    }
+
+    // ---------- accepted-observation projection (#114) -----------------
+
+    use rusqlite::{params, Connection};
+
+    fn open_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::index::apply_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn seed_member(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO team_members \
+                (id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
+             VALUES (?1, ?1, '', ?2, 0, 0, 0)",
+            params![id, format!("/x/{id}.md")],
+        )
+        .unwrap();
+    }
+
+    fn seed_note(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO notes (id, bundle_id, title, modified_ms, preview, body_size) \
+             VALUES (?1, ?2, 'T', 0, '', 0)",
+            params![id, format!("b_{id}")],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn accepted_observations_projection_round_trips() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_a");
+        seed_note(&conn, "n1");
+        let tx = conn.transaction().unwrap();
+        let id1 = crate::observations::persist::insert_pending(
+            &tx, "tm_a", "n1", "Async-first communicator.", 1_000,
+        )
+        .unwrap();
+        let id2 = crate::observations::persist::insert_pending(
+            &tx, "tm_a", "n1", "Detail-oriented.", 2_000,
+        )
+        .unwrap();
+        let _pending = crate::observations::persist::insert_pending(
+            &tx, "tm_a", "n1", "Still being reviewed.", 3_000,
+        )
+        .unwrap();
+        crate::observations::persist::set_status(
+            &tx, &id1,
+            crate::observations::persist::ObservationStatus::Accepted, 1_500,
+        )
+        .unwrap();
+        crate::observations::persist::set_status(
+            &tx, &id2,
+            crate::observations::persist::ObservationStatus::Accepted, 2_500,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let rows = crate::observations::persist::list_by_member(
+            &conn,
+            "tm_a",
+            Some(crate::observations::persist::ObservationStatus::Accepted),
+        )
+        .unwrap();
+        let projected = project_accepted_observations(rows);
+        assert_eq!(projected.len(), 2);
+        // Order: most-recent-first (created_ms DESC).
+        assert_eq!(projected[0]["obs_id"], serde_json::Value::String(id2.clone()));
+        assert_eq!(projected[0]["body"], serde_json::json!("Detail-oriented."));
+        assert_eq!(projected[0]["created_ms"], serde_json::json!(2_000));
+        assert_eq!(projected[1]["obs_id"], serde_json::Value::String(id1));
+        // The pending row never appears.
+        assert!(!projected.iter().any(|o| o["body"] == "Still being reviewed."));
+    }
+
+    #[test]
+    fn accepted_observations_projection_respects_cap() {
+        let mut rows: Vec<crate::observations::persist::ProfileObservation> = Vec::new();
+        for i in 0..(ACCEPTED_OBSERVATIONS_CAP + 5) {
+            rows.push(crate::observations::persist::ProfileObservation {
+                id: format!("obs_{i}"),
+                member_id: "tm_a".into(),
+                source_note_id: "n1".into(),
+                source_note_title: None,
+                body: format!("body {i}"),
+                status: crate::observations::persist::ObservationStatus::Accepted,
+                created_ms: i as i64,
+                reviewed_ms: Some(i as i64),
+            });
+        }
+        let projected = project_accepted_observations(rows);
+        assert_eq!(projected.len(), ACCEPTED_OBSERVATIONS_CAP);
     }
 }
