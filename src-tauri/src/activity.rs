@@ -25,6 +25,8 @@ pub struct DailyActivitySummary {
     pub meetings_upcoming: u32,
     pub meetings_missing_note: u32,
     pub people_interacted: u32,
+    /// Currently-unresolved questions across all notes (#113).
+    pub open_questions_count: u32,
 }
 
 #[tauri::command]
@@ -50,7 +52,17 @@ pub(crate) fn compute_daily_activity(
         meetings_upcoming: count_meetings_upcoming(conn, now_ms, day_end_ms)?,
         meetings_missing_note: count_meetings_missing_note(conn, day_start_ms, now_ms)?,
         people_interacted: count_people_interacted(conn, day_start_ms, day_end_ms)?,
+        open_questions_count: count_open_questions(conn)?,
     })
+}
+
+fn count_open_questions(conn: &Connection) -> rusqlite::Result<u32> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM note_open_questions WHERE resolved = 0",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n as u32)
 }
 
 /// `(day_start_ms, day_end_ms, now_ms)` in UTC. `day_start_ms` is the

@@ -238,6 +238,62 @@ export async function setActionWorkstream(
   await invoke<void>("set_action_workstream", { actionId, workstreamId });
 }
 
+// --- Open questions (#113) ----------------------------------------
+
+export type QuestionScope = "open" | "resolved" | "all";
+
+export type OpenQuestionItem = {
+  id: string;
+  /** Parent note id. Field name preserved from the action surface for
+   *  legacy compatibility — values are bundle-id-shaped strings. */
+  origin_note_path: string;
+  origin_line: number;
+  note_title: string | null;
+  workstream_id: string | null;
+  workstream_title: string | null;
+  text: string;
+  resolved: boolean;
+  resolved_ms: number | null;
+  resolved_note: string | null;
+  asked_of_id: string | null;
+  asked_of_display_name: string | null;
+  created_ms: number;
+};
+
+export async function listOpenQuestions(
+  scope: QuestionScope = "open",
+  askedOfId?: string,
+  workstreamId?: string,
+): Promise<OpenQuestionItem[]> {
+  return invoke<OpenQuestionItem[]>("list_open_questions", {
+    scope,
+    askedOfId,
+    workstreamId,
+  });
+}
+
+export async function resolveOpenQuestion(
+  id: string,
+  answer: string | null,
+): Promise<void> {
+  await invoke<void>("resolve_open_question", { id, answer });
+}
+
+export async function reopenOpenQuestion(id: string): Promise<void> {
+  await invoke<void>("reopen_open_question", { id });
+}
+
+export async function setOpenQuestionAskedOf(
+  id: string,
+  memberId: string | null,
+): Promise<void> {
+  await invoke<void>("set_open_question_asked_of", { id, memberId });
+}
+
+export async function deleteOpenQuestion(id: string): Promise<void> {
+  await invoke<void>("delete_open_question", { id });
+}
+
 /** Path to the on-disk audio/transcript root (#112). After the
  *  notes-to-DB move this still serves the audio recording flow,
  *  which writes `<notes_dir>/<note_id>/audio.wav`. The "is owned"
@@ -710,6 +766,9 @@ export type WorkstreamDetail = Workstream & {
   /** Unified action items pinned to or originating from this
    *  workstream (#111). Replaces the previous `WorkstreamAction[]`. */
   actions: ActionListItem[];
+  /** Open questions inheriting from this workstream's attached notes
+   *  via the `workstream_signals(kind='note')` pivot (#113). */
+  open_questions: OpenQuestionItem[];
   links: WorkstreamLink[];
   /** Teams chat messages attached to this workstream via the
    *  `workstream_signals` pivot (kind='teams_message'). Recency-desc.
@@ -1054,6 +1113,8 @@ export type DailyActivitySummary = {
   meetings_upcoming: number;
   meetings_missing_note: number;
   people_interacted: number;
+  /** Currently-unresolved open questions across all notes (#113). */
+  open_questions_count: number;
 };
 
 export async function getDailyActivity(): Promise<DailyActivitySummary> {

@@ -6544,3 +6544,101 @@ button.workstream-external-chip:hover {
   font-size: 13px;
   color: var(--fg-muted);
 }
+
+/* ----- Open questions (#113) ----- */
+
+.resolve-popover-anchor {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+.home-question-checkbox {
+  /* Same footprint as the home-checkbox but with a circular outline
+     so the question vs. action distinction is visible at a glance. */
+  border-radius: 50%;
+}
+.home-question-checkbox:not(.resolved) svg {
+  color: var(--fg-muted);
+}
+.home-question-checkbox.resolved {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.resolve-popover {
+  position: absolute;
+  top: 30px;
+  left: 0;
+  z-index: 20;
+  min-width: 280px;
+  padding: 8px;
+  border-radius: 10px;
+  border: 0.5px solid var(--home-line);
+  background: var(--bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18),
+    0 4px 12px rgba(0, 0, 0, 0.08);
+  animation: nh-pop-in 140ms ease-out;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.resolve-popover-input {
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 0.5px solid var(--home-line);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+.resolve-popover-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.resolve-popover-btn {
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 0.5px solid var(--home-line);
+  background: transparent;
+  color: var(--fg);
+  cursor: pointer;
+}
+.resolve-popover-btn:hover {
+  background: var(--home-card-hover);
+}
+.resolve-popover-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.resolve-popover-primary:hover {
+  filter: brightness(1.05);
+  background: var(--accent);
+}
+.resolve-popover-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.home-action-answer {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+.home-action-answer-bullet {
+  flex-shrink: 0;
+}
+.home-action-answer-text {
+  min-width: 0;
+  word-break: break-word;
+}
+.actions-filter-spacer {
+  flex: 1;
+}

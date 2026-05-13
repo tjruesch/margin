@@ -46,7 +46,9 @@ the raw inputs:
 - _None._ if no actions.
 
 ## Open questions
-- Bullet list. _None._ if nothing.
+- [?] Question, when no specific person owes the answer.
+- [?] Sarah — Confirm the migration runs before the freeze.
+- _None._ if nothing.
 
 ---
 
@@ -90,7 +92,9 @@ approved, rejected, deferred). One short sentence each.
 `- [ ] {Owner} — {action}` or `- [ ] {action}` if owner unclear. Imperative form. \
 Include deadlines only when stated.
 - **Open questions**: questions left unanswered, blockers, deferred topics. \
-Phrased as questions.
+Phrased as questions. Format as `- [?] {Asked-of} — {question}` or \
+`- [?] {question}` when no specific person owes the answer — the `[?]` \
+marker is what the app parses into the Open Questions surface.
 - **Names**: preserve as written in the user's notes; check the transcript \
 when the user wrote initials or partial names. If unclear, omit owner rather \
 than guess.
@@ -190,9 +194,10 @@ _None._
 
 ## Open questions
 
-- Does auto-creating a sample project violate the empty-canvas philosophy \
+- [?] Does auto-creating a sample project violate the empty-canvas philosophy \
 enough to outweigh the activation lift?
-- Do we have the data to prove the empty state is the cause of the 40% drop?
+- [?] Lin — Do we have the data to prove the empty state is the cause of \
+the 40% drop?
 
 ---
 

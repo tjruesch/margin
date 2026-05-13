@@ -1,5 +1,5 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AssigneeChip, stripLeadingOwnerPrefix } from "./AssigneeChip";
 import { dueBucket, friendlyDueLabel } from "./dueLabel";
@@ -7,12 +7,20 @@ import {
   type ActionListItem,
   type CalendarEvent,
   type ConnectorStatusEvent,
+  deleteOpenQuestion,
   listCalendarEvents,
+  listOpenQuestions,
   type NoteListItem,
+  type OpenQuestionItem,
   openOrCreateEventNote,
+  type QuestionScope,
+  reopenOpenQuestion,
+  resolveOpenQuestion,
+  setOpenQuestionAskedOf,
   type TeamMember,
   type Workstream,
 } from "./file";
+import { ResolveQuestionPopover } from "./ResolveQuestionPopover";
 import { WorkstreamChip } from "./WorkstreamChip";
 import { ActivityPanel } from "./ActivityPanel";
 import { avatarColor } from "./initials";
@@ -30,6 +38,7 @@ import {
   IconChecklist,
   IconChevRight,
   IconFileText,
+  IconHelp,
   IconHome,
   IconMic,
   IconMore,
@@ -69,6 +78,9 @@ type Props = {
   /** Open action items across all non-archived owned notes. Drives the
    *  Action items sidebar nav, the count badge, and the home teaser. */
   actions: ActionListItem[];
+  /** Currently-unresolved open questions count for the sidebar badge
+   *  (#113). Updated alongside `actions` on every save. */
+  openQuestionCount: number;
   /** Flip an action item's done state. Optimistic upstream. */
   onToggleAction: (id: string, nextDone: boolean) => void;
   /** Permanently remove an action item's checkbox line from its source
@@ -114,6 +126,7 @@ type Props = {
 type NavId =
   | "home"
   | "actions"
+  | "openquestions"
   | "workstreams"
   | "favorites"
   | "archive"
@@ -307,6 +320,7 @@ export function Home({
   onFavoriteRow,
   onDuplicateRow,
   actions,
+  openQuestionCount,
   onToggleAction,
   onDeleteAction,
   onAddInboxTodo,
@@ -532,6 +546,7 @@ export function Home({
           active={nav}
           onSelect={setNav}
           actionCount={openActionCount}
+          openQuestionCount={openQuestionCount}
           workstreamCount={workstreams.filter((w) => w.open_action_count > 0).length}
           tags={allTags}
           activeTag={tagFilter}
@@ -655,6 +670,12 @@ export function Home({
             onReassign={onReassignAction}
             onReattachWorkstream={onReattachActionWorkstream}
           />
+        ) : nav === "openquestions" ? (
+          <OpenQuestionsFeed
+            onOpenNote={onOpen}
+            members={members}
+            workstreams={workstreams}
+          />
         ) : (
           <>
             {nav !== "favorites" && openActionCount > 0 && (
@@ -698,6 +719,7 @@ function Sidebar({
   active,
   onSelect,
   actionCount,
+  openQuestionCount,
   workstreamCount,
   tags,
   activeTag,
@@ -710,6 +732,7 @@ function Sidebar({
   active: NavId;
   onSelect: (id: NavId) => void;
   actionCount: number;
+  openQuestionCount: number;
   workstreamCount: number;
   tags: string[];
   activeTag: string | null;
@@ -754,6 +777,13 @@ function Sidebar({
           badge={actionCount > 0 ? String(actionCount) : null}
           active={active === "actions"}
           onClick={() => onSelect("actions")}
+        />
+        <NavItem
+          icon={<IconHelp size={14} sw={1.7} />}
+          label="Open questions"
+          badge={openQuestionCount > 0 ? String(openQuestionCount) : null}
+          active={active === "openquestions"}
+          onClick={() => onSelect("openquestions")}
         />
         <NavItem
           icon={<IconBriefcase size={14} sw={1.7} />}
@@ -999,6 +1029,8 @@ function pageHeaderTitle(nav: NavId): string {
   switch (nav) {
     case "actions":
       return "Action items";
+    case "openquestions":
+      return "Open questions";
     case "workstreams":
       return "Workstreams";
     case "team":
@@ -1770,6 +1802,297 @@ function ActionsFeed({
         </div>
       )}
     </section>
+  );
+}
+
+// ---------- Open questions feed (#113) ------------------------------------
+
+/// Dedicated Open Questions page — clones the data flow of
+/// `ActionsFeed` but reads from `note_open_questions` via the
+/// `listOpenQuestions` IPC. Top-of-page tab toggle picks open vs.
+/// resolved. Asked-of and workstream filters mirror the actions
+/// surface. No due-date bucketing — questions don't carry due dates
+/// in v1; rows are ordered by parent note's `modified_ms desc`.
+function OpenQuestionsFeed({
+  onOpenNote,
+  members,
+  workstreams,
+}: {
+  onOpenNote: (path: string) => void;
+  members: TeamMember[];
+  workstreams: Workstream[];
+}) {
+  const [scope, setScope] = useState<QuestionScope>("open");
+  const [items, setItems] = useState<OpenQuestionItem[]>([]);
+  const [askedOfFilter, setAskedOfFilter] = useState<string | null>(null);
+  const [workstreamFilter, setWorkstreamFilter] = useState<string | null>(
+    null,
+  );
+
+  const refresh = useCallback(async () => {
+    try {
+      const list = await listOpenQuestions(
+        scope,
+        askedOfFilter ?? undefined,
+        workstreamFilter ?? undefined,
+      );
+      setItems(list);
+    } catch (err) {
+      console.error("listOpenQuestions failed:", err);
+    }
+  }, [scope, askedOfFilter, workstreamFilter]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const onResolve = useCallback(
+    async (id: string, answer: string | null) => {
+      setItems((curr) => curr.filter((q) => q.id !== id));
+      try {
+        await resolveOpenQuestion(id, answer);
+      } catch (err) {
+        console.error("resolveOpenQuestion failed:", err);
+      }
+      await refresh();
+    },
+    [refresh],
+  );
+
+  const onReopen = useCallback(
+    async (id: string) => {
+      setItems((curr) => curr.filter((q) => q.id !== id));
+      try {
+        await reopenOpenQuestion(id);
+      } catch (err) {
+        console.error("reopenOpenQuestion failed:", err);
+      }
+      await refresh();
+    },
+    [refresh],
+  );
+
+  const onReassign = useCallback(
+    async (id: string, memberId: string | null) => {
+      setItems((curr) =>
+        curr.map((q) =>
+          q.id === id
+            ? {
+                ...q,
+                asked_of_id: memberId,
+                asked_of_display_name:
+                  memberId === null
+                    ? null
+                    : members.find((m) => m.id === memberId)?.display_name ?? null,
+              }
+            : q,
+        ),
+      );
+      try {
+        await setOpenQuestionAskedOf(id, memberId);
+      } catch (err) {
+        console.error("setOpenQuestionAskedOf failed:", err);
+      }
+      await refresh();
+    },
+    [members, refresh],
+  );
+
+  const onDelete = useCallback(
+    async (id: string) => {
+      setItems((curr) => curr.filter((q) => q.id !== id));
+      try {
+        await deleteOpenQuestion(id);
+      } catch (err) {
+        console.error("deleteOpenQuestion failed:", err);
+      }
+      await refresh();
+    },
+    [refresh],
+  );
+
+  const filterBar = (
+    <div className="actions-filter-bar">
+      <button
+        type="button"
+        className={"home-filter-chip" + (scope === "open" ? " active" : "")}
+        onClick={() => setScope("open")}
+      >
+        Open
+      </button>
+      <button
+        type="button"
+        className={"home-filter-chip" + (scope === "resolved" ? " active" : "")}
+        onClick={() => setScope("resolved")}
+      >
+        Resolved
+      </button>
+      <span className="actions-filter-spacer" />
+      {members.length > 0 && (
+        <select
+          className={
+            "home-filter-chip actions-filter-select" +
+            (askedOfFilter ? " active" : "")
+          }
+          value={askedOfFilter ?? ""}
+          onChange={(e) => setAskedOfFilter(e.target.value || null)}
+          title="Filter by asked-of"
+        >
+          <option value="">Asked of…</option>
+          {members.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.display_name}
+            </option>
+          ))}
+        </select>
+      )}
+      {workstreams.length > 0 && (
+        <select
+          className={
+            "home-filter-chip actions-filter-select" +
+            (workstreamFilter ? " active" : "")
+          }
+          value={workstreamFilter ?? ""}
+          onChange={(e) => setWorkstreamFilter(e.target.value || null)}
+          title="Filter by workstream"
+        >
+          <option value="">Workstream…</option>
+          {workstreams.map((w) => (
+            <option key={w.id} value={w.id}>
+              {w.title}
+            </option>
+          ))}
+        </select>
+      )}
+    </div>
+  );
+
+  if (items.length === 0) {
+    return (
+      <section className="home-section">
+        {filterBar}
+        <p className="home-empty">
+          {scope === "open"
+            ? "No open questions. Add `- [?] question` lines to any note to track unresolved questions."
+            : "No resolved questions yet."}
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="home-section">
+      {filterBar}
+      <div className="home-actions">
+        {items.map((q) => (
+          <OpenQuestionRow
+            key={q.id}
+            q={q}
+            members={members}
+            onOpenNote={onOpenNote}
+            onResolve={(answer) => void onResolve(q.id, answer)}
+            onReopen={() => void onReopen(q.id)}
+            onReassign={(memberId) => void onReassign(q.id, memberId)}
+            onDelete={() => void onDelete(q.id)}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function OpenQuestionRow({
+  q,
+  members,
+  onOpenNote,
+  onResolve,
+  onReopen,
+  onReassign,
+  onDelete,
+}: {
+  q: OpenQuestionItem;
+  members: TeamMember[];
+  onOpenNote: (path: string) => void;
+  onResolve: (answer: string | null) => void;
+  onReopen: () => void;
+  onReassign: (memberId: string | null) => void;
+  onDelete: () => void;
+}) {
+  const displayText = q.asked_of_id
+    ? stripLeadingOwnerPrefix(q.text)
+    : q.text;
+  const open = () => q.origin_note_path && onOpenNote(q.origin_note_path);
+  return (
+    <div
+      className="home-action-row"
+      role="button"
+      tabIndex={0}
+      onClick={open}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+        }
+      }}
+      title={q.note_title ? `Open ${q.note_title}` : undefined}
+    >
+      <ResolveQuestionPopover
+        resolved={q.resolved}
+        initialAnswer={q.resolved_note}
+        onResolve={onResolve}
+        onReopen={onReopen}
+      />
+      <div className="home-action-body">
+        <div className={"home-action-text" + (q.resolved ? " done" : "")}>
+          {displayText}
+        </div>
+        {q.resolved && q.resolved_note && (
+          <div className="home-action-answer">
+            <span className="home-action-answer-bullet">↳</span>
+            <span className="home-action-answer-text">{q.resolved_note}</span>
+          </div>
+        )}
+        {(q.note_title || q.workstream_title) && (
+          <div className="home-action-origin">
+            <IconFileText size={10} sw={1.7} />
+            {q.note_title && (
+              <>
+                <span className="home-action-origin-label">Note</span>
+                <span className="home-action-origin-sep">·</span>
+                <span className="home-action-origin-title">{q.note_title}</span>
+              </>
+            )}
+            {q.workstream_title && (
+              <>
+                <span className="home-action-origin-sep">·</span>
+                <IconBriefcase size={10} sw={1.7} />
+                <span className="home-action-origin-title">
+                  {q.workstream_title}
+                </span>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+      <AssigneeChip
+        assigneeId={q.asked_of_id}
+        assigneeDisplayName={q.asked_of_display_name}
+        members={members}
+        onPick={(memberId) => onReassign(memberId)}
+      />
+      <button
+        type="button"
+        className="home-action-delete"
+        aria-label="Delete question"
+        title="Delete"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDelete();
+        }}
+      >
+        <IconTrash size={14} sw={1.7} />
+      </button>
+    </div>
   );
 }
 

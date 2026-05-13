@@ -879,6 +879,437 @@ pub fn set_action_workstream(
     Ok(())
 }
 
+// ===== Open questions (#113) =====================================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenQuestionItem {
+    pub id: String,
+    /// Source note id. Field name preserved from the action surface
+    /// for legacy compatibility.
+    pub origin_note_path: String,
+    pub origin_line: i64,
+    pub note_title: Option<String>,
+    pub workstream_id: Option<String>,
+    pub workstream_title: Option<String>,
+    pub text: String,
+    pub resolved: bool,
+    pub resolved_ms: Option<i64>,
+    pub resolved_note: Option<String>,
+    pub asked_of_id: Option<String>,
+    pub asked_of_display_name: Option<String>,
+    pub created_ms: i64,
+}
+
+#[derive(Deserialize, Default, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum QuestionScope {
+    #[default]
+    Open,
+    Resolved,
+    All,
+}
+
+/// Plain connection-taking variant for callers outside the Tauri
+/// command layer (e.g. `workstreams::persist::get_workstream_detail`).
+pub fn list_open_questions_for(
+    conn: &rusqlite::Connection,
+    scope: QuestionScope,
+    asked_of_id: Option<&str>,
+    workstream_id: Option<&str>,
+) -> rusqlite::Result<Vec<OpenQuestionItem>> {
+    let resolved_filter: Option<i64> = match scope {
+        QuestionScope::Open => Some(0),
+        QuestionScope::Resolved => Some(1),
+        QuestionScope::All => None,
+    };
+    let mut stmt = conn.prepare(
+        "SELECT q.id, q.origin_note_id, q.origin_line, q.text, q.resolved, \
+                q.resolved_ms, q.resolved_note, q.asked_of_id, q.created_ms, \
+                n.title AS note_title, \
+                w.id    AS workstream_id, \
+                w.title AS workstream_title, \
+                t.display_name AS asked_of_display_name, \
+                n.modified_ms AS order_ms \
+           FROM note_open_questions q \
+           LEFT JOIN notes              n  ON n.id = q.origin_note_id \
+           LEFT JOIN workstream_signals ws ON ws.kind = 'note' \
+                                          AND ws.item_id = q.origin_note_id \
+           LEFT JOIN workstreams        w  ON w.id   = ws.workstream_id \
+                                          AND w.status = 'active' \
+           LEFT JOIN team_members       t  ON t.id   = q.asked_of_id \
+          WHERE (n.id IS NULL OR n.archived = 0) \
+            AND (?1 IS NULL OR q.resolved = ?1) \
+            AND (?2 IS NULL OR q.asked_of_id = ?2) \
+            AND (?3 IS NULL OR w.id = ?3) \
+          ORDER BY q.resolved ASC, order_ms DESC, q.origin_line ASC",
+    )?;
+    let mut rows = stmt.query_map(
+        rusqlite::params![resolved_filter, asked_of_id, workstream_id],
+        |r| {
+            Ok(OpenQuestionItem {
+                id: r.get(0)?,
+                origin_note_path: r.get(1)?,
+                origin_line: r.get(2)?,
+                text: r.get(3)?,
+                resolved: r.get::<_, i64>(4)? != 0,
+                resolved_ms: r.get(5)?,
+                resolved_note: r.get(6)?,
+                asked_of_id: r.get(7)?,
+                created_ms: r.get(8)?,
+                note_title: r.get(9)?,
+                workstream_id: r.get(10)?,
+                workstream_title: r.get(11)?,
+                asked_of_display_name: r.get(12)?,
+            })
+        },
+    )?;
+    // De-dupe by question id: a note pinned to N workstreams produces
+    // N JOIN rows. Keep the first per id (the JOIN's ORDER BY puts
+    // the most-recently-active workstream first).
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut out: Vec<OpenQuestionItem> = Vec::new();
+    while let Some(row) = rows.next() {
+        let item = row?;
+        if seen.insert(item.id.clone()) {
+            out.push(item);
+        }
+    }
+    Ok(out)
+}
+
+/// Return open-question rows joined to their parent note and (when
+/// the note is attached to a workstream via `workstream_signals`)
+/// the workstream's title.
+#[tauri::command]
+pub fn list_open_questions(
+    scope: Option<QuestionScope>,
+    asked_of_id: Option<String>,
+    workstream_id: Option<String>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<OpenQuestionItem>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    list_open_questions_for(
+        &c,
+        scope.unwrap_or_default(),
+        asked_of_id.as_deref(),
+        workstream_id.as_deref(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Locate a `- [?]` or `- [x]` line matching `want_text` (#113). The
+/// hash compares against the line's parsed question text with any
+/// trailing ` → answer: …` segment stripped, so we can find the line
+/// before AND after resolution.
+fn locate_question_line(
+    body_md: &str,
+    cached_line: usize,
+    want_text: &str,
+) -> Option<usize> {
+    let lines: Vec<&str> = body_md.split('\n').collect();
+    let want_hash = action_text_hash(want_text);
+    let try_line = |line: &str| -> Option<String> {
+        let trimmed = line.trim_start();
+        let after_bullet = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))?;
+        let bytes = after_bullet.as_bytes();
+        if bytes.len() < 4 || bytes[0] != b'[' || bytes[2] != b']' || bytes[3] != b' ' {
+            return None;
+        }
+        if !matches!(bytes[1], b'?' | b'x' | b'X') {
+            return None;
+        }
+        let raw_text = after_bullet[4..].trim();
+        if raw_text.is_empty() {
+            return None;
+        }
+        Some(strip_trailing_answer_segment(raw_text).to_string())
+    };
+    if cached_line >= 1 && cached_line <= lines.len() {
+        if let Some(line_text) = try_line(lines[cached_line - 1]) {
+            if action_text_hash(&line_text) == want_hash {
+                return Some(cached_line - 1);
+            }
+        }
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(line_text) = try_line(line) {
+            if action_text_hash(&line_text) == want_hash {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Generic body-mutate scaffold for question IPCs (#113). Mirrors
+/// `mutate_note_action_body`. `mutate` returns `Some(new_line)` to
+/// replace the line, `None` to delete it, `Err` to abort.
+fn mutate_note_question_body<F>(
+    note_id: &str,
+    cached_line: usize,
+    want_text: &str,
+    conn: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+    mutate: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Result<Option<String>, String>,
+{
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    let body: String = c
+        .query_row(
+            "SELECT body_md FROM notes WHERE id = ?1",
+            rusqlite::params![note_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|e| format!("note not found: {e}"))?;
+    let idx = locate_question_line(&body, cached_line, want_text).ok_or_else(|| {
+        "Question not found in note (index may be stale; reload to refresh)".to_string()
+    })?;
+    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
+    match mutate(&lines[idx])? {
+        Some(new_line) => {
+            if new_line == lines[idx] {
+                return Ok(());
+            }
+            lines[idx] = new_line;
+        }
+        None => {
+            lines.remove(idx);
+        }
+    }
+    let new_body = lines.join("\n");
+    let now = current_unix_ms();
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    let parsed = crate::index::parse_indexable_from_body(note_id, &new_body, now);
+    crate::index::upsert_in_tx(&tx, note_id, &parsed).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Resolve a question (#113). Marks the row `resolved=1` first so the
+/// subsequent body-mutate + `upsert_in_tx` pass doesn't blow it away
+/// (the wholesale-replace inside `upsert_in_tx` is scoped to
+/// `resolved = 0`). Body line flips `[?]` → `[x]`; if `answer` is
+/// supplied, it's appended as ` → answer: <text>`.
+#[tauri::command]
+pub fn resolve_open_question(
+    id: String,
+    answer: Option<String>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let (note_id, origin_line, text, was_resolved): (String, usize, String, bool) = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT origin_note_id, origin_line, text, resolved \
+               FROM note_open_questions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .map_err(|e| format!("question not found: {e}"))?
+    };
+    if was_resolved {
+        return Ok(());
+    }
+    let answer_clean = answer.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let now = current_unix_ms();
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.execute(
+            "UPDATE note_open_questions \
+                SET resolved = 1, resolved_ms = ?2, resolved_note = ?3 \
+              WHERE id = ?1",
+            rusqlite::params![id, now, answer_clean],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let answer_for_body = answer_clean.clone();
+    mutate_note_question_body(&note_id, origin_line, &text, &conn, |line| {
+        let flipped = flip_question_marker_to_resolved(line);
+        let with_answer = match &answer_for_body {
+            Some(a) => format!("{flipped} \u{2192} answer: {a}"),
+            None => flipped,
+        };
+        Ok(Some(with_answer))
+    })
+}
+
+/// Reopen a resolved question (#113). Body line flips `[x]` → `[?]`
+/// and any trailing ` → answer: …` segment is dropped; the
+/// `upsert_in_tx` ON CONFLICT branch picks up the now-`[?]` line and
+/// resets `resolved` / `resolved_ms` / `resolved_note` on the row.
+#[tauri::command]
+pub fn reopen_open_question(
+    id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let (note_id, origin_line, text, was_resolved): (String, usize, String, bool) = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT origin_note_id, origin_line, text, resolved \
+               FROM note_open_questions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .map_err(|e| format!("question not found: {e}"))?
+    };
+    if !was_resolved {
+        return Ok(());
+    }
+    mutate_note_question_body(&note_id, origin_line, &text, &conn, |line| {
+        let dropped = drop_trailing_answer(line);
+        let flipped = flip_resolved_marker_to_question(&dropped);
+        Ok(Some(flipped))
+    })
+}
+
+/// Reassign a question to a different team member, or unassign with
+/// `None` (#113). Rewrites the leading `Asked-of — ` prefix on the
+/// markdown line — same machinery as `set_action_assignee`.
+#[tauri::command]
+pub fn set_open_question_asked_of(
+    id: String,
+    member_id: Option<String>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let (note_id, origin_line, text, current_asked_of): (
+        String,
+        usize,
+        String,
+        Option<String>,
+    ) = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT origin_note_id, origin_line, text, asked_of_id \
+               FROM note_open_questions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("question not found: {e}"))?
+    };
+    if member_id == current_asked_of {
+        return Ok(());
+    }
+    let new_owner_name: Option<String> = if let Some(m) = member_id.as_deref() {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        let members =
+            crate::team::list_team_members_raw(&c).map_err(|e| e)?;
+        match members.into_iter().find(|tm| tm.id == m) {
+            Some(tm) => Some(tm.display_name),
+            None => return Err(format!("team member not found: {m}")),
+        }
+    } else {
+        None
+    };
+    mutate_note_question_body(&note_id, origin_line, &text, &conn, |line| {
+        rewrite_action_owner(line, new_owner_name.as_deref())
+            .map(Some)
+            .ok_or_else(|| "question line is not a recognizable checkbox".to_string())
+    })
+}
+
+/// Delete a question (#113). Drops the `- [?]`/`- [x]` line from the
+/// body; the reindex either skips it (the line is gone) or naturally
+/// re-emits any other unresolved questions. The row is removed
+/// directly first so a stale `cached_line` failure doesn't leave the
+/// row around.
+#[tauri::command]
+pub fn delete_open_question(
+    id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let (note_id, origin_line, text): (String, usize, String) = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT origin_note_id, origin_line, text \
+               FROM note_open_questions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("question not found: {e}"))?
+    };
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.execute(
+            "DELETE FROM note_open_questions WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Best-effort: remove the line from the body. If the line is
+    // already gone (user edited it away), the locate-step error is
+    // swallowed so the row deletion still stands.
+    let _ = mutate_note_question_body(&note_id, origin_line, &text, &conn, |_| Ok(None));
+    Ok(())
+}
+
+/// Flip `[?]` → `[x]` on a question line, preserving indent,
+/// bullet, and trailing text.
+fn flip_question_marker_to_resolved(line: &str) -> String {
+    flip_marker_at(line, b'?', b'x')
+}
+
+/// Flip `[x]`/`[X]` → `[?]` on a question line.
+fn flip_resolved_marker_to_question(line: &str) -> String {
+    flip_marker_at(line, b'x', b'?')
+}
+
+fn flip_marker_at(line: &str, _from: u8, to: u8) -> String {
+    if let Some(open) = line.find('[') {
+        let close = open + 2;
+        if line.as_bytes().get(close) == Some(&b']') {
+            let mut out = String::with_capacity(line.len());
+            out.push_str(&line[..open + 1]);
+            out.push(to as char);
+            out.push_str(&line[open + 2..]);
+            return out;
+        }
+    }
+    line.to_string()
+}
+
+/// Drop a trailing ` → answer: …` segment from a line, preserving
+/// everything before it.
+fn drop_trailing_answer(line: &str) -> String {
+    for marker in [" \u{2192} answer:", " -> answer:"] {
+        if let Some(idx) = line.find(marker) {
+            return line[..idx].trim_end().to_string();
+        }
+    }
+    line.to_string()
+}
+
+// ===== end open questions =========================================
+
 /// Replace the character between `[` and `]` on the first checkbox the
 /// line contains. Preserves indentation, bullet character, and
 /// trailing text/whitespace. Always normalizes done to lowercase `x`.
@@ -934,11 +1365,57 @@ pub(crate) struct ParsedAction {
     pub owner_candidate: Option<String>,
 }
 
+/// One open-question line extracted from a note body (#113). Same shape
+/// as `ParsedAction` minus the done/due fields — questions don't carry
+/// per-line state in the source markdown beyond `[?]` / `[x]`.
+#[derive(Clone, Debug)]
+pub(crate) struct ParsedQuestion {
+    pub line: usize,
+    pub text: String,
+    /// Leading `Asked-of — ` segment, same convention as action owners.
+    pub owner_candidate: Option<String>,
+}
+
 /// Walk a note body and return every markdown task line as a
 /// ParsedAction. Lines inside fenced code blocks are skipped (mirrors
 /// the heuristic used by `extract_preview` for prose extraction).
 pub(crate) fn parse_actions(body: &str) -> Vec<ParsedAction> {
     let mut out = Vec::new();
+    walk_body_lines(body, |line_no, trimmed| {
+        if let Some((text, done, due_ms)) = parse_action_line(trimmed) {
+            let owner_candidate = extract_owner_candidate(&text);
+            out.push(ParsedAction {
+                line: line_no,
+                text,
+                done,
+                due_ms,
+                owner_candidate,
+            });
+        }
+    });
+    out
+}
+
+/// Walk a note body and return every `- [?]` line as a
+/// `ParsedQuestion` (#113). Reuses `walk_body_lines` for the
+/// code-fence-aware iteration so the two parsers stay in sync.
+pub(crate) fn parse_open_questions(body: &str) -> Vec<ParsedQuestion> {
+    let mut out = Vec::new();
+    walk_body_lines(body, |line_no, trimmed| {
+        if let Some(text) = parse_question_line(trimmed) {
+            let owner_candidate = extract_owner_candidate(&text);
+            out.push(ParsedQuestion {
+                line: line_no,
+                text,
+                owner_candidate,
+            });
+        }
+    });
+    out
+}
+
+/// Iterate non-fenced body lines, yielding `(1-based line, trimmed)`.
+fn walk_body_lines<F: FnMut(usize, &str)>(body: &str, mut yield_line: F) {
     let mut in_code_fence = false;
     for (i, raw) in body.lines().enumerate() {
         let trimmed = raw.trim_start();
@@ -949,18 +1426,8 @@ pub(crate) fn parse_actions(body: &str) -> Vec<ParsedAction> {
         if in_code_fence {
             continue;
         }
-        if let Some((text, done, due_ms)) = parse_action_line(trimmed) {
-            let owner_candidate = extract_owner_candidate(&text);
-            out.push(ParsedAction {
-                line: i + 1,
-                text,
-                done,
-                due_ms,
-                owner_candidate,
-            });
-        }
+        yield_line(i + 1, trimmed);
     }
-    out
 }
 
 /// Extract a leading `{Owner} {sep} ` segment from action text where
@@ -1094,6 +1561,42 @@ fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
         return None;
     }
     Some((text, done, due_ms))
+}
+
+/// Match `- [?] question text` / `* [?] …` / `+ [?] …` lines (#113).
+/// Returns the trimmed question text with any trailing
+/// ` → answer: …` segment stripped — that segment only appears on
+/// resolved-and-flipped lines, so an open `[?]` line shouldn't have
+/// one, but be tolerant.
+fn parse_question_line(line: &str) -> Option<String> {
+    let after_bullet = line
+        .strip_prefix("- ")
+        .or_else(|| line.strip_prefix("* "))
+        .or_else(|| line.strip_prefix("+ "))?;
+    let bytes = after_bullet.as_bytes();
+    if bytes.len() < 4 || bytes[0] != b'[' || bytes[2] != b']' || bytes[3] != b' ' {
+        return None;
+    }
+    if bytes[1] != b'?' {
+        return None;
+    }
+    let raw_text = after_bullet[4..].trim();
+    if raw_text.is_empty() {
+        return None;
+    }
+    Some(strip_trailing_answer_segment(raw_text).to_string())
+}
+
+/// Drop a trailing ` → answer: …` segment (the marker we append when
+/// resolving a question via the IPC). U+2192 is `→`. Tolerates the
+/// ASCII fallback `-> answer:` too in case a user types it by hand.
+fn strip_trailing_answer_segment(text: &str) -> &str {
+    for marker in [" \u{2192} answer:", " -> answer:"] {
+        if let Some(idx) = text.find(marker) {
+            return text[..idx].trim_end();
+        }
+    }
+    text
 }
 
 /// If `s` ends with a recognized ` @<token>`, return `(text_without_token,
@@ -1246,6 +1749,14 @@ pub(crate) fn action_text_hash(text: &str) -> String {
 
 pub(crate) fn action_id(bundle_id: &str, text: &str) -> String {
     format!("{bundle_id}:{}", action_text_hash(text))
+}
+
+/// Stable id for an open-question row (#113). The `q:` infix
+/// distinguishes question ids from action ids ("<bundle>:<hash>") so
+/// the same bundle can carry both without colliding in
+/// `events.ref_id` / `embeddings.ref_id` payloads.
+pub(crate) fn open_question_id(bundle_id: &str, text: &str) -> String {
+    format!("{bundle_id}:q:{}", action_text_hash(text))
 }
 
 const PREVIEW_MAX_CHARS: usize = 160;
@@ -1604,6 +2115,57 @@ pub fn body_backfill_if_pending(
     Ok(())
 }
 
+/// One-shot reparse for the open-questions migration (#113). On the
+/// first boot after #027, walk every note row and run
+/// `parse_indexable_from_body` + `upsert_in_tx`, which writes any
+/// `- [?]` lines into the new `note_open_questions` table.
+/// Idempotent: gated by the `questions_backfill_done` meta flag.
+pub fn questions_backfill_if_pending(
+    conn: &mut rusqlite::Connection,
+) -> Result<(), String> {
+    let done: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'questions_backfill_done'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "1".to_string());
+    if done == "1" {
+        return Ok(());
+    }
+
+    let rows: Vec<(String, String, String, i64)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, bundle_id, body_md, modified_ms FROM notes")
+            .map_err(|e| e.to_string())?;
+        let mapped = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        mapped.filter_map(|r| r.ok()).collect()
+    };
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for (id, bundle_id, body_md, modified_ms) in &rows {
+        let parsed = crate::index::parse_indexable_from_body(bundle_id, body_md, *modified_ms);
+        crate::index::upsert_in_tx(&tx, id, &parsed).map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+
+    conn.execute(
+        "UPDATE meta SET value = '1' WHERE key = 'questions_backfill_done'",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Export every note in the DB to `dir_path/<bundle_id>/note.md`
 /// using the legacy frontmatter format (#112). Round-trippable: the
 /// resulting tree can be re-read by the migration's
@@ -1899,6 +2461,58 @@ mod tests {
         let body = "- regular bullet\n- [text]\n- [ ]nospace\n- [ ]\n";
         let got = parse_actions(body);
         assert!(got.is_empty(), "got: {:?}", got.iter().map(|a| &a.text).collect::<Vec<_>>());
+    }
+
+    // ----- #113 open questions -----
+
+    #[test]
+    fn parse_open_questions_basic() {
+        let body = "intro\n- [?] foo\n- [?] Sarah — bar\n- [ ] not a question\n";
+        let got = parse_open_questions(body);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].line, 2);
+        assert_eq!(got[0].text, "foo");
+        assert!(got[0].owner_candidate.is_none());
+        assert_eq!(got[1].text, "Sarah — bar");
+        assert_eq!(got[1].owner_candidate.as_deref(), Some("Sarah"));
+    }
+
+    #[test]
+    fn parse_open_questions_alt_bullets() {
+        let body = "* [?] starred\n+ [?] plussed\n";
+        let got = parse_open_questions(body);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text, "starred");
+        assert_eq!(got[1].text, "plussed");
+    }
+
+    #[test]
+    fn parse_open_questions_skips_code_fences() {
+        let body = "```\n- [?] inside fence\n```\n- [?] after fence\n";
+        let got = parse_open_questions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "after fence");
+    }
+
+    #[test]
+    fn parse_open_questions_ignores_action_marker() {
+        // `- [x]` (resolved-as-action shape) shouldn't be picked up by
+        // the question parser. The questions table tracks rows by id;
+        // a flipped marker is identified via existing-row state, not
+        // by re-parsing the new line as a question.
+        let body = "- [x] looks resolved\n- [ ] open action\n";
+        assert!(parse_open_questions(body).is_empty());
+    }
+
+    #[test]
+    fn parse_open_questions_strips_trailing_answer() {
+        // Tolerate ` → answer: …` on the line so a manually-edited
+        // resolved question that the user typed back into `[?]` still
+        // hashes to the original text.
+        let body = "- [?] foo \u{2192} answer: yes\n";
+        let got = parse_open_questions(body);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "foo");
     }
 
     #[test]

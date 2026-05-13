@@ -55,6 +55,7 @@ import {
   setNoteTags,
   shareNote,
   listActions,
+  listOpenQuestions,
   listTeamMembers,
   listWorkstreams,
   synthesizeWorkstreams,
@@ -300,6 +301,11 @@ export default function App() {
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [notesLoading, setNotesLoading] = useState<boolean>(true);
   const [actions, setActions] = useState<ActionListItem[]>([]);
+  /** Currently-unresolved open questions (#113). Surfaces as the
+   *  badge count on the "Open questions" sidebar entry. Refreshed on
+   *  every save (alongside `actions`) since `write_note` re-parses
+   *  body_md and the count can shift. */
+  const [openQuestionCount, setOpenQuestionCount] = useState<number>(0);
   // Synthesized workstreams (#71). Populated by listWorkstreams on
   // mount; refreshed when the synthesizer emits `workstream-status`.
   const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
@@ -449,6 +455,15 @@ export default function App() {
       setActions(items);
     } catch (err) {
       console.error("listActions failed:", err);
+    }
+    // Open-question count refreshes on the same beat — both surfaces
+    // derive from `body_md` (#113), so a `write_note` that bumps one
+    // can shift the other.
+    try {
+      const qs = await listOpenQuestions("open");
+      setOpenQuestionCount(qs.length);
+    } catch (err) {
+      console.error("listOpenQuestions failed:", err);
     }
   }, []);
 
@@ -2042,6 +2057,7 @@ export default function App() {
             onFavoriteRow={(p, next) => void onFavoriteNote(p, next)}
             onDuplicateRow={(p) => void onDuplicateNote(p)}
             actions={actions}
+            openQuestionCount={openQuestionCount}
             onToggleAction={(id, next) => void onToggleAction(id, next)}
             onDeleteAction={(id) => void onDeleteAction(id)}
             onAddInboxTodo={onAddInboxTodo}
