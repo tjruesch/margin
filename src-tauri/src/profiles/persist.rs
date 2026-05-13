@@ -249,7 +249,7 @@ pub fn ttl_eligible_members(
 /// defeat that. Returns the inserted row hydrated as a
 /// `ProfileSnapshot`.
 pub fn insert_snapshot(
-    conn: &Connection,
+    tx: &rusqlite::Transaction<'_>,
     person_id: &str,
     computed_ms: i64,
     body: &ProfileSnapshotBody,
@@ -257,7 +257,7 @@ pub fn insert_snapshot(
 ) -> rusqlite::Result<ProfileSnapshot> {
     let body_json = serde_json::to_string(body)
         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO profile_snapshots \
             (person_id, computed_ms, body_json, source_hash) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -304,18 +304,34 @@ mod tests {
         .unwrap();
     }
 
+    /// Test wrapper: open a tx, insert, commit. The production
+    /// `insert_snapshot` requires a `&Transaction` (#116) so each test
+    /// either uses this helper or opens its own tx.
+    fn ins(
+        conn: &mut Connection,
+        person_id: &str,
+        computed_ms: i64,
+        body: &ProfileSnapshotBody,
+        source_hash: &str,
+    ) -> rusqlite::Result<ProfileSnapshot> {
+        let tx = conn.transaction()?;
+        let snap = insert_snapshot(&tx, person_id, computed_ms, body, source_hash)?;
+        tx.commit()?;
+        Ok(snap)
+    }
+
     #[test]
     fn get_latest_returns_most_recent() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         let body = ProfileSnapshotBody {
             role_observed: Some("Engineer".into()),
             ..Default::default()
         };
-        insert_snapshot(&conn, "tm_a", 100, &body, "hash-v1").unwrap();
+        ins(&mut conn, "tm_a", 100, &body, "hash-v1").unwrap();
         let mut newer = body.clone();
         newer.role_observed = Some("Senior engineer".into());
-        insert_snapshot(&conn, "tm_a", 200, &newer, "hash-v2").unwrap();
+        ins(&mut conn, "tm_a", 200, &newer, "hash-v2").unwrap();
 
         let snap = get_latest_for_person(&conn, "tm_a").unwrap().unwrap();
         assert_eq!(snap.computed_ms, 200);
@@ -325,21 +341,21 @@ mod tests {
 
     #[test]
     fn get_latest_returns_none_when_absent() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         assert!(get_latest_for_person(&conn, "tm_a").unwrap().is_none());
     }
 
     #[test]
     fn get_latest_map_returns_only_requested_ids() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         seed_member(&conn, "tm_b", false);
         seed_member(&conn, "tm_c", false);
         let body = ProfileSnapshotBody::default();
-        insert_snapshot(&conn, "tm_a", 100, &body, "h-a").unwrap();
-        insert_snapshot(&conn, "tm_b", 100, &body, "h-b").unwrap();
-        insert_snapshot(&conn, "tm_c", 100, &body, "h-c").unwrap();
+        ins(&mut conn, "tm_a", 100, &body, "h-a").unwrap();
+        ins(&mut conn, "tm_b", 100, &body, "h-b").unwrap();
+        ins(&mut conn, "tm_c", 100, &body, "h-c").unwrap();
 
         let map = get_latest_map(&conn, &["tm_a", "tm_c"]).unwrap();
         assert_eq!(map.len(), 2);
@@ -350,7 +366,7 @@ mod tests {
 
     #[test]
     fn dirty_members_picks_never_computed() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         // No snapshot, no events — still dirty (first-pass case).
         let dirty = dirty_members(&conn).unwrap();
@@ -359,13 +375,13 @@ mod tests {
 
     #[test]
     fn dirty_members_picks_changed_actors() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         seed_member(&conn, "tm_b", false);
         let body = ProfileSnapshotBody::default();
         // Both have an existing snapshot at t=100.
-        insert_snapshot(&conn, "tm_a", 100, &body, "h-a").unwrap();
-        insert_snapshot(&conn, "tm_b", 100, &body, "h-b").unwrap();
+        ins(&mut conn, "tm_a", 100, &body, "h-a").unwrap();
+        ins(&mut conn, "tm_b", 100, &body, "h-b").unwrap();
         // Only tm_a has a new event since.
         seed_event(&conn, "tm_a", 200);
 
@@ -376,7 +392,7 @@ mod tests {
 
     #[test]
     fn dirty_members_excludes_self() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_self", true);
         seed_member(&conn, "tm_a", false);
         // Self has no snapshot but is excluded by the WHERE clause.
@@ -387,11 +403,11 @@ mod tests {
 
     #[test]
     fn ttl_eligible_drops_fresh_snapshots() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         let body = ProfileSnapshotBody::default();
         // Snapshot at t=1000.
-        insert_snapshot(&conn, "tm_a", 1000, &body, "h-a").unwrap();
+        ins(&mut conn, "tm_a", 1000, &body, "h-a").unwrap();
         // Event at t=2000 (so it IS dirty).
         seed_event(&conn, "tm_a", 2000);
         // now=2500, ttl=24h. Snapshot is only 1500ms old → not eligible.
@@ -401,10 +417,10 @@ mod tests {
 
     #[test]
     fn ttl_eligible_picks_stale_dirty() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         let body = ProfileSnapshotBody::default();
-        insert_snapshot(&conn, "tm_a", 1000, &body, "h-a").unwrap();
+        ins(&mut conn, "tm_a", 1000, &body, "h-a").unwrap();
         seed_event(&conn, "tm_a", 2_000_000_000);
         let now = 1_000 + 25 * 3600 * 1000; // 25h later
         let elig = ttl_eligible_members(&conn, now, 24 * 3600 * 1000, false).unwrap();
@@ -413,10 +429,10 @@ mod tests {
 
     #[test]
     fn ttl_eligible_force_bypasses_ttl() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         let body = ProfileSnapshotBody::default();
-        insert_snapshot(&conn, "tm_a", 1000, &body, "h-a").unwrap();
+        ins(&mut conn, "tm_a", 1000, &body, "h-a").unwrap();
         seed_event(&conn, "tm_a", 2000);
         // Fresh snapshot, but force=true.
         let elig = ttl_eligible_members(&conn, 2500, 24 * 3600 * 1000, true).unwrap();
@@ -425,7 +441,7 @@ mod tests {
 
     #[test]
     fn ttl_eligible_includes_never_computed() {
-        let conn = fresh_conn();
+        let mut conn = fresh_conn();
         seed_member(&conn, "tm_a", false);
         // No snapshot, no events — first-pass case.
         let elig = ttl_eligible_members(&conn, 5000, 24 * 3600 * 1000, false).unwrap();

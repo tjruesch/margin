@@ -1,15 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 
-import { getDailyActivity, type DailyActivitySummary } from "./file";
+import {
+  getDailyActivity,
+  listRecentActivity,
+  type ActivityEventRow,
+  type DailyActivitySummary,
+} from "./file";
 
 type Props = {
   open: boolean;
   onClose: () => void;
+  /** Activated when the user clicks a row in the RECENT section (#116).
+   *  Implementations should switch nav to Team detail for `memberId`
+   *  and seed `highlightObsId` so the SuggestionsTab scrolls + flashes
+   *  the matching accepted row. `highlightObsId` is null for the
+   *  profile_snapshot_created kind, which lands on the Profile tab. */
+  onOpenObservation: (memberId: string, highlightObsId: string | null) => void;
 };
 
-export function ActivityPanel({ open, onClose }: Props) {
+export function ActivityPanel({ open, onClose, onOpenObservation }: Props) {
   const panelRef = useRef<HTMLDivElement | null>(null);
   const [summary, setSummary] = useState<DailyActivitySummary | null>(null);
+  const [events, setEvents] = useState<ActivityEventRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -38,16 +50,21 @@ export function ActivityPanel({ open, onClose }: Props) {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    getDailyActivity()
-      .then((s) => {
-        if (!cancelled) setSummary(s);
-      })
-      .catch((e) => {
+    void (async () => {
+      try {
+        const [s, ev] = await Promise.all([
+          getDailyActivity(),
+          listRecentActivity(),
+        ]);
+        if (cancelled) return;
+        setSummary(s);
+        setEvents(ev);
+      } catch (e) {
         if (!cancelled) setError(String(e));
-      })
-      .finally(() => {
+      } finally {
         if (!cancelled) setLoading(false);
-      });
+      }
+    })();
     return () => {
       cancelled = true;
     };
@@ -56,7 +73,8 @@ export function ActivityPanel({ open, onClose }: Props) {
   if (!open) return null;
 
   const rows = summary ? buildRows(summary) : [];
-  const isEmpty = !loading && !error && summary != null && rows.length === 0;
+  const isEmpty =
+    !loading && !error && summary != null && rows.length === 0 && events.length === 0;
 
   return (
     <div
@@ -73,16 +91,73 @@ export function ActivityPanel({ open, onClose }: Props) {
       ) : isEmpty ? (
         <div className="activity-empty">No activity yet today.</div>
       ) : (
-        <ul className="activity-rows">
-          {rows.map((r, i) => (
-            <li key={i} className="activity-row">
-              {r}
-            </li>
-          ))}
-        </ul>
+        <>
+          {rows.length > 0 && (
+            <ul className="activity-rows">
+              {rows.map((r, i) => (
+                <li key={i} className="activity-row">
+                  {r}
+                </li>
+              ))}
+            </ul>
+          )}
+          {events.length > 0 && (
+            <>
+              <div className="activity-section-head">RECENT</div>
+              <ul className="activity-event-list">
+                {events.map((ev) => (
+                  <li
+                    key={`${ev.ts_ms}-${ev.kind}-${ev.ref_id}`}
+                    className="activity-event-row"
+                  >
+                    <button
+                      type="button"
+                      className="activity-event-btn"
+                      onClick={() => {
+                        onOpenObservation(
+                          ev.actor_id,
+                          ev.kind === "observation_accepted" ? ev.ref_id : null,
+                        );
+                        onClose();
+                      }}
+                    >
+                      <div className="activity-event-meta">
+                        {formatTime(ev.ts_ms)} · {labelFor(ev)}
+                      </div>
+                      {ev.kind === "observation_accepted" && ev.body && (
+                        <div className="activity-event-body">
+                          "{truncate(ev.body, 80)}"
+                        </div>
+                      )}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </>
       )}
     </div>
   );
+}
+
+function labelFor(ev: ActivityEventRow): string {
+  if (ev.kind === "observation_accepted") {
+    return `Accepted observation about ${ev.actor_display_name}`;
+  }
+  return `${ev.actor_display_name}'s profile updated`;
+}
+
+function formatTime(ts_ms: number): string {
+  return new Date(ts_ms).toLocaleTimeString(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function truncate(s: string, cap: number): string {
+  if (s.length <= cap) return s;
+  return s.slice(0, cap - 1).trimEnd() + "…";
 }
 
 function buildRows(s: DailyActivitySummary): string[] {

@@ -582,6 +582,22 @@ export function Home({
             <ActivityPanel
               open={activityOpen}
               onClose={() => setActivityOpen(false)}
+              onOpenObservation={(memberId, highlightObsId) => {
+                // Switch to the Team view first (#116). The
+                // `margin:open-team-member` event is dispatched on
+                // the next tick so TeamView's listener is mounted by
+                // the time it fires.
+                window.dispatchEvent(
+                  new CustomEvent("margin:nav", { detail: "team" }),
+                );
+                setTimeout(() => {
+                  window.dispatchEvent(
+                    new CustomEvent("margin:open-team-member", {
+                      detail: { memberId, highlightObsId },
+                    }),
+                  );
+                }, 0);
+              }}
             />
           </div>
           <div className="notifications-anchor">

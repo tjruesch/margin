@@ -37,6 +37,95 @@ pub fn get_daily_activity(
     compute_daily_activity(&c).map_err(|e| e.to_string())
 }
 
+/// Single event row surfaced in the daily activity popover's
+/// "RECENT" section (#116). Today-windowed, capped at 20, hydrated
+/// with the actor's display name and (for observation_accepted) the
+/// observation body. Filtered Rust-side to drop orphan-actor rows
+/// and accepts whose status drifted to `rejected`.
+#[derive(Debug, Serialize, Clone)]
+pub struct ActivityEventRow {
+    pub ts_ms: i64,
+    pub kind: String,
+    pub actor_id: String,
+    pub actor_display_name: String,
+    pub ref_kind: String,
+    pub ref_id: String,
+    pub body: String,
+    pub current_status: Option<String>,
+}
+
+const RECENT_ACTIVITY_CAP: usize = 20;
+
+#[tauri::command]
+pub fn list_recent_activity(
+    conn: State<'_, Mutex<Connection>>,
+) -> Result<Vec<ActivityEventRow>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let (day_start_ms, day_end_ms, _now_ms) = today_window();
+    compute_recent_activity(&c, day_start_ms, day_end_ms).map_err(|e| e.to_string())
+}
+
+pub(crate) fn compute_recent_activity(
+    conn: &Connection,
+    day_start_ms: i64,
+    day_end_ms: i64,
+) -> rusqlite::Result<Vec<ActivityEventRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT \
+            e.ts_ms, \
+            e.kind, \
+            e.actor_id, \
+            COALESCE(tm.display_name, '') AS actor_display_name, \
+            COALESCE(e.ref_kind, '') AS ref_kind, \
+            COALESCE(e.ref_id, '') AS ref_id, \
+            COALESCE(po.body, '') AS body, \
+            po.status AS current_status \
+           FROM events e \
+           LEFT JOIN team_members tm ON tm.id = e.actor_id \
+           LEFT JOIN profile_observations po \
+             ON e.kind = 'observation_accepted' AND po.id = e.ref_id \
+          WHERE e.ts_ms >= ?1 \
+            AND e.ts_ms < ?2 \
+            AND e.kind IN ('observation_accepted', 'profile_snapshot_created') \
+          ORDER BY e.ts_ms DESC \
+          LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        params![day_start_ms, day_end_ms, RECENT_ACTIVITY_CAP as i64],
+        |r| {
+            Ok(ActivityEventRow {
+                ts_ms: r.get(0)?,
+                kind: r.get(1)?,
+                actor_id: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                actor_display_name: r.get(3)?,
+                ref_kind: r.get(4)?,
+                ref_id: r.get(5)?,
+                body: r.get(6)?,
+                current_status: r.get(7)?,
+            })
+        },
+    )?;
+    let mut out: Vec<ActivityEventRow> = Vec::new();
+    for row in rows {
+        let r = row?;
+        // Drop orphaned actors (unlinked or member deleted before FK
+        // CASCADE caught up). The display name carries the resolved
+        // label; empty = nothing to show.
+        if r.actor_display_name.is_empty() {
+            continue;
+        }
+        // Drop accepts that have since been rejected — the user moved
+        // on; the activity row would be a lie.
+        if r.kind == "observation_accepted"
+            && r.current_status.as_deref() == Some("rejected")
+        {
+            continue;
+        }
+        out.push(r);
+    }
+    Ok(out)
+}
+
 pub(crate) fn compute_daily_activity(
     conn: &Connection,
 ) -> rusqlite::Result<DailyActivitySummary> {
@@ -517,5 +606,149 @@ mod tests {
 
         let s = compute_daily_activity(&conn).unwrap();
         assert_eq!(s.people_interacted, 0, "self never counts");
+    }
+
+    // ---------- list_recent_activity (#116) ----------------------------
+
+    fn seed_note(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO notes(id, bundle_id, title, modified_ms, preview, body_size) \
+             VALUES (?1, ?2, 'T', 0, '', 0)",
+            params![id, format!("b_{id}")],
+        )
+        .unwrap();
+    }
+
+    fn seed_observation(
+        conn: &Connection,
+        id: &str,
+        member_id: &str,
+        note_id: &str,
+        body: &str,
+        status: &str,
+        created_ms: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO profile_observations \
+                (id, member_id, source_note_id, body, status, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, member_id, note_id, body, status, created_ms],
+        )
+        .unwrap();
+    }
+
+    fn seed_event_row(
+        conn: &Connection,
+        ts_ms: i64,
+        kind: &str,
+        actor_id: Option<&str>,
+        ref_kind: &str,
+        ref_id: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, '{}', ?1)",
+            params![ts_ms, kind, actor_id, ref_kind, ref_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_recent_activity_returns_today_events_descending() {
+        let conn = open_db();
+        let (day_start, day_end, _) = today_window();
+        seed_teammate(&conn, "tm_alice", "alice@x.io", "Alice");
+        seed_teammate(&conn, "tm_bob", "bob@x.io", "Bob");
+        seed_note(&conn, "n1");
+        seed_observation(
+            &conn, "obs_1", "tm_alice", "n1", "Async-first.", "accepted",
+            day_start + 1_000,
+        );
+
+        seed_event_row(
+            &conn, day_start + 1_000, "observation_accepted",
+            Some("tm_alice"), "observation", "obs_1",
+        );
+        seed_event_row(
+            &conn, day_start + 2_000, "profile_snapshot_created",
+            Some("tm_bob"), "person", "tm_bob",
+        );
+
+        let rows = compute_recent_activity(&conn, day_start, day_end).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Most recent first.
+        assert_eq!(rows[0].kind, "profile_snapshot_created");
+        assert_eq!(rows[0].actor_display_name, "Bob");
+        assert_eq!(rows[1].kind, "observation_accepted");
+        assert_eq!(rows[1].actor_display_name, "Alice");
+        assert_eq!(rows[1].body, "Async-first.");
+        assert_eq!(rows[1].current_status.as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn list_recent_activity_drops_accepts_now_rejected() {
+        let conn = open_db();
+        let (day_start, day_end, _) = today_window();
+        seed_teammate(&conn, "tm_alice", "alice@x.io", "Alice");
+        seed_note(&conn, "n1");
+        // User accepted then changed their mind — observation status is
+        // now 'rejected' but the original accept event still exists.
+        seed_observation(
+            &conn, "obs_1", "tm_alice", "n1", "x.", "rejected", day_start + 1_000,
+        );
+        seed_event_row(
+            &conn, day_start + 1_000, "observation_accepted",
+            Some("tm_alice"), "observation", "obs_1",
+        );
+
+        let rows = compute_recent_activity(&conn, day_start, day_end).unwrap();
+        assert!(rows.is_empty(), "rejected accept should not surface");
+    }
+
+    #[test]
+    fn list_recent_activity_drops_null_actor_rows() {
+        let conn = open_db();
+        let (day_start, day_end, _) = today_window();
+        // Events with no actor_id (the column is nullable). Display
+        // name resolves to empty via COALESCE — Rust filter drops it.
+        // FK CASCADE makes "team_member deleted but event survives"
+        // impossible, so the realistic orphan case is a NULL actor.
+        seed_event_row(
+            &conn, day_start + 1_000, "profile_snapshot_created",
+            None, "person", "tm_ghost",
+        );
+
+        let rows = compute_recent_activity(&conn, day_start, day_end).unwrap();
+        assert!(rows.is_empty(), "null-actor row should not surface");
+    }
+
+    #[test]
+    fn list_recent_activity_only_today_window() {
+        let conn = open_db();
+        let (day_start, day_end, _) = today_window();
+        seed_teammate(&conn, "tm_alice", "alice@x.io", "Alice");
+        // Yesterday's event.
+        seed_event_row(
+            &conn, day_start - 1_000, "profile_snapshot_created",
+            Some("tm_alice"), "person", "tm_alice",
+        );
+
+        let rows = compute_recent_activity(&conn, day_start, day_end).unwrap();
+        assert!(rows.is_empty(), "yesterday's event must not surface");
+    }
+
+    #[test]
+    fn list_recent_activity_caps_at_20() {
+        let conn = open_db();
+        let (day_start, day_end, _) = today_window();
+        seed_teammate(&conn, "tm_alice", "alice@x.io", "Alice");
+        for i in 0..30 {
+            seed_event_row(
+                &conn, day_start + i, "profile_snapshot_created",
+                Some("tm_alice"), "person", "tm_alice",
+            );
+        }
+        let rows = compute_recent_activity(&conn, day_start, day_end).unwrap();
+        assert_eq!(rows.len(), 20);
     }
 }

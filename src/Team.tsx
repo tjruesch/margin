@@ -41,6 +41,44 @@ export function TeamView({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [pendingCounts, setPendingCounts] = useState<Record<string, number>>({});
+  // Cross-link state (#115, lifted up for #116). Owned here so the
+  // activity-popover → team-detail jump can seed both the highlight
+  // and the active tab without per-mount races.
+  const [highlightObsId, setHighlightObsId] = useState<string | null>(null);
+  const [flashKey, setFlashKey] = useState(0);
+  const [pendingTab, setPendingTab] = useState<
+    "profile" | "suggestions" | "tasks" | null
+  >(null);
+
+  const onCiteClick = useCallback((obsId: string) => {
+    setHighlightObsId(obsId);
+    setFlashKey((k) => k + 1);
+    setPendingTab("suggestions");
+  }, []);
+
+  // Cross-app navigation from ActivityPanel (#116). The event detail
+  // carries a memberId (required) and an optional highlightObsId. We
+  // set selectedId so the TeamDetail mounts, and seed the highlight
+  // + tab so the Suggestions row scrolls into view + flashes.
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const detail = (ev as CustomEvent).detail as
+        | { memberId?: string; highlightObsId?: string | null }
+        | undefined;
+      if (!detail?.memberId) return;
+      setSelectedId(detail.memberId);
+      if (detail.highlightObsId) {
+        setHighlightObsId(detail.highlightObsId);
+        setFlashKey((k) => k + 1);
+        setPendingTab("suggestions");
+      } else {
+        setPendingTab("profile");
+      }
+    };
+    window.addEventListener("margin:open-team-member", handler);
+    return () =>
+      window.removeEventListener("margin:open-team-member", handler);
+  }, []);
 
   const reload = useCallback(async () => {
     const fresh = await listTeamMembers();
@@ -100,8 +138,13 @@ export function TeamView({
         member={member}
         members={members}
         pendingCount={pendingCounts[member.id] ?? 0}
+        highlightObsId={highlightObsId}
+        flashKey={flashKey}
+        pendingTab={pendingTab}
+        onPendingTabConsumed={() => setPendingTab(null)}
         onBack={() => setSelectedId(null)}
         onSelectMember={setSelectedId}
+        onCiteClick={onCiteClick}
         onOpenNote={onOpenNote}
         onOpenWorkstream={onOpenWorkstream}
         onToggleAction={onToggleAction}
@@ -329,8 +372,13 @@ function TeamDetail({
   member,
   members,
   pendingCount,
+  highlightObsId,
+  flashKey,
+  pendingTab,
+  onPendingTabConsumed,
   onBack,
   onSelectMember,
+  onCiteClick,
   onUpdated,
   onDeleted,
   onOpenNote,
@@ -342,8 +390,13 @@ function TeamDetail({
   member: TeamMember;
   members: TeamMember[];
   pendingCount: number;
+  highlightObsId: string | null;
+  flashKey: number;
+  pendingTab: "profile" | "suggestions" | "tasks" | null;
+  onPendingTabConsumed: () => void;
   onBack: () => void;
   onSelectMember: (id: string) => void;
+  onCiteClick: (obsId: string) => void;
   onUpdated: (next: TeamMember) => void;
   onDeleted: () => void;
   onOpenNote: (path: string) => void;
@@ -353,25 +406,21 @@ function TeamDetail({
   onObservationsChanged: () => void;
 }) {
   const [tab, setTab] = useState<"profile" | "suggestions" | "tasks">("profile");
-  // Cross-link state (#115). A click on a citation chip in the Profile
-  // tab sets `highlightObsId` and bumps `flashKey`; the SuggestionsTab
-  // effect depends on both so re-clicks of the same id re-trigger the
-  // scroll-and-flash sequence.
-  const [highlightObsId, setHighlightObsId] = useState<string | null>(null);
-  const [flashKey, setFlashKey] = useState(0);
-
-  const onCiteClick = useCallback((obsId: string) => {
-    setTab("suggestions");
-    setHighlightObsId(obsId);
-    setFlashKey((k) => k + 1);
-  }, []);
 
   // Reset to Profile when switching to a different member so the user
   // never lands on a stale Tasks tab from the previous selection.
   useEffect(() => {
     setTab("profile");
-    setHighlightObsId(null);
   }, [member.id]);
+
+  // Consume a one-shot pending tab seed from the parent (set by either
+  // a citation chip click or a cross-app navigation from ActivityPanel).
+  useEffect(() => {
+    if (pendingTab) {
+      setTab(pendingTab);
+      onPendingTabConsumed();
+    }
+  }, [pendingTab, onPendingTabConsumed]);
 
   const commitName = async (next: string) => {
     const trimmed = next.trim();

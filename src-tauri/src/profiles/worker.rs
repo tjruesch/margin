@@ -293,9 +293,24 @@ async fn recompute_one(
 
     {
         let conn_state = app.state::<std::sync::Mutex<Connection>>();
-        let c = conn_state.lock().map_err(|e| e.to_string())?;
-        persist::insert_snapshot(&c, person_id, now, &body, &source_hash)
+        let mut c = conn_state.lock().map_err(|e| e.to_string())?;
+        let tx = c.transaction().map_err(|e| e.to_string())?;
+        persist::insert_snapshot(&tx, person_id, now, &body, &source_hash)
             .map_err(|e| e.to_string())?;
+        // Side-channel event for the activity feed (#116). The snapshot
+        // itself has no UI navigation target — the row click jumps to the
+        // member's Team detail page, so ref_kind="person" + ref_id=person_id.
+        crate::events::emit(
+            &tx,
+            now,
+            "profile_snapshot_created",
+            Some(person_id),
+            "person",
+            person_id,
+            &serde_json::json!({}),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
     }
     Ok(RecomputeOutcome::Wrote)
 }

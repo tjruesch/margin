@@ -1213,3 +1213,18 @@ export type DailyActivitySummary = {
 export async function getDailyActivity(): Promise<DailyActivitySummary> {
   return invoke<DailyActivitySummary>("get_daily_activity");
 }
+
+export type ActivityEventRow = {
+  ts_ms: number;
+  kind: "observation_accepted" | "profile_snapshot_created";
+  actor_id: string;
+  actor_display_name: string;
+  ref_kind: string;
+  ref_id: string;
+  body: string;
+  current_status: string | null;
+};
+
+export async function listRecentActivity(): Promise<ActivityEventRow[]> {
+  return invoke<ActivityEventRow[]>("list_recent_activity");
+}
