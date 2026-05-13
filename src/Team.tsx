@@ -353,11 +353,24 @@ function TeamDetail({
   onObservationsChanged: () => void;
 }) {
   const [tab, setTab] = useState<"profile" | "suggestions" | "tasks">("profile");
+  // Cross-link state (#115). A click on a citation chip in the Profile
+  // tab sets `highlightObsId` and bumps `flashKey`; the SuggestionsTab
+  // effect depends on both so re-clicks of the same id re-trigger the
+  // scroll-and-flash sequence.
+  const [highlightObsId, setHighlightObsId] = useState<string | null>(null);
+  const [flashKey, setFlashKey] = useState(0);
+
+  const onCiteClick = useCallback((obsId: string) => {
+    setTab("suggestions");
+    setHighlightObsId(obsId);
+    setFlashKey((k) => k + 1);
+  }, []);
 
   // Reset to Profile when switching to a different member so the user
   // never lands on a stale Tasks tab from the previous selection.
   useEffect(() => {
     setTab("profile");
+    setHighlightObsId(null);
   }, [member.id]);
 
   const commitName = async (next: string) => {
@@ -511,6 +524,7 @@ function TeamDetail({
           members={members}
           onSelectMember={onSelectMember}
           onOpenWorkstream={onOpenWorkstream}
+          onCiteClick={onCiteClick}
         />
       )}
       {tab === "suggestions" && (
@@ -518,6 +532,8 @@ function TeamDetail({
           member={member}
           onOpenNote={onOpenNote}
           onChanged={onObservationsChanged}
+          highlightId={highlightObsId}
+          flashKey={flashKey}
         />
       )}
       {tab === "tasks" && (
@@ -541,26 +557,39 @@ function ProfileSnapshotPane({
   members,
   onSelectMember,
   onOpenWorkstream,
+  onCiteClick,
 }: {
   member: TeamMember;
   members: TeamMember[];
   onSelectMember: (id: string) => void;
   onOpenWorkstream: (id: string) => void;
+  onCiteClick: (obsId: string) => void;
 }) {
   const [snap, setSnap] = useState<ProfileSnapshot | null | "loading">(
     "loading",
   );
+  const [acceptedById, setAcceptedById] = useState<
+    Map<string, ProfileObservation>
+  >(() => new Map());
   const [recomputing, setRecomputing] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     setSnap("loading");
+    setAcceptedById(new Map());
     void (async () => {
       try {
-        const s = await getProfileSnapshot(member.id);
-        if (!cancelled) setSnap(s);
+        const [s, accepted] = await Promise.all([
+          getProfileSnapshot(member.id),
+          listProfileObservations(member.id, "accepted"),
+        ]);
+        if (cancelled) return;
+        setSnap(s);
+        const map = new Map<string, ProfileObservation>();
+        for (const obs of accepted) map.set(obs.id, obs);
+        setAcceptedById(map);
       } catch (err) {
-        console.error("getProfileSnapshot failed:", err);
+        console.error("ProfileSnapshotPane fetch failed:", err);
         if (!cancelled) setSnap(null);
       }
     })();
@@ -572,8 +601,14 @@ function ProfileSnapshotPane({
   const onRefresh = async () => {
     setRecomputing(true);
     try {
-      const fresh = await forceRecomputeProfile(member.id);
+      const [fresh, accepted] = await Promise.all([
+        forceRecomputeProfile(member.id),
+        listProfileObservations(member.id, "accepted"),
+      ]);
       setSnap(fresh);
+      const map = new Map<string, ProfileObservation>();
+      for (const obs of accepted) map.set(obs.id, obs);
+      setAcceptedById(map);
     } catch (err) {
       console.error("forceRecomputeProfile failed:", err);
     } finally {
@@ -604,8 +639,10 @@ function ProfileSnapshotPane({
     <ProfileSnapshotView
       snap={snap}
       members={members}
+      acceptedById={acceptedById}
       onSelectMember={onSelectMember}
       onOpenWorkstream={onOpenWorkstream}
+      onCiteClick={onCiteClick}
       onRefresh={() => void onRefresh()}
       refreshing={recomputing}
     />
@@ -615,15 +652,19 @@ function ProfileSnapshotPane({
 function ProfileSnapshotView({
   snap,
   members,
+  acceptedById,
   onSelectMember,
   onOpenWorkstream,
+  onCiteClick,
   onRefresh,
   refreshing,
 }: {
   snap: ProfileSnapshot;
   members: TeamMember[];
+  acceptedById: Map<string, ProfileObservation>;
   onSelectMember: (id: string) => void;
   onOpenWorkstream: (id: string) => void;
+  onCiteClick: (obsId: string) => void;
   onRefresh: () => void;
   refreshing: boolean;
 }) {
@@ -636,6 +677,16 @@ function ProfileSnapshotView({
   const { body, computed_ms } = snap;
   const collaborators = body.frequent_collaborators ?? [];
   const focus = body.recent_focus ?? [];
+  // Resolve cited observation ids to their full ProfileObservation rows;
+  // silently skip ids that no longer match an accepted observation
+  // (rejected/deleted since the snapshot was computed — stale cite).
+  const citedObservations = useMemo(
+    () =>
+      (body.evidence_observation_ids ?? [])
+        .map((id) => acceptedById.get(id))
+        .filter((o): o is ProfileObservation => o !== undefined),
+    [body.evidence_observation_ids, acceptedById],
+  );
 
   return (
     <div className="team-profile">
@@ -711,6 +762,25 @@ function ProfileSnapshotView({
         </section>
       )}
 
+      {citedObservations.length > 0 && (
+        <section className="team-profile-section">
+          <h4 className="home-action-bucket-head">Backed by observations</h4>
+          <div className="team-profile-chips">
+            {citedObservations.map((obs) => (
+              <button
+                key={obs.id}
+                type="button"
+                className="team-profile-chip team-profile-citation"
+                onClick={() => onCiteClick(obs.id)}
+                title={obs.body}
+              >
+                <span>{truncateText(obs.body, 60)}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
       <div className="team-profile-meta">
         <span>Computed {formatRelative(computed_ms)}</span>
         <button
@@ -743,35 +813,50 @@ function formatRelative(ms: number): string {
   return `${years}y ago`;
 }
 
+function truncateText(s: string, cap: number): string {
+  if (s.length <= cap) return s;
+  return s.slice(0, cap - 1).trimEnd() + "…";
+}
+
 // ---------- Suggestions tab (#52) ---------------------------------------
 
 function SuggestionsTab({
   member,
   onOpenNote,
   onChanged,
+  highlightId,
+  flashKey,
 }: {
   member: TeamMember;
   onOpenNote: (path: string) => void;
   onChanged: () => void;
+  highlightId: string | null;
+  flashKey: number;
 }) {
   const [pending, setPending] = useState<ProfileObservation[]>([]);
   const [accepted, setAccepted] = useState<ProfileObservation[]>([]);
   const [rejected, setRejected] = useState<ProfileObservation[]>([]);
+  const [citedSet, setCitedSet] = useState<Set<string>>(() => new Set());
   const [showRejected, setShowRejected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [flashing, setFlashing] = useState<string | null>(null);
+  const cardRefs = useRef<Record<string, HTMLElement | null>>({});
 
   const reload = useCallback(async () => {
     setLoading(true);
     try {
-      const [p, a, r] = await Promise.all([
+      const [p, a, r, snap] = await Promise.all([
         listProfileObservations(member.id, "pending"),
         listProfileObservations(member.id, "accepted"),
         listProfileObservations(member.id, "rejected"),
+        getProfileSnapshot(member.id),
       ]);
       setPending(p);
       setAccepted(a);
       setRejected(r);
+      const ids = snap?.body.evidence_observation_ids ?? [];
+      setCitedSet(new Set(ids));
     } catch (err) {
       console.error("listProfileObservations failed:", err);
     } finally {
@@ -782,6 +867,19 @@ function SuggestionsTab({
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  // Scroll-into-view + transient flash when the Profile tab triggers a
+  // cross-link. `flashKey` re-fires the effect even when `highlightId`
+  // is unchanged (re-click of the same chip).
+  useEffect(() => {
+    if (loading || !highlightId) return;
+    const el = cardRefs.current[highlightId];
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setFlashing(highlightId);
+    const t = window.setTimeout(() => setFlashing(null), 1800);
+    return () => window.clearTimeout(t);
+  }, [highlightId, flashKey, loading]);
 
   const runAction = async (id: string, action: () => Promise<void>) => {
     setBusyId(id);
@@ -798,7 +896,15 @@ function SuggestionsTab({
 
   if (loading) return <div className="team-tasks-loading" />;
 
-  const recentAccepted = accepted.slice(0, 5);
+  // Show the 5 most-recent accepted rows. Then union in any cited rows
+  // that fell outside the recent-5 window so the Profile-tab cross-link
+  // can always scroll to its target. Cap the merged list at 10.
+  const recentAcceptedBase = accepted.slice(0, 5);
+  const recentAcceptedIds = new Set(recentAcceptedBase.map((o) => o.id));
+  const olderCited = accepted.filter(
+    (o) => citedSet.has(o.id) && !recentAcceptedIds.has(o.id),
+  );
+  const recentAccepted = [...recentAcceptedBase, ...olderCited].slice(0, 10);
   const isEmpty =
     pending.length === 0 && accepted.length === 0 && rejected.length === 0;
 
@@ -874,7 +980,13 @@ function SuggestionsTab({
             {recentAccepted.map((obs) => (
               <article
                 key={obs.id}
-                className="team-suggestion-card team-suggestion-accepted"
+                ref={(el) => {
+                  cardRefs.current[obs.id] = el;
+                }}
+                className={
+                  "team-suggestion-card team-suggestion-accepted" +
+                  (flashing === obs.id ? " team-suggestion-flash" : "")
+                }
               >
                 <p className="team-suggestion-body">{obs.body}</p>
                 <div className="team-suggestion-footer">
@@ -885,11 +997,21 @@ function SuggestionsTab({
                   >
                     {obs.source_note_title ?? "Source note"}
                   </button>
-                  <span className="team-suggestion-meta">
-                    {obs.reviewed_ms !== null
-                      ? formatRelative(obs.reviewed_ms)
-                      : ""}
-                  </span>
+                  <div className="team-suggestion-meta-row">
+                    {citedSet.has(obs.id) && (
+                      <span
+                        className="team-suggestion-cited"
+                        title="Cited by current profile"
+                      >
+                        ✓ Cited
+                      </span>
+                    )}
+                    <span className="team-suggestion-meta">
+                      {obs.reviewed_ms !== null
+                        ? formatRelative(obs.reviewed_ms)
+                        : ""}
+                    </span>
+                  </div>
                 </div>
               </article>
             ))}

@@ -3952,6 +3952,41 @@ input.nh-title {
   color: var(--muted, #999);
 }
 
+/* Profile ↔ Suggestions cross-linking (#115) */
+
+.team-profile-citation {
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.team-suggestion-meta-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.team-suggestion-cited {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(34, 119, 51, 0.12);
+  color: var(--accent, #2a7);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+@keyframes team-suggestion-flash {
+  0%   { box-shadow: 0 0 0 2px var(--accent, #2a7); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.team-suggestion-flash {
+  animation: team-suggestion-flash 1.6s ease-out;
+}
+
 .team-suggestion-toggle {
   align-self: flex-start;
   background: transparent;
