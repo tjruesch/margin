@@ -144,6 +144,49 @@ export async function forceRecomputeProfile(
   return invoke<ProfileSnapshot>("force_recompute_profile", { memberId });
 }
 
+// --- Profile observations (#52) -----------------------------------------
+
+export type ObservationStatus = "pending" | "accepted" | "rejected";
+
+export type ProfileObservation = {
+  id: string;
+  member_id: string;
+  source_note_id: string;
+  source_note_title: string | null;
+  body: string;
+  status: ObservationStatus;
+  created_ms: number;
+  reviewed_ms: number | null;
+};
+
+export async function listProfileObservations(
+  memberId: string,
+  status?: ObservationStatus,
+): Promise<ProfileObservation[]> {
+  return invoke<ProfileObservation[]>("list_profile_observations", {
+    memberId,
+    status: status ?? null,
+  });
+}
+
+export async function pendingObservationCounts(): Promise<
+  Record<string, number>
+> {
+  return invoke<Record<string, number>>("pending_observation_counts");
+}
+
+export async function acceptProfileObservation(id: string): Promise<void> {
+  await invoke<void>("accept_profile_observation", { id });
+}
+
+export async function rejectProfileObservation(id: string): Promise<void> {
+  await invoke<void>("reject_profile_observation", { id });
+}
+
+export async function deleteProfileObservation(id: string): Promise<void> {
+  await invoke<void>("delete_profile_observation", { id });
+}
+
 // --- Notes (bundle abstraction) ------------------------------------------
 
 export type NoteRef = { id: string; note_path: string };

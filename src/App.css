@@ -3851,6 +3851,157 @@ input.nh-title {
   font-size: 12.5px;
 }
 
+/* ----- Suggestions tab (#52) ----- */
+
+.team-suggestions {
+  flex: 1;
+  min-height: 0;
+  margin-top: 14px;
+  padding-bottom: 24px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.team-suggestion-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.team-suggestion-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border, #e2e2e2);
+  border-radius: 8px;
+  background: var(--card-bg, transparent);
+}
+
+.team-suggestion-body {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.team-suggestion-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.team-suggestion-source {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: 12.5px;
+  color: var(--muted, #777);
+  cursor: pointer;
+  text-align: left;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.team-suggestion-source:hover {
+  text-decoration: underline;
+  color: var(--fg, #222);
+}
+
+.team-suggestion-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.team-suggestion-accept,
+.team-suggestion-reject {
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12.5px;
+  cursor: pointer;
+  border: 1px solid var(--border, #d0d0d0);
+  background: transparent;
+  color: inherit;
+}
+.team-suggestion-accept {
+  background: var(--accent, #2a7);
+  border-color: var(--accent, #2a7);
+  color: #fff;
+}
+.team-suggestion-accept:hover {
+  filter: brightness(0.95);
+}
+.team-suggestion-reject:hover {
+  background: var(--hover, rgba(0, 0, 0, 0.04));
+}
+.team-suggestion-accept:disabled,
+.team-suggestion-reject:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.team-suggestion-accepted {
+  opacity: 0.7;
+}
+
+.team-suggestion-meta {
+  font-size: 12px;
+  color: var(--muted, #999);
+}
+
+.team-suggestion-toggle {
+  align-self: flex-start;
+  background: transparent;
+  border: 0;
+  padding: 4px 0;
+  color: var(--muted, #777);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.team-suggestion-toggle:hover {
+  color: var(--fg, #222);
+}
+
+.team-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent, #2a7);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.team-row {
+  position: relative;
+}
+.team-row-pending {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent, #2a7);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 /* ----- Team detail tabs (#50) ----- */
 
 .team-detail-tabs {

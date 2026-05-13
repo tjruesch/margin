@@ -7,15 +7,20 @@ import { IconChevLeft, IconPlus, IconTrash } from "./icons";
 import {
   AliasKind,
   type ActionListItem,
+  type ProfileObservation,
   type ProfileSnapshot,
   type TeamMember,
   type TypedAlias,
+  acceptProfileObservation,
   createTeamMember,
   deleteTeamMember,
   forceRecomputeProfile,
   getProfileSnapshot,
   listActions,
+  listProfileObservations,
   listTeamMembers,
+  pendingObservationCounts,
+  rejectProfileObservation,
   updateTeamMember,
 } from "./file";
 import { avatarColor, initialsFromName } from "./initials";
@@ -35,11 +40,24 @@ export function TeamView({
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [pendingCounts, setPendingCounts] = useState<Record<string, number>>({});
 
   const reload = useCallback(async () => {
     const fresh = await listTeamMembers();
     setMembers(fresh);
   }, []);
+
+  const reloadCounts = useCallback(async () => {
+    try {
+      setPendingCounts(await pendingObservationCounts());
+    } catch (err) {
+      console.error("pendingObservationCounts failed:", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    void reloadCounts();
+  }, [reloadCounts]);
 
   // Tell App.tsx (and anyone else holding a member-list copy) that the
   // roster changed. Dispatched after any create / update / delete so
@@ -81,12 +99,14 @@ export function TeamView({
       <TeamDetail
         member={member}
         members={members}
+        pendingCount={pendingCounts[member.id] ?? 0}
         onBack={() => setSelectedId(null)}
         onSelectMember={setSelectedId}
         onOpenNote={onOpenNote}
         onOpenWorkstream={onOpenWorkstream}
         onToggleAction={onToggleAction}
         onReassignAction={onReassignAction}
+        onObservationsChanged={() => void reloadCounts()}
         onUpdated={(next) => {
           setMembers((prev) => prev.map((m) => (m.id === next.id ? next : m)));
           announceTeamChanged();
@@ -103,6 +123,7 @@ export function TeamView({
   return (
     <ListPane
       members={members}
+      pendingCounts={pendingCounts}
       onSelect={setSelectedId}
       onCreated={async (m) => {
         await reload();
@@ -117,10 +138,12 @@ export function TeamView({
 
 function ListPane({
   members,
+  pendingCounts,
   onSelect,
   onCreated,
 }: {
   members: TeamMember[];
+  pendingCounts: Record<string, number>;
   onSelect: (id: string) => void;
   onCreated: (member: TeamMember) => void;
 }) {
@@ -153,7 +176,12 @@ function ListPane({
       ) : (
         <div className="team-list">
           {members.map((m) => (
-            <TeamRow key={m.id} member={m} onClick={() => onSelect(m.id)} />
+            <TeamRow
+              key={m.id}
+              member={m}
+              pendingCount={pendingCounts[m.id] ?? 0}
+              onClick={() => onSelect(m.id)}
+            />
           ))}
         </div>
       )}
@@ -161,7 +189,15 @@ function ListPane({
   );
 }
 
-function TeamRow({ member, onClick }: { member: TeamMember; onClick: () => void }) {
+function TeamRow({
+  member,
+  pendingCount,
+  onClick,
+}: {
+  member: TeamMember;
+  pendingCount: number;
+  onClick: () => void;
+}) {
   return (
     <div
       className="team-row"
@@ -185,6 +221,14 @@ function TeamRow({ member, onClick }: { member: TeamMember; onClick: () => void 
           {member.role || (member.is_self ? "Your profile" : "—")}
         </div>
       </div>
+      {pendingCount > 0 && (
+        <span
+          className="team-row-pending"
+          title={`${pendingCount} suggestion${pendingCount === 1 ? "" : "s"} pending`}
+        >
+          {pendingCount}
+        </span>
+      )}
     </div>
   );
 }
@@ -284,6 +328,7 @@ function TeamComposerForm({
 function TeamDetail({
   member,
   members,
+  pendingCount,
   onBack,
   onSelectMember,
   onUpdated,
@@ -292,9 +337,11 @@ function TeamDetail({
   onOpenWorkstream,
   onToggleAction,
   onReassignAction,
+  onObservationsChanged,
 }: {
   member: TeamMember;
   members: TeamMember[];
+  pendingCount: number;
   onBack: () => void;
   onSelectMember: (id: string) => void;
   onUpdated: (next: TeamMember) => void;
@@ -303,8 +350,9 @@ function TeamDetail({
   onOpenWorkstream: (id: string) => void;
   onToggleAction: (id: string, nextDone: boolean) => void;
   onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
+  onObservationsChanged: () => void;
 }) {
-  const [tab, setTab] = useState<"profile" | "tasks">("profile");
+  const [tab, setTab] = useState<"profile" | "suggestions" | "tasks">("profile");
 
   // Reset to Profile when switching to a different member so the user
   // never lands on a stale Tasks tab from the previous selection.
@@ -435,6 +483,20 @@ function TeamDetail({
           <button
             type="button"
             role="tab"
+            aria-selected={tab === "suggestions"}
+            className={
+              "nh-segmented-btn" + (tab === "suggestions" ? " active" : "")
+            }
+            onClick={() => setTab("suggestions")}
+          >
+            Suggestions
+            {pendingCount > 0 && (
+              <span className="team-tab-badge">{pendingCount}</span>
+            )}
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={tab === "tasks"}
             className={"nh-segmented-btn" + (tab === "tasks" ? " active" : "")}
             onClick={() => setTab("tasks")}
@@ -449,6 +511,13 @@ function TeamDetail({
           members={members}
           onSelectMember={onSelectMember}
           onOpenWorkstream={onOpenWorkstream}
+        />
+      )}
+      {tab === "suggestions" && (
+        <SuggestionsTab
+          member={member}
+          onOpenNote={onOpenNote}
+          onChanged={onObservationsChanged}
         />
       )}
       {tab === "tasks" && (
@@ -672,6 +741,201 @@ function formatRelative(ms: number): string {
   if (months < 12) return `${months}mo ago`;
   const years = Math.floor(months / 12);
   return `${years}y ago`;
+}
+
+// ---------- Suggestions tab (#52) ---------------------------------------
+
+function SuggestionsTab({
+  member,
+  onOpenNote,
+  onChanged,
+}: {
+  member: TeamMember;
+  onOpenNote: (path: string) => void;
+  onChanged: () => void;
+}) {
+  const [pending, setPending] = useState<ProfileObservation[]>([]);
+  const [accepted, setAccepted] = useState<ProfileObservation[]>([]);
+  const [rejected, setRejected] = useState<ProfileObservation[]>([]);
+  const [showRejected, setShowRejected] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [p, a, r] = await Promise.all([
+        listProfileObservations(member.id, "pending"),
+        listProfileObservations(member.id, "accepted"),
+        listProfileObservations(member.id, "rejected"),
+      ]);
+      setPending(p);
+      setAccepted(a);
+      setRejected(r);
+    } catch (err) {
+      console.error("listProfileObservations failed:", err);
+    } finally {
+      setLoading(false);
+    }
+  }, [member.id]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const runAction = async (id: string, action: () => Promise<void>) => {
+    setBusyId(id);
+    try {
+      await action();
+      await reload();
+      onChanged();
+    } catch (err) {
+      console.error("observation action failed:", err);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (loading) return <div className="team-tasks-loading" />;
+
+  const recentAccepted = accepted.slice(0, 5);
+  const isEmpty =
+    pending.length === 0 && accepted.length === 0 && rejected.length === 0;
+
+  if (isEmpty) {
+    return (
+      <div className="team-suggestions">
+        <p className="home-empty">
+          No suggestions yet. Margin proposes observations from new meetings
+          with {member.display_name}; they'll appear here for you to accept or
+          reject.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="team-suggestions">
+      {pending.length > 0 && (
+        <section className="team-profile-section">
+          <h4 className="home-action-bucket-head">
+            Pending ({pending.length})
+          </h4>
+          <div className="team-suggestion-list">
+            {pending.map((obs) => (
+              <article key={obs.id} className="team-suggestion-card">
+                <p className="team-suggestion-body">{obs.body}</p>
+                <div className="team-suggestion-footer">
+                  <button
+                    type="button"
+                    className="team-suggestion-source"
+                    onClick={() => onOpenNote(obs.source_note_id)}
+                    title={obs.source_note_id}
+                  >
+                    {obs.source_note_title ?? "Source note"}
+                  </button>
+                  <div className="team-suggestion-actions">
+                    <button
+                      type="button"
+                      className="team-suggestion-reject"
+                      disabled={busyId === obs.id}
+                      onClick={() =>
+                        void runAction(obs.id, () =>
+                          rejectProfileObservation(obs.id),
+                        )
+                      }
+                    >
+                      Reject
+                    </button>
+                    <button
+                      type="button"
+                      className="team-suggestion-accept"
+                      disabled={busyId === obs.id}
+                      onClick={() =>
+                        void runAction(obs.id, () =>
+                          acceptProfileObservation(obs.id),
+                        )
+                      }
+                    >
+                      Accept
+                    </button>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {recentAccepted.length > 0 && (
+        <section className="team-profile-section">
+          <h4 className="home-action-bucket-head">Recently accepted</h4>
+          <div className="team-suggestion-list">
+            {recentAccepted.map((obs) => (
+              <article
+                key={obs.id}
+                className="team-suggestion-card team-suggestion-accepted"
+              >
+                <p className="team-suggestion-body">{obs.body}</p>
+                <div className="team-suggestion-footer">
+                  <button
+                    type="button"
+                    className="team-suggestion-source"
+                    onClick={() => onOpenNote(obs.source_note_id)}
+                  >
+                    {obs.source_note_title ?? "Source note"}
+                  </button>
+                  <span className="team-suggestion-meta">
+                    {obs.reviewed_ms !== null
+                      ? formatRelative(obs.reviewed_ms)
+                      : ""}
+                  </span>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {rejected.length > 0 && (
+        <section className="team-profile-section">
+          <button
+            type="button"
+            className="team-suggestion-toggle"
+            onClick={() => setShowRejected((v) => !v)}
+          >
+            {showRejected ? "Hide rejected" : `Show rejected (${rejected.length})`}
+          </button>
+          {showRejected && (
+            <div className="team-suggestion-list">
+              {rejected.map((obs) => (
+                <article
+                  key={obs.id}
+                  className="team-suggestion-card team-suggestion-accepted"
+                >
+                  <p className="team-suggestion-body">{obs.body}</p>
+                  <div className="team-suggestion-footer">
+                    <button
+                      type="button"
+                      className="team-suggestion-source"
+                      onClick={() => onOpenNote(obs.source_note_id)}
+                    >
+                      {obs.source_note_title ?? "Source note"}
+                    </button>
+                    <span className="team-suggestion-meta">
+                      {obs.reviewed_ms !== null
+                        ? formatRelative(obs.reviewed_ms)
+                        : ""}
+                    </span>
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+    </div>
+  );
 }
 
 // ---------- EditableField -----------------------------------------------

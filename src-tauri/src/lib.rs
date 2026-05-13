@@ -12,6 +12,7 @@ mod events;
 mod index;
 mod keychain;
 mod notes;
+mod observations;
 mod paths;
 mod profiles;
 mod reconcile;
@@ -510,6 +511,11 @@ pub fn run() {
             embeddings::commands::force_reindex_embeddings,
             profiles::commands::get_profile_snapshot,
             profiles::commands::force_recompute_profile,
+            observations::commands::list_profile_observations,
+            observations::commands::pending_observation_counts,
+            observations::commands::accept_profile_observation,
+            observations::commands::reject_profile_observation,
+            observations::commands::delete_profile_observation,
             start_meeting_recording,
             stop_meeting_recording,
             start_voice_recording,

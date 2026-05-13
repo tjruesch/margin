@@ -237,10 +237,36 @@ Channel hints `[mic]` / `[system]` are audio-capture metadata, not identity clai
 
 Action items in your output MUST use canonical display names from the attendee list, or be left unowned (`- [ ] task`) when ownership is unclear.";
 
+/// Side-channel policy for AI-suggested per-attendee observations (#52).
+/// Carries its own ephemeral cache breakpoint so it can evolve without
+/// busting the `SYSTEM_PROMPT` / glossary / attendee-policy caches.
+/// The post-processor strips the marker block from the output before
+/// returning the markdown to the caller — the user never sees it.
+const OBSERVATIONS_POLICY_PROMPT: &str = "## Optional: per-attendee observations (side-channel)
+
+If the meeting reveals new signal about how an attendee works (priorities, working style, communication preferences, expertise areas), append a single trailing block AFTER the markdown body, between these exact markers:
+
+<!-- MARGIN_OBSERVATIONS_START -->
+[
+  { \"member_id\": \"tm_xxx\", \"body\": \"Prefers async; replies in tight bullets.\" }
+]
+<!-- MARGIN_OBSERVATIONS_END -->
+
+Rules:
+- `member_id` MUST match the backtick-quoted id from the `## Attendees` block. Never invent ids.
+- `body` is one short sentence, declarative, third-person. No quotes, no hedging.
+- At most one observation per attendee per meeting. Skip attendees with nothing new to add. Zero observations is fine — omit the entire block.
+- Do NOT observe the user themselves (the `(You)` attendee).
+- Only emit signal that would help a colleague reading the profile months later. Skip transient or meeting-specific notes (those belong in action items).
+- The markers MUST be on their own lines. Nothing follows the end marker.";
+
 /// Cap on profile-body chars copied into the `## Attendees` section per
 /// attendee. ~600 chars × ~5 attendees ≈ 3K chars per reconcile — small
 /// next to the transcript and well within budget.
 const PROFILE_EXCERPT_CHARS: usize = 600;
+
+const OBSERVATIONS_START_MARKER: &str = "<!-- MARGIN_OBSERVATIONS_START -->";
+const OBSERVATIONS_END_MARKER: &str = "<!-- MARGIN_OBSERVATIONS_END -->";
 
 /// Format the transcript for the reconcile user message. Rendering rules:
 ///
@@ -355,7 +381,9 @@ fn format_attendee_entry(member: &TeamMember, excerpt: &str) -> String {
     let mut s = String::new();
     s.push_str("- **");
     s.push_str(&member.display_name);
-    s.push_str("**");
+    s.push_str("** `");
+    s.push_str(&member.id);
+    s.push('`');
     if member.is_self {
         s.push_str(" (You)");
     }
@@ -395,6 +423,64 @@ fn format_attendees_section(entries: &[(TeamMember, String)]) -> Option<String> 
         out.push_str(&format_attendee_entry(m, excerpt));
     }
     Some(out)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedObservation {
+    member_id: String,
+    body: String,
+}
+
+/// Split the reconcile response into the cleaned markdown body + parsed
+/// observations (#52). The model is asked to append a JSON array between
+/// `OBSERVATIONS_START_MARKER` and `OBSERVATIONS_END_MARKER`.
+///
+/// Strict tolerance:
+/// - No start marker → markdown returned untouched, empty Vec.
+/// - Markers present but malformed JSON between them → markdown stripped
+///   anyway (we never want raw markers leaking into the saved note),
+///   empty Vec.
+/// - Items missing `member_id`/`body` fields are dropped silently.
+/// - End marker absent → everything after the start marker is dropped,
+///   no observations parsed.
+fn strip_observations_block(raw: &str) -> (String, Vec<ParsedObservation>) {
+    let Some(start_idx) = raw.find(OBSERVATIONS_START_MARKER) else {
+        return (raw.to_string(), Vec::new());
+    };
+    let body = raw[..start_idx].trim_end().to_string();
+    let after_start = &raw[start_idx + OBSERVATIONS_START_MARKER.len()..];
+    let Some(end_off) = after_start.find(OBSERVATIONS_END_MARKER) else {
+        // Start marker without end → strip from start onward, parse nothing.
+        return (body, Vec::new());
+    };
+    let json_slice = after_start[..end_off].trim();
+
+    let parsed: serde_json::Value = match serde_json::from_str(json_slice) {
+        Ok(v) => v,
+        Err(_) => return (body, Vec::new()),
+    };
+    let arr = match parsed.as_array() {
+        Some(a) => a,
+        None => return (body, Vec::new()),
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(member_id) = item.get("member_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(body_str) = item.get("body").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let trimmed = body_str.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        out.push(ParsedObservation {
+            member_id: member_id.to_string(),
+            body: trimmed.to_string(),
+        });
+    }
+    (body, out)
 }
 
 /// Format the user's glossary as a small system-block addendum that nudges
@@ -624,6 +710,16 @@ pub async fn reconcile_notes(
         text: ATTENDEE_POLICY_PROMPT,
         cache_control: CacheControl { kind: "ephemeral" },
     });
+    // Side-channel observations policy (#52). Only installed when the
+    // call has attendees attached — without an `## Attendees` block the
+    // model has no valid ids to reference.
+    if !entries.is_empty() {
+        system.push(SystemBlock {
+            kind: "text",
+            text: OBSERVATIONS_POLICY_PROMPT,
+            cache_control: CacheControl { kind: "ephemeral" },
+        });
+    }
 
     let body = ReqBody {
         model,
@@ -693,6 +789,51 @@ pub async fn reconcile_notes(
         ));
     }
 
+    // Split off the side-channel observations block (#52). The returned
+    // markdown is what the user sees; observations are persisted as
+    // `pending` rows the user reviews from the Team detail page.
+    let (markdown_body, observations) = strip_observations_block(&assembled);
+    if !observations.is_empty() {
+        let attendee_ids: std::collections::HashSet<&str> =
+            entries.iter().map(|(m, _)| m.id.as_str()).collect();
+        let note_id_for_obs = note_path.as_deref();
+        match (note_id_for_obs, conn_state.lock()) {
+            (Some(nid), Ok(mut c)) => {
+                let now_obs_ms = crate::events::current_unix_ms();
+                match c.transaction() {
+                    Ok(tx) => {
+                        let mut inserted = 0usize;
+                        for obs in &observations {
+                            if !attendee_ids.contains(obs.member_id.as_str()) {
+                                continue;
+                            }
+                            match crate::observations::persist::insert_pending(
+                                &tx,
+                                &obs.member_id,
+                                nid,
+                                &obs.body,
+                                now_obs_ms,
+                            ) {
+                                Ok(_) => inserted += 1,
+                                Err(e) => eprintln!("[reconcile] insert observation: {e}"),
+                            }
+                        }
+                        if let Err(e) = tx.commit() {
+                            eprintln!("[reconcile] commit observations: {e}");
+                        } else if inserted > 0 {
+                            eprintln!("[reconcile] inserted {inserted} pending observations");
+                        }
+                    }
+                    Err(e) => eprintln!("[reconcile] begin tx for observations: {e}"),
+                }
+            }
+            (None, _) => {
+                eprintln!("[reconcile] skipping observations — no note_path available");
+            }
+            (_, Err(e)) => eprintln!("[reconcile] lock conn for observations: {e}"),
+        }
+    }
+
     // Stamp the transcript so the post-record banner can suppress its
     // Generate-notes CTA next time the note is opened. Failure to write
     // is non-fatal — the user got their reconciled output, the flag is
@@ -709,7 +850,7 @@ pub async fn reconcile_notes(
     }
 
     let _ = app.emit("reconcile-progress", "done");
-    Ok(assembled)
+    Ok(markdown_body)
 }
 
 #[cfg(test)]
@@ -863,12 +1004,12 @@ mod tests {
         ];
         let got = format_attendees_section(&entries).expect("non-empty");
         assert!(got.starts_with("## Attendees\n\n"));
-        assert!(got.contains("**Tom Ruesch** (You) — CEO"));
+        // The canonical id is now embedded after the display name (#52)
+        // so the observations side-channel can reference it.
+        assert!(got.contains("**Tom Ruesch** `tom ruesch-id` (You) — CEO"));
         assert!(got.contains("Aliases: TJ, Tom"));
         assert!(got.contains("Background: Leads engineering."));
-        // Sarah has no role, no aliases, no profile — single-line entry.
-        assert!(got.contains("**Sarah Smith**"));
-        assert!(!got.contains("Sarah Smith** —"));
+        assert!(got.contains("**Sarah Smith** `sarah smith-id`"));
         assert!(!got.contains("Aliases: \n"));
         assert!(!got.contains("Background: \n"));
     }
@@ -877,5 +1018,63 @@ mod tests {
     fn format_attendees_section_returns_none_when_empty() {
         let got = format_attendees_section(&[]);
         assert!(got.is_none());
+    }
+
+    // ---------- strip_observations_block (#52) -------------------------
+
+    #[test]
+    fn strip_observations_block_returns_raw_when_no_markers() {
+        let raw = "# Note\n\n## Summary\n\nA brief meeting.";
+        let (body, obs) = strip_observations_block(raw);
+        assert_eq!(body, raw);
+        assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn strip_observations_block_extracts_valid_payload() {
+        let raw = "# Note\n\n## Summary\n\nWe met.\n\n<!-- MARGIN_OBSERVATIONS_START -->\n[\n  {\"member_id\": \"tm_a\", \"body\": \"Async-first.\"},\n  {\"member_id\": \"tm_b\", \"body\": \"Detail-oriented.\"}\n]\n<!-- MARGIN_OBSERVATIONS_END -->\n";
+        let (body, obs) = strip_observations_block(raw);
+        assert_eq!(body, "# Note\n\n## Summary\n\nWe met.");
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].member_id, "tm_a");
+        assert_eq!(obs[0].body, "Async-first.");
+        assert_eq!(obs[1].member_id, "tm_b");
+        assert_eq!(obs[1].body, "Detail-oriented.");
+    }
+
+    #[test]
+    fn strip_observations_block_drops_malformed_json_but_still_strips() {
+        let raw = "# Note\n\nBody.\n\n<!-- MARGIN_OBSERVATIONS_START -->\nthis isn't json\n<!-- MARGIN_OBSERVATIONS_END -->";
+        let (body, obs) = strip_observations_block(raw);
+        // Markers stripped, body preserved.
+        assert_eq!(body, "# Note\n\nBody.");
+        assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn strip_observations_block_drops_items_missing_fields() {
+        let raw = "# Note\n\nBody.\n\n<!-- MARGIN_OBSERVATIONS_START -->\n[\n  {\"member_id\": \"tm_a\"},\n  {\"body\": \"orphaned\"},\n  {\"member_id\": \"tm_b\", \"body\": \"   \"},\n  {\"member_id\": \"tm_c\", \"body\": \"keep me\"}\n]\n<!-- MARGIN_OBSERVATIONS_END -->";
+        let (body, obs) = strip_observations_block(raw);
+        assert_eq!(body, "# Note\n\nBody.");
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].member_id, "tm_c");
+        assert_eq!(obs[0].body, "keep me");
+    }
+
+    #[test]
+    fn strip_observations_block_handles_start_without_end_marker() {
+        let raw = "# Note\n\nBody.\n\n<!-- MARGIN_OBSERVATIONS_START -->\n[ {\"member_id\":\"tm_a\",\"body\":\"x\"} ]\n";
+        let (body, obs) = strip_observations_block(raw);
+        // Everything from the start marker is dropped — never leak markers.
+        assert_eq!(body, "# Note\n\nBody.");
+        assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn strip_observations_block_trims_trailing_whitespace_before_marker() {
+        let raw = "# Note\n\nBody.\n\n\n<!-- MARGIN_OBSERVATIONS_START -->\n[]\n<!-- MARGIN_OBSERVATIONS_END -->\n";
+        let (body, obs) = strip_observations_block(raw);
+        assert_eq!(body, "# Note\n\nBody.");
+        assert!(obs.is_empty());
     }
 }
