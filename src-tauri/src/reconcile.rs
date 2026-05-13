@@ -547,22 +547,37 @@ pub async fn reconcile_notes(
         Vec::new()
     };
 
-    // Read each attendee's profile.md (best-effort) and build truncated
-    // excerpts. A read error degrades to an empty excerpt for that member —
-    // the rest of the prompt is unaffected.
+    // Pull the latest profile snapshot per attendee (#107) and flatten
+    // each into the multi-line excerpt the prompt has shipped for
+    // months. Missing snapshots (worker hasn't run yet) degrade to an
+    // empty excerpt for that member — the rest of the prompt is
+    // unaffected. The legacy `profile.md` disk reads went away in
+    // #107; the column on team_members survives but unread.
+    let snapshot_map = if attendees.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        match conn_state.lock() {
+            Ok(c) => {
+                let ids: Vec<&str> = attendees.iter().map(|m| m.id.as_str()).collect();
+                crate::profiles::persist::get_latest_map(&c, &ids).unwrap_or_else(|e| {
+                    eprintln!("[reconcile] get_latest_map failed: {e}");
+                    std::collections::HashMap::new()
+                })
+            }
+            Err(_) => std::collections::HashMap::new(),
+        }
+    };
     let mut entries: Vec<(TeamMember, String)> = Vec::with_capacity(attendees.len());
     for m in attendees {
-        let body = match tokio::fs::read_to_string(&m.profile_md_path).await {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!(
-                    "[reconcile] read profile {} failed: {e}",
-                    m.profile_md_path
-                );
-                String::new()
-            }
-        };
-        let excerpt = excerpt_profile(&body, &m.display_name, PROFILE_EXCERPT_CHARS);
+        let excerpt = snapshot_map
+            .get(&m.id)
+            .map(|snap| {
+                crate::profiles::prompt::render_snapshot_excerpt(
+                    &snap.body,
+                    PROFILE_EXCERPT_CHARS,
+                )
+            })
+            .unwrap_or_default();
         entries.push((m, excerpt));
     }
     let attendees_section = format_attendees_section(&entries);

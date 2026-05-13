@@ -28,7 +28,7 @@ import { MoreMenu } from "./MoreMenu";
 import { type NotificationRecord, unreadCount } from "./notifications";
 import { NotificationsPanel } from "./NotificationsPanel";
 import { SearchPalette } from "./SearchPalette";
-import { TeamView, type EditorSettings as TeamEditorSettings } from "./Team";
+import { TeamView } from "./Team";
 import { WorkstreamsView } from "./Workstreams";
 import {
   IconArchive,
@@ -90,9 +90,6 @@ type Props = {
    *  optional payload after `@` (e.g. `2026-05-15` or `2026-05-15 09:00`);
    *  Rust resolves any relative form during write_note. */
   onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
-  /** Editor preferences threaded through so the Team detail view can
-   *  hand them to the embedded markdown editor. */
-  editor: TeamEditorSettings;
   /** Team members for the assignee-chip dropdown on action rows (#51). */
   members: TeamMember[];
   /** Reassign an action to a different team member (or null to unassign).
@@ -324,7 +321,6 @@ export function Home({
   onToggleAction,
   onDeleteAction,
   onAddInboxTodo,
-  editor,
   members,
   onReassignAction,
   onReattachActionWorkstream,
@@ -642,7 +638,6 @@ export function Home({
 
         {nav === "team" ? (
           <TeamView
-            editor={editor}
             onOpenNote={onOpen}
             onOpenWorkstream={openWorkstream}
             onToggleAction={onToggleAction}

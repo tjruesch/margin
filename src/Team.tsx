@@ -2,45 +2,30 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 
 import { dueBucket } from "./dueLabel";
-import { Editor } from "./Editor";
 import { ActionRow, BUCKET_ORDER } from "./Home";
 import { IconChevLeft, IconPlus, IconTrash } from "./icons";
 import {
   AliasKind,
   type ActionListItem,
+  type ProfileSnapshot,
   type TeamMember,
   type TypedAlias,
   createTeamMember,
   deleteTeamMember,
+  forceRecomputeProfile,
+  getProfileSnapshot,
   listActions,
   listTeamMembers,
-  readFile,
   updateTeamMember,
-  writeFile,
 } from "./file";
 import { avatarColor, initialsFromName } from "./initials";
 
-export type EditorSettings = {
-  tabSize: number;
-  useTabs: boolean;
-  softWrap: boolean;
-  fontSize: number;
-};
-
-// Stable empty array for Editor's `actions` prop — profile.md bodies
-// don't carry action items, but the prop is required by Editor's type.
-// Reusing the same reference avoids busting the Editor's `useMemo` for
-// extensions on every TeamView re-render.
-const EMPTY_ACTIONS: ActionListItem[] = [];
-
 export function TeamView({
-  editor,
   onOpenNote,
   onOpenWorkstream,
   onToggleAction,
   onReassignAction,
 }: {
-  editor: EditorSettings;
   onOpenNote: (path: string) => void;
   /** Routes workstream-sourced rows to the Workstreams view (#100). */
   onOpenWorkstream: (id: string) => void;
@@ -96,8 +81,8 @@ export function TeamView({
       <TeamDetail
         member={member}
         members={members}
-        editor={editor}
         onBack={() => setSelectedId(null)}
+        onSelectMember={setSelectedId}
         onOpenNote={onOpenNote}
         onOpenWorkstream={onOpenWorkstream}
         onToggleAction={onToggleAction}
@@ -296,13 +281,11 @@ function TeamComposerForm({
 
 // ---------- Detail pane --------------------------------------------------
 
-const PROFILE_SAVE_DEBOUNCE_MS = 600;
-
 function TeamDetail({
   member,
   members,
-  editor,
   onBack,
+  onSelectMember,
   onUpdated,
   onDeleted,
   onOpenNote,
@@ -312,8 +295,8 @@ function TeamDetail({
 }: {
   member: TeamMember;
   members: TeamMember[];
-  editor: EditorSettings;
   onBack: () => void;
+  onSelectMember: (id: string) => void;
   onUpdated: (next: TeamMember) => void;
   onDeleted: () => void;
   onOpenNote: (path: string) => void;
@@ -321,10 +304,6 @@ function TeamDetail({
   onToggleAction: (id: string, nextDone: boolean) => void;
   onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
-  const [body, setBody] = useState<string | null>(null);
-  const pendingBody = useRef<string | null>(null);
-  const saveTimer = useRef<number | null>(null);
-  const profilePath = member.profile_md_path;
   const [tab, setTab] = useState<"profile" | "tasks">("profile");
 
   // Reset to Profile when switching to a different member so the user
@@ -332,61 +311,6 @@ function TeamDetail({
   useEffect(() => {
     setTab("profile");
   }, [member.id]);
-
-  // Load profile.md whenever the targeted member changes.
-  useEffect(() => {
-    let cancelled = false;
-    setBody(null);
-    pendingBody.current = null;
-    void (async () => {
-      try {
-        const file = await readFile(profilePath);
-        if (!cancelled) setBody(file.content);
-      } catch (err) {
-        console.error("read profile failed:", err);
-        if (!cancelled) setBody("");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [profilePath]);
-
-  // Debounced flush. On unmount or member-switch, write any pending body
-  // immediately so we don't lose the user's last keystrokes.
-  const flushPending = useCallback(() => {
-    if (saveTimer.current !== null) {
-      window.clearTimeout(saveTimer.current);
-      saveTimer.current = null;
-    }
-    const next = pendingBody.current;
-    if (next === null) return;
-    pendingBody.current = null;
-    void writeFile(profilePath, next).catch((err) => {
-      console.error("write profile failed:", err);
-    });
-  }, [profilePath]);
-
-  useEffect(() => {
-    return () => {
-      flushPending();
-    };
-  }, [flushPending]);
-
-  const onBodyChange = (next: string) => {
-    setBody(next);
-    pendingBody.current = next;
-    if (saveTimer.current !== null) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => {
-      saveTimer.current = null;
-      const value = pendingBody.current;
-      if (value === null) return;
-      pendingBody.current = null;
-      void writeFile(profilePath, value).catch((err) => {
-        console.error("write profile failed:", err);
-      });
-    }, PROFILE_SAVE_DEBOUNCE_MS);
-  };
 
   const commitName = async (next: string) => {
     const trimmed = next.trim();
@@ -432,7 +356,6 @@ function TeamDetail({
       },
     );
     if (!ok) return;
-    flushPending();
     try {
       await deleteTeamMember(member.id);
       onDeleted();
@@ -447,10 +370,7 @@ function TeamDetail({
         <button
           type="button"
           className="team-detail-back"
-          onClick={() => {
-            flushPending();
-            onBack();
-          }}
+          onClick={onBack}
         >
           <IconChevLeft size={14} sw={1.8} />
           Back to team
@@ -523,24 +443,14 @@ function TeamDetail({
           </button>
         </div>
       </div>
-      {/* Profile body — hidden, not unmounted, so the editor's debounced
-          save and the EditableField drafts survive a Tasks-tab detour. */}
-      <div
-        className="team-detail-editor"
-        style={{ display: tab === "profile" ? undefined : "none" }}
-      >
-        {body !== null && (
-          <Editor
-            value={body}
-            onChange={onBodyChange}
-            tabSize={editor.tabSize}
-            useTabs={editor.useTabs}
-            softWrap={editor.softWrap}
-            fontSize={editor.fontSize}
-            actions={EMPTY_ACTIONS}
-          />
-        )}
-      </div>
+      {tab === "profile" && (
+        <ProfileSnapshotPane
+          member={member}
+          members={members}
+          onSelectMember={onSelectMember}
+          onOpenWorkstream={onOpenWorkstream}
+        />
+      )}
       {tab === "tasks" && (
         <TasksTab
           member={member}
@@ -553,6 +463,215 @@ function TeamDetail({
       )}
     </section>
   );
+}
+
+// ---------- Profile snapshot pane (#107) --------------------------------
+
+function ProfileSnapshotPane({
+  member,
+  members,
+  onSelectMember,
+  onOpenWorkstream,
+}: {
+  member: TeamMember;
+  members: TeamMember[];
+  onSelectMember: (id: string) => void;
+  onOpenWorkstream: (id: string) => void;
+}) {
+  const [snap, setSnap] = useState<ProfileSnapshot | null | "loading">(
+    "loading",
+  );
+  const [recomputing, setRecomputing] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setSnap("loading");
+    void (async () => {
+      try {
+        const s = await getProfileSnapshot(member.id);
+        if (!cancelled) setSnap(s);
+      } catch (err) {
+        console.error("getProfileSnapshot failed:", err);
+        if (!cancelled) setSnap(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [member.id]);
+
+  const onRefresh = async () => {
+    setRecomputing(true);
+    try {
+      const fresh = await forceRecomputeProfile(member.id);
+      setSnap(fresh);
+    } catch (err) {
+      console.error("forceRecomputeProfile failed:", err);
+    } finally {
+      setRecomputing(false);
+    }
+  };
+
+  if (snap === "loading") return <div className="team-tasks-loading" />;
+  if (snap === null) {
+    return (
+      <div className="team-profile-empty">
+        <p className="home-empty">
+          Snapshot not yet computed. Margin builds this from your activity
+          with {member.display_name}; it'll appear within an hour.
+        </p>
+        <button
+          type="button"
+          className="settings-btn"
+          onClick={() => void onRefresh()}
+          disabled={recomputing}
+        >
+          {recomputing ? "Computing…" : "Compute now"}
+        </button>
+      </div>
+    );
+  }
+  return (
+    <ProfileSnapshotView
+      snap={snap}
+      members={members}
+      onSelectMember={onSelectMember}
+      onOpenWorkstream={onOpenWorkstream}
+      onRefresh={() => void onRefresh()}
+      refreshing={recomputing}
+    />
+  );
+}
+
+function ProfileSnapshotView({
+  snap,
+  members,
+  onSelectMember,
+  onOpenWorkstream,
+  onRefresh,
+  refreshing,
+}: {
+  snap: ProfileSnapshot;
+  members: TeamMember[];
+  onSelectMember: (id: string) => void;
+  onOpenWorkstream: (id: string) => void;
+  onRefresh: () => void;
+  refreshing: boolean;
+}) {
+  const memberById = useMemo(() => {
+    const map = new Map<string, TeamMember>();
+    for (const m of members) map.set(m.id, m);
+    return map;
+  }, [members]);
+
+  const { body, computed_ms } = snap;
+  const collaborators = body.frequent_collaborators ?? [];
+  const focus = body.recent_focus ?? [];
+
+  return (
+    <div className="team-profile">
+      {(body.role_observed || body.working_hours_observed) && (
+        <div className="team-profile-strip">
+          {body.role_observed && (
+            <span className="team-profile-role">{body.role_observed}</span>
+          )}
+          {body.working_hours_observed && (
+            <span className="team-profile-hours">
+              {body.working_hours_observed.start_local} →{" "}
+              {body.working_hours_observed.end_local}
+            </span>
+          )}
+        </div>
+      )}
+
+      {collaborators.length > 0 && (
+        <section className="team-profile-section">
+          <h4 className="home-action-bucket-head">Frequent collaborators</h4>
+          <div className="team-profile-chips">
+            {collaborators.map((c) => {
+              const m = memberById.get(c.person_id);
+              if (!m) return null;
+              return (
+                <button
+                  key={c.person_id}
+                  type="button"
+                  className="team-profile-chip"
+                  title={c.evidence}
+                  onClick={() => onSelectMember(c.person_id)}
+                >
+                  <Avatar member={m} size={22} />
+                  <span>{m.display_name}</span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {focus.length > 0 && (
+        <section className="team-profile-section">
+          <h4 className="home-action-bucket-head">Recent focus</h4>
+          <div className="team-profile-chips">
+            {focus.map((f) => (
+              <button
+                key={f.workstream_id}
+                type="button"
+                className="team-profile-chip"
+                onClick={() => onOpenWorkstream(f.workstream_id)}
+              >
+                <span>{f.title}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {body.communication_style_notes && (
+        <section className="team-profile-section">
+          <h4 className="home-action-bucket-head">Communication style</h4>
+          <p className="team-profile-style">{body.communication_style_notes}</p>
+        </section>
+      )}
+
+      {body.last_seen_active_ms !== null && (
+        <section className="team-profile-section">
+          <h4 className="home-action-bucket-head">Last seen active</h4>
+          <p className="team-profile-meta-line">
+            {formatRelative(body.last_seen_active_ms)}
+          </p>
+        </section>
+      )}
+
+      <div className="team-profile-meta">
+        <span>Computed {formatRelative(computed_ms)}</span>
+        <button
+          type="button"
+          className="settings-btn"
+          onClick={onRefresh}
+          disabled={refreshing}
+        >
+          {refreshing ? "Refreshing…" : "Refresh"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function formatRelative(ms: number): string {
+  const diff = Date.now() - ms;
+  if (diff < 0) return "just now";
+  const secs = Math.floor(diff / 1000);
+  if (secs < 60) return "just now";
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  const years = Math.floor(months / 12);
+  return `${years}y ago`;
 }
 
 // ---------- EditableField -----------------------------------------------

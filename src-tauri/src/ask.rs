@@ -349,23 +349,31 @@ pub async fn start(
         return Ok(());
     }
 
-    // Read profile.md contents off-lock (small file IO, no need to
-    // hold the SQLite mutex). Failure on any one profile degrades to
-    // an empty excerpt — the model still has the display_name + aliases.
+    // Pull the latest profile snapshot per team member (#107) and
+    // render the same multi-line excerpt the prompt has historically
+    // consumed. Missing snapshots degrade to an empty excerpt — the
+    // model still has display_name + aliases from the directory.
+    let snapshot_map = {
+        let state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+        let c = state.lock().map_err(|e| e.to_string())?;
+        let ids: Vec<&str> = team.iter().map(|m| m.id.as_str()).collect();
+        crate::profiles::persist::get_latest_map(&c, &ids).unwrap_or_else(|e| {
+            eprintln!("[ask] get_latest_map failed: {e}");
+            std::collections::HashMap::new()
+        })
+    };
     let mut profile_excerpts: Vec<(crate::team::TeamMember, String)> =
         Vec::with_capacity(team.len());
     for m in team {
-        let body = match tokio::fs::read_to_string(&m.profile_md_path).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!(
-                    "[ask] read profile {} failed: {e}",
-                    m.profile_md_path
-                );
-                String::new()
-            }
-        };
-        let excerpt = truncate_chars(body.trim(), PER_PROFILE_CAP);
+        let excerpt = snapshot_map
+            .get(&m.id)
+            .map(|snap| {
+                crate::profiles::prompt::render_snapshot_excerpt(
+                    &snap.body,
+                    PER_PROFILE_CAP,
+                )
+            })
+            .unwrap_or_default();
         profile_excerpts.push((m, excerpt));
     }
 

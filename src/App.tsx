@@ -2061,7 +2061,6 @@ export default function App() {
             onToggleAction={(id, next) => void onToggleAction(id, next)}
             onDeleteAction={(id) => void onDeleteAction(id)}
             onAddInboxTodo={onAddInboxTodo}
-            editor={{ tabSize, useTabs, softWrap, fontSize }}
             members={members}
             onReassignAction={onReassignAction}
             onReattachActionWorkstream={onReattachActionWorkstream}

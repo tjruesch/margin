@@ -3758,17 +3758,97 @@ input.nh-title {
   cursor: not-allowed;
 }
 
-.team-detail-editor {
+/* ----- Profile snapshot pane (#107) ----- */
+
+.team-profile {
   flex: 1;
   min-height: 0;
   margin-top: 14px;
-  padding-bottom: 12px;
+  padding-bottom: 24px;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
+  gap: 18px;
 }
-.team-detail-editor > * {
-  flex: 1;
-  min-height: 0;
+
+.team-profile-empty {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 0;
+  align-items: flex-start;
+}
+
+.team-profile-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 14px;
+  color: var(--muted, #777);
+  font-size: 13px;
+}
+.team-profile-role {
+  color: var(--fg, #222);
+  font-weight: 500;
+}
+.team-profile-hours {
+  font-variant-numeric: tabular-nums;
+}
+
+.team-profile-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.team-profile-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.team-profile-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 4px;
+  border: 1px solid var(--border, #e2e2e2);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.team-profile-chip:hover {
+  background: var(--hover, rgba(0, 0, 0, 0.04));
+}
+.team-profile-chip:not(:has(.team-avatar)) {
+  padding-left: 10px;
+}
+
+.team-profile-style {
+  margin: 0;
+  font-style: italic;
+  color: var(--muted, #555);
+  line-height: 1.5;
+}
+
+.team-profile-meta-line {
+  margin: 0;
+  color: var(--muted, #777);
+  font-size: 13px;
+}
+
+.team-profile-meta {
+  margin-top: auto;
+  padding-top: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-top: 1px solid var(--border, #eee);
+  color: var(--muted, #777);
+  font-size: 12.5px;
 }
 
 /* ----- Team detail tabs (#50) ----- */

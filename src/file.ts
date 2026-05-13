@@ -94,6 +94,56 @@ export async function forceReindexEmbeddings(): Promise<void> {
   await invoke<void>("force_reindex_embeddings");
 }
 
+// --- Profile snapshots (#107) -------------------------------------------
+
+export type ProfileCollaborator = {
+  person_id: string;
+  score: number;
+  evidence: string;
+};
+
+export type ProfileFocus = {
+  workstream_id: string;
+  title: string;
+  confidence: number;
+};
+
+export type ProfileWorkingHours = {
+  start_local: string;
+  end_local: string;
+};
+
+export type ProfileSnapshotBody = {
+  role_observed: string | null;
+  frequent_collaborators: ProfileCollaborator[];
+  recent_focus: ProfileFocus[];
+  working_hours_observed: ProfileWorkingHours | null;
+  communication_style_notes: string | null;
+  last_seen_active_ms: number | null;
+  evidence_observation_ids: string[];
+};
+
+export type ProfileSnapshot = {
+  person_id: string;
+  computed_ms: number;
+  body: ProfileSnapshotBody;
+  source_hash: string;
+};
+
+export async function getProfileSnapshot(
+  memberId: string,
+): Promise<ProfileSnapshot | null> {
+  return invoke<ProfileSnapshot | null>("get_profile_snapshot", {
+    memberId,
+  });
+}
+
+export async function forceRecomputeProfile(
+  memberId: string,
+): Promise<ProfileSnapshot> {
+  return invoke<ProfileSnapshot>("force_recompute_profile", { memberId });
+}
+
 // --- Notes (bundle abstraction) ------------------------------------------
 
 export type NoteRef = { id: string; note_path: string };

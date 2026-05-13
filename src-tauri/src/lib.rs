@@ -13,6 +13,7 @@ mod index;
 mod keychain;
 mod notes;
 mod paths;
+mod profiles;
 mod reconcile;
 mod reminders;
 mod sharing;
@@ -487,6 +488,11 @@ pub fn run() {
             // configured (emits `embed-status: needs_key`).
             embeddings::start_worker(app.handle().clone());
 
+            // Profile snapshot worker (#107). Ticks every 60s,
+            // dirty-tracked by the events table. Idle until the
+            // Anthropic API key is configured.
+            profiles::start_worker(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -502,6 +508,8 @@ pub fn run() {
             keychain::delete_voyage_api_key,
             keychain::has_voyage_api_key,
             embeddings::commands::force_reindex_embeddings,
+            profiles::commands::get_profile_snapshot,
+            profiles::commands::force_recompute_profile,
             start_meeting_recording,
             stop_meeting_recording,
             start_voice_recording,
