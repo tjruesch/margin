@@ -113,6 +113,13 @@ export type ProfileWorkingHours = {
   end_local: string;
 };
 
+export type ProfileWaitingItem = {
+  description: string;
+  source_kind: string;
+  source_ref_id: string;
+  since_ms: number;
+};
+
 export type ProfileSnapshotBody = {
   role_observed: string | null;
   frequent_collaborators: ProfileCollaborator[];
@@ -121,6 +128,12 @@ export type ProfileSnapshotBody = {
   communication_style_notes: string | null;
   last_seen_active_ms: number | null;
   evidence_observation_ids: string[];
+  // v3 fields (#120) — backend ships them after the worker prompt
+  // changes land; until then they arrive undefined and the UI shows
+  // empty-state copy.
+  summary_prose?: string | null;
+  waiting_from_me?: ProfileWaitingItem[];
+  waiting_for_them?: ProfileWaitingItem[];
 };
 
 export type ProfileSnapshot = {
@@ -142,6 +155,18 @@ export async function forceRecomputeProfile(
   memberId: string,
 ): Promise<ProfileSnapshot> {
   return invoke<ProfileSnapshot>("force_recompute_profile", { memberId });
+}
+
+export type TeamWaitingCounts = {
+  from_me: number;
+  for_them: number;
+  last_seen_active_ms: number | null;
+};
+
+export async function teamWaitingCounts(): Promise<
+  Record<string, TeamWaitingCounts>
+> {
+  return invoke<Record<string, TeamWaitingCounts>>("team_waiting_counts");
 }
 
 // --- Profile observations (#52) -----------------------------------------

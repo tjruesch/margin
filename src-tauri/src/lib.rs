@@ -511,6 +511,7 @@ pub fn run() {
             embeddings::commands::force_reindex_embeddings,
             profiles::commands::get_profile_snapshot,
             profiles::commands::force_recompute_profile,
+            profiles::commands::team_waiting_counts,
             observations::commands::list_profile_observations,
             observations::commands::pending_observation_counts,
             observations::commands::accept_profile_observation,

@@ -27,6 +27,25 @@ pub struct ProfileSnapshotBody {
     /// Pointers into `profile_observations` (#52). Empty in v1.
     #[serde(default)]
     pub evidence_observation_ids: Vec<String>,
+    /// v3 fields (#120) — prose summary + waiting-direction analysis.
+    /// The worker prompt doesn't emit these yet; `#[serde(default)]`
+    /// keeps old snapshots deserializing cleanly. Frontend already
+    /// renders them via the list / detail surfaces (zero-state until
+    /// the v3 worker ships).
+    #[serde(default)]
+    pub summary_prose: Option<String>,
+    #[serde(default)]
+    pub waiting_from_me: Vec<WaitingItem>,
+    #[serde(default)]
+    pub waiting_for_them: Vec<WaitingItem>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct WaitingItem {
+    pub description: String,
+    pub source_kind: String,
+    pub source_ref_id: String,
+    pub since_ms: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
