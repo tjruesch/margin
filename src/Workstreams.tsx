@@ -50,6 +50,7 @@ import {
 import { AssigneeChip } from "./AssigneeChip";
 import { ResolveQuestionPopover } from "./ResolveQuestionPopover";
 import { DueChip } from "./Home";
+import { usePageDetailLifecycle } from "./pageDetail";
 import {
   IconArchive,
   IconBell,
@@ -868,6 +869,10 @@ function WorkstreamDetailView({
   const [moreOpen, setMoreOpen] = useState(false);
   const [pickerMode, setPickerMode] = useState<"owner" | "parent" | null>(null);
   const [externalDialog, setExternalDialog] = useState<ExternalParticipant | null>(null);
+
+  // Tell Home.tsx to drop its page-level H1 + list actions for as long
+  // as this detail view is mounted; this view owns its own header zone.
+  usePageDetailLifecycle();
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -1727,15 +1732,15 @@ function WorkstreamPickerModal({
   );
 }
 
-/// Standalone back link rendered above the breadcrumb on the detail
-/// view (#101). Splitting it out of DetailHeader lets us render
-/// `back → breadcrumb → title` for nested workstreams instead of the
-/// older `breadcrumb → back → title` order.
+/// Breadcrumb-style "Back to workstreams" link rendered at the top of
+/// the detail view. Sits inline (no portal) since the page-level
+/// PageHeader is suppressed for the detail screen — the detail view
+/// owns its own header zone.
 function WorkstreamBackLink({ onBack }: { onBack: () => void }) {
   return (
     <button
       type="button"
-      className="workstream-back-link"
+      className="detail-crumb"
       onClick={onBack}
       aria-label="Back to workstreams"
     >

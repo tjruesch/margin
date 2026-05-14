@@ -1473,6 +1473,39 @@ select.settings-input {
   font-size: 13.5px;
   color: var(--fg-muted);
 }
+
+/* Portal slot for detail-view back links. Sits tight under the H1 in
+   the page header; empty (and zero-height) on pages without a detail
+   open, so it doesn't affect layout when unused. */
+.page-header-breadcrumb-slot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.page-header-breadcrumb-slot:empty {
+  margin: 0;
+}
+
+.page-header-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  padding: 3px 6px;
+  margin-left: -6px;
+  border-radius: 6px;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 80ms ease, color 80ms ease;
+}
+.page-header-back:hover {
+  background: var(--home-card-hover);
+  color: var(--fg);
+}
 .home-greeting-accent {
   color: var(--accent);
   font-weight: 600;
@@ -3413,15 +3446,133 @@ input.nh-title {
   gap: 8px;
 }
 
+/* The list pane is a flex column that fills the available vertical
+   space (the page-header is its only sibling above). Toolbar + table
+   head stay fixed; only `.team-list-scroll` overflows. */
+.team-list-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding-bottom: 0;
+}
+.team-list-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 24px;
+}
+
+/* Team list toolbar — search input + total count, sits above the
+   grouped lists. */
+.team-list-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 18px 0 8px;
+  flex-shrink: 0;
+}
+
+/* Shared column-width grid used by the table head and every row.
+   `auto` for the indicator columns keeps the header in lockstep with
+   the right edge of the data even at narrow widths. */
+.team-list-table-head,
+.team-row {
+  display: grid;
+  grid-template-columns: 1fr 76px 76px 88px;
+  align-items: center;
+  gap: 12px;
+}
+.team-list-table-head {
+  padding: 6px 8px;
+  flex-shrink: 0;
+  border-bottom: 1px solid color-mix(in srgb, var(--fg) 8%, transparent);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.team-list-col-person {
+  text-align: left;
+}
+.team-list-col-indicator {
+  text-align: center;
+}
+.team-list-search {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  max-width: 320px;
+  padding: 7px 12px;
+  border: 1px solid var(--border, color-mix(in srgb, var(--fg) 12%, transparent));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+  color: var(--fg-muted);
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.team-list-search:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: var(--bg);
+  color: var(--fg);
+}
+.team-list-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+}
+.team-list-search input::placeholder {
+  color: var(--fg-muted);
+}
+.team-list-search input::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+.team-list-count {
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Section subgroups: "You" then "Team · N". Sticky inside the scroll
+   region so the section context stays visible while you scroll. */
+.team-list-group + .team-list-group {
+  margin-top: 18px;
+}
+.team-list-group-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 8px 4px;
+  background: var(--bg);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+}
+.team-list-group-count {
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--fg-muted);
+  opacity: 0.7;
+}
+
 .team-list {
   display: flex;
   flex-direction: column;
-  margin-top: 14px;
 }
 .team-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+  /* grid template lives on the shared selector above */
   padding: 10px 8px;
   border-radius: 8px;
   cursor: pointer;
@@ -3431,9 +3582,57 @@ input.nh-title {
   text-align: left;
   outline: none;
 }
+/* Subtle row separator — sits between sibling rows only, never at the
+   top or bottom of a section. Uses an inset box-shadow so the hover
+   background doesn't bleed over the divider. */
+.team-row + .team-row {
+  box-shadow: inset 0 1px 0 0 color-mix(in srgb, var(--fg) 6%, transparent);
+}
 .team-row:hover,
 .team-row:focus-visible {
   background: var(--home-card-hover);
+}
+
+.team-row-person {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+/* Indicator chips — three of them on the right of each row.
+   Color-coded by direction: "on you" warns, "on them" cool, pending
+   suggestions accent. Empty (count = 0) collapses to a quiet "—". */
+.team-row-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  margin: 0 auto;
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.team-row-indicator-empty {
+  background: transparent;
+  color: color-mix(in srgb, var(--fg-muted) 60%, transparent);
+  font-weight: 400;
+}
+.team-row-indicator-on-you {
+  background: color-mix(in srgb, #c44a1f 14%, transparent);
+  color: #c44a1f;
+}
+.team-row-indicator-on-them {
+  background: color-mix(in srgb, #3a5da8 14%, transparent);
+  color: #3a5da8;
+}
+.team-row-indicator-suggestion {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
 }
 .team-avatar {
   display: inline-flex;
@@ -3489,45 +3688,64 @@ input.nh-title {
   min-height: 0;
   padding: 10px 32px 0;
 }
-.team-detail-toolbar {
+/* Shared detail-screen top bar — small breadcrumb on the left, optional
+   icon action(s) on the right. Replaces the page-level PageHeader
+   while a detail view is on screen. */
+.detail-topbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 12px;
+  gap: 12px;
+  padding: 6px 0 8px;
 }
-.team-detail-back,
-.team-detail-delete {
+.detail-crumb {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
-  border-radius: 6px;
-  border: none;
+  gap: 4px;
   background: transparent;
+  border: none;
+  padding: 3px 6px;
+  margin-left: -6px;
+  border-radius: 6px;
   color: var(--fg-muted);
   font: inherit;
   font-size: 12.5px;
-  font-weight: 500;
   cursor: pointer;
-  transition: all 120ms ease;
+  transition: background 80ms ease, color 80ms ease;
 }
-.team-detail-back:hover {
-  color: var(--fg);
+.detail-crumb:hover {
   background: var(--home-card-hover);
+  color: var(--fg);
 }
-.team-detail-delete {
+.detail-action-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: background 80ms ease, color 80ms ease;
+}
+.detail-action-icon:hover {
+  background: var(--home-card-hover);
+  color: var(--fg);
+}
+.detail-action-icon.detail-action-danger {
   color: #c44a1f;
 }
-.team-detail-delete:hover {
+.detail-action-icon.detail-action-danger:hover {
   background: color-mix(in srgb, #c44a1f 10%, transparent);
 }
 
 .team-detail-header {
   display: flex;
-  align-items: flex-start;
-  gap: 18px;
-  padding-bottom: 16px;
-  border-bottom: 0.5px solid var(--home-line);
+  align-items: center;
+  gap: 16px;
+  padding: 6px 0 16px;
 }
 .team-detail-fields {
   display: flex;
@@ -3535,6 +3753,15 @@ input.nh-title {
   gap: 4px;
   flex: 1;
   min-width: 0;
+}
+
+.team-detail-sub {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--fg-muted);
 }
 
 /* Click-to-edit fields. Display variant looks like text; hover hints at
@@ -3571,40 +3798,54 @@ input.nh-title {
 .team-detail-name,
 .team-detail-name.team-field-input {
   font-family: "Fraunces", Georgia, serif;
-  font-size: 24px;
+  font-size: 32px;
   font-weight: 500;
   font-variation-settings: "opsz" 144;
   letter-spacing: -0.012em;
+  line-height: 1.1;
+  color: var(--fg);
+  /* Stop the click target from spanning the whole fields column when
+     it's just the user's name. Sized to fit content, with a sensible
+     ceiling for very long names. */
+  width: auto;
+  max-width: min(100%, 22ch);
+  align-self: flex-start;
 }
 .team-detail-role,
 .team-detail-role.team-field-input {
-  font-size: 13.5px;
+  font-size: 13px;
   color: var(--fg-muted);
+  line-height: 1.4;
+  width: auto;
+  max-width: 32ch;
 }
 .team-detail-aliases,
 .team-detail-aliases.team-field-input {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--fg-muted);
 }
 
 /* ----- Identities trigger + modal (#87) ----- */
 
+/* Inline identities affordance in the header subline. Quiet
+   background chip; matches the height of the role line so the two
+   elements baseline cleanly. */
 .team-detail-aliases-trigger {
-  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
   font: inherit;
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--fg-muted);
-  background: transparent;
-  border: 1px dashed var(--border, rgba(0, 0, 0, 0.15));
-  border-radius: 6px;
-  padding: 4px 10px;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  border: none;
+  border-radius: 999px;
+  padding: 3px 10px;
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition: background 120ms ease, color 120ms ease;
 }
 .team-detail-aliases-trigger:hover {
-  background: var(--bg-soft, rgba(0, 0, 0, 0.04));
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
   color: var(--fg);
-  border-color: var(--border-strong, rgba(0, 0, 0, 0.25));
 }
 
 .identities-modal-backdrop {
@@ -3763,12 +4004,12 @@ input.nh-title {
 .team-profile {
   flex: 1;
   min-height: 0;
-  margin-top: 14px;
-  padding-bottom: 24px;
+  margin-top: 18px;
+  padding-bottom: 32px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: 28px;
 }
 
 .team-profile-empty {
@@ -3779,64 +4020,207 @@ input.nh-title {
   align-items: flex-start;
 }
 
+/* Zone 1 — Hero */
+
+.team-profile-hero {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
 .team-profile-strip {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   gap: 14px;
-  color: var(--muted, #777);
-  font-size: 13px;
+  color: var(--fg-muted, #888);
+  font-size: 12px;
+  letter-spacing: 0.01em;
 }
-.team-profile-role {
+.team-profile-strip-item {
+  font-variant-numeric: tabular-nums;
+}
+.team-profile-strip-emphasis {
   color: var(--fg, #222);
   font-weight: 500;
 }
-.team-profile-hours {
+
+.team-profile-summary {
+  margin: 0;
+  color: var(--fg, #1f1f1f);
+  font-size: 16px;
+  line-height: 1.55;
+  max-width: 70ch;
+}
+.team-profile-summary--placeholder {
+  color: var(--fg-muted, #999);
+  font-style: italic;
+}
+
+/* Zone 2 — Waiting (the directional pair) */
+
+.team-profile-waiting {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 22px;
+  padding: 18px 20px;
+  border: 1px solid var(--border, #e6e2d8);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.015);
+}
+@media (max-width: 720px) {
+  .team-profile-waiting {
+    grid-template-columns: 1fr;
+  }
+  .team-profile-waiting-divider {
+    display: none;
+  }
+}
+
+.team-profile-waiting-col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.team-profile-waiting-divider {
+  width: 1px;
+  background: var(--border, #e6e2d8);
+  align-self: stretch;
+}
+
+.team-profile-waiting-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.team-profile-waiting-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--fg-muted, #888);
+}
+
+.team-profile-waiting-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--accent, #2a7);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+.team-profile-waiting-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.team-profile-waiting-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13.5px;
+  line-height: 1.45;
+  color: var(--fg, #222);
+}
+
+.team-profile-waiting-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.team-profile-waiting-meta {
+  flex: 0 0 auto;
+  color: var(--fg-muted, #aaa);
+  font-size: 11.5px;
   font-variant-numeric: tabular-nums;
 }
 
-.team-profile-section {
+.team-profile-waiting-empty {
+  margin: 0;
+  color: var(--fg-muted, #aaa);
+  font-size: 13px;
+  font-style: italic;
+  line-height: 1.5;
+}
+
+/* Zone 3 — At a glance (quieter list of label/value rows) */
+
+.team-profile-glance {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 14px;
+}
+
+.team-profile-glance-row {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  align-items: baseline;
+  gap: 16px;
+}
+@media (max-width: 560px) {
+  .team-profile-glance-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}
+
+.team-profile-glance-label {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg-muted, #888);
+  line-height: 1.6;
 }
 
 .team-profile-chips {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 }
 
 .team-profile-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px 4px 4px;
-  border: 1px solid var(--border, #e2e2e2);
+  padding: 3px 10px;
+  border: 0;
   border-radius: 999px;
-  background: transparent;
-  color: inherit;
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--fg, #222);
   font-size: 12.5px;
   cursor: pointer;
+  line-height: 1.4;
+  transition: background 80ms ease;
 }
 .team-profile-chip:hover {
-  background: var(--hover, rgba(0, 0, 0, 0.04));
+  background: rgba(0, 0, 0, 0.09);
 }
-.team-profile-chip:not(:has(.team-avatar)) {
-  padding-left: 10px;
+.team-profile-chip--avatar {
+  padding-left: 3px;
 }
 
 .team-profile-style {
   margin: 0;
   font-style: italic;
-  color: var(--muted, #555);
-  line-height: 1.5;
-}
-
-.team-profile-meta-line {
-  margin: 0;
-  color: var(--muted, #777);
-  font-size: 13px;
+  color: var(--fg-muted, #555);
+  font-size: 13.5px;
+  line-height: 1.55;
 }
 
 .team-profile-meta {
@@ -4016,35 +4400,14 @@ input.nh-title {
   line-height: 1;
 }
 
-.team-row {
-  position: relative;
-}
-.team-row-pending {
-  position: absolute;
-  right: 14px;
-  top: 50%;
-  transform: translateY(-50%);
-  min-width: 20px;
-  height: 20px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: var(--accent, #2a7);
-  color: #fff;
-  font-size: 11px;
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
+/* Replaced by the inline `.team-row-indicator-suggestion` chip in the
+   new grid layout. Kept selector here as a no-op so any stale class
+   reference doesn't crash; can be cleaned up in a follow-up. */
 
 /* ----- Team detail tabs (#50) ----- */
 
 .team-detail-tabs {
-  display: flex;
-  margin-top: 14px;
-}
-.team-detail-tabs .nh-segmented {
-  flex: 0 0 auto;
+  margin: 0 -6px 4px;
 }
 
 .team-tasks-tab {
@@ -4053,6 +4416,15 @@ input.nh-title {
   margin-top: 12px;
   overflow-y: auto;
   padding-bottom: 24px;
+}
+
+/* The bucket left-color-bar exists for the Home Action-items surface,
+   where it color-codes due-date urgency. In the Team-detail Tasks tab
+   the buckets aren't due-date grouped, so the bar is just visual
+   noise — drop it here. */
+.team-tasks-tab .home-action-bucket {
+  border-left: 0;
+  padding-left: 0;
 }
 
 .team-tasks-loading {

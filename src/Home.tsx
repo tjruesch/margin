@@ -339,6 +339,21 @@ export function Home({
   const [panelOpen, setPanelOpen] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // Counter-style tracking of open detail breadcrumbs. Each
+  // `PageHeaderBreadcrumb` mount increments, unmount decrements.
+  // Greater than 0 means a detail view is active and the list-scoped
+  // page actions ("+ Add team member" etc.) should be hidden.
+  const [detailOpenCount, setDetailOpenCount] = useState(0);
+  useEffect(() => {
+    const onOpen = () => setDetailOpenCount((n) => n + 1);
+    const onClose = () => setDetailOpenCount((n) => Math.max(0, n - 1));
+    window.addEventListener("margin:page-detail-open", onOpen);
+    window.addEventListener("margin:page-detail-closed", onClose);
+    return () => {
+      window.removeEventListener("margin:page-detail-open", onOpen);
+      window.removeEventListener("margin:page-detail-closed", onClose);
+    };
+  }, []);
   const unreadBadge = useMemo(() => unreadCount(notifications), [notifications]);
 
   // Global keyboard shortcuts for the search palette:
@@ -639,13 +654,15 @@ export function Home({
             onNewMeeting={onNewMeeting}
           />
         ) : (
-          <PageHeader
-            title={pageHeaderTitle(nav)}
-            actions={renderScopedActions(nav, {
-              onRefreshWorkstreams,
-              synthInFlight,
-            })}
-          />
+          detailOpenCount > 0 ? null : (
+            <PageHeader
+              title={pageHeaderTitle(nav)}
+              actions={renderScopedActions(nav, {
+                onRefreshWorkstreams,
+                synthInFlight,
+              })}
+            />
+          )
         )}
 
         {nav === "home" && upcoming.length > 0 && (

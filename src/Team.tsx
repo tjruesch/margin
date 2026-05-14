@@ -3,13 +3,15 @@ import { ask } from "@tauri-apps/plugin-dialog";
 
 import { dueBucket } from "./dueLabel";
 import { ActionRow, BUCKET_ORDER } from "./Home";
-import { IconChevLeft, IconPlus, IconTrash } from "./icons";
+import { IconChevLeft, IconPlus, IconSearch, IconTrash } from "./icons";
+import { usePageDetailLifecycle } from "./pageDetail";
 import {
   AliasKind,
   type ActionListItem,
   type ProfileObservation,
   type ProfileSnapshot,
   type TeamMember,
+  type TeamWaitingCounts,
   type TypedAlias,
   acceptProfileObservation,
   createTeamMember,
@@ -21,6 +23,7 @@ import {
   listTeamMembers,
   pendingObservationCounts,
   rejectProfileObservation,
+  teamWaitingCounts,
   updateTeamMember,
 } from "./file";
 import { avatarColor, initialsFromName } from "./initials";
@@ -41,6 +44,9 @@ export function TeamView({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [pendingCounts, setPendingCounts] = useState<Record<string, number>>({});
+  const [waitingMap, setWaitingMap] = useState<
+    Record<string, TeamWaitingCounts>
+  >({});
   // Cross-link state (#115, lifted up for #116). Owned here so the
   // activity-popover → team-detail jump can seed both the highlight
   // and the active tab without per-mount races.
@@ -87,9 +93,14 @@ export function TeamView({
 
   const reloadCounts = useCallback(async () => {
     try {
-      setPendingCounts(await pendingObservationCounts());
+      const [pending, waiting] = await Promise.all([
+        pendingObservationCounts(),
+        teamWaitingCounts(),
+      ]);
+      setPendingCounts(pending);
+      setWaitingMap(waiting);
     } catch (err) {
-      console.error("pendingObservationCounts failed:", err);
+      console.error("team counts fetch failed:", err);
     }
   }, []);
 
@@ -167,6 +178,7 @@ export function TeamView({
     <ListPane
       members={members}
       pendingCounts={pendingCounts}
+      waitingMap={waitingMap}
       onSelect={setSelectedId}
       onCreated={async (m) => {
         await reload();
@@ -182,15 +194,19 @@ export function TeamView({
 function ListPane({
   members,
   pendingCounts,
+  waitingMap,
   onSelect,
   onCreated,
 }: {
   members: TeamMember[];
   pendingCounts: Record<string, number>;
+  waitingMap: Record<string, TeamWaitingCounts>;
   onSelect: (id: string) => void;
   onCreated: (member: TeamMember) => void;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
+  const [query, setQuery] = useState("");
+
   // The "Add team member" trigger lives in PageHeader (Home.tsx) when
   // nav === "team"; we listen for its dispatched event and open the
   // inline composer below.
@@ -200,8 +216,23 @@ function ListPane({
     return () =>
       window.removeEventListener("margin:open-team-composer", onOpen);
   }, []);
+
+  const q = query.trim().toLowerCase();
+  const filtered = useMemo(() => {
+    if (!q) return members;
+    return members.filter((m) => {
+      if (m.display_name.toLowerCase().includes(q)) return true;
+      if (m.role.toLowerCase().includes(q)) return true;
+      if (m.aliases.some((a) => a.value.toLowerCase().includes(q))) return true;
+      return false;
+    });
+  }, [members, q]);
+
+  const self = !q ? filtered.find((m) => m.is_self) : undefined;
+  const team = !q ? filtered.filter((m) => !m.is_self) : filtered;
+
   return (
-    <section className="home-section">
+    <section className="home-section team-list-pane">
       {composerOpen && (
         <TeamComposerForm
           onClose={() => setComposerOpen(false)}
@@ -211,22 +242,104 @@ function ListPane({
           }}
         />
       )}
+
       {members.length === 0 ? (
         <p className="home-empty">
           No team members yet — start with someone you work with regularly so
           Claude can attribute action items to them by name.
         </p>
       ) : (
-        <div className="team-list">
-          {members.map((m) => (
-            <TeamRow
-              key={m.id}
-              member={m}
-              pendingCount={pendingCounts[m.id] ?? 0}
-              onClick={() => onSelect(m.id)}
-            />
-          ))}
-        </div>
+        <>
+          <div className="team-list-toolbar">
+            <label className="team-list-search">
+              <IconSearch size={13} sw={1.8} />
+              <input
+                type="search"
+                placeholder="Search team…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                aria-label="Search team"
+              />
+            </label>
+            <span className="team-list-count">
+              {q
+                ? `${filtered.length} of ${members.length}`
+                : `${members.length} ${
+                    members.length === 1 ? "member" : "members"
+                  }`}
+            </span>
+          </div>
+
+          <div className="team-list-table-head" role="row" aria-hidden>
+            <span className="team-list-col team-list-col-person">Person</span>
+            <span
+              className="team-list-col team-list-col-indicator"
+              title="Waiting on you"
+            >
+              On you
+            </span>
+            <span
+              className="team-list-col team-list-col-indicator"
+              title="Waiting on them"
+            >
+              On them
+            </span>
+            <span
+              className="team-list-col team-list-col-indicator"
+              title="Pending suggestions"
+            >
+              Suggest.
+            </span>
+          </div>
+
+          <div className="team-list-scroll">
+            {filtered.length === 0 ? (
+              <p className="home-empty">
+                No matches for &ldquo;{query}&rdquo;.
+              </p>
+            ) : (
+              <>
+                {self && (
+                  <div className="team-list-group">
+                    <h4 className="team-list-group-head">You</h4>
+                    <div className="team-list">
+                      <TeamRow
+                        key={self.id}
+                        member={self}
+                        pendingCount={pendingCounts[self.id] ?? 0}
+                        waiting={waitingMap[self.id]}
+                        onClick={() => onSelect(self.id)}
+                      />
+                    </div>
+                  </div>
+                )}
+                {team.length > 0 && (
+                  <div className="team-list-group">
+                    {!q && (
+                      <h4 className="team-list-group-head">
+                        Team
+                        <span className="team-list-group-count">
+                          {team.length}
+                        </span>
+                      </h4>
+                    )}
+                    <div className="team-list">
+                      {team.map((m) => (
+                        <TeamRow
+                          key={m.id}
+                          member={m}
+                          pendingCount={pendingCounts[m.id] ?? 0}
+                          waiting={waitingMap[m.id]}
+                          onClick={() => onSelect(m.id)}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </>
       )}
     </section>
   );
@@ -235,12 +348,16 @@ function ListPane({
 function TeamRow({
   member,
   pendingCount,
+  waiting,
   onClick,
 }: {
   member: TeamMember;
   pendingCount: number;
+  waiting: TeamWaitingCounts | undefined;
   onClick: () => void;
 }) {
+  const onYou = waiting?.from_me ?? 0;
+  const onThem = waiting?.for_them ?? 0;
   return (
     <div
       className="team-row"
@@ -254,25 +371,57 @@ function TeamRow({
         }
       }}
     >
-      <Avatar member={member} size={38} />
-      <div className="team-row-body">
-        <div className="team-row-name">
-          {member.display_name}
-          {member.is_self && <span className="team-self-badge">You</span>}
-        </div>
-        <div className="team-row-role">
-          {member.role || (member.is_self ? "Your profile" : "—")}
+      <div className="team-row-person">
+        <Avatar member={member} size={36} />
+        <div className="team-row-body">
+          <div className="team-row-name">
+            {member.display_name}
+            {member.is_self && <span className="team-self-badge">You</span>}
+          </div>
+          <div className="team-row-role">
+            {member.role || (member.is_self ? "Your profile" : "—")}
+          </div>
         </div>
       </div>
-      {pendingCount > 0 && (
-        <span
-          className="team-row-pending"
-          title={`${pendingCount} suggestion${pendingCount === 1 ? "" : "s"} pending`}
-        >
-          {pendingCount}
-        </span>
-      )}
+      <RowIndicator
+        count={onYou}
+        tone="on-you"
+        label={`${onYou} item${onYou === 1 ? "" : "s"} waiting on you`}
+      />
+      <RowIndicator
+        count={onThem}
+        tone="on-them"
+        label={`${onThem} item${onThem === 1 ? "" : "s"} waiting on ${member.display_name}`}
+      />
+      <RowIndicator
+        count={pendingCount}
+        tone="suggestion"
+        label={`${pendingCount} pending suggestion${pendingCount === 1 ? "" : "s"}`}
+      />
     </div>
+  );
+}
+
+function RowIndicator({
+  count,
+  tone,
+  label,
+}: {
+  count: number;
+  tone: "on-you" | "on-them" | "suggestion";
+  label: string;
+}) {
+  if (count <= 0) {
+    return <span className="team-row-indicator team-row-indicator-empty">—</span>;
+  }
+  return (
+    <span
+      className={`team-row-indicator team-row-indicator-${tone}`}
+      title={label}
+      aria-label={label}
+    >
+      {count}
+    </span>
   );
 }
 
@@ -406,6 +555,9 @@ function TeamDetail({
   onObservationsChanged: () => void;
 }) {
   const [tab, setTab] = useState<"profile" | "suggestions" | "tasks">("profile");
+  // Tell Home.tsx to drop its page-level H1 + list actions for as long
+  // as this detail view is mounted (#117-ish navigation polish).
+  usePageDetailLifecycle();
 
   // Reset to Profile when switching to a different member so the user
   // never lands on a stale Tasks tab from the previous selection.
@@ -476,28 +628,29 @@ function TeamDetail({
 
   return (
     <section className="team-detail">
-      <div className="team-detail-toolbar">
+      <div className="detail-topbar">
         <button
           type="button"
-          className="team-detail-back"
+          className="detail-crumb"
           onClick={onBack}
         >
-          <IconChevLeft size={14} sw={1.8} />
-          Back to team
+          <IconChevLeft size={13} sw={1.8} />
+          Team
         </button>
         {!member.is_self && (
           <button
             type="button"
-            className="team-detail-delete"
+            className="detail-action-icon detail-action-danger"
             onClick={() => void onDelete()}
+            aria-label="Delete team member"
+            title="Delete"
           >
-            <IconTrash size={13} sw={1.8} />
-            Delete
+            <IconTrash size={14} sw={1.8} />
           </button>
         )}
       </div>
       <header className="team-detail-header">
-        <Avatar member={member} size={64} />
+        <Avatar member={member} size={48} />
         <div className="team-detail-fields">
           <EditableField
             value={member.display_name}
@@ -506,19 +659,21 @@ function TeamDetail({
             className="team-detail-name"
             blankFallback={member.display_name}
           />
-          <EditableField
-            value={member.role}
-            placeholder="Role (e.g. SDK lead)"
-            onCommit={(v) => void commitRole(v)}
-            className="team-detail-role"
-          />
-          <button
-            type="button"
-            className="team-detail-aliases-trigger"
-            onClick={() => setShowIdentitiesModal(true)}
-          >
-            {identitiesSummary(member.aliases)}
-          </button>
+          <div className="team-detail-sub">
+            <EditableField
+              value={member.role}
+              placeholder="Add a role"
+              onCommit={(v) => void commitRole(v)}
+              className="team-detail-role"
+            />
+            <button
+              type="button"
+              className="team-detail-aliases-trigger"
+              onClick={() => setShowIdentitiesModal(true)}
+            >
+              {identitiesSummary(member.aliases)}
+            </button>
+          </div>
         </div>
       </header>
       {showIdentitiesModal && (
@@ -531,41 +686,39 @@ function TeamDetail({
           }}
         />
       )}
-      <div className="team-detail-tabs">
-        <div className="nh-segmented" role="tablist" aria-label="Section">
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "profile"}
-            className={"nh-segmented-btn" + (tab === "profile" ? " active" : "")}
-            onClick={() => setTab("profile")}
-          >
-            Profile
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "suggestions"}
-            className={
-              "nh-segmented-btn" + (tab === "suggestions" ? " active" : "")
-            }
-            onClick={() => setTab("suggestions")}
-          >
-            Suggestions
-            {pendingCount > 0 && (
-              <span className="team-tab-badge">{pendingCount}</span>
-            )}
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={tab === "tasks"}
-            className={"nh-segmented-btn" + (tab === "tasks" ? " active" : "")}
-            onClick={() => setTab("tasks")}
-          >
-            Tasks
-          </button>
-        </div>
+      <div className="team-detail-tabs home-filter" role="tablist" aria-label="Section">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "profile"}
+          className={"home-filter-chip" + (tab === "profile" ? " active" : "")}
+          onClick={() => setTab("profile")}
+        >
+          Profile
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "suggestions"}
+          className={
+            "home-filter-chip" + (tab === "suggestions" ? " active" : "")
+          }
+          onClick={() => setTab("suggestions")}
+        >
+          Suggestions
+          {pendingCount > 0 && (
+            <span className="actions-filter-count">{pendingCount}</span>
+          )}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "tasks"}
+          className={"home-filter-chip" + (tab === "tasks" ? " active" : "")}
+          onClick={() => setTab("tasks")}
+        >
+          Tasks
+        </button>
       </div>
       {tab === "profile" && (
         <ProfileSnapshotPane
@@ -723,9 +876,26 @@ function ProfileSnapshotView({
     return map;
   }, [members]);
 
-  const { body, computed_ms } = snap;
-  const collaborators = body.frequent_collaborators ?? [];
+  const { body, computed_ms, person_id } = snap;
+  const subject = memberById.get(person_id);
+  // The team_members.role is already shown in the page header. Suppress
+  // the snapshot's observed-role echo when it agrees; only surface it
+  // when the AI has noticed a drift.
+  const observedRoleDiffers =
+    body.role_observed != null &&
+    body.role_observed.trim().toLowerCase() !==
+      (subject?.role ?? "").trim().toLowerCase();
+  // Frequent collaborators sourced from the user's own data graph will
+  // include the user themselves. Drop the self row — listing the reader
+  // as their colleague's "frequent collaborator" makes no sense. The
+  // deeper reframe of this field is a future issue.
+  const collaborators = (body.frequent_collaborators ?? []).filter((c) => {
+    const m = memberById.get(c.person_id);
+    return m != null && !m.is_self;
+  });
   const focus = body.recent_focus ?? [];
+  const waitingFromMe = body.waiting_from_me ?? [];
+  const waitingForThem = body.waiting_for_them ?? [];
   // Resolve cited observation ids to their full ProfileObservation rows;
   // silently skip ids that no longer match an accepted observation
   // (rejected/deleted since the snapshot was computed — stale cite).
@@ -736,99 +906,186 @@ function ProfileSnapshotView({
         .filter((o): o is ProfileObservation => o !== undefined),
     [body.evidence_observation_ids, acceptedById],
   );
+  const firstName = (subject?.display_name ?? "").split(" ")[0] || "them";
+
+  const hasStrip =
+    observedRoleDiffers ||
+    body.working_hours_observed != null ||
+    body.last_seen_active_ms != null;
 
   return (
     <div className="team-profile">
-      {(body.role_observed || body.working_hours_observed) && (
-        <div className="team-profile-strip">
-          {body.role_observed && (
-            <span className="team-profile-role">{body.role_observed}</span>
-          )}
-          {body.working_hours_observed && (
-            <span className="team-profile-hours">
-              {body.working_hours_observed.start_local} →{" "}
-              {body.working_hours_observed.end_local}
+      {/* Zone 1 — Hero. The summary is the page's centerpiece (large,
+          high-contrast prose). Meta strip floats above as small
+          muted attributes — never compete with the summary. */}
+      <header className="team-profile-hero">
+        {hasStrip && (
+          <div className="team-profile-strip">
+            {observedRoleDiffers && body.role_observed && (
+              <span className="team-profile-strip-emphasis">
+                {body.role_observed}
+              </span>
+            )}
+            {body.working_hours_observed && (
+              <span className="team-profile-strip-item">
+                {body.working_hours_observed.start_local} →{" "}
+                {body.working_hours_observed.end_local}
+              </span>
+            )}
+            {body.last_seen_active_ms != null && (
+              <span className="team-profile-strip-item">
+                Last active {formatRelative(body.last_seen_active_ms)}
+              </span>
+            )}
+          </div>
+        )}
+        {body.summary_prose ? (
+          <p className="team-profile-summary">{body.summary_prose}</p>
+        ) : (
+          <p className="team-profile-summary team-profile-summary--placeholder">
+            A short portrait of {firstName} appears here once Margin has
+            enough signal — focus, working style, and how to work well
+            together.
+          </p>
+        )}
+      </header>
+
+      {/* Zone 2 — Between you & them. Directional pair; highest
+          actionable content; deserves visual weight as a panel. */}
+      <section className="team-profile-waiting" aria-label="Between you and this person">
+        <div className="team-profile-waiting-col">
+          <div className="team-profile-waiting-head">
+            <span className="team-profile-waiting-label">
+              Waiting on you
             </span>
+            {waitingFromMe.length > 0 && (
+              <span className="team-profile-waiting-count">
+                {waitingFromMe.length}
+              </span>
+            )}
+          </div>
+          {waitingFromMe.length > 0 ? (
+            <ul className="team-profile-waiting-list">
+              {waitingFromMe.map((w, i) => (
+                <li key={`fm-${i}`} className="team-profile-waiting-item">
+                  <span className="team-profile-waiting-body">
+                    {w.description}
+                  </span>
+                  <span className="team-profile-waiting-meta">
+                    {formatRelative(w.since_ms)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="team-profile-waiting-empty">All caught up.</p>
           )}
         </div>
-      )}
+        <div className="team-profile-waiting-divider" aria-hidden="true" />
+        <div className="team-profile-waiting-col">
+          <div className="team-profile-waiting-head">
+            <span className="team-profile-waiting-label">
+              Waiting on {firstName}
+            </span>
+            {waitingForThem.length > 0 && (
+              <span className="team-profile-waiting-count">
+                {waitingForThem.length}
+              </span>
+            )}
+          </div>
+          {waitingForThem.length > 0 ? (
+            <ul className="team-profile-waiting-list">
+              {waitingForThem.map((w, i) => (
+                <li key={`ft-${i}`} className="team-profile-waiting-item">
+                  <span className="team-profile-waiting-body">
+                    {w.description}
+                  </span>
+                  <span className="team-profile-waiting-meta">
+                    {formatRelative(w.since_ms)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="team-profile-waiting-empty">Nothing outstanding.</p>
+          )}
+        </div>
+      </section>
 
-      {collaborators.length > 0 && (
-        <section className="team-profile-section">
-          <h4 className="home-action-bucket-head">Frequent collaborators</h4>
-          <div className="team-profile-chips">
-            {collaborators.map((c) => {
-              const m = memberById.get(c.person_id);
-              if (!m) return null;
-              return (
+      {/* Zone 3 — At-a-glance. Quieter visual weight; supports the
+          hero without competing with it. Sections only render when
+          their data is non-empty. */}
+      <div className="team-profile-glance">
+        {focus.length > 0 && (
+          <section className="team-profile-glance-row">
+            <h4 className="team-profile-glance-label">Working on</h4>
+            <div className="team-profile-chips">
+              {focus.map((f) => (
                 <button
-                  key={c.person_id}
+                  key={f.workstream_id}
                   type="button"
                   className="team-profile-chip"
-                  title={c.evidence}
-                  onClick={() => onSelectMember(c.person_id)}
+                  onClick={() => onOpenWorkstream(f.workstream_id)}
                 >
-                  <Avatar member={m} size={22} />
-                  <span>{m.display_name}</span>
+                  <span>{f.title}</span>
                 </button>
-              );
-            })}
-          </div>
-        </section>
-      )}
+              ))}
+            </div>
+          </section>
+        )}
 
-      {focus.length > 0 && (
-        <section className="team-profile-section">
-          <h4 className="home-action-bucket-head">Recent focus</h4>
-          <div className="team-profile-chips">
-            {focus.map((f) => (
-              <button
-                key={f.workstream_id}
-                type="button"
-                className="team-profile-chip"
-                onClick={() => onOpenWorkstream(f.workstream_id)}
-              >
-                <span>{f.title}</span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
+        {collaborators.length > 0 && (
+          <section className="team-profile-glance-row">
+            <h4 className="team-profile-glance-label">Often with</h4>
+            <div className="team-profile-chips">
+              {collaborators.map((c) => {
+                const m = memberById.get(c.person_id);
+                if (!m) return null;
+                return (
+                  <button
+                    key={c.person_id}
+                    type="button"
+                    className="team-profile-chip team-profile-chip--avatar"
+                    title={c.evidence}
+                    onClick={() => onSelectMember(c.person_id)}
+                  >
+                    <Avatar member={m} size={18} />
+                    <span>{m.display_name}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        )}
 
-      {body.communication_style_notes && (
-        <section className="team-profile-section">
-          <h4 className="home-action-bucket-head">Communication style</h4>
-          <p className="team-profile-style">{body.communication_style_notes}</p>
-        </section>
-      )}
+        {body.communication_style_notes && (
+          <section className="team-profile-glance-row">
+            <h4 className="team-profile-glance-label">Communication style</h4>
+            <p className="team-profile-style">
+              {body.communication_style_notes}
+            </p>
+          </section>
+        )}
 
-      {body.last_seen_active_ms !== null && (
-        <section className="team-profile-section">
-          <h4 className="home-action-bucket-head">Last seen active</h4>
-          <p className="team-profile-meta-line">
-            {formatRelative(body.last_seen_active_ms)}
-          </p>
-        </section>
-      )}
-
-      {citedObservations.length > 0 && (
-        <section className="team-profile-section">
-          <h4 className="home-action-bucket-head">Backed by observations</h4>
-          <div className="team-profile-chips">
-            {citedObservations.map((obs) => (
-              <button
-                key={obs.id}
-                type="button"
-                className="team-profile-chip team-profile-citation"
-                onClick={() => onCiteClick(obs.id)}
-                title={obs.body}
-              >
-                <span>{truncateText(obs.body, 60)}</span>
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
+        {citedObservations.length > 0 && (
+          <section className="team-profile-glance-row">
+            <h4 className="team-profile-glance-label">Backed by</h4>
+            <div className="team-profile-chips">
+              {citedObservations.map((obs) => (
+                <button
+                  key={obs.id}
+                  type="button"
+                  className="team-profile-chip team-profile-citation"
+                  onClick={() => onCiteClick(obs.id)}
+                  title={obs.body}
+                >
+                  <span>{truncateText(obs.body, 60)}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+      </div>
 
       <div className="team-profile-meta">
         <span>Computed {formatRelative(computed_ms)}</span>
@@ -1429,9 +1686,9 @@ const ALIAS_KIND_LABELS: Array<{ value: string; label: string }> = [
 ];
 
 function identitiesSummary(aliases: TypedAlias[]): string {
-  if (aliases.length === 0) return "Manage identities…";
-  if (aliases.length === 1) return `1 identity · manage…`;
-  return `${aliases.length} identities · manage…`;
+  if (aliases.length === 0) return "Add identity";
+  if (aliases.length === 1) return "1 identity";
+  return `${aliases.length} identities`;
 }
 
 type Draft = { kind: string; value: string };
