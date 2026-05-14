@@ -411,8 +411,18 @@ Waiting analysis:\n\
     source_kind     — copy verbatim from the candidate.\n\
     source_ref_id   — copy verbatim; never invent ids.\n\
     since_ms        — copy verbatim.\n\
-- Drop candidates that read as resolved, transactional, or social (auto-replies, OOO, social acks like \"thanks!\", calendar invites already past).\n\
-- Cap each direction at 5 items; pick the most consequential.\n\
+- Your default is to DROP. Most candidates won't be substantive — emit a WaitingItem only when the message contains a real, unanswered ask or action item. When in doubt, drop.\n\
+- DROP a candidate when its preview is any of:\n\
+    * a social ack or thank-you (\"Thanks!\", \"Danke!\", \"Perfect, danke\", \"OK\", \"Got it\", \"Sounds good\") even if followed by a long name+title signature block.\n\
+    * a meeting/event cancellation, decline, or status update (\"Abgesagt: …\", \"Declined: …\").\n\
+    * an out-of-office / auto-reply (\"I'm out until …\", \"Currently on leave\").\n\
+    * agreement / confirmation of the user's prior message (\"Ja, so sehe ich das auch.\", \"Sicher, kein Problem\").\n\
+    * a status report from the sender about their own work (\"Hab ich erledigt\", \"Working on it\").\n\
+- KEEP a candidate when its preview is:\n\
+    * a direct question to the user (\"Können wir da unterstützen?\", \"Any update on the rollout?\").\n\
+    * an explicit request for action (\"Kannst du bitte … exportieren?\", \"Please confirm the Q3 budget by Friday\").\n\
+    * a pending decision waiting on the user (\"Sollen wir mit X oder Y weitergehen?\").\n\
+- Cap each direction at 5 items; if you have more substantive candidates than that, pick the highest-stakes (deadlines, decisions, blockers) over the smallest-ask ones.\n\
 - Never emit a source_ref_id that wasn't in the candidate set — the post-parse validator will drop it anyway.";
 
 pub async fn call_anthropic(
@@ -426,7 +436,11 @@ pub async fn call_anthropic(
 
     let body = serde_json::json!({
         "model": anthropic::DEFAULT_MODEL,
-        "max_tokens": 1024,
+        // v3 (#120) extends the schema with summary_prose plus up to
+        // 10 WaitingItems (5 each direction) — each carrying a short
+        // description + ids. 1024 wasn't enough; the response was
+        // truncating mid-string. 4096 leaves comfortable headroom.
+        "max_tokens": 4096,
         "system": [
             {
                 "type": "text",

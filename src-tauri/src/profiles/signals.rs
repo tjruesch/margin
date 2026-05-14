@@ -33,6 +33,106 @@ pub struct WaitingCandidate {
     pub preview: String,
 }
 
+/// Drop a candidate when its preview is a social ack or sign-off
+/// followed by signature material — those messages shouldn't bother
+/// the LLM. The rules:
+///
+/// 1. A `?` anywhere in the preview means it's a real ask → keep.
+/// 2. Take the first phrase (split on `.` `!` `\n`). Strip a known
+///    ack token (Thank you / Danke / OK / etc.) from its start.
+///    a. If the result is empty AND every later phrase looks like
+///       signature material → drop.
+///    b. If the result is empty but a later phrase has real prose →
+///       keep (e.g. "Thanks! Btw, can you confirm?").
+/// 3. Otherwise, keep if total alphanumeric content ≥ 30 chars.
+fn is_substantive_preview(preview: &str) -> bool {
+    if preview.contains('?') {
+        return true;
+    }
+    let lowered = preview.to_ascii_lowercase();
+    let mut phrases = lowered.split(|c: char| matches!(c, '.' | '!' | '\n'));
+    let first = phrases.next().unwrap_or("").trim();
+    let after_ack = strip_leading_ack(first).trim();
+
+    if after_ack.is_empty() {
+        // First phrase was a pure ack. Keep only if a *later* phrase
+        // carries real substance (not signature lines).
+        return phrases.any(|p| {
+            let pt = p.trim();
+            !pt.is_empty()
+                && !looks_like_signature_fragment(pt)
+                && pt.chars().filter(|c| c.is_alphanumeric()).count() >= 20
+        });
+    }
+
+    // First phrase has content. Use overall length as the cheap signal.
+    let alnum: usize = lowered.chars().filter(|c| c.is_alphanumeric()).count();
+    alnum >= 30
+}
+
+/// True when a phrase looks like email-signature scaffolding (job
+/// title / company / contact info), not a real conversational line.
+fn looks_like_signature_fragment(phrase: &str) -> bool {
+    static SIG_TOKENS: &[&str] = &[
+        "manager",
+        "director",
+        " lead",
+        " ceo",
+        " cto",
+        " cfo",
+        " vp ",
+        "engineer",
+        "developer",
+        "consultant",
+        "elanlanguages",
+        "elan languages",
+        "regards",
+        "grüße",
+        "freundlich",
+        "tel:",
+        "mob:",
+        "phone:",
+        "http://",
+        "https://",
+        "www.",
+    ];
+    SIG_TOKENS.iter().any(|t| phrase.contains(t))
+}
+
+fn strip_leading_ack(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    // Order matters: longest prefixes first so "vielen dank" doesn't
+    // get short-circuited by "danke".
+    const ACK_PREFIXES: &[&str] = &[
+        "vielen dank",
+        "thank you",
+        "thanks",
+        "danke schön",
+        "danke dir",
+        "danke",
+        "sounds good",
+        "got it",
+        "merci",
+        "cheers",
+        "perfect",
+        "noted",
+        "agreed",
+        "alright",
+        "super",
+        "great",
+        "okay",
+        "ok",
+    ];
+    for prefix in ACK_PREFIXES {
+        if trimmed.starts_with(prefix) {
+            let rest = &trimmed[prefix.len()..];
+            return rest
+                .trim_start_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
+        }
+    }
+    trimmed
+}
+
 /// Items the team member is waiting on the user to act on. Combines
 /// inbound email candidates, inbound Teams candidates, and past
 /// meetings that lack a note. Sorted by recency desc, capped.
@@ -382,7 +482,17 @@ where
 {
     let mut out = Vec::new();
     for r in rows {
-        out.push(r?);
+        let c = r?;
+        // Pre-filter obvious social acks / signature-only previews
+        // (#120 polish). Spares the LLM from having to reason about
+        // them and prevents "Thank you! [signature]" false positives.
+        // Meeting candidates are exempt — their preview is built from
+        // the title, not the body, and "Meeting: …" is always
+        // substantive enough to consider.
+        if c.source_kind != "meeting" && !is_substantive_preview(&c.preview) {
+            continue;
+        }
+        out.push(c);
     }
     Ok(out)
 }
@@ -535,6 +645,62 @@ mod tests {
         .unwrap();
     }
 
+    // ---------- Substance filter -----------------------------------------
+
+    #[test]
+    fn substance_filter_drops_thanks_plus_signature() {
+        // The exact false-positive that surfaced for Heike in the wild.
+        assert!(!is_substantive_preview(
+            "Thank you! Heike Epple Operations Manager | ELAN Languages"
+        ));
+    }
+
+    #[test]
+    fn substance_filter_drops_short_acks() {
+        assert!(!is_substantive_preview("Danke fürs Update"));
+        assert!(!is_substantive_preview("Thanks!"));
+        assert!(!is_substantive_preview("OK"));
+        assert!(!is_substantive_preview("Perfect, danke"));
+        assert!(!is_substantive_preview("got it"));
+    }
+
+    #[test]
+    fn substance_filter_keeps_questions_even_after_ack() {
+        // "Danke" front, but a real question follows.
+        assert!(is_substantive_preview(
+            "Danke für dein Update. Wer kommt heute zum Meeting?"
+        ));
+        assert!(is_substantive_preview("Können wir da unterstützen?"));
+        assert!(is_substantive_preview("any update on the rollout?"));
+    }
+
+    #[test]
+    fn substance_filter_keeps_substantive_no_question() {
+        assert!(is_substantive_preview(
+            "Kannst du dir bitte die folgenden Daten aus dem PK App exportieren"
+        ));
+        assert!(is_substantive_preview(
+            "Hey, was ist denn aus den bridge Zugängen geworden"
+        ));
+    }
+
+    #[test]
+    fn signals_query_skips_thanks_plus_signature_candidate() {
+        let conn = open_db();
+        seed_self(&conn, "tm_self", "me@x.io");
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        let now = 1_700_000_000_000;
+        seed_email(
+            &conn, "e_thanks", "t1", "alice@x.io",
+            now - 1_000,
+            "Thank you! Alice Example, Engineering Manager | Example Inc.",
+        );
+        seed_recipient(&conn, "e_thanks", "me@x.io", Some("tm_self"));
+
+        let got = inbound_email(&conn, "tm_alice", now - RECENCY_WINDOW_MS).unwrap();
+        assert!(got.is_empty(), "Thank-you-with-signature must be filtered before reaching the LLM");
+    }
+
     // ---------- Email ------------------------------------------------------
 
     #[test]
@@ -590,7 +756,11 @@ mod tests {
         seed_self(&conn, "tm_self", "me@x.io");
         seed_teammate(&conn, "tm_alice", "alice@x.io");
         let now = 1_700_000_000_000;
-        seed_email(&conn, "e1", "t1", "alice@x.io", now - 1_000, "alias-route");
+        seed_email(
+            &conn, "e1", "t1", "alice@x.io",
+            now - 1_000,
+            "can you take a look at the Q3 budget rollover?",
+        );
         seed_recipient(&conn, "e1", "me@x.io", None);
 
         let got = inbound_email(&conn, "tm_alice", now - RECENCY_WINDOW_MS).unwrap();
@@ -672,7 +842,10 @@ mod tests {
         seed_teams_chat_member(
             &conn, "c1", "aad-alice", Some("alice@x.io"), Some("tm_alice"), false,
         );
-        seed_teams_msg(&conn, "m1", "c1", Some("me@x.io"), None, now - 1_000, "ping");
+        seed_teams_msg(
+            &conn, "m1", "c1", Some("me@x.io"), None, now - 1_000,
+            "ping — any update on the rollout?",
+        );
 
         let got = outbound_teams(&conn, "tm_alice", now - RECENCY_WINDOW_MS).unwrap();
         assert_eq!(got.len(), 1);
@@ -756,7 +929,11 @@ mod tests {
         for i in 0..25 {
             let id = format!("e{i}");
             let thread = format!("t{i}");
-            seed_email(&conn, &id, &thread, "alice@x.io", now - 1_000 - i as i64, "x");
+            seed_email(
+                &conn, &id, &thread, "alice@x.io",
+                now - 1_000 - i as i64,
+                "Hey can you take a look at this please?",
+            );
             seed_recipient(&conn, &id, "me@x.io", Some("tm_self"));
         }
 
@@ -772,7 +949,7 @@ mod tests {
         let now = 1_700_000_000_000;
 
         // 1× inbound email
-        seed_email(&conn, "e1", "t1", "alice@x.io", now - 1_000, "x");
+        seed_email(&conn, "e1", "t1", "alice@x.io", now - 1_000, "any update on the rollout?");
         seed_recipient(&conn, "e1", "me@x.io", Some("tm_self"));
         // 1× inbound teams
         seed_teams_chat_member(&conn, "c1", "aad-self", Some("me@x.io"), Some("tm_self"), true);
