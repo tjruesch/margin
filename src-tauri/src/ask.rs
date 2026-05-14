@@ -2311,6 +2311,8 @@ mod tests {
             due_ms: None,
             assignee_id: None,
             assignee_display_name: None,
+            subject_member_id: None,
+            manual_override: false,
         }
     }
 

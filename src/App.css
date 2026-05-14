@@ -4150,6 +4150,49 @@ input.nh-title {
   font-variant-numeric: tabular-nums;
 }
 
+/* Worker-extracted waiting action rows (#120 follow-up). Visible
+   resolve + ignore affordances; subtle source-kind glyph. */
+.team-profile-waiting-action {
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+.team-profile-waiting-action .team-profile-waiting-body {
+  cursor: default;
+}
+.team-profile-waiting-check,
+.team-profile-waiting-ignore {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg-muted, #888);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 80ms ease, color 80ms ease;
+}
+.team-profile-waiting-check:hover {
+  background: color-mix(in srgb, var(--accent, #2a7) 14%, transparent);
+  color: var(--accent, #2a7);
+}
+.team-profile-waiting-ignore:hover {
+  background: color-mix(in srgb, var(--fg, #222) 8%, transparent);
+  color: var(--fg, #222);
+}
+.team-profile-waiting-kind {
+  flex: 0 0 auto;
+  width: 14px;
+  color: var(--fg-muted, #999);
+  font-size: 12px;
+  text-align: center;
+}
+
 .team-profile-waiting-empty {
   margin: 0;
   color: var(--fg-muted, #aaa);

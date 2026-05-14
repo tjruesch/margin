@@ -60,7 +60,8 @@ const SCHEMA_V26: &str = include_str!("migrations/026_notes_to_db.sql");
 const SCHEMA_V27: &str = include_str!("migrations/027_open_questions.sql");
 const SCHEMA_V28: &str = include_str!("migrations/028_profile_snapshots.sql");
 const SCHEMA_V29: &str = include_str!("migrations/029_profile_observations.sql");
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_V30: &str = include_str!("migrations/030_action_waiting.sql");
+const SCHEMA_VERSION: i64 = 30;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -270,6 +271,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V29)?;
         version = 29;
     }
+    if version == 29 {
+        conn.execute_batch(SCHEMA_V30)?;
+        version = 30;
+    }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
@@ -346,6 +351,8 @@ pub fn list_actions(
     scope: ActionScope,
     assignee_id: Option<&str>,
     workstream_id: Option<&str>,
+    subject_member_id: Option<&str>,
+    origin_synth_kinds_json: Option<&str>,
 ) -> Result<Vec<ActionListItem>> {
     let where_done = match scope {
         ActionScope::Open => "AND a.done = 0",
@@ -356,13 +363,14 @@ pub fn list_actions(
     // unconditionally; SQLite short-circuits when the bound value is
     // NULL. Avoids dynamic-params gymnastics.
     //
+    // The `origin_synth_kinds_json` filter is a JSON array of strings
+    // (or NULL); rows match when their `origin_synth_kind` appears in
+    // the array. `json_each` makes the IN-list portable to any length
+    // without dynamic placeholders.
+    //
     // The visibility guard: a row is visible iff
     //   - it has no origin note OR its origin note is non-archived, AND
     //   - it has no workstream attachment OR its workstream is active.
-    // This is stricter than the pre-unification UNION (which separated
-    // the two checks per origin) but it lines up with what users
-    // expect: archiving a note hides its actions; archiving a
-    // workstream hides the actions pinned to it.
     let sql = format!(
         "SELECT a.id, a.origin_kind, a.origin_note_id, a.origin_line, \
                 a.origin_synth_kind, a.origin_synth_id, \
@@ -371,6 +379,7 @@ pub fn list_actions(
                 n.title AS note_title, \
                 w.title AS workstream_title, \
                 t.display_name AS assignee_display_name, \
+                a.subject_member_id, a.manual_override, \
                 COALESCE(n.modified_ms, w.last_activity_ms, a.created_ms) AS order_ms \
            FROM actions a \
            LEFT JOIN notes        n ON n.id        = a.origin_note_id \
@@ -379,31 +388,38 @@ pub fn list_actions(
           WHERE (a.origin_note_id IS NULL OR n.archived = 0) \
             AND (a.workstream_id  IS NULL OR w.status   = 'active') \
             {where_done} \
-            AND (?1 IS NULL OR a.assignee_id   = ?1) \
-            AND (?2 IS NULL OR a.workstream_id = ?2) \
+            AND (?1 IS NULL OR a.assignee_id        = ?1) \
+            AND (?2 IS NULL OR a.workstream_id      = ?2) \
+            AND (?3 IS NULL OR a.subject_member_id  = ?3) \
+            AND (?4 IS NULL OR a.origin_synth_kind IN (SELECT value FROM json_each(?4))) \
           ORDER BY (a.due_ms IS NULL), a.due_ms ASC, order_ms DESC, \
                    a.origin_line ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![assignee_id, workstream_id], |r| {
-        Ok(ActionListItem {
-            id: r.get(0)?,
-            origin_kind: r.get(1)?,
-            origin_note_path: r.get(2)?,
-            origin_line: r.get(3)?,
-            origin_synth_kind: r.get(4)?,
-            origin_synth_id: r.get(5)?,
-            workstream_id: r.get(6)?,
-            text: r.get(7)?,
-            done: r.get::<_, i64>(8)? != 0,
-            due_ms: r.get(9)?,
-            assignee_id: r.get(10)?,
-            created_ms: r.get(11)?,
-            note_title: r.get(12)?,
-            workstream_title: r.get(13)?,
-            assignee_display_name: r.get(14)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        params![assignee_id, workstream_id, subject_member_id, origin_synth_kinds_json],
+        |r| {
+            Ok(ActionListItem {
+                id: r.get(0)?,
+                origin_kind: r.get(1)?,
+                origin_note_path: r.get(2)?,
+                origin_line: r.get(3)?,
+                origin_synth_kind: r.get(4)?,
+                origin_synth_id: r.get(5)?,
+                workstream_id: r.get(6)?,
+                text: r.get(7)?,
+                done: r.get::<_, i64>(8)? != 0,
+                due_ms: r.get(9)?,
+                assignee_id: r.get(10)?,
+                created_ms: r.get(11)?,
+                note_title: r.get(12)?,
+                workstream_title: r.get(13)?,
+                assignee_display_name: r.get(14)?,
+                subject_member_id: r.get(15)?,
+                manual_override: r.get::<_, i64>(16)? != 0,
+            })
+        },
+    )?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -1699,7 +1715,7 @@ mod tests {
         tx.execute("UPDATE notes SET archived = 1 WHERE id = 'arc'", []).unwrap();
         tx.commit().unwrap();
 
-        let opens = list_actions(&conn, ActionScope::Open, None, None).unwrap();
+        let opens = list_actions(&conn, ActionScope::Open, None, None, None, None).unwrap();
         assert_eq!(opens.len(), 1);
         assert_eq!(opens[0].text, "visible");
     }
@@ -2191,14 +2207,14 @@ mod tests {
         )
         .unwrap();
 
-        let only_a = list_actions(&conn, ActionScope::All, None, Some("ws_a"))
+        let only_a = list_actions(&conn, ActionScope::All, None, Some("ws_a"), None, None)
             .unwrap();
         let ids_a: Vec<&str> = only_a.iter().map(|r| r.id.as_str()).collect();
         assert!(ids_a.contains(&"wsa_a"));
         assert!(ids_a.contains(&"n:1"));
         assert!(!ids_a.contains(&"wsa_b"));
 
-        let only_b = list_actions(&conn, ActionScope::All, None, Some("ws_b"))
+        let only_b = list_actions(&conn, ActionScope::All, None, Some("ws_b"), None, None)
             .unwrap();
         let ids_b: Vec<&str> = only_b.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids_b, vec!["wsa_b"]);

@@ -24,12 +24,27 @@ use serde::Serialize;
 pub const RECENCY_WINDOW_MS: i64 = 30 * 24 * 3_600 * 1_000;
 pub const CANDIDATES_PER_DIRECTION_CAP: usize = 20;
 pub const MEETING_SUBCAP: usize = 5;
+pub const TAIL_CAP: usize = 5;
+pub const TAIL_PREVIEW_CHARS: usize = 200;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct WaitingCandidate {
     pub source_kind: String,
     pub source_ref_id: String,
     pub since_ms: i64,
+    pub preview: String,
+    /// Up to 5 follow-up messages from the same thread/chat, ordered
+    /// oldest-first. Each line lets the LLM judge whether the ask is
+    /// pending, resolved, or committed-not-delivered. Empty for
+    /// meeting candidates (their "tail" is the meeting note, which
+    /// we surface via the note-linked-action subsystem).
+    pub conversation_tail: Vec<TailEntry>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct TailEntry {
+    pub ms: i64,
+    pub from_kind: String, // "self" | "them"
     pub preview: String,
 }
 
@@ -136,6 +151,8 @@ fn strip_leading_ack(s: &str) -> &str {
 /// Items the team member is waiting on the user to act on. Combines
 /// inbound email candidates, inbound Teams candidates, and past
 /// meetings that lack a note. Sorted by recency desc, capped.
+/// Conversation tails are hydrated per candidate so the LLM can judge
+/// resolution status from the reply chain.
 pub fn candidates_from_me(
     conn: &Connection,
     person_id: &str,
@@ -149,6 +166,7 @@ pub fn candidates_from_me(
         conn, person_id, cutoff, now_ms, MEETING_SUBCAP,
     )?);
     sort_and_cap(&mut out, CANDIDATES_PER_DIRECTION_CAP);
+    hydrate_tails(conn, &mut out)?;
     Ok(out)
 }
 
@@ -168,6 +186,7 @@ pub fn candidates_for_them(
         conn, person_id, now_ms, MEETING_SUBCAP,
     )?);
     sort_and_cap(&mut out, CANDIDATES_PER_DIRECTION_CAP);
+    hydrate_tails(conn, &mut out)?;
     Ok(out)
 }
 
@@ -178,9 +197,11 @@ fn sort_and_cap(items: &mut Vec<WaitingCandidate>, cap: usize) {
 
 // ---------- Email ---------------------------------------------------------
 
-/// Person → self, no self reply in the same thread, within the recency
-/// window. Uses the `self_alias_emails` CTE pattern from `activity.rs`
-/// to identify the user across address forms.
+/// Person → self emails within the recency window. The previous
+/// "NOT EXISTS (later self reply)" filter is gone — resolution is
+/// now an LLM judgment based on the hydrated `conversation_tail`.
+/// Uses the `self_alias_emails` CTE pattern from `activity.rs` to
+/// identify the user across address forms.
 fn inbound_email(
     conn: &Connection,
     person_id: &str,
@@ -210,12 +231,6 @@ fn inbound_email(
                        OR lower(er.email) IN (SELECT email FROM self_emails) \
                    ) \
            ) \
-           AND NOT EXISTS ( \
-                SELECT 1 FROM email_messages em2 \
-                 WHERE em2.thread_id = em.thread_id \
-                   AND em2.sent_at_ms > em.sent_at_ms \
-                   AND lower(em2.from_email) IN (SELECT email FROM self_emails) \
-           ) \
          ORDER BY em.sent_at_ms DESC \
          LIMIT ?3";
     let mut stmt = conn.prepare(sql)?;
@@ -226,7 +241,9 @@ fn inbound_email(
     collect_rows(rows)
 }
 
-/// Self → person, no reply from the person in the same thread.
+/// Self → person emails within the recency window. Like inbound,
+/// the "no reply" SQL filter is gone; the LLM judges resolution
+/// from the `conversation_tail`.
 fn outbound_email(
     conn: &Connection,
     person_id: &str,
@@ -256,12 +273,6 @@ fn outbound_email(
                        OR lower(er.email) IN (SELECT email FROM their_emails) \
                    ) \
            ) \
-           AND NOT EXISTS ( \
-                SELECT 1 FROM email_messages em2 \
-                 WHERE em2.thread_id = em.thread_id \
-                   AND em2.sent_at_ms > em.sent_at_ms \
-                   AND lower(em2.from_email) IN (SELECT email FROM their_emails) \
-           ) \
          ORDER BY em.sent_at_ms DESC \
          LIMIT ?3";
     let mut stmt = conn.prepare(sql)?;
@@ -278,26 +289,24 @@ fn row_to_email_candidate(r: &rusqlite::Row<'_>) -> rusqlite::Result<WaitingCand
         source_ref_id: r.get(0)?,
         since_ms: r.get(1)?,
         preview: r.get(2)?,
+        conversation_tail: Vec::new(),
     })
 }
 
 // ---------- Teams ---------------------------------------------------------
 
-/// Person in a chat → message; self hasn't posted in that chat since.
-/// Matches the person via `teams_chat_members` (both email and aad_id
-/// paths) so we catch messages even when `from_email` is NULL.
+/// Person → self Teams messages within the recency window. Matches
+/// the person via `teams_chat_members` (both email and aad_id paths)
+/// so we catch messages even when `from_email` is NULL. The "no
+/// reply" SQL filter is gone; the LLM judges resolution from
+/// the `conversation_tail`.
 fn inbound_teams(
     conn: &Connection,
     person_id: &str,
     cutoff_ms: i64,
 ) -> rusqlite::Result<Vec<WaitingCandidate>> {
     let sql = "\
-        WITH self_emails AS ( \
-            SELECT lower(a.value) AS email FROM team_member_aliases a \
-              JOIN team_members m ON m.id = a.member_id \
-             WHERE a.kind = 'email' AND m.is_self = 1 \
-        ), \
-        their_chats AS ( \
+        WITH their_chats AS ( \
             SELECT DISTINCT chat_id FROM teams_chat_members \
              WHERE team_member_id = ?1 \
         ) \
@@ -315,21 +324,6 @@ fn inbound_teams(
                     AND lower(tm.from_email) = lower(tcm.email) \
                 ) \
            ) \
-           AND NOT EXISTS ( \
-                SELECT 1 FROM teams_messages tm2 \
-                 WHERE tm2.chat_id = tm.chat_id \
-                   AND tm2.sent_at_ms > tm.sent_at_ms \
-                   AND ( \
-                       lower(COALESCE(tm2.from_email, '')) IN (SELECT email FROM self_emails) \
-                       OR EXISTS ( \
-                           SELECT 1 FROM teams_chat_members scm \
-                            WHERE scm.chat_id = tm2.chat_id \
-                              AND scm.is_self = 1 \
-                              AND tm2.from_aad_id IS NOT NULL \
-                              AND tm2.from_aad_id = scm.aad_id \
-                       ) \
-                   ) \
-           ) \
          ORDER BY tm.sent_at_ms DESC \
          LIMIT ?3";
     let mut stmt = conn.prepare(sql)?;
@@ -340,7 +334,8 @@ fn inbound_teams(
     collect_rows(rows)
 }
 
-/// Self → person in a chat; person hasn't posted in that chat since.
+/// Self → person Teams messages within the recency window. "No
+/// reply" SQL filter dropped; LLM does resolution.
 fn outbound_teams(
     conn: &Connection,
     person_id: &str,
@@ -366,21 +361,6 @@ fn outbound_teams(
                 lower(COALESCE(tm.from_email, '')) IN (SELECT email FROM self_emails) \
                 OR (tm.from_aad_id IS NOT NULL AND tm.from_aad_id = scm.aad_id) \
            ) \
-           AND NOT EXISTS ( \
-                SELECT 1 FROM teams_messages tm2 \
-                  JOIN teams_chat_members tcm2 \
-                    ON tcm2.chat_id = tm2.chat_id AND tcm2.team_member_id = ?1 \
-                 WHERE tm2.chat_id = tm.chat_id \
-                   AND tm2.sent_at_ms > tm.sent_at_ms \
-                   AND ( \
-                       (tm2.from_aad_id IS NOT NULL AND tm2.from_aad_id = tcm2.aad_id) \
-                       OR ( \
-                           tm2.from_email IS NOT NULL \
-                           AND tcm2.email IS NOT NULL \
-                           AND lower(tm2.from_email) = lower(tcm2.email) \
-                       ) \
-                   ) \
-           ) \
          ORDER BY tm.sent_at_ms DESC \
          LIMIT ?3";
     let mut stmt = conn.prepare(sql)?;
@@ -397,6 +377,7 @@ fn row_to_teams_candidate(r: &rusqlite::Row<'_>) -> rusqlite::Result<WaitingCand
         source_ref_id: r.get(0)?,
         since_ms: r.get(1)?,
         preview: r.get(2)?,
+        conversation_tail: Vec::new(),
     })
 }
 
@@ -432,6 +413,7 @@ fn meeting_past_without_note(
                 source_ref_id: r.get(0)?,
                 since_ms: r.get(1)?,
                 preview: r.get(2)?,
+                conversation_tail: Vec::new(),
             })
         },
     )?;
@@ -471,9 +453,115 @@ fn meeting_future_unaccepted(
             source_ref_id: r.get(0)?,
             since_ms: r.get(1)?,
             preview: r.get(2)?,
+            conversation_tail: Vec::new(),
         })
     })?;
     collect_rows(rows)
+}
+
+// ---------- Tail hydration -----------------------------------------------
+
+/// Walk the candidate list and fill in `conversation_tail` for every
+/// email and Teams candidate. Meeting candidates keep an empty tail.
+/// We issue one query per candidate (small N: capped at 20), each
+/// returning up to `TAIL_CAP` rows; total work is bounded.
+fn hydrate_tails(
+    conn: &Connection,
+    candidates: &mut [WaitingCandidate],
+) -> rusqlite::Result<()> {
+    for c in candidates.iter_mut() {
+        match c.source_kind.as_str() {
+            "email" => {
+                c.conversation_tail = email_tail(conn, &c.source_ref_id, c.since_ms)?;
+            }
+            "teams" => {
+                c.conversation_tail = teams_tail(conn, &c.source_ref_id, c.since_ms)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn email_tail(
+    conn: &Connection,
+    msg_id: &str,
+    after_ms: i64,
+) -> rusqlite::Result<Vec<TailEntry>> {
+    let sql = "\
+        WITH self_emails AS ( \
+            SELECT lower(a.value) AS email FROM team_member_aliases a \
+              JOIN team_members m ON m.id = a.member_id \
+             WHERE a.kind = 'email' AND m.is_self = 1 \
+        ), \
+        tgt AS ( SELECT thread_id FROM email_messages WHERE id = ?1 ) \
+        SELECT em.sent_at_ms, \
+               CASE WHEN lower(em.from_email) IN (SELECT email FROM self_emails) \
+                    THEN 'self' ELSE 'them' END AS from_kind, \
+               COALESCE(NULLIF(em.body_preview, ''), em.subject, '') AS preview \
+          FROM email_messages em \
+         WHERE em.thread_id = (SELECT thread_id FROM tgt) \
+           AND em.sent_at_ms > ?2 \
+         ORDER BY em.sent_at_ms ASC \
+         LIMIT ?3";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![msg_id, after_ms, TAIL_CAP as i64], |r| {
+        Ok(TailEntry {
+            ms: r.get(0)?,
+            from_kind: r.get(1)?,
+            preview: truncate(&r.get::<_, String>(2)?, TAIL_PREVIEW_CHARS),
+        })
+    })?;
+    rows.collect()
+}
+
+fn teams_tail(
+    conn: &Connection,
+    msg_id: &str,
+    after_ms: i64,
+) -> rusqlite::Result<Vec<TailEntry>> {
+    let sql = "\
+        WITH self_emails AS ( \
+            SELECT lower(a.value) AS email FROM team_member_aliases a \
+              JOIN team_members m ON m.id = a.member_id \
+             WHERE a.kind = 'email' AND m.is_self = 1 \
+        ), \
+        tgt AS ( SELECT chat_id FROM teams_messages WHERE id = ?1 ) \
+        SELECT tm.sent_at_ms, \
+               CASE \
+                 WHEN lower(COALESCE(tm.from_email, '')) IN (SELECT email FROM self_emails) THEN 'self' \
+                 WHEN EXISTS ( \
+                     SELECT 1 FROM teams_chat_members scm \
+                      WHERE scm.chat_id = tm.chat_id \
+                        AND scm.is_self = 1 \
+                        AND tm.from_aad_id IS NOT NULL \
+                        AND tm.from_aad_id = scm.aad_id \
+                 ) THEN 'self' \
+                 ELSE 'them' \
+               END AS from_kind, \
+               COALESCE(tm.body_preview, '') AS preview \
+          FROM teams_messages tm \
+         WHERE tm.chat_id = (SELECT chat_id FROM tgt) \
+           AND tm.sent_at_ms > ?2 \
+         ORDER BY tm.sent_at_ms ASC \
+         LIMIT ?3";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![msg_id, after_ms, TAIL_CAP as i64], |r| {
+        Ok(TailEntry {
+            ms: r.get(0)?,
+            from_kind: r.get(1)?,
+            preview: truncate(&r.get::<_, String>(2)?, TAIL_PREVIEW_CHARS),
+        })
+    })?;
+    rows.collect()
+}
+
+fn truncate(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(cap.saturating_sub(1)).collect();
+    format!("{cut}\u{2026}")
 }
 
 fn collect_rows<I>(rows: I) -> rusqlite::Result<Vec<WaitingCandidate>>
@@ -720,17 +808,23 @@ mod tests {
     }
 
     #[test]
-    fn inbound_email_excludes_after_self_reply() {
+    fn inbound_email_surfaces_even_with_self_reply() {
+        // Resolution is now an LLM judgment: candidates always surface
+        // regardless of whether self has replied. The LLM reads the
+        // hydrated `conversation_tail` and decides resolved vs pending.
         let conn = open_db();
         seed_self(&conn, "tm_self", "me@x.io");
         seed_teammate(&conn, "tm_alice", "alice@x.io");
         let now = 1_700_000_000_000;
-        seed_email(&conn, "e1", "t1", "alice@x.io", now - 2_000, "ping?");
+        seed_email(&conn, "e1", "t1", "alice@x.io", now - 2_000, "any update on the rollout?");
         seed_recipient(&conn, "e1", "me@x.io", Some("tm_self"));
-        seed_email(&conn, "e2", "t1", "me@x.io", now - 1_000, "pong");
+        seed_email(&conn, "e2", "t1", "me@x.io", now - 1_000, "yes shipping today");
 
-        let got = inbound_email(&conn, "tm_alice", now - RECENCY_WINDOW_MS).unwrap();
-        assert!(got.is_empty(), "self replied → should be cleared");
+        let got = candidates_from_me(&conn, "tm_alice", now).unwrap();
+        assert!(got.iter().any(|c| c.source_ref_id == "e1"));
+        let cand = got.iter().find(|c| c.source_ref_id == "e1").unwrap();
+        assert_eq!(cand.conversation_tail.len(), 1);
+        assert_eq!(cand.conversation_tail[0].from_kind, "self");
     }
 
     #[test]
@@ -782,17 +876,21 @@ mod tests {
     }
 
     #[test]
-    fn outbound_email_excludes_after_their_reply() {
+    fn outbound_email_surfaces_even_with_their_reply() {
+        // Same: candidate surfaces, tail tells the LLM about the reply.
         let conn = open_db();
         seed_self(&conn, "tm_self", "me@x.io");
         seed_teammate(&conn, "tm_alice", "alice@x.io");
         let now = 1_700_000_000_000;
-        seed_email(&conn, "e1", "t1", "me@x.io", now - 2_000, "any update?");
+        seed_email(&conn, "e1", "t1", "me@x.io", now - 2_000, "any update on the rollout?");
         seed_recipient(&conn, "e1", "alice@x.io", Some("tm_alice"));
-        seed_email(&conn, "e2", "t1", "alice@x.io", now - 1_000, "yes!");
+        seed_email(&conn, "e2", "t1", "alice@x.io", now - 1_000, "yes shipping today");
 
-        let got = outbound_email(&conn, "tm_alice", now - RECENCY_WINDOW_MS).unwrap();
-        assert!(got.is_empty());
+        let got = candidates_for_them(&conn, "tm_alice", now).unwrap();
+        assert!(got.iter().any(|c| c.source_ref_id == "e1"));
+        let cand = got.iter().find(|c| c.source_ref_id == "e1").unwrap();
+        assert_eq!(cand.conversation_tail.len(), 1);
+        assert_eq!(cand.conversation_tail[0].from_kind, "them");
     }
 
     // ---------- Teams ------------------------------------------------------
@@ -816,7 +914,9 @@ mod tests {
     }
 
     #[test]
-    fn inbound_teams_excludes_after_self_reply() {
+    fn inbound_teams_surfaces_with_tail_when_self_replied() {
+        // Same as the email version: candidate surfaces, tail tells
+        // the LLM the chat history.
         let conn = open_db();
         seed_self(&conn, "tm_self", "me@x.io");
         seed_teammate(&conn, "tm_alice", "alice@x.io");
@@ -825,11 +925,21 @@ mod tests {
         seed_teams_chat_member(
             &conn, "c1", "aad-alice", Some("alice@x.io"), Some("tm_alice"), false,
         );
-        seed_teams_msg(&conn, "m1", "c1", None, Some("aad-alice"), now - 2_000, "?");
-        seed_teams_msg(&conn, "m2", "c1", Some("me@x.io"), None, now - 1_000, "ok");
+        seed_teams_msg(
+            &conn, "m1", "c1", None, Some("aad-alice"),
+            now - 2_000, "Hey, can you send the file?",
+        );
+        seed_teams_msg(
+            &conn, "m2", "c1", Some("me@x.io"), None,
+            now - 1_000, "ok will send tomorrow",
+        );
 
-        let got = inbound_teams(&conn, "tm_alice", now - RECENCY_WINDOW_MS).unwrap();
-        assert!(got.is_empty());
+        let got = candidates_from_me(&conn, "tm_alice", now).unwrap();
+        assert!(got.iter().any(|c| c.source_ref_id == "m1"));
+        let cand = got.iter().find(|c| c.source_ref_id == "m1").unwrap();
+        assert_eq!(cand.conversation_tail.len(), 1);
+        assert_eq!(cand.conversation_tail[0].from_kind, "self");
+        assert!(cand.conversation_tail[0].preview.contains("send tomorrow"));
     }
 
     #[test]

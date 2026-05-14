@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -326,9 +326,187 @@ async fn recompute_one(
             &serde_json::json!({}),
         )
         .map_err(|e| e.to_string())?;
+        // Sync the LLM's waiting view into the unified `actions` table
+        // (#120 follow-up). The body fields are kept for back-compat
+        // and debuggability but the frontend reads from `actions`.
+        sync_waiting_actions(&tx, person_id, &body, now)
+            .map_err(|e| format!("sync_waiting_actions: {e}"))?;
         tx.commit().map_err(|e| e.to_string())?;
     }
     Ok(RecomputeOutcome::Wrote)
+}
+
+/// Reconcile the LLM's current "waiting" view with the `actions`
+/// table. For each WaitingItem the model emitted, ensure an action
+/// row exists (skip if previously dismissed by the user). For each
+/// existing waiting-action whose source_ref_id the LLM no longer
+/// considers pending, auto-mark `done=1` — UNLESS the user has
+/// touched it (`manual_override=1`), in which case leave alone.
+fn sync_waiting_actions(
+    tx: &rusqlite::Transaction<'_>,
+    person_id: &str,
+    body: &crate::profiles::persist::ProfileSnapshotBody,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let self_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(self_id) = self_id else {
+        // No self member configured yet — nothing to assign.
+        return Ok(());
+    };
+
+    let mut live_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for w in &body.waiting_from_me {
+        // assignee = self (you owe them), subject = person.
+        if let Some(action_id) =
+            upsert_waiting_action(tx, w, &self_id, person_id, now_ms)?
+        {
+            live_ids.insert(action_id);
+        }
+    }
+    for w in &body.waiting_for_them {
+        // assignee = person (they owe you), subject = self.
+        if let Some(action_id) =
+            upsert_waiting_action(tx, w, person_id, &self_id, now_ms)?
+        {
+            live_ids.insert(action_id);
+        }
+    }
+
+    auto_resolve_missing(tx, person_id, &self_id, &live_ids, now_ms)?;
+    Ok(())
+}
+
+/// Stable, deterministic action id for a worker-extracted waiting
+/// item. Combines (source_kind, source_ref_id, assignee_id) so re-
+/// runs hit the same row. Uses a sha256 prefix to keep the id short
+/// and free of awkward source-id characters in keys.
+fn waiting_action_id(source_kind: &str, source_ref_id: &str, assignee_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(source_kind.as_bytes());
+    h.update(b":");
+    h.update(source_ref_id.as_bytes());
+    h.update(b":");
+    h.update(assignee_id.as_bytes());
+    let digest = h.finalize();
+    format!("wait:{:x}", &digest[..8].iter().fold(0u64, |acc, b| (acc << 8) | (*b as u64)))
+}
+
+fn upsert_waiting_action(
+    tx: &rusqlite::Transaction<'_>,
+    w: &crate::profiles::persist::WaitingItem,
+    assignee_id: &str,
+    subject_member_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Option<String>> {
+    let synth_kind = match w.source_kind.as_str() {
+        "email" => "email_waiting",
+        "teams" => "teams_waiting",
+        "meeting" => "meeting_waiting",
+        _ => return Ok(None),
+    };
+
+    // Skip if the user explicitly dismissed this source.
+    let dismissed: bool = tx
+        .query_row(
+            "SELECT 1 FROM dismissed_action_sources \
+              WHERE origin_synth_kind = ?1 \
+                AND origin_synth_id = ?2 \
+                AND (assignee_id = ?3 OR (assignee_id IS NULL AND ?3 IS NULL))",
+            rusqlite::params![synth_kind, w.source_ref_id, assignee_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if dismissed {
+        return Ok(None);
+    }
+
+    let action_id = waiting_action_id(synth_kind, &w.source_ref_id, assignee_id);
+
+    // If a row exists AND manual_override=1, leave it alone entirely.
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT manual_override FROM actions WHERE id = ?1",
+            rusqlite::params![action_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if matches!(existing, Some(1)) {
+        return Ok(Some(action_id));
+    }
+
+    // Otherwise upsert: keep `done` and `manual_override` at their
+    // current values (0 by default for fresh rows), refresh text +
+    // due/synth fields. We don't recompute `created_ms` on update.
+    tx.execute(
+        "INSERT INTO actions \
+            (id, origin_kind, origin_note_id, origin_line, \
+             origin_synth_kind, origin_synth_id, workstream_id, \
+             text, done, due_ms, assignee_id, created_ms, \
+             subject_member_id, manual_override) \
+         VALUES (?1, 'synth', NULL, NULL, ?2, ?3, NULL, \
+                 ?4, 0, NULL, ?5, ?6, ?7, 0) \
+         ON CONFLICT(id) DO UPDATE SET \
+            text = excluded.text, \
+            origin_synth_kind = excluded.origin_synth_kind, \
+            origin_synth_id = excluded.origin_synth_id, \
+            subject_member_id = excluded.subject_member_id \
+          WHERE manual_override = 0",
+        rusqlite::params![
+            action_id,
+            synth_kind,
+            w.source_ref_id,
+            w.description,
+            assignee_id,
+            now_ms,
+            subject_member_id,
+        ],
+    )?;
+
+    Ok(Some(action_id))
+}
+
+/// For every `_waiting` action row touching this person (either as
+/// assignee or subject), if its id isn't in the LLM's current live
+/// set and `manual_override = 0`, mark it done. This is the auto-
+/// resolution path — the LLM judges something resolved by simply
+/// omitting it from the next snapshot's output.
+fn auto_resolve_missing(
+    tx: &rusqlite::Transaction<'_>,
+    person_id: &str,
+    self_id: &str,
+    live_ids: &std::collections::HashSet<String>,
+    _now_ms: i64,
+) -> rusqlite::Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT id FROM actions \
+          WHERE origin_kind = 'synth' \
+            AND origin_synth_kind IN ('email_waiting', 'teams_waiting', 'meeting_waiting') \
+            AND manual_override = 0 \
+            AND done = 0 \
+            AND ( \
+                (assignee_id = ?1 AND subject_member_id = ?2) \
+                OR (assignee_id = ?2 AND subject_member_id = ?1) \
+            )",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![self_id, person_id], |r| {
+        r.get::<_, String>(0)
+    })?;
+    let existing: Vec<String> = rows.filter_map(Result::ok).collect();
+    for id in existing {
+        if live_ids.contains(&id) {
+            continue;
+        }
+        tx.execute("UPDATE actions SET done = 1 WHERE id = ?1", rusqlite::params![id])?;
+    }
+    Ok(())
 }
 
 /// Walk a waiting-candidate array under the given pointer in the

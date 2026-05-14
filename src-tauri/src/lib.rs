@@ -543,6 +543,7 @@ pub fn run() {
             notes::set_action_assignee,
             notes::set_action_workstream,
             notes::delete_action,
+            notes::dismiss_waiting_action,
             notes::list_open_questions,
             notes::resolve_open_question,
             notes::reopen_open_question,

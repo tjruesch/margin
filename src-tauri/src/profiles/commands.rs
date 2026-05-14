@@ -44,41 +44,76 @@ pub struct TeamWaitingCounts {
 }
 
 /// Bulk waiting/last-active counts across the whole team. Returns a
-/// map keyed by `team_members.id`; rows without a snapshot map to a
-/// zero-default entry (counts = 0, last-active = None). Populated by
-/// the v3 worker (#120); until that lands, all counts stay 0 — the
-/// frontend still renders the table structure, just with empty cells.
+/// map keyed by `team_members.id`. Waiting counts come from the
+/// unified `actions` table (post #120 follow-up), filtered to rows
+/// the profile worker created: `origin_synth_kind` matches a
+/// `_waiting` variant, `done = 0`. `last_seen_active_ms` still
+/// comes from the latest profile snapshot's body.
 #[tauri::command]
 pub fn team_waiting_counts(
     conn: tauri::State<'_, Mutex<Connection>>,
 ) -> Result<HashMap<String, TeamWaitingCounts>, String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
-    // Collect every team_member id (cheap — small table).
-    let mut stmt = c
-        .prepare("SELECT id FROM team_members")
-        .map_err(|e| e.to_string())?;
-    let ids: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(stmt);
+    let ids: Vec<String> = {
+        let mut stmt = c
+            .prepare("SELECT id FROM team_members")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
 
+    // last_seen_active_ms continues to come from snapshots.
     let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
     let snapshots =
         persist::get_latest_map(&c, &id_refs).map_err(|e| e.to_string())?;
 
+    let self_id: Option<String> = c
+        .query_row(
+            "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+
     let mut out: HashMap<String, TeamWaitingCounts> = HashMap::new();
     for id in &ids {
-        let entry = match snapshots.get(id) {
-            Some(snap) => TeamWaitingCounts {
-                from_me: snap.body.waiting_from_me.len() as u32,
-                for_them: snap.body.waiting_for_them.len() as u32,
-                last_seen_active_ms: snap.body.last_seen_active_ms,
+        let from_me_count = self_id
+            .as_ref()
+            .map(|s| count_waiting(&c, s.as_str(), id.as_str()).unwrap_or(0))
+            .unwrap_or(0);
+        let for_them_count = self_id
+            .as_ref()
+            .map(|s| count_waiting(&c, id.as_str(), s.as_str()).unwrap_or(0))
+            .unwrap_or(0);
+        let last_seen = snapshots
+            .get(id)
+            .and_then(|snap| snap.body.last_seen_active_ms);
+        out.insert(
+            id.clone(),
+            TeamWaitingCounts {
+                from_me: from_me_count,
+                for_them: for_them_count,
+                last_seen_active_ms: last_seen,
             },
-            None => TeamWaitingCounts::default(),
-        };
-        out.insert(id.clone(), entry);
+        );
     }
     Ok(out)
+}
+
+/// Count open `_waiting` actions where `assignee_id = ?1` and
+/// `subject_member_id = ?2`. Helper for `team_waiting_counts`.
+fn count_waiting(conn: &Connection, assignee_id: &str, subject_id: &str) -> rusqlite::Result<u32> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM actions \
+          WHERE done = 0 \
+            AND origin_kind = 'synth' \
+            AND origin_synth_kind IN ('email_waiting','teams_waiting','meeting_waiting') \
+            AND assignee_id = ?1 \
+            AND subject_member_id = ?2",
+        rusqlite::params![assignee_id, subject_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as u32)
 }

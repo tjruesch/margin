@@ -324,17 +324,46 @@ export type ActionListItem = {
   /** Canonical display name from team_members, joined for render so the
    *  frontend can show an avatar chip without a second IPC round-trip. */
   assignee_display_name: string | null;
+  /** For worker-extracted waiting actions, the *other* party in the
+   *  conversation (counterparty of `assignee_id`). NULL for note-origin
+   *  rows and any synth row without a single counterparty. */
+  subject_member_id: string | null;
+  /** Set to `true` once the user has touched a worker-extracted row
+   *  (toggled done, reassigned). The profile worker stops auto-
+   *  modifying the row after that. */
+  manual_override: boolean;
+};
+
+export type ListActionsFilters = {
+  scope?: ActionScope;
+  assigneeId?: string;
+  workstreamId?: string;
+  /** Filter to worker-extracted rows whose subject is this team member
+   *  (the counterparty in the conversation). */
+  subjectMemberId?: string;
+  /** Filter to rows whose `origin_synth_kind` is one of these values.
+   *  Common usage: `["email_waiting","teams_waiting","meeting_waiting"]`
+   *  to fetch only worker-extracted waiting actions. */
+  originSynthKinds?: string[];
 };
 
 export async function listActions(
-  scope: ActionScope = "open",
+  scopeOrFilters: ActionScope | ListActionsFilters = "open",
   assigneeId?: string,
   workstreamId?: string,
 ): Promise<ActionListItem[]> {
+  // Two call shapes for back-compat. Old: listActions("open", "id1", "id2").
+  // New: listActions({ scope, assigneeId, subjectMemberId, originSynthKinds }).
+  const filters: ListActionsFilters =
+    typeof scopeOrFilters === "string"
+      ? { scope: scopeOrFilters, assigneeId, workstreamId }
+      : scopeOrFilters;
   return invoke<ActionListItem[]>("list_actions", {
-    scope,
-    assigneeId,
-    workstreamId,
+    scope: filters.scope ?? "open",
+    assigneeId: filters.assigneeId,
+    workstreamId: filters.workstreamId,
+    subjectMemberId: filters.subjectMemberId,
+    originSynthKinds: filters.originSynthKinds,
   });
 }
 
@@ -344,6 +373,13 @@ export async function setActionDone(id: string, done: boolean): Promise<void> {
 
 export async function deleteAction(id: string): Promise<void> {
   await invoke<void>("delete_action", { id });
+}
+
+/** Permanently dismiss a worker-extracted waiting action so the
+ *  profile worker won't recreate it on the next recompute. Records
+ *  the source in `dismissed_action_sources` and deletes the row. */
+export async function dismissWaitingAction(id: string): Promise<void> {
+  await invoke<void>("dismiss_waiting_action", { id });
 }
 
 /** Attach an action to a workstream, or clear the attachment with

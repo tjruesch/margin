@@ -801,6 +801,8 @@ fn list_actions_for(
         crate::notes::ActionScope::All,
         None,
         Some(workstream_id),
+        None,
+        None,
     )
 }
 
@@ -1150,8 +1152,11 @@ pub fn set_action_done(
             |r| r.get(0),
         )
         .unwrap_or(0);
+    // Bump `manual_override` so the profile worker stops auto-touching
+    // this row (#120 follow-up). Harmless for non-waiting synth rows
+    // because the worker only checks the flag on `_waiting` variants.
     conn.execute(
-        "UPDATE actions SET done = ?2 WHERE id = ?1",
+        "UPDATE actions SET done = ?2, manual_override = 1 WHERE id = ?1",
         params![action_id, done as i64],
     )?;
     // Live action_completed event on a 0→1 transition (#106). Skipped
@@ -1202,7 +1207,7 @@ pub fn set_action_assignee(
     assignee_id: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE actions SET assignee_id = ?2 WHERE id = ?1",
+        "UPDATE actions SET assignee_id = ?2, manual_override = 1 WHERE id = ?1",
         params![action_id, assignee_id],
     )?;
     Ok(())
@@ -1523,15 +1528,17 @@ mod tests {
         // erroring.
         conn.execute_batch(
             "CREATE TABLE actions (
-                 id               TEXT PRIMARY KEY,
-                 note_path        TEXT NOT NULL,
-                 line             INTEGER NOT NULL,
-                 text             TEXT NOT NULL,
-                 done             INTEGER NOT NULL DEFAULT 0,
-                 created_ms       INTEGER NOT NULL,
-                 due_ms           INTEGER,
-                 reminder_sent_ms INTEGER,
-                 assignee_id      TEXT
+                 id                TEXT PRIMARY KEY,
+                 note_path         TEXT NOT NULL,
+                 line              INTEGER NOT NULL,
+                 text              TEXT NOT NULL,
+                 done              INTEGER NOT NULL DEFAULT 0,
+                 created_ms        INTEGER NOT NULL,
+                 due_ms            INTEGER,
+                 reminder_sent_ms  INTEGER,
+                 assignee_id       TEXT,
+                 subject_member_id TEXT,
+                 manual_override   INTEGER NOT NULL DEFAULT 0
              );",
         )
         .unwrap();
@@ -1576,6 +1583,11 @@ mod tests {
         // note_path → note_id; required for persist tests that exercise
         // get_workstream_detail's JOIN onto notes.
         conn.execute_batch(include_str!("../migrations/026_notes_to_db.sql"))
+            .unwrap();
+        // 030 adds `subject_member_id` and `manual_override` columns
+        // to `actions`, plus the `dismissed_action_sources` table —
+        // required by the waiting-action upsert path (#120 follow-up).
+        conn.execute_batch(include_str!("../migrations/030_action_waiting.sql"))
             .unwrap();
         conn
     }

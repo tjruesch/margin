@@ -99,6 +99,14 @@ pub struct ActionListItem {
     /// the frontend can surface an avatar chip without a second
     /// round-trip (#50/#51).
     pub assignee_display_name: Option<String>,
+    /// For waiting-extracted synth rows, points at the *other* person
+    /// in the conversation (counterparty of the assignee). NULL for
+    /// note-origin rows and any synth row with no single counterparty.
+    pub subject_member_id: Option<String>,
+    /// 1 once the user has touched this synth row; the profile worker
+    /// stops auto-modifying it after that. Avoids the user-unchecks /
+    /// worker-rechecks loop.
+    pub manual_override: bool,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -291,14 +299,21 @@ pub fn list_actions(
     scope: Option<ActionScope>,
     assignee_id: Option<String>,
     workstream_id: Option<String>,
+    subject_member_id: Option<String>,
+    origin_synth_kinds: Option<Vec<String>>,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<Vec<ActionListItem>, String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
+    let kinds_json = origin_synth_kinds
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()));
     crate::index::list_actions(
         &c,
         scope.unwrap_or_default(),
         assignee_id.as_deref(),
         workstream_id.as_deref(),
+        subject_member_id.as_deref(),
+        kinds_json.as_deref(),
     )
     .map_err(|e| e.to_string())
 }
@@ -824,6 +839,42 @@ pub fn set_action_assignee(
             .map(Some)
             .ok_or_else(|| "action line is not a recognizable checkbox".to_string())
     })
+}
+
+/// "Ignore" a worker-extracted waiting action: record the source in
+/// `dismissed_action_sources` so the profile worker doesn't recreate
+/// it, then delete the action row. Idempotent — re-dismissing the
+/// same source is a no-op.
+#[tauri::command]
+pub fn dismiss_waiting_action(
+    id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT origin_synth_kind, origin_synth_id, assignee_id \
+               FROM actions WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let now = crate::events::current_unix_ms();
+    if let Some((Some(kind), Some(ref_id), assignee_id)) = row {
+        tx.execute(
+            "INSERT OR IGNORE INTO dismissed_action_sources \
+                (origin_synth_kind, origin_synth_id, assignee_id, dismissed_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![kind, ref_id, assignee_id, now],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute("DELETE FROM actions WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Delete an action item (#111). Note-origin rows drop the literal

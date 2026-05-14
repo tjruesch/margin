@@ -404,24 +404,38 @@ Summary prose:\n\
 - Skip clichés (\"hard worker\", \"team player\"). Be specific. Use null if signal is too thin to write something honest.\n\
 \n\
 Waiting analysis:\n\
-- The user message includes `waiting_candidates: { from_me, for_them }`. Each candidate is `{ source_kind, source_ref_id, since_ms, preview }`.\n\
+- The user message includes `waiting_candidates: { from_me, for_them }`. Each candidate is `{ source_kind, source_ref_id, since_ms, preview, conversation_tail }`.\n\
 - `from_me` candidates are things this person is waiting on the user for; `for_them` are things the user is waiting on this person for.\n\
-- For each candidate that's still relevant, emit one WaitingItem with:\n\
-    description     — one short sentence (e.g. \"Confirm the Q3 budget\" not \"Re: Re: budget thread\").\n\
+- `conversation_tail` is up to 5 follow-up messages in the same thread/chat, ordered oldest-first, each `{ms, from_kind, preview}` where `from_kind` is \"self\" or \"them\". USE IT to decide resolution.\n\
+- For each candidate that's still pending, emit one WaitingItem with:\n\
+    description     — one short sentence (e.g. \"Confirm the Q3 budget\" not \"Re: Re: budget thread\"). If committed-not-delivered, include the commitment context (e.g. \"Send the bridge access list (committed Tuesday)\").\n\
     source_kind     — copy verbatim from the candidate.\n\
     source_ref_id   — copy verbatim; never invent ids.\n\
     since_ms        — copy verbatim.\n\
-- Your default is to DROP. Most candidates won't be substantive — emit a WaitingItem only when the message contains a real, unanswered ask or action item. When in doubt, drop.\n\
-- DROP a candidate when its preview is any of:\n\
-    * a social ack or thank-you (\"Thanks!\", \"Danke!\", \"Perfect, danke\", \"OK\", \"Got it\", \"Sounds good\") even if followed by a long name+title signature block.\n\
-    * a meeting/event cancellation, decline, or status update (\"Abgesagt: …\", \"Declined: …\").\n\
-    * an out-of-office / auto-reply (\"I'm out until …\", \"Currently on leave\").\n\
-    * agreement / confirmation of the user's prior message (\"Ja, so sehe ich das auch.\", \"Sicher, kein Problem\").\n\
-    * a status report from the sender about their own work (\"Hab ich erledigt\", \"Working on it\").\n\
-- KEEP a candidate when its preview is:\n\
-    * a direct question to the user (\"Können wir da unterstützen?\", \"Any update on the rollout?\").\n\
-    * an explicit request for action (\"Kannst du bitte … exportieren?\", \"Please confirm the Q3 budget by Friday\").\n\
-    * a pending decision waiting on the user (\"Sollen wir mit X oder Y weitergehen?\").\n\
+- Your default is to DROP. Most candidates won't be substantive — emit a WaitingItem only when the message contains a real, unanswered or undelivered ask. When in doubt, drop.\n\
+\n\
+Resolution judgment (decide per candidate by reading `conversation_tail`):\n\
+- RESOLVED → drop. Markers:\n\
+    * Self reply delivers the requested artifact (\"Here's the file: …\", \"Done, link below\", \"Habe ich gerade geschickt\").\n\
+    * Self reply substantively answers the question (\"The number is 42.\", \"We're going with vendor X because …\").\n\
+    * Counterparty acknowledges receipt and the loop is closed (\"Got it, thanks!\").\n\
+- PENDING (no reply) → emit. The candidate has zero or only counterparty messages in the tail.\n\
+- COMMITTED-NOT-DELIVERED → emit, with commitment context in description. Markers:\n\
+    * Self reply commits to future action without delivering (\"Sure, I'll send tomorrow\", \"Looking into it\", \"Komme ich noch drauf zurück\", \"Will do\", \"OK, mache ich\") AND no later delivery in the tail.\n\
+    * Counterparty has followed up after a self ack (\"Any update?\", \"Ping\").\n\
+\n\
+Other DROP triggers (regardless of tail):\n\
+    * Original preview is a social ack or thank-you (\"Thanks!\", \"Danke!\", \"Perfect, danke\", \"OK\", \"Got it\", \"Sounds good\").\n\
+    * Meeting/event cancellation, decline, or status update (\"Abgesagt: …\", \"Declined: …\").\n\
+    * Out-of-office / auto-reply (\"I'm out until …\", \"Currently on leave\").\n\
+    * Agreement / confirmation of the user's prior message (\"Ja, so sehe ich das auch.\", \"Sicher, kein Problem\").\n\
+    * A status report from the sender about their own work (\"Hab ich erledigt\", \"Working on it\").\n\
+\n\
+KEEP examples:\n\
+    * Direct question to the user (\"Können wir da unterstützen?\", \"Any update on the rollout?\").\n\
+    * Explicit request for action (\"Kannst du bitte … exportieren?\", \"Please confirm the Q3 budget by Friday\").\n\
+    * Pending decision waiting on the user (\"Sollen wir mit X oder Y weitergehen?\").\n\
+\n\
 - Cap each direction at 5 items; if you have more substantive candidates than that, pick the highest-stakes (deadlines, decisions, blockers) over the smallest-ask ones.\n\
 - Never emit a source_ref_id that wasn't in the candidate set — the post-parse validator will drop it anyway.";
 

@@ -16,6 +16,7 @@ import {
   acceptProfileObservation,
   createTeamMember,
   deleteTeamMember,
+  dismissWaitingAction,
   forceRecomputeProfile,
   getProfileSnapshot,
   listActions,
@@ -23,9 +24,12 @@ import {
   listTeamMembers,
   pendingObservationCounts,
   rejectProfileObservation,
+  setActionDone,
   teamWaitingCounts,
   updateTeamMember,
 } from "./file";
+
+const WAITING_SYNTH_KINDS = ["email_waiting", "teams_waiting", "meeting_waiting"];
 import { avatarColor, initialsFromName } from "./initials";
 
 export function TeamView({
@@ -767,29 +771,59 @@ function ProfileSnapshotPane({
   onOpenWorkstream: (id: string) => void;
   onCiteClick: (obsId: string) => void;
 }) {
+  const selfId = useMemo(
+    () => members.find((m) => m.is_self)?.id ?? null,
+    [members],
+  );
   const [snap, setSnap] = useState<ProfileSnapshot | null | "loading">(
     "loading",
   );
   const [acceptedById, setAcceptedById] = useState<
     Map<string, ProfileObservation>
   >(() => new Map());
+  const [onYou, setOnYou] = useState<ActionListItem[]>([]);
+  const [onThem, setOnThem] = useState<ActionListItem[]>([]);
   const [recomputing, setRecomputing] = useState(false);
+
+  const fetchWaiting = useCallback(async (memberId: string) => {
+    if (!selfId) return { fm: [], ft: [] };
+    const [fm, ft] = await Promise.all([
+      listActions({
+        scope: "open",
+        assigneeId: selfId,
+        subjectMemberId: memberId,
+        originSynthKinds: WAITING_SYNTH_KINDS,
+      }),
+      listActions({
+        scope: "open",
+        assigneeId: memberId,
+        subjectMemberId: selfId,
+        originSynthKinds: WAITING_SYNTH_KINDS,
+      }),
+    ]);
+    return { fm, ft };
+  }, [selfId]);
 
   useEffect(() => {
     let cancelled = false;
     setSnap("loading");
     setAcceptedById(new Map());
+    setOnYou([]);
+    setOnThem([]);
     void (async () => {
       try {
-        const [s, accepted] = await Promise.all([
+        const [s, accepted, waiting] = await Promise.all([
           getProfileSnapshot(member.id),
           listProfileObservations(member.id, "accepted"),
+          fetchWaiting(member.id),
         ]);
         if (cancelled) return;
         setSnap(s);
         const map = new Map<string, ProfileObservation>();
         for (const obs of accepted) map.set(obs.id, obs);
         setAcceptedById(map);
+        setOnYou(waiting.fm);
+        setOnThem(waiting.ft);
       } catch (err) {
         console.error("ProfileSnapshotPane fetch failed:", err);
         if (!cancelled) setSnap(null);
@@ -798,23 +832,53 @@ function ProfileSnapshotPane({
     return () => {
       cancelled = true;
     };
-  }, [member.id]);
+  }, [member.id, fetchWaiting]);
 
   const onRefresh = async () => {
     setRecomputing(true);
     try {
-      const [fresh, accepted] = await Promise.all([
+      const [fresh, accepted, waiting] = await Promise.all([
         forceRecomputeProfile(member.id),
         listProfileObservations(member.id, "accepted"),
+        fetchWaiting(member.id),
       ]);
       setSnap(fresh);
       const map = new Map<string, ProfileObservation>();
       for (const obs of accepted) map.set(obs.id, obs);
       setAcceptedById(map);
+      setOnYou(waiting.fm);
+      setOnThem(waiting.ft);
     } catch (err) {
       console.error("forceRecomputeProfile failed:", err);
     } finally {
       setRecomputing(false);
+    }
+  };
+
+  // Optimistic action mutations: update local state right away so the
+  // UI feels snappy, then re-fetch to converge with the DB.
+  const onResolve = async (actionId: string) => {
+    setOnYou((prev) => prev.filter((a) => a.id !== actionId));
+    setOnThem((prev) => prev.filter((a) => a.id !== actionId));
+    try {
+      await setActionDone(actionId, true);
+    } catch (err) {
+      console.error("setActionDone failed:", err);
+      const waiting = await fetchWaiting(member.id);
+      setOnYou(waiting.fm);
+      setOnThem(waiting.ft);
+    }
+  };
+  const onIgnore = async (actionId: string) => {
+    setOnYou((prev) => prev.filter((a) => a.id !== actionId));
+    setOnThem((prev) => prev.filter((a) => a.id !== actionId));
+    try {
+      await dismissWaitingAction(actionId);
+    } catch (err) {
+      console.error("dismissWaitingAction failed:", err);
+      const waiting = await fetchWaiting(member.id);
+      setOnYou(waiting.fm);
+      setOnThem(waiting.ft);
     }
   };
 
@@ -842,9 +906,13 @@ function ProfileSnapshotPane({
       snap={snap}
       members={members}
       acceptedById={acceptedById}
+      waitingOnYou={onYou}
+      waitingOnThem={onThem}
       onSelectMember={onSelectMember}
       onOpenWorkstream={onOpenWorkstream}
       onCiteClick={onCiteClick}
+      onResolveWaiting={(id) => void onResolve(id)}
+      onIgnoreWaiting={(id) => void onIgnore(id)}
       onRefresh={() => void onRefresh()}
       refreshing={recomputing}
     />
@@ -855,18 +923,26 @@ function ProfileSnapshotView({
   snap,
   members,
   acceptedById,
+  waitingOnYou,
+  waitingOnThem,
   onSelectMember,
   onOpenWorkstream,
   onCiteClick,
+  onResolveWaiting,
+  onIgnoreWaiting,
   onRefresh,
   refreshing,
 }: {
   snap: ProfileSnapshot;
   members: TeamMember[];
   acceptedById: Map<string, ProfileObservation>;
+  waitingOnYou: ActionListItem[];
+  waitingOnThem: ActionListItem[];
   onSelectMember: (id: string) => void;
   onOpenWorkstream: (id: string) => void;
   onCiteClick: (obsId: string) => void;
+  onResolveWaiting: (actionId: string) => void;
+  onIgnoreWaiting: (actionId: string) => void;
   onRefresh: () => void;
   refreshing: boolean;
 }) {
@@ -894,8 +970,6 @@ function ProfileSnapshotView({
     return m != null && !m.is_self;
   });
   const focus = body.recent_focus ?? [];
-  const waitingFromMe = body.waiting_from_me ?? [];
-  const waitingForThem = body.waiting_for_them ?? [];
   // Resolve cited observation ids to their full ProfileObservation rows;
   // silently skip ids that no longer match an accepted observation
   // (rejected/deleted since the snapshot was computed — stale cite).
@@ -958,23 +1032,21 @@ function ProfileSnapshotView({
             <span className="team-profile-waiting-label">
               Waiting on you
             </span>
-            {waitingFromMe.length > 0 && (
+            {waitingOnYou.length > 0 && (
               <span className="team-profile-waiting-count">
-                {waitingFromMe.length}
+                {waitingOnYou.length}
               </span>
             )}
           </div>
-          {waitingFromMe.length > 0 ? (
+          {waitingOnYou.length > 0 ? (
             <ul className="team-profile-waiting-list">
-              {waitingFromMe.map((w, i) => (
-                <li key={`fm-${i}`} className="team-profile-waiting-item">
-                  <span className="team-profile-waiting-body">
-                    {w.description}
-                  </span>
-                  <span className="team-profile-waiting-meta">
-                    {formatRelative(w.since_ms)}
-                  </span>
-                </li>
+              {waitingOnYou.map((a) => (
+                <WaitingActionRow
+                  key={a.id}
+                  action={a}
+                  onResolve={onResolveWaiting}
+                  onIgnore={onIgnoreWaiting}
+                />
               ))}
             </ul>
           ) : (
@@ -987,23 +1059,21 @@ function ProfileSnapshotView({
             <span className="team-profile-waiting-label">
               Waiting on {firstName}
             </span>
-            {waitingForThem.length > 0 && (
+            {waitingOnThem.length > 0 && (
               <span className="team-profile-waiting-count">
-                {waitingForThem.length}
+                {waitingOnThem.length}
               </span>
             )}
           </div>
-          {waitingForThem.length > 0 ? (
+          {waitingOnThem.length > 0 ? (
             <ul className="team-profile-waiting-list">
-              {waitingForThem.map((w, i) => (
-                <li key={`ft-${i}`} className="team-profile-waiting-item">
-                  <span className="team-profile-waiting-body">
-                    {w.description}
-                  </span>
-                  <span className="team-profile-waiting-meta">
-                    {formatRelative(w.since_ms)}
-                  </span>
-                </li>
+              {waitingOnThem.map((a) => (
+                <WaitingActionRow
+                  key={a.id}
+                  action={a}
+                  onResolve={onResolveWaiting}
+                  onIgnore={onIgnoreWaiting}
+                />
               ))}
             </ul>
           ) : (
@@ -1099,6 +1169,52 @@ function ProfileSnapshotView({
         </button>
       </div>
     </div>
+  );
+}
+
+function WaitingActionRow({
+  action,
+  onResolve,
+  onIgnore,
+}: {
+  action: ActionListItem;
+  onResolve: (id: string) => void;
+  onIgnore: (id: string) => void;
+}) {
+  const kindIcon =
+    action.origin_synth_kind === "email_waiting"
+      ? "✉"
+      : action.origin_synth_kind === "teams_waiting"
+      ? "▣"
+      : "◷";
+  return (
+    <li className="team-profile-waiting-item team-profile-waiting-action">
+      <button
+        type="button"
+        className="team-profile-waiting-check"
+        aria-label="Resolve"
+        title="Resolve"
+        onClick={() => onResolve(action.id)}
+      >
+        ○
+      </button>
+      <span className="team-profile-waiting-kind" aria-hidden>
+        {kindIcon}
+      </span>
+      <span className="team-profile-waiting-body">{action.text}</span>
+      <span className="team-profile-waiting-meta">
+        {formatRelative(action.created_ms)}
+      </span>
+      <button
+        type="button"
+        className="team-profile-waiting-ignore"
+        aria-label="Ignore"
+        title="Ignore — won't surface again"
+        onClick={() => onIgnore(action.id)}
+      >
+        ×
+      </button>
+    </li>
   );
 }
 
