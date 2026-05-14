@@ -291,6 +291,22 @@ async fn recompute_one(
         eprintln!("[profiles] dropped {dropped} hallucinated obs_ids for {person_id}");
     }
 
+    // Strip hallucinated waiting source_ref_ids before persist (#120).
+    // Same pattern as the obs_id filter: the model may emit ids it
+    // wasn't given. Build the allowed sets from the input candidates
+    // and retain only matches; then dedup by source_ref_id (the model
+    // sometimes echoes the same email twice across re-iterations).
+    let allowed_from_me = waiting_ref_ids(&inputs, "/waiting_candidates/from_me");
+    let allowed_for_them = waiting_ref_ids(&inputs, "/waiting_candidates/for_them");
+    let dropped_fm = filter_and_dedup_waiting(&mut body.waiting_from_me, &allowed_from_me);
+    let dropped_ft = filter_and_dedup_waiting(&mut body.waiting_for_them, &allowed_for_them);
+    if dropped_fm + dropped_ft > 0 {
+        eprintln!(
+            "[profiles] dropped {}+{} hallucinated waiting refs for {person_id}",
+            dropped_fm, dropped_ft
+        );
+    }
+
     {
         let conn_state = app.state::<std::sync::Mutex<Connection>>();
         let mut c = conn_state.lock().map_err(|e| e.to_string())?;
@@ -313,4 +329,110 @@ async fn recompute_one(
         tx.commit().map_err(|e| e.to_string())?;
     }
     Ok(RecomputeOutcome::Wrote)
+}
+
+/// Walk a waiting-candidate array under the given pointer in the
+/// prompt-inputs JSON and collect the `source_ref_id` values. Used
+/// by `recompute_one` to build the allow-set for validation.
+fn waiting_ref_ids(
+    inputs: &serde_json::Value,
+    pointer: &str,
+) -> std::collections::HashSet<String> {
+    inputs
+        .pointer(pointer)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| c.get("source_ref_id").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Drop items whose `source_ref_id` isn't in `allowed`, then dedup
+/// the remainder by `source_ref_id` (first occurrence wins). Returns
+/// the number of items removed.
+fn filter_and_dedup_waiting(
+    items: &mut Vec<crate::profiles::persist::WaitingItem>,
+    allowed: &std::collections::HashSet<String>,
+) -> usize {
+    let before = items.len();
+    items.retain(|w| allowed.contains(&w.source_ref_id));
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|w| seen.insert(w.source_ref_id.clone()));
+    before - items.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiles::persist::WaitingItem;
+    use std::collections::HashSet;
+
+    fn item(id: &str) -> WaitingItem {
+        WaitingItem {
+            description: format!("desc {id}"),
+            source_kind: "email".into(),
+            source_ref_id: id.into(),
+            since_ms: 0,
+        }
+    }
+
+    #[test]
+    fn filter_drops_hallucinated_ids() {
+        let mut items = vec![item("a"), item("ghost"), item("b")];
+        let mut allowed = HashSet::new();
+        allowed.insert("a".into());
+        allowed.insert("b".into());
+        let dropped = filter_and_dedup_waiting(&mut items, &allowed);
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            items.iter().map(|w| w.source_ref_id.clone()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn filter_dedups_repeats() {
+        let mut items = vec![item("a"), item("b"), item("a")];
+        let mut allowed = HashSet::new();
+        allowed.insert("a".into());
+        allowed.insert("b".into());
+        filter_and_dedup_waiting(&mut items, &allowed);
+        assert_eq!(items.len(), 2);
+        // First occurrence wins.
+        assert_eq!(items[0].source_ref_id, "a");
+        assert_eq!(items[1].source_ref_id, "b");
+    }
+
+    #[test]
+    fn filter_handles_empty_allowed() {
+        let mut items = vec![item("a"), item("b")];
+        let allowed = HashSet::new();
+        let dropped = filter_and_dedup_waiting(&mut items, &allowed);
+        assert_eq!(dropped, 2);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn waiting_ref_ids_extracts_from_pointer() {
+        let inputs = serde_json::json!({
+            "waiting_candidates": {
+                "from_me": [
+                    {"source_kind": "email", "source_ref_id": "e1", "since_ms": 1, "preview": "x"},
+                    {"source_kind": "teams", "source_ref_id": "m2", "since_ms": 2, "preview": "y"},
+                ],
+                "for_them": [
+                    {"source_kind": "email", "source_ref_id": "e3", "since_ms": 3, "preview": "z"},
+                ],
+            }
+        });
+        let fm = waiting_ref_ids(&inputs, "/waiting_candidates/from_me");
+        assert_eq!(fm.len(), 2);
+        assert!(fm.contains("e1") && fm.contains("m2"));
+        let ft = waiting_ref_ids(&inputs, "/waiting_candidates/for_them");
+        assert_eq!(ft.len(), 1);
+        assert!(ft.contains("e3"));
+    }
 }

@@ -30,6 +30,7 @@
 pub mod commands;
 pub mod persist;
 pub mod prompt;
+pub mod signals;
 pub mod worker;
 
 pub use persist::{

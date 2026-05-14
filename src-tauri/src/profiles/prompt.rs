@@ -131,7 +131,8 @@ pub async fn build_prompt_inputs(
     app: &AppHandle,
     person_id: &str,
 ) -> Result<serde_json::Value, String> {
-    let (member_block, edge_rows, event_rows, accepted_observations) = {
+    let now_ms = crate::events::current_unix_ms();
+    let (member_block, edge_rows, event_rows, accepted_observations, waiting_from_me, waiting_for_them) = {
         let conn_state = app.state::<std::sync::Mutex<Connection>>();
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         let accepted = crate::observations::persist::list_by_member(
@@ -141,11 +142,17 @@ pub async fn build_prompt_inputs(
         )
         .map_err(|e| format!("accepted observations: {e}"))?;
         let projected = project_accepted_observations(accepted);
+        let from_me = crate::profiles::signals::candidates_from_me(&c, person_id, now_ms)
+            .map_err(|e| format!("from_me candidates: {e}"))?;
+        let for_them = crate::profiles::signals::candidates_for_them(&c, person_id, now_ms)
+            .map_err(|e| format!("for_them candidates: {e}"))?;
         (
             load_member(&c, person_id)?,
             load_edges(&c, person_id)?,
             load_events(&c, person_id)?,
             projected,
+            from_me,
+            for_them,
         )
     };
     let display_name = member_block.display_name.clone();
@@ -190,6 +197,10 @@ pub async fn build_prompt_inputs(
         "events": event_rows,
         "retrieval_hits": retrieval_hits,
         "accepted_observations": accepted_observations,
+        "waiting_candidates": {
+            "from_me": waiting_from_me,
+            "for_them": waiting_for_them,
+        },
     }))
 }
 
@@ -347,8 +358,9 @@ pub enum CallError {
 
 const SYSTEM_PROMPT: &str = "You synthesize a structured profile of a single person from \
 edges (graph signals), events (recent activity), retrieval hits \
-(notes/messages mentioning them), and previously-vetted accepted \
-observations.\n\n\
+(notes/messages mentioning them), previously-vetted accepted \
+observations, and per-direction waiting candidates (unanswered \
+inbound/outbound emails, Teams messages, and pending meetings).\n\n\
 Output **only** a single JSON object matching this schema. No prose, \
 no markdown fences, no keys outside the schema.\n\n\
 ```\n\
@@ -359,7 +371,17 @@ no markdown fences, no keys outside the schema.\n\n\
   \"working_hours_observed\":  {\"start_local\": string, \"end_local\": string}|null,\n\
   \"communication_style_notes\": string|null,       // one sentence, lower-cased except proper nouns\n\
   \"last_seen_active_ms\":     int|null,\n\
-  \"evidence_observation_ids\": [string]            // obs_ids from accepted_observations that meaningfully shaped this snapshot; [] when none used\n\
+  \"evidence_observation_ids\": [string],           // obs_ids from accepted_observations that meaningfully shaped this snapshot; [] when none used\n\
+  \"summary_prose\":           string|null,         // 2-4 sentences of prose; the most important field\n\
+  \"waiting_from_me\":         [WaitingItem],       // they're waiting on the user (the user owes them)\n\
+  \"waiting_for_them\":        [WaitingItem]        // the user is waiting on them\n\
+}\n\
+\n\
+WaitingItem = {\n\
+  \"description\":     string,                       // one-sentence rephrasing of the preview\n\
+  \"source_kind\":     \"email\"|\"teams\"|\"meeting\",   // copy verbatim from the candidate\n\
+  \"source_ref_id\":   string,                       // copy verbatim; never invent\n\
+  \"since_ms\":        int                           // copy verbatim from the candidate\n\
 }\n\
 ```\n\n\
 Rules:\n\
@@ -374,7 +396,24 @@ Accepted observations:\n\
 - The user message includes `accepted_observations[]`: previously-reviewed observations the user has explicitly vetted. Each is `{obs_id, body, created_ms}`.\n\
 - These are **ground truth**, not hypotheses — weight them more heavily than any single edge or event when they conflict.\n\
 - When an observation directly shapes a field (e.g. `role_observed`, `communication_style_notes`), include its `obs_id` in `evidence_observation_ids`.\n\
-- Cite only the obs_ids you actually used. Do not pad. Cite each obs_id at most once. Use obs_ids exactly as given — do not invent.";
+- Cite only the obs_ids you actually used. Do not pad. Cite each obs_id at most once. Use obs_ids exactly as given — do not invent.\n\
+\n\
+Summary prose:\n\
+- This is the most important field. 2-4 sentences. Third person, declarative.\n\
+- Synthesize role + recent focus + working style + any accepted observations into a paragraph a colleague reading this profile cold would find useful.\n\
+- Skip clichés (\"hard worker\", \"team player\"). Be specific. Use null if signal is too thin to write something honest.\n\
+\n\
+Waiting analysis:\n\
+- The user message includes `waiting_candidates: { from_me, for_them }`. Each candidate is `{ source_kind, source_ref_id, since_ms, preview }`.\n\
+- `from_me` candidates are things this person is waiting on the user for; `for_them` are things the user is waiting on this person for.\n\
+- For each candidate that's still relevant, emit one WaitingItem with:\n\
+    description     — one short sentence (e.g. \"Confirm the Q3 budget\" not \"Re: Re: budget thread\").\n\
+    source_kind     — copy verbatim from the candidate.\n\
+    source_ref_id   — copy verbatim; never invent ids.\n\
+    since_ms        — copy verbatim.\n\
+- Drop candidates that read as resolved, transactional, or social (auto-replies, OOO, social acks like \"thanks!\", calendar invites already past).\n\
+- Cap each direction at 5 items; pick the most consequential.\n\
+- Never emit a source_ref_id that wasn't in the candidate set — the post-parse validator will drop it anyway.";
 
 pub async fn call_anthropic(
     api_key: &str,
@@ -490,6 +529,7 @@ mod tests {
             communication_style_notes: Some("Concise, async-first.".into()),
             last_seen_active_ms: None,
             evidence_observation_ids: vec![],
+            ..Default::default()
         };
         let s = render_snapshot_excerpt(&body, 1000);
         assert!(s.contains("Role: Senior backend engineer"));
