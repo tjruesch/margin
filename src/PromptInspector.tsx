@@ -235,25 +235,59 @@ function InspectorBody({
 
 function MetaRow({ dump }: { dump: PromptDump }) {
   const created = new Date(dump.created_ms).toLocaleString();
+  const hasCacheActivity =
+    (dump.cache_read_tokens ?? 0) > 0 || (dump.cache_creation_tokens ?? 0) > 0;
   return (
-    <div className="inspector-meta">
-      <span>
-        <strong>{dump.latency_ms.toLocaleString()}</strong> ms
-      </span>
-      <span className="inspector-meta-dot">·</span>
-      <span>
-        <strong>{dump.sources.length}</strong> sources
-      </span>
-      <span className="inspector-meta-dot">·</span>
-      <span>
-        <strong>{dump.dispatches.length}</strong> tool calls
-      </span>
-      <span className="inspector-meta-dot">·</span>
-      <span className="inspector-meta-time" title={created}>
-        {created}
-      </span>
-    </div>
+    <>
+      <div className="inspector-meta">
+        <span>
+          <strong>{dump.latency_ms.toLocaleString()}</strong> ms
+        </span>
+        <span className="inspector-meta-dot">·</span>
+        <span>
+          <strong>{dump.sources.length}</strong> sources
+        </span>
+        <span className="inspector-meta-dot">·</span>
+        <span>
+          <strong>{dump.dispatches.length}</strong> tool calls
+        </span>
+        <span className="inspector-meta-dot">·</span>
+        <span className="inspector-meta-time" title={created}>
+          {created}
+        </span>
+      </div>
+      {hasCacheActivity && (
+        <div className="inspector-meta inspector-meta-tokens">
+          <span>
+            <strong>{formatTokensShort(dump.cache_read_tokens)}</strong> cache read
+          </span>
+          <span className="inspector-meta-dot">·</span>
+          <span>
+            <strong>{formatTokensShort(dump.tokens_in)}</strong> fresh in
+          </span>
+          {(dump.cache_creation_tokens ?? 0) > 0 && (
+            <>
+              <span className="inspector-meta-dot">·</span>
+              <span>
+                <strong>{formatTokensShort(dump.cache_creation_tokens)}</strong>{" "}
+                cache written
+              </span>
+            </>
+          )}
+          <span className="inspector-meta-dot">·</span>
+          <span>
+            <strong>{formatTokensShort(dump.tokens_out)}</strong> out
+          </span>
+        </div>
+      )}
+    </>
   );
+}
+
+function formatTokensShort(n: number | null | undefined): string {
+  if (n == null) return "—";
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return n.toString();
 }
 
 function DispatchRow({ dispatch }: { dispatch: PromptDispatch }) {

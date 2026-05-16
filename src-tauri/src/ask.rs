@@ -249,6 +249,11 @@ pub struct PromptDumpView {
     pub query: String,
     pub tokens_in: Option<i64>,
     pub tokens_out: Option<i64>,
+    /// Prompt-cache write count (#142). NULL on pre-#142 rows + on
+    /// turns where caching was inactive.
+    pub cache_creation_tokens: Option<i64>,
+    /// Prompt-cache read count (#142). Same NULL semantics.
+    pub cache_read_tokens: Option<i64>,
 }
 
 /// Per-turn telemetry row for the Settings → Diagnostics view (#135).
@@ -267,6 +272,10 @@ pub struct ChatTurnMetric {
     pub assistant_text_chars: i64,
     pub tokens_in: Option<i64>,
     pub tokens_out: Option<i64>,
+    /// Prompt-cache write count (#142). NULL when caching inactive.
+    pub cache_creation_tokens: Option<i64>,
+    /// Prompt-cache read count (#142). NULL when caching inactive.
+    pub cache_read_tokens: Option<i64>,
     pub sources_total: i64,
     /// `{"note": 200, "event": 50, "workstream": 30, "teams_message": 200}`
     pub sources_by_kind: serde_json::Value,
@@ -557,15 +566,33 @@ pub async fn start(
         if h.role == "user" || h.role == "assistant" {
             messages.push(ApiMessage {
                 role: h.role,
-                content: vec![ContentBlock::Text { text: h.content }],
+                content: vec![ContentBlock::Text {
+                    text: h.content,
+                    cache_control: None,
+                }],
             });
         }
     }
+    // Split the assembled user message into a stable context block
+    // (cache_control: ephemeral) and a per-turn question block (no
+    // marker so a new question doesn't bust the cache prefix). #142.
+    // The full string still gets persisted to prompt_dumps for the
+    // inspector — splitting only affects request shape.
+    let (context_block, question_block) = split_at_question_marker(&user_message);
+    let mut user_content: Vec<ContentBlock> = Vec::new();
+    user_content.push(ContentBlock::Text {
+        text: context_block,
+        cache_control: Some(CacheControl { kind: "ephemeral" }),
+    });
+    if !question_block.is_empty() {
+        user_content.push(ContentBlock::Text {
+            text: question_block,
+            cache_control: None,
+        });
+    }
     messages.push(ApiMessage {
         role: "user".to_string(),
-        content: vec![ContentBlock::Text {
-            text: user_message.clone(),
-        }],
+        content: user_content,
     });
 
     let model = model.as_deref().unwrap_or(DEFAULT_MODEL).to_string();
@@ -606,7 +633,7 @@ pub async fn start(
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 struct CacheControl {
     #[serde(rename = "type")]
     kind: &'static str,
@@ -623,12 +650,16 @@ struct SystemBlock {
 /// One content block in a request `messages[]` content array. Mirrors
 /// Anthropic's content block schema for assistant `text` / `tool_use`
 /// and user `tool_result` blocks. The `type` discriminator is emitted
-/// via serde.
+/// via serde. `cache_control` on `Text` and `ToolResult` blocks is
+/// opt-in per #142 — marking a block extends the cache prefix to
+/// include everything up to and including it.
 #[derive(Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
     Text {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     ToolUse {
         id: String,
@@ -640,11 +671,30 @@ enum ContentBlock {
         content: String,
         #[serde(skip_serializing_if = "is_false")]
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// Split an assembled user-message string at the `# Question` marker
+/// (#142). Returns `(context, question)`. When the marker is absent
+/// the full text is treated as context with an empty question — the
+/// request will then send a single content block as before, just
+/// with `cache_control` set. `rfind` so the last `# Question`
+/// occurrence wins if a user happens to paste one in their query.
+fn split_at_question_marker(user_message: &str) -> (String, String) {
+    const MARKER: &str = "# Question\n\n";
+    match user_message.rfind(MARKER) {
+        Some(i) => (
+            user_message[..i].to_string(),
+            user_message[i..].to_string(),
+        ),
+        None => (user_message.to_string(), String::new()),
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -695,9 +745,14 @@ async fn run_loop(
     // Token accumulators (#135). Multi-pass turns re-send the full
     // history each pass so input_tokens double-counts repeated context;
     // it's a directional indicator for the diagnostics view, not a
-    // precise billing metric. The UI labels it accordingly.
+    // precise billing metric. The UI labels it accordingly. With
+    // caching active (#142) most of the per-pass input is served from
+    // cache → tokens_in stays small and the cache_* totals carry the
+    // bulk; the diagnostics row formats accordingly.
     let mut total_tokens_in: i64 = 0;
     let mut total_tokens_out: i64 = 0;
+    let mut total_cache_creation: i64 = 0;
+    let mut total_cache_read: i64 = 0;
 
     for _ in 0..MAX_TOOL_ITERATIONS {
         let body = ApiRequest {
@@ -716,6 +771,8 @@ async fn run_loop(
         let pass = stream_pass(app, turn_id, api_key, &body).await?;
         total_tokens_in += pass.tokens_in;
         total_tokens_out += pass.tokens_out;
+        total_cache_creation += pass.cache_creation_tokens;
+        total_cache_read += pass.cache_read_tokens;
 
         if pass.pending_tool_calls.is_empty() {
             // No tool calls — the model is done with this turn.
@@ -735,6 +792,8 @@ async fn run_loop(
                 query,
                 Some(total_tokens_in),
                 Some(total_tokens_out),
+                Some(total_cache_creation),
+                Some(total_cache_read),
             );
             return Ok(());
         }
@@ -747,8 +806,9 @@ async fn run_loop(
             content: pass.assistant_blocks,
         });
 
-        let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(pass.pending_tool_calls.len());
-        for tc in pass.pending_tool_calls {
+        let pending_total = pass.pending_tool_calls.len();
+        let mut result_blocks: Vec<ContentBlock> = Vec::with_capacity(pending_total);
+        for (tc_idx, tc) in pass.pending_tool_calls.into_iter().enumerate() {
             let target_n = tc
                 .input
                 .get("n")
@@ -820,10 +880,19 @@ async fn run_loop(
                 },
             );
 
+            // Mark only the last tool_result with cache_control so the
+            // request stays under the 4-breakpoint budget while still
+            // extending the cache prefix across tool-use passes (#142).
+            let is_last_pending = tc_idx + 1 == pending_total;
             result_blocks.push(ContentBlock::ToolResult {
                 tool_use_id: tc.id,
                 content: result.content,
                 is_error: result.is_error,
+                cache_control: if is_last_pending {
+                    Some(CacheControl { kind: "ephemeral" })
+                } else {
+                    None
+                },
             });
         }
         messages.push(ApiMessage {
@@ -849,6 +918,8 @@ async fn run_loop(
     let final_pass = stream_pass(app, turn_id, api_key, &final_body).await?;
     total_tokens_in += final_pass.tokens_in;
     total_tokens_out += final_pass.tokens_out;
+    total_cache_creation += final_pass.cache_creation_tokens;
+    total_cache_read += final_pass.cache_read_tokens;
     let _ = app.emit(
         "ai-stream",
         StreamEvent::Done {
@@ -865,6 +936,8 @@ async fn run_loop(
         query,
         Some(total_tokens_in),
         Some(total_tokens_out),
+        Some(total_cache_creation),
+        Some(total_cache_read),
     );
     Ok(())
 }
@@ -1005,11 +1078,18 @@ struct PassResult {
     pending_tool_calls: Vec<PendingToolCall>,
     /// `usage.input_tokens` from the SSE `message_start` event (#135).
     /// One pass = one HTTP request, so this is the input cost for that
-    /// specific request. `run_loop` sums across passes.
+    /// specific request. `run_loop` sums across passes. With caching
+    /// enabled (#142), this is the count NOT served from cache.
     tokens_in: i64,
     /// `usage.output_tokens` from the SSE `message_delta` event (#135).
     /// Anthropic streams cumulative counts; the last value wins.
     tokens_out: i64,
+    /// `usage.cache_creation_input_tokens` — tokens *written* to the
+    /// cache on this request (1.25× billed). Absent on a miss → 0 (#142).
+    cache_creation_tokens: i64,
+    /// `usage.cache_read_input_tokens` — tokens *read* from the cache
+    /// (0.1× billed). Absent before any cache exists → 0 (#142).
+    cache_read_tokens: i64,
 }
 
 struct PendingToolCall {
@@ -1070,6 +1150,10 @@ async fn stream_pass(
     // cumulatively on message_delta so the last value is the final.
     let mut tokens_in: i64 = 0;
     let mut tokens_out: i64 = 0;
+    // #142 cache telemetry: present on `message_start.usage` only when
+    // caching is active for this request. Absent → 0.
+    let mut cache_creation_tokens: i64 = 0;
+    let mut cache_read_tokens: i64 = 0;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("stream chunk: {e}"))?;
@@ -1180,14 +1264,28 @@ async fn stream_pass(
                 }
                 "message_start" => {
                     // Initial usage payload: `input_tokens` is fixed for
-                    // this request (no output yet). #135 telemetry.
-                    if let Some(t) = parsed
+                    // this request (no output yet). #135 telemetry. Also
+                    // carries cache_* fields when caching is active — see
+                    // #142. Absent → defaults to 0.
+                    if let Some(usage) = parsed
                         .get("message")
                         .and_then(|m| m.get("usage"))
-                        .and_then(|u| u.get("input_tokens"))
-                        .and_then(|n| n.as_i64())
                     {
-                        tokens_in = t;
+                        if let Some(t) = usage.get("input_tokens").and_then(|n| n.as_i64()) {
+                            tokens_in = t;
+                        }
+                        if let Some(t) = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|n| n.as_i64())
+                        {
+                            cache_creation_tokens = t;
+                        }
+                        if let Some(t) = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|n| n.as_i64())
+                        {
+                            cache_read_tokens = t;
+                        }
                     }
                 }
                 "message_delta" => {
@@ -1230,7 +1328,10 @@ async fn stream_pass(
         match state {
             BlockState::Text { text } => {
                 if !text.is_empty() {
-                    assistant_blocks.push(ContentBlock::Text { text });
+                    assistant_blocks.push(ContentBlock::Text {
+                        text,
+                        cache_control: None,
+                    });
                 }
             }
             BlockState::ToolUse { id, name, json_buf } => {
@@ -1256,6 +1357,8 @@ async fn stream_pass(
         pending_tool_calls,
         tokens_in,
         tokens_out,
+        cache_creation_tokens,
+        cache_read_tokens,
     })
 }
 
@@ -2182,6 +2285,8 @@ fn persist_prompt_dump(
     query: &str,
     tokens_in: Option<i64>,
     tokens_out: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
 ) {
     let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
     let conn = match conn_state.lock() {
@@ -2202,6 +2307,8 @@ fn persist_prompt_dump(
         query,
         tokens_in,
         tokens_out,
+        cache_creation_tokens,
+        cache_read_tokens,
     ) {
         eprintln!("[ask] prompt_dump write failed: {e}");
     }
@@ -2220,6 +2327,8 @@ fn write_prompt_dump(
     query: &str,
     tokens_in: Option<i64>,
     tokens_out: Option<i64>,
+    cache_creation_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
 ) -> rusqlite::Result<()> {
     let tool_names_json =
         serde_json::to_string(TOOL_NAMES).unwrap_or_else(|_| "[]".to_string());
@@ -2230,8 +2339,9 @@ fn write_prompt_dump(
     conn.execute(
         "INSERT INTO prompt_dumps(turn_id, prompt, system_prompt, tool_names_json, \
                                   sources_json, dispatches_json, latency_ms, created_ms, \
-                                  query, tokens_in, tokens_out) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+                                  query, tokens_in, tokens_out, \
+                                  cache_creation_tokens, cache_read_tokens) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
          ON CONFLICT(turn_id) DO UPDATE SET \
             prompt = excluded.prompt, \
             system_prompt = excluded.system_prompt, \
@@ -2241,7 +2351,9 @@ fn write_prompt_dump(
             latency_ms = excluded.latency_ms, \
             query = excluded.query, \
             tokens_in = excluded.tokens_in, \
-            tokens_out = excluded.tokens_out",
+            tokens_out = excluded.tokens_out, \
+            cache_creation_tokens = excluded.cache_creation_tokens, \
+            cache_read_tokens = excluded.cache_read_tokens",
         rusqlite::params![
             turn_id,
             prompt,
@@ -2254,6 +2366,8 @@ fn write_prompt_dump(
             query,
             tokens_in,
             tokens_out,
+            cache_creation_tokens,
+            cache_read_tokens,
         ],
     )?;
     Ok(())
@@ -2269,7 +2383,8 @@ fn read_prompt_dump(
     use rusqlite::OptionalExtension as _;
     conn.query_row(
         "SELECT turn_id, prompt, system_prompt, tool_names_json, sources_json, \
-                dispatches_json, latency_ms, created_ms, query, tokens_in, tokens_out \
+                dispatches_json, latency_ms, created_ms, query, tokens_in, tokens_out, \
+                cache_creation_tokens, cache_read_tokens \
          FROM prompt_dumps WHERE turn_id = ?1",
         rusqlite::params![turn_id],
         |r| {
@@ -2291,6 +2406,8 @@ fn read_prompt_dump(
                 query: r.get(8)?,
                 tokens_in: r.get(9)?,
                 tokens_out: r.get(10)?,
+                cache_creation_tokens: r.get(11)?,
+                cache_read_tokens: r.get(12)?,
             })
         },
     )
@@ -2378,7 +2495,7 @@ fn read_chat_turn_metrics(
         "SELECT p.turn_id, cm.conversation_id, p.created_ms, p.latency_ms, p.query, \
                 COALESCE(LENGTH(cm.text), 0) AS assistant_text_chars, \
                 p.tokens_in, p.tokens_out, p.sources_json, p.dispatches_json, \
-                cm.text \
+                cm.text, p.cache_creation_tokens, p.cache_read_tokens \
            FROM prompt_dumps p \
            LEFT JOIN chat_messages cm \
                   ON cm.turn_id = p.turn_id AND cm.role = 'assistant' \
@@ -2420,6 +2537,8 @@ fn read_chat_turn_metrics(
             assistant_text_chars: r.get(5)?,
             tokens_in: r.get(6)?,
             tokens_out: r.get(7)?,
+            cache_creation_tokens: r.get(11)?,
+            cache_read_tokens: r.get(12)?,
             sources_total,
             sources_by_kind,
             citations,
@@ -3840,6 +3959,8 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("migrations/037_prompt_dumps_telemetry.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("migrations/038_prompt_cache_tokens.sql"))
+            .unwrap();
         // `list_chat_turn_metrics` joins `chat_messages`; create a
         // minimal schema (no FK, simpler than running migration 035)
         // so the LEFT JOIN has a target even when no rows are seeded.
@@ -3899,6 +4020,8 @@ mod tests {
             "what's up",
             Some(500),
             Some(120),
+            Some(15_000),
+            Some(2_000),
         )
         .unwrap();
 
@@ -3910,6 +4033,8 @@ mod tests {
         assert_eq!(dump.query, "what's up");
         assert_eq!(dump.tokens_in, Some(500));
         assert_eq!(dump.tokens_out, Some(120));
+        assert_eq!(dump.cache_creation_tokens, Some(15_000));
+        assert_eq!(dump.cache_read_tokens, Some(2_000));
         assert!(dump.system_prompt.contains("personal notes"), "system_prompt captured");
         assert!(dump.tool_names.iter().any(|n| n == "read_teams_message"), "tool names list");
         assert_eq!(dump.sources[0]["label"].as_str(), Some("1"));
@@ -3929,12 +4054,13 @@ mod tests {
         let sources_a = vec![make_source(AskSourceKind::Note, "1", "First")];
         let sources_b = vec![make_source(AskSourceKind::Note, "2", "Second")];
         write_prompt_dump(
-            &conn, "turn_x", "first attempt", &sources_a, &[], 100, 1_000, "q1", None, None,
+            &conn, "turn_x", "first attempt", &sources_a, &[], 100, 1_000, "q1",
+            None, None, None, None,
         )
         .unwrap();
         write_prompt_dump(
             &conn, "turn_x", "second attempt", &sources_b, &[], 200, 2_000, "q2",
-            Some(900), Some(50),
+            Some(900), Some(50), None, None,
         )
         .unwrap();
         let dump = read_prompt_dump(&conn, "turn_x").unwrap().expect("row");
@@ -4013,11 +4139,13 @@ mod tests {
         // Two dumps at different times + matching chat messages.
         let sources = vec![make_source(AskSourceKind::Note, "1", "A")];
         write_prompt_dump(
-            &conn, "turn_a", "p1", &sources, &[], 50, 1_000, "q-a", Some(100), Some(20),
+            &conn, "turn_a", "p1", &sources, &[], 50, 1_000, "q-a",
+            Some(100), Some(20), None, None,
         )
         .unwrap();
         write_prompt_dump(
-            &conn, "turn_b", "p2", &sources, &[], 75, 2_000, "q-b", Some(200), Some(30),
+            &conn, "turn_b", "p2", &sources, &[], 75, 2_000, "q-b",
+            Some(200), Some(30), None, None,
         )
         .unwrap();
         seed_chat_message_for_metric(&conn, "turn_a", "see [1]");
@@ -4039,7 +4167,8 @@ mod tests {
     fn list_chat_turn_metrics_handles_missing_chat_message() {
         let conn = dump_test_db();
         write_prompt_dump(
-            &conn, "orphan", "p", &[], &[], 10, 1_000, "q", Some(5), Some(2),
+            &conn, "orphan", "p", &[], &[], 10, 1_000, "q",
+            Some(5), Some(2), None, None,
         )
         .unwrap();
         // No matching chat_messages row → assistant_text_chars = 0,
@@ -4067,7 +4196,7 @@ mod tests {
         ];
         write_prompt_dump(
             &conn, "turn_z", "p", &sources, &dispatches, 100, 1_000, "q",
-            None, None,
+            None, None, None, None,
         )
         .unwrap();
         let metrics = read_chat_turn_metrics(&conn, 10).unwrap();
@@ -4077,5 +4206,117 @@ mod tests {
         assert_eq!(metrics[0].sources_by_kind["teams_message"], 1);
         assert_eq!(metrics[0].tool_call_count, 2);
         assert!(metrics[0].had_error_dispatch);
+    }
+
+    // ----- #142 prompt caching --------------------------------------------
+
+    /// Mirrors the SSE message_start parser's view of the usage payload.
+    /// Returned tuple: (input, output, cache_creation, cache_read). Keeps
+    /// the parsing logic testable without needing a real HTTP roundtrip.
+    fn parse_usage_for_test(usage: &serde_json::Value) -> (i64, i64, i64, i64) {
+        let input = usage
+            .get("input_tokens")
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        let output = usage
+            .get("output_tokens")
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        let creation = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        let read = usage
+            .get("cache_read_input_tokens")
+            .and_then(|n| n.as_i64())
+            .unwrap_or(0);
+        (input, output, creation, read)
+    }
+
+    #[test]
+    fn usage_parse_captures_all_four_fields_when_present() {
+        let usage = serde_json::json!({
+            "input_tokens": 234,
+            "output_tokens": 567,
+            "cache_creation_input_tokens": 15_000,
+            "cache_read_input_tokens": 2_500,
+        });
+        let (input, output, creation, read) = parse_usage_for_test(&usage);
+        assert_eq!(input, 234);
+        assert_eq!(output, 567);
+        assert_eq!(creation, 15_000);
+        assert_eq!(read, 2_500);
+    }
+
+    #[test]
+    fn usage_parse_handles_absent_cache_fields_as_zero() {
+        // On a cache miss Anthropic omits the cache_* fields entirely.
+        // Confirmed against the docs: absent (not zero).
+        let usage = serde_json::json!({
+            "input_tokens": 17_000,
+            "output_tokens": 412,
+        });
+        let (_input, _output, creation, read) = parse_usage_for_test(&usage);
+        assert_eq!(creation, 0);
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn split_at_question_marker_when_present() {
+        let s = "# Notes directory\n\n[1] foo\n\n# Question\n\nDoes she need something?";
+        let (context, question) = split_at_question_marker(s);
+        assert_eq!(context, "# Notes directory\n\n[1] foo\n\n");
+        assert_eq!(question, "# Question\n\nDoes she need something?");
+    }
+
+    #[test]
+    fn split_at_question_marker_falls_through_when_absent() {
+        let s = "no marker here";
+        let (context, question) = split_at_question_marker(s);
+        assert_eq!(context, "no marker here");
+        assert!(question.is_empty());
+    }
+
+    #[test]
+    fn split_at_question_marker_uses_rfind_for_user_pasted_markers() {
+        // If a user pastes "# Question" inside their query, we still
+        // want the LAST occurrence to win (the real section header).
+        let s = "# Question\n\nuser said \"# Question\\n\\n\" in their text\n\n# Question\n\nreal one";
+        let (_context, question) = split_at_question_marker(s);
+        assert!(question.ends_with("real one"), "rfind picks the last marker: {}", question);
+    }
+
+    #[test]
+    fn content_block_text_with_cache_control_serializes_field() {
+        let block = ContentBlock::Text {
+            text: "hi".into(),
+            cache_control: Some(CacheControl { kind: "ephemeral" }),
+        };
+        let s = serde_json::to_string(&block).unwrap();
+        assert!(s.contains("\"cache_control\":{\"type\":\"ephemeral\"}"), "got: {s}");
+    }
+
+    #[test]
+    fn content_block_text_without_cache_control_omits_field() {
+        let block = ContentBlock::Text {
+            text: "hi".into(),
+            cache_control: None,
+        };
+        let s = serde_json::to_string(&block).unwrap();
+        assert!(!s.contains("cache_control"), "field should be omitted: {s}");
+    }
+
+    #[test]
+    fn content_block_tool_result_supports_cache_control() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "tool_1".into(),
+            content: "result".into(),
+            is_error: false,
+            cache_control: Some(CacheControl { kind: "ephemeral" }),
+        };
+        let s = serde_json::to_string(&block).unwrap();
+        assert!(s.contains("\"cache_control\":{\"type\":\"ephemeral\"}"), "got: {s}");
+        // is_error=false is skipped per the existing serde attr.
+        assert!(!s.contains("is_error"), "is_error=false should be omitted: {s}");
     }
 }

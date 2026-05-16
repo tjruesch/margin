@@ -1261,10 +1261,8 @@ function DiagnosticsRow({
   });
   const query = metric.query || "(no query stored)";
   const truncatedQuery = query.length > 80 ? query.slice(0, 77) + "…" : query;
-  const tokens =
-    metric.tokens_out != null
-      ? `${formatTokens(metric.tokens_in)}/${formatTokens(metric.tokens_out)}`
-      : "—";
+  const tokens = formatTokensCell(metric);
+  const tokensTooltip = formatTokensTooltip(metric);
   const noCitations =
     metric.citations.length === 0 && metric.assistant_text_chars > 0;
   const srcsTooltip = Object.entries(metric.sources_by_kind)
@@ -1294,7 +1292,9 @@ function DiagnosticsRow({
       </td>
       <td className="diagnostics-num">{metric.citations.length}</td>
       <td className="diagnostics-num">{metric.tool_call_count}</td>
-      <td className="diagnostics-num">{tokens}</td>
+      <td className="diagnostics-num" title={tokensTooltip}>
+        {tokens}
+      </td>
       <td className="diagnostics-num">
         {(metric.latency_ms / 1000).toFixed(metric.latency_ms < 1000 ? 2 : 1)}s
       </td>
@@ -1306,6 +1306,38 @@ function formatTokens(n: number | null): string {
   if (n == null) return "—";
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return n.toString();
+}
+
+/// Compact cell for the Diagnostics tokens column. When the turn used
+/// prompt caching (#142), surface the cache-read portion separately so
+/// the savings are visible at a glance. Format: "17.0k🔁 + 0.3k → 0.4k"
+/// reads as "served from cache + new + output". Cache-creation isn't
+/// shown inline (it's a one-time event the user already paid for);
+/// surfaced via the cell tooltip + the inspector instead.
+function formatTokensCell(m: ChatTurnMetric): string {
+  if (m.tokens_out == null) return "—";
+  const read = m.cache_read_tokens ?? 0;
+  const create = m.cache_creation_tokens ?? 0;
+  const fresh = m.tokens_in ?? 0;
+  if (read === 0 && create === 0) {
+    return `${formatTokens(fresh)}/${formatTokens(m.tokens_out)}`;
+  }
+  return `${formatTokens(read)}🔁 + ${formatTokens(fresh)} → ${formatTokens(m.tokens_out)}`;
+}
+
+function formatTokensTooltip(m: ChatTurnMetric): string {
+  if (m.tokens_out == null) return "No token data";
+  const lines = [
+    `Fresh input: ${formatTokens(m.tokens_in)}`,
+    `Output: ${formatTokens(m.tokens_out)}`,
+  ];
+  if (m.cache_read_tokens != null && m.cache_read_tokens > 0) {
+    lines.push(`Cache read: ${formatTokens(m.cache_read_tokens)} (0.1× rate)`);
+  }
+  if (m.cache_creation_tokens != null && m.cache_creation_tokens > 0) {
+    lines.push(`Cache write: ${formatTokens(m.cache_creation_tokens)} (1.25× rate)`);
+  }
+  return lines.join("\n");
 }
 
 /// Construct a minimal ChatMessageView from a metric row so the

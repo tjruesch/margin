@@ -755,6 +755,10 @@ export type PromptDump = {
   query: string;
   tokens_in: number | null;
   tokens_out: number | null;
+  /** Prompt-cache write count (#142). Null when caching inactive. */
+  cache_creation_tokens: number | null;
+  /** Prompt-cache read count (#142). Null when caching inactive. */
+  cache_read_tokens: number | null;
 };
 
 /** Per-turn telemetry row for the Settings → Diagnostics view (#135).
@@ -769,6 +773,10 @@ export type ChatTurnMetric = {
   assistant_text_chars: number;
   tokens_in: number | null;
   tokens_out: number | null;
+  /** Prompt-cache write count (#142). Null when caching inactive. */
+  cache_creation_tokens: number | null;
+  /** Prompt-cache read count (#142). Null when caching inactive. */
+  cache_read_tokens: number | null;
   sources_total: number;
   sources_by_kind: Record<string, number>;
   citations: string[];
