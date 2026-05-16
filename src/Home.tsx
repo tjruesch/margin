@@ -9,6 +9,7 @@ import {
   type ConnectorStatusEvent,
   deleteOpenQuestion,
   listCalendarEvents,
+  listConnectors,
   listOpenQuestions,
   type NoteListItem,
   type OpenQuestionItem,
@@ -151,6 +152,45 @@ export function DueChip({ dueMs }: { dueMs: number | null }) {
       {friendlyDueLabel(dueMs, now)}
     </span>
   );
+}
+
+/// Connector-health hook (#141). Returns `true` when at least one
+/// connector has a non-null `last_error` — drives the alert dot on the
+/// sidebar Settings nav item so the user notices a broken sync without
+/// having to open Settings → Connectors proactively. Refreshes on every
+/// `connector-status` Tauri event, so the dot flips off the moment the
+/// runner reports the next successful sync.
+function useConnectorHealthAlert(): boolean {
+  const [hasError, setHasError] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const list = await listConnectors();
+        if (cancelled) return;
+        setHasError(list.some((c) => !!c.last_error));
+      } catch (e) {
+        if (!cancelled) console.error("[home] listConnectors failed:", e);
+      }
+    };
+    void refresh();
+    let unlisten: UnlistenFn | null = null;
+    (async () => {
+      const fn = await listen<ConnectorStatusEvent>("connector-status", () => {
+        void refresh();
+      });
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    })();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, []);
+  return hasError;
 }
 
 /// Live calendar data hook (#62). Returns mapped `UpcomingEvent`s for
@@ -534,6 +574,7 @@ export function Home({
   const openActionCount = actions.filter((a) => !a.done).length;
 
   const { upcoming, raw: rawEvents, nowMs: eventsNowMs } = useUpcomingEvents();
+  const settingsAlert = useConnectorHealthAlert();
 
   // Today-bound count for the greeting subline. Counts events whose
   // start falls between today's midnight and tomorrow's, ignoring
@@ -613,6 +654,7 @@ export function Home({
           activeTag={tagFilter}
           onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
           onOpenSettings={onOpenSettings}
+          settingsAlert={settingsAlert}
           onOpenPalette={() => setPaletteOpen(true)}
           onNewNote={onNewNote}
           onNewMeeting={onNewMeeting}
@@ -815,6 +857,7 @@ function Sidebar({
   activeTag,
   onTagSelect,
   onOpenSettings,
+  settingsAlert,
   onOpenPalette,
   onNewNote,
   onNewMeeting,
@@ -828,6 +871,10 @@ function Sidebar({
   activeTag: string | null;
   onTagSelect: (tag: string) => void;
   onOpenSettings: () => void;
+  /** Surface a small dot on the Settings nav item when any connector
+   *  is errored (#141). Lets the user notice broken sync from anywhere
+   *  in the app, not just by visiting Settings → Connectors. */
+  settingsAlert: boolean;
   onOpenPalette: () => void;
   /** Global compose CTAs. The Greeting on Home renders these inline;
    *  on every other nav we surface them from the sidebar footer
@@ -959,6 +1006,7 @@ function Sidebar({
           icon={<IconSettings size={14} sw={1.7} />}
           label="Settings"
           active={false}
+          alert={settingsAlert}
           onClick={onOpenSettings}
         />
       </div>
@@ -971,12 +1019,17 @@ function NavItem({
   label,
   active,
   badge,
+  alert,
   onClick,
 }: {
   icon: React.ReactNode;
   label: string;
   active: boolean;
   badge?: string | null;
+  /** Tiny dot on the icon corner when something needs attention but
+   *  there's no count to surface — currently the Settings entry uses
+   *  this for broken-connector state (#141). Composes with `badge`. */
+  alert?: boolean;
   onClick: () => void;
 }) {
   return (
@@ -985,7 +1038,10 @@ function NavItem({
       className={"home-nav-item" + (active ? " active" : "")}
       onClick={onClick}
     >
-      <span className="home-nav-icon">{icon}</span>
+      <span className="home-nav-icon">
+        {icon}
+        {alert && <span className="home-nav-alert-dot" aria-hidden="true" />}
+      </span>
       <span className="home-nav-label">{label}</span>
       {badge && <span className="home-nav-badge">{badge}</span>}
     </button>

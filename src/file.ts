@@ -804,6 +804,13 @@ export async function deleteConnector(connectorId: string): Promise<void> {
   return invoke<void>("delete_connector", { connectorId });
 }
 
+/** Force the runner to pick a connector up on its next ≤15s tick,
+ *  regardless of its scheduled next-due time. Powers the "Sync now"
+ *  button after a reauth flow + the impatient user case (#141). */
+export async function syncConnectorNow(connectorId: string): Promise<void> {
+  return invoke<void>("sync_connector_now", { connectorId });
+}
+
 // --- Calendar events (#63) -----------------------------------------------
 
 export type CalendarAttendee = {

@@ -1263,9 +1263,24 @@ select.settings-input {
   display: inline-flex;
   justify-content: center;
   color: var(--fg-muted);
+  position: relative;
 }
 .home-nav-item.active .home-nav-icon {
   color: var(--fg);
+}
+/* Alert dot on nav items (e.g. Settings when a connector is errored — #141).
+   Tiny, top-right of the icon, with a halo of background color so it
+   reads on hover states too. */
+.home-nav-alert-dot {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #c44a1f;
+  box-shadow: 0 0 0 1.5px var(--bg);
+  pointer-events: none;
 }
 .home-nav-label {
   flex: 1;

@@ -20,6 +20,7 @@ import {
   setFirecrawlApiKey,
   setVoyageApiKey,
   startOAuthConnector,
+  syncConnectorNow,
 } from "./file";
 import {
   IconChevLeft,
@@ -400,6 +401,14 @@ function ConnectorsSection() {
     }
   };
 
+  const onSyncNow = async (connectorId: string) => {
+    try {
+      await syncConnectorNow(connectorId);
+    } catch (e) {
+      console.error("[settings] syncConnectorNow failed:", e);
+    }
+  };
+
   const noProviders = providers.length === 0;
 
   return (
@@ -444,6 +453,7 @@ function ConnectorsSection() {
               info={c}
               onRemove={() => onRemove(c.id, c.display_name)}
               onReconnect={() => onReconnect(c.kind)}
+              onSyncNow={() => onSyncNow(c.id)}
             />
           ))}
         </div>
@@ -462,10 +472,12 @@ function ConnectorRow({
   info,
   onRemove,
   onReconnect,
+  onSyncNow,
 }: {
   info: ConnectorInfo;
   onRemove: () => void;
   onReconnect: () => void;
+  onSyncNow: () => void;
 }) {
   const status = info.last_error
     ? "error"
@@ -499,6 +511,14 @@ function ConnectorRow({
             Reconnect
           </button>
         )}
+        <button
+          type="button"
+          className="connector-row-sync"
+          onClick={onSyncNow}
+          title="Trigger a sync on the next tick (within 15s)"
+        >
+          Sync now
+        </button>
         <button
           type="button"
           className="connector-row-remove"

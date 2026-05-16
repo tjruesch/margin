@@ -47,6 +47,41 @@ pub fn list_connectors(
     Ok(out)
 }
 
+/// Zero `sync_status.next_due_ms` for a connector so the runner picks
+/// it up on its next ≤15s tick. Inserts a fresh row if the connector
+/// has never synced. Pure DB logic; the command wrapper below adds
+/// the state-lock layer.
+fn force_next_due_now(conn: &Connection, connector_id: &str) -> rusqlite::Result<()> {
+    let n = conn.execute(
+        "UPDATE sync_status SET next_due_ms = 0 WHERE connector_id = ?1",
+        rusqlite::params![connector_id],
+    )?;
+    if n == 0 {
+        // First-ever sync — no sync_status row yet. Insert one with
+        // next_due_ms = 0 so the runner picks it up on the next tick.
+        conn.execute(
+            "INSERT INTO sync_status(connector_id, last_sync_ms, next_due_ms) \
+             VALUES (?1, 0, 0) \
+             ON CONFLICT(connector_id) DO UPDATE SET next_due_ms = 0",
+            rusqlite::params![connector_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// Force the runner to pick this connector up on its next tick (≤15s),
+/// regardless of `next_due_ms`. Powers the "Sync now" button after a
+/// reauth flow + the impatient-user case. No-op if the connector id
+/// doesn't exist; the runner's join against `connectors` will skip it.
+#[tauri::command]
+pub fn sync_connector_now(
+    connector_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    force_next_due_now(&c, &connector_id).map_err(|e| e.to_string())
+}
+
 #[derive(Serialize, Clone)]
 pub struct OAuthProviderInfo {
     pub kind: String,
@@ -419,4 +454,100 @@ fn yaml_escape(s: &str) -> String {
     }
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn open_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+             INSERT INTO meta(key, value) VALUES ('schema_version', '0');",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("../migrations/008_connectors.sql"))
+            .unwrap();
+        // Seed one connector so FK on sync_status.connector_id can hold.
+        conn.execute(
+            "INSERT INTO connectors(id, kind, display_name, enabled, config_json, created_ms, updated_ms) \
+             VALUES ('c1', 'microsoft_graph', 'Test', 1, '{}', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn sync_now_resets_next_due_for_existing_status() {
+        let conn = open_test_db();
+        // Seed sync_status with a far-future next_due_ms.
+        conn.execute(
+            "INSERT INTO sync_status(connector_id, last_sync_ms, last_success_ms, next_due_ms) \
+             VALUES ('c1', 1_000, 1_000, 9_999_999_999_999)",
+            [],
+        )
+        .unwrap();
+        force_next_due_now(&conn, "c1").unwrap();
+        let next: i64 = conn
+            .query_row(
+                "SELECT next_due_ms FROM sync_status WHERE connector_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn sync_now_creates_status_when_missing() {
+        let conn = open_test_db();
+        // No sync_status row yet for c1 — verify pre-state.
+        let pre: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_status WHERE connector_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 0);
+        force_next_due_now(&conn, "c1").unwrap();
+        let (n, due): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(next_due_ms) FROM sync_status WHERE connector_id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(due, 0);
+    }
+
+    #[test]
+    fn sync_now_preserves_last_error_so_dot_stays_until_runner_succeeds() {
+        // Edge case: user clicks "Sync now" while the connector is in
+        // reauth_needed state. We must NOT clear last_error here —
+        // only the runner's success path clears it (write_sync_status_ok).
+        // Otherwise the dot would disappear before the sync actually
+        // succeeded, misleading the user.
+        let conn = open_test_db();
+        conn.execute(
+            "INSERT INTO sync_status(connector_id, last_sync_ms, last_error, next_due_ms) \
+             VALUES ('c1', 1_000, 'reauth_needed: revoked', 9_999_999_999_999)",
+            [],
+        )
+        .unwrap();
+        force_next_due_now(&conn, "c1").unwrap();
+        let (next, err): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT next_due_ms, last_error FROM sync_status WHERE connector_id = 'c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(err.as_deref(), Some("reauth_needed: revoked"));
+    }
 }
