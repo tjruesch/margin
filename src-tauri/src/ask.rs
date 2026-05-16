@@ -68,7 +68,12 @@ const WORKSTREAM_CAP: usize = 30;
 /// Anything older than this is only reachable via the workstream surface.
 const TEAMS_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
 /// Hard cap on Teams messages embedded in the prompt section (#136).
-const TEAMS_MESSAGE_CAP: usize = 30;
+/// Sized to comfortably hold ~5 days of typical traffic — empirically
+/// the DB has ~40 messages/day for one active user, so 30 was way too
+/// tight (covered only ~4 hours and dropped same-day unanswered asks).
+/// 200 mirrors `DIRECTORY_CAP`; previews are one line each so the token
+/// cost is bounded.
+const TEAMS_MESSAGE_CAP: usize = 200;
 /// Per-category top-N when expanding a workstream via `read_workstream`
 /// (emails / events / notes returned per call).
 const WORKSTREAM_DETAIL_TOP_N: usize = 5;
