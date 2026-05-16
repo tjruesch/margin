@@ -9,14 +9,16 @@
 use std::collections::HashMap;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::{
     ExternalParticipant, NoteRef, Workstream, WorkstreamDetail, WorkstreamLink,
     WriteCounts,
 };
-use crate::connectors::calendar;
-use crate::connectors::email;
+use crate::connectors::calendar::{self, CalendarEvent};
+use crate::connectors::email::{self, EmailMessage};
+use crate::connectors::teams::TeamsMessage;
 
 const META_LAST_CLUSTERED: &str = "last_clustered_ms";
 
@@ -1406,6 +1408,161 @@ pub fn cleanup_orphan_signals(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Manual attach (#108). Mirrors the synthesizer's `workstream_signals`
+/// write but called from the frontend's "Attach to workstream…"
+/// affordance. INSERT OR IGNORE makes the call idempotent — the
+/// synth's bias toward existing memberships means a manual
+/// attachment naturally survives the next pass.
+pub fn attach_signal(
+    conn: &Connection,
+    workstream_id: &str,
+    kind: &str,
+    item_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO workstream_signals \
+            (workstream_id, kind, item_id, added_ms) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![workstream_id, kind, item_id, now_ms],
+    )?;
+    Ok(())
+}
+
+/// Manual detach (#108). The synth may re-attach on its next pass;
+/// v1 accepts that. If users complain a `manual_detached_ms` column
+/// can gate re-attach in a follow-up.
+pub fn detach_signal(
+    conn: &Connection,
+    workstream_id: &str,
+    kind: &str,
+    item_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM workstream_signals \
+          WHERE workstream_id = ?1 AND kind = ?2 AND item_id = ?3",
+        params![workstream_id, kind, item_id],
+    )?;
+    Ok(())
+}
+
+/// One row in the unassigned-content feed (#108). Tagged-enum serde
+/// shape lands on the frontend as `{kind: "email" | …, item: {…}}`
+/// — the four payload variants reuse the same hydrated structs the
+/// workstream detail page consumes, so row chrome stays consistent
+/// across the two surfaces.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", content = "item", rename_all = "snake_case")]
+pub enum UnassignedItem {
+    Email(EmailMessage),
+    Event(CalendarEvent),
+    Note(NoteRef),
+    TeamsMessage(TeamsMessage),
+}
+
+/// Recent entities (across email, event, note, teams_message) whose
+/// id is NOT in `workstream_signals.item_id` — the "Unassigned" pill
+/// on the Workstreams view (#108). One UNION ALL query picks the
+/// candidates + their sort_ms; per-kind hydration through
+/// `signals::registry` produces the rich rows.
+pub fn list_unassigned(
+    conn: &Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<UnassignedItem>> {
+    use crate::workstreams::signals::{registry, HydratedSignal};
+    use std::collections::HashMap;
+
+    // Candidate ids in recency-desc order. The recurring-series
+    // filter on `event` mirrors the embeddings rule (#109): one
+    // canonical occurrence per series, not N.
+    let mut stmt = conn.prepare(
+        "SELECT 'email' AS kind, em.id AS item_id, em.sent_at_ms AS sort_ms \
+           FROM email_messages em \
+          WHERE NOT EXISTS ( \
+                SELECT 1 FROM workstream_signals ws \
+                 WHERE ws.kind = 'email' AND ws.item_id = em.id) \
+         UNION ALL \
+         SELECT 'event', ce.id, ce.start_ms \
+           FROM calendar_events ce \
+          WHERE NOT EXISTS ( \
+                SELECT 1 FROM workstream_signals ws \
+                 WHERE ws.kind = 'event' AND ws.item_id = ce.id) \
+            AND ( \
+                ce.series_master_id IS NULL \
+             OR ce.start_ms = ( \
+                    SELECT MIN(c2.start_ms) FROM calendar_events c2 \
+                     WHERE c2.series_master_id = ce.series_master_id \
+                ) \
+           ) \
+         UNION ALL \
+         SELECT 'note', n.id, n.modified_ms \
+           FROM notes n \
+          WHERE n.archived = 0 AND NOT EXISTS ( \
+                SELECT 1 FROM workstream_signals ws \
+                 WHERE ws.kind = 'note' AND ws.item_id = n.id) \
+         UNION ALL \
+         SELECT 'teams_message', tm.id, tm.sent_at_ms \
+           FROM teams_messages tm \
+          WHERE NOT EXISTS ( \
+                SELECT 1 FROM workstream_signals ws \
+                 WHERE ws.kind = 'teams_message' AND ws.item_id = tm.id) \
+         ORDER BY sort_ms DESC \
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let candidates: Vec<(String, String, i64)> = rows.filter_map(Result::ok).collect();
+
+    // Group ids by kind; hydrate each kind once via registry.
+    let mut ids_by_kind: HashMap<String, Vec<String>> = HashMap::new();
+    for (kind, id, _) in &candidates {
+        ids_by_kind.entry(kind.clone()).or_default().push(id.clone());
+    }
+    let reg = registry();
+    let mut hydrated_by_kind: HashMap<String, HashMap<String, HydratedSignal>> =
+        HashMap::new();
+    for (kind, ids) in &ids_by_kind {
+        let rows = reg.hydrate(conn, kind, ids)?;
+        let mut by_id: HashMap<String, HydratedSignal> = HashMap::new();
+        for row in rows {
+            let id = match &row {
+                HydratedSignal::Email(m) => m.id.clone(),
+                HydratedSignal::Event(e) => e.id.clone(),
+                HydratedSignal::Note(n) => n.note_path.clone(),
+                HydratedSignal::TeamsMessage(t) => t.id.clone(),
+            };
+            by_id.insert(id, row);
+        }
+        hydrated_by_kind.insert(kind.clone(), by_id);
+    }
+
+    // Reassemble in the original sort_ms-desc order. Missing rows
+    // (hydrate dropped them silently because the upstream entity
+    // vanished between query + hydrate) skip gracefully.
+    let mut out: Vec<UnassignedItem> = Vec::with_capacity(candidates.len());
+    for (kind, id, _) in candidates {
+        let Some(by_id) = hydrated_by_kind.get_mut(&kind) else {
+            continue;
+        };
+        let Some(row) = by_id.remove(&id) else {
+            continue;
+        };
+        let item = match row {
+            HydratedSignal::Email(m) => UnassignedItem::Email(m),
+            HydratedSignal::Event(e) => UnassignedItem::Event(e),
+            HydratedSignal::Note(n) => UnassignedItem::Note(n),
+            HydratedSignal::TeamsMessage(t) => UnassignedItem::TeamsMessage(t),
+        };
+        out.push(item);
+    }
+    Ok(out)
+}
+
 /// Synthesizer-driven resurrect: flip an archived workstream back to
 /// active, stamp `reopened_at_ms = now`, leave `archived_at_ms` as
 /// historical record. No-op if the workstream isn't currently
@@ -1594,7 +1751,10 @@ mod tests {
             );",
         )
         .unwrap();
-        // 024 (teams_messages) is unrelated to actions; skip.
+        // 024 (teams_messages) — needed by list_unassigned (#108)
+        // which UNION ALLs across the four kinds.
+        conn.execute_batch(include_str!("../migrations/024_teams.sql"))
+            .unwrap();
         // 025 (#111) collapses workstream_actions into the unified
         // actions table. Without it, the persist write path's
         // INSERT INTO actions blows up.
@@ -3395,5 +3555,175 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kind, "synth");
+    }
+
+    // ---------- Manual attach / detach + unassigned feed (#108) ----------
+
+    fn seed_teams_msg(conn: &Connection, id: &str, sent_at: i64) {
+        conn.execute(
+            "INSERT INTO teams_messages(\
+                id, connector_id, external_id, chat_id, chat_kind, \
+                sent_at_ms, modified_ms\
+             ) VALUES (?1, 'mg:test', ?1, 'chat-1', 'oneOnOne', ?2, ?2)",
+            params![id, sent_at],
+        )
+        .unwrap();
+    }
+
+    fn seed_ws_active(conn: &Connection, id: &str) {
+        conn.execute(
+            "INSERT INTO workstreams(id, title, summary, status, \
+                                       last_activity_ms, created_ms, updated_ms) \
+             VALUES (?1, 'WS', '', 'active', 0, 0, 0)",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    fn count_signals(conn: &Connection, ws: &str, kind: &str, item: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM workstream_signals \
+              WHERE workstream_id = ?1 AND kind = ?2 AND item_id = ?3",
+            params![ws, kind, item],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// `attach_signal` inserts a `workstream_signals` row.
+    #[test]
+    fn attach_signal_inserts_pivot_row() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 1_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 1);
+    }
+
+    /// Re-attaching the same (workstream, kind, item) is a no-op
+    /// thanks to INSERT OR IGNORE on the primary key.
+    #[test]
+    fn attach_signal_is_idempotent() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 1_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        attach_signal(&conn, "ws1", "email", "em:1", 6_000).unwrap();
+        assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 1);
+    }
+
+    /// Detach removes the pivot row; surviving rows are untouched.
+    #[test]
+    fn detach_signal_removes_pivot_row() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 1_000);
+        seed_email(&conn, "em:2", 2_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        attach_signal(&conn, "ws1", "email", "em:2", 5_000).unwrap();
+        detach_signal(&conn, "ws1", "email", "em:1").unwrap();
+        assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 0);
+        assert_eq!(count_signals(&conn, "ws1", "email", "em:2"), 1);
+    }
+
+    /// Detaching a non-existent pivot row is a no-op (zero rows
+    /// affected), never an error.
+    #[test]
+    fn detach_signal_noop_when_absent() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        detach_signal(&conn, "ws1", "email", "em:missing").unwrap();
+    }
+
+    /// Items already attached to any workstream are excluded from
+    /// the unassigned feed.
+    #[test]
+    fn list_unassigned_excludes_items_in_workstream_signals() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:attached", 5_000);
+        seed_email(&conn, "em:floating", 3_000);
+        attach_signal(&conn, "ws1", "email", "em:attached", 5_000).unwrap();
+
+        let items = list_unassigned(&conn, 100).unwrap();
+        let ids: Vec<String> = items
+            .iter()
+            .filter_map(|u| match u {
+                UnassignedItem::Email(m) => Some(m.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["em:floating"]);
+    }
+
+    /// Output is sorted by recency (sort_ms) DESC across kinds.
+    #[test]
+    fn list_unassigned_orders_by_recency_desc() {
+        let conn = open_test_db();
+        seed_email(&conn, "em:old", 1_000);
+        seed_event(&conn, "ev:newest", 9_000);
+        seed_note(&conn, "n:mid", 5_000);
+        seed_teams_msg(&conn, "tm:second", 7_000);
+
+        let items = list_unassigned(&conn, 100).unwrap();
+        let order: Vec<&str> = items
+            .iter()
+            .map(|u| match u {
+                UnassignedItem::Email(m) => m.id.as_str(),
+                UnassignedItem::Event(e) => e.id.as_str(),
+                UnassignedItem::Note(n) => n.note_path.as_str(),
+                UnassignedItem::TeamsMessage(t) => t.id.as_str(),
+            })
+            .collect();
+        assert_eq!(order, vec!["ev:newest", "tm:second", "n:mid", "em:old"]);
+    }
+
+    /// Archived notes don't appear in the feed.
+    #[test]
+    fn list_unassigned_skips_archived_notes() {
+        let conn = open_test_db();
+        seed_note(&conn, "n:live", 1_000);
+        seed_note(&conn, "n:gone", 2_000);
+        conn.execute(
+            "UPDATE notes SET archived = 1 WHERE id = 'n:gone'",
+            [],
+        )
+        .unwrap();
+        let items = list_unassigned(&conn, 100).unwrap();
+        let notes: Vec<String> = items
+            .iter()
+            .filter_map(|u| match u {
+                UnassignedItem::Note(n) => Some(n.note_path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, vec!["n:live"]);
+    }
+
+    /// Recurring occurrences collapse to the earliest in the feed
+    /// (#109 rule, mirrored from the embeddings worker).
+    #[test]
+    fn list_unassigned_skips_recurring_occurrences() {
+        let conn = open_test_db();
+        conn.execute(
+            "INSERT INTO calendar_events(\
+                id, connector_id, external_id, title, start_ms, end_ms, \
+                all_day, modified_ms, series_master_id\
+             ) VALUES \
+             ('occ1', 'mg:test', 'occ1', 'Standup', 1_000, 1_000, 0, 1_000, 'mg:test::m1'), \
+             ('occ2', 'mg:test', 'occ2', 'Standup', 2_000, 2_000, 0, 2_000, 'mg:test::m1'), \
+             ('occ3', 'mg:test', 'occ3', 'Standup', 3_000, 3_000, 0, 3_000, 'mg:test::m1')",
+            [],
+        )
+        .unwrap();
+        let items = list_unassigned(&conn, 100).unwrap();
+        let events: Vec<String> = items
+            .iter()
+            .filter_map(|u| match u {
+                UnassignedItem::Event(e) => Some(e.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(events, vec!["occ1"]);
     }
 }

@@ -24,19 +24,23 @@ import {
   type EmailMessage,
   type ExternalParticipant,
   type TeamMember,
+  type UnassignedItem,
   type Workstream,
   type WorkstreamDetail,
   type WorkstreamLink,
   type WorkstreamLinkSummarizedEvent,
   type WorkstreamStatus,
   addWorkstreamLinkFromUrl,
+  attachSignalToWorkstream,
   createTeamMember,
   createWorkstream,
   deleteAction,
+  detachSignalFromWorkstream,
   getEmailBody,
   getWorkstreamDetails,
   listArchivedWorkstreams,
   listTeamMembers,
+  listUnassignedItems,
   markWorkstreamSeen,
   openOrCreateEventNote,
   removeWorkstreamLink,
@@ -91,6 +95,7 @@ export function WorkstreamsView({
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [composerOpen, setComposerOpen] = useState(false);
+  const [unassignedOpen, setUnassignedOpen] = useState(false);
   // Page header dispatches `margin:open-workstream-composer` when the
   // user clicks "New workstream". Composer state lives here so we can
   // close it from the form's Cancel / save paths.
@@ -99,6 +104,13 @@ export function WorkstreamsView({
     window.addEventListener("margin:open-workstream-composer", onOpen);
     return () =>
       window.removeEventListener("margin:open-workstream-composer", onOpen);
+  }, []);
+  // "Unassigned (N)" pill dispatches `margin:open-unassigned` (#108).
+  useEffect(() => {
+    const onOpen = () => setUnassignedOpen(true);
+    window.addEventListener("margin:open-unassigned", onOpen);
+    return () =>
+      window.removeEventListener("margin:open-unassigned", onOpen);
   }, []);
   // Team-member cache for owner / member chips (#81). Loaded once and
   // refreshed on `margin:team-changed` events.
@@ -225,6 +237,17 @@ export function WorkstreamsView({
             // notes / set owner before the next synth pass runs.
             setSelectedId(id);
           }}
+        />
+      )}
+
+      {unassignedOpen && (
+        <UnassignedFeed
+          workstreams={workstreams}
+          onOpenWorkstream={(id) => {
+            setUnassignedOpen(false);
+            setSelectedId(id);
+          }}
+          onClose={() => setUnassignedOpen(false)}
         />
       )}
 
@@ -897,6 +920,23 @@ function WorkstreamDetailView({
     void reload();
   }, [reload]);
 
+  /// Detach an entity from this workstream (#108). Optimistic — fire
+  /// the IPC and refetch. The unassigned-changed event keeps the
+  /// page header pill in sync without a separate refetch.
+  const handleDetach = useCallback(
+    async (kind: string, itemId: string) => {
+      try {
+        await detachSignalFromWorkstream(id, kind, itemId);
+        window.dispatchEvent(new CustomEvent("margin:unassigned-changed"));
+        await reload();
+      } catch (e) {
+        console.error("detachSignalFromWorkstream failed:", e);
+        alert("Could not detach. See console.");
+      }
+    },
+    [id, reload],
+  );
+
   // Reopened-marker clearing (#78). When the user opens a workstream
   // that was just reopened by the synthesizer, fire markWorkstreamSeen
   // on UNMOUNT so the user has the entire detail-view lifetime to see
@@ -1282,16 +1322,27 @@ function WorkstreamDetailView({
         onResolved={() => void reload()}
       />
 
-      <EmailsSection emails={detail.emails} />
+      <EmailsSection
+        emails={detail.emails}
+        onDetach={(itemId) => void handleDetach("email", itemId)}
+      />
 
       <MeetingsSection
         events={detail.events}
         onOpenEvent={onOpenEvent}
+        onDetach={(itemId) => void handleDetach("event", itemId)}
       />
 
-      <MessagesSection messages={detail.teams_messages} />
+      <MessagesSection
+        messages={detail.teams_messages}
+        onDetach={(itemId) => void handleDetach("teams_message", itemId)}
+      />
 
-      <NotesSection notes={detail.notes} onOpenNote={onOpenNote} />
+      <NotesSection
+        notes={detail.notes}
+        onOpenNote={onOpenNote}
+        onDetach={(itemId) => void handleDetach("note", itemId)}
+      />
 
       {detail.children.length > 0 ? (
         <ChildrenSection
@@ -2528,7 +2579,13 @@ function OpenQuestionsSection({
   );
 }
 
-function EmailsSection({ emails }: { emails: EmailMessage[] }) {
+function EmailsSection({
+  emails,
+  onDetach,
+}: {
+  emails: EmailMessage[];
+  onDetach?: (itemId: string) => void;
+}) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [bodies, setBodies] = useState<Record<string, BodyState>>({});
 
@@ -2586,6 +2643,19 @@ function EmailsSection({ emails }: { emails: EmailMessage[] }) {
                 <span className="workstream-email-subject">{m.subject}</span>
                 <span className="workstream-email-chev">{open ? "▾" : "▸"}</span>
               </button>
+              {onDetach && (
+                <button
+                  type="button"
+                  className="ws-detach-btn"
+                  title="Detach from this workstream"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDetach(m.id);
+                  }}
+                >
+                  Detach
+                </button>
+              )}
               {open ? (
                 <div className="workstream-email-body">
                   <EmailBodyPanel body={body} fallbackPreview={m.body_preview} />
@@ -2656,8 +2726,10 @@ function EmailBodyPanel({
 /// lazy fetch is needed.
 function MessagesSection({
   messages,
+  onDetach,
 }: {
   messages: import("./file").TeamsMessage[];
+  onDetach?: (itemId: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   if (messages.length === 0) return null;
@@ -2694,6 +2766,19 @@ function MessagesSection({
                 </span>
                 <span className="workstream-email-chev">{open ? "▾" : "▸"}</span>
               </button>
+              {onDetach && (
+                <button
+                  type="button"
+                  className="ws-detach-btn"
+                  title="Detach from this workstream"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDetach(m.id);
+                  }}
+                >
+                  Detach
+                </button>
+              )}
               {open && (
                 <div className="workstream-email-body">
                   {m.body_html ? (
@@ -2721,9 +2806,11 @@ function MessagesSection({
 function MeetingsSection({
   events,
   onOpenEvent,
+  onDetach,
 }: {
   events: WorkstreamDetail["events"];
   onOpenEvent: (eventId: string) => void | Promise<void>;
+  onDetach?: (itemId: string) => void;
 }) {
   if (events.length === 0) return null;
   return (
@@ -2753,6 +2840,19 @@ function MeetingsSection({
                 </span>
               ) : null}
             </button>
+            {onDetach && (
+              <button
+                type="button"
+                className="ws-detach-btn"
+                title="Detach from this workstream"
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  onDetach(e.id);
+                }}
+              >
+                Detach
+              </button>
+            )}
           </li>
         ))}
       </ul>
@@ -2763,9 +2863,11 @@ function MeetingsSection({
 function NotesSection({
   notes,
   onOpenNote,
+  onDetach,
 }: {
   notes: WorkstreamDetail["notes"];
   onOpenNote: (path: string) => void;
+  onDetach?: (itemId: string) => void;
 }) {
   if (notes.length === 0) return null;
   return (
@@ -2786,6 +2888,19 @@ function NotesSection({
                 {n.title || n.note_path}
               </span>
             </button>
+            {onDetach && (
+              <button
+                type="button"
+                className="ws-detach-btn"
+                title="Detach from this workstream"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDetach(n.note_path);
+                }}
+              >
+                Detach
+              </button>
+            )}
           </li>
         ))}
       </ul>
@@ -2824,5 +2939,276 @@ function formatShortDateTime(ms: number): string {
     hour: "numeric",
     minute: "2-digit",
   }).format(new Date(ms));
+}
+
+// ---------- Unassigned feed (#108) ---------------------------------------
+
+function unassignedKey(u: UnassignedItem): string {
+  switch (u.kind) {
+    case "email":
+      return `email:${u.item.id}`;
+    case "event":
+      return `event:${u.item.id}`;
+    case "note":
+      return `note:${u.item.note_path}`;
+    case "teams_message":
+      return `teams_message:${u.item.id}`;
+  }
+}
+
+function unassignedItemId(u: UnassignedItem): string {
+  return u.kind === "note" ? u.item.note_path : u.item.id;
+}
+
+function unassignedSortMs(u: UnassignedItem): number {
+  switch (u.kind) {
+    case "email":
+      return u.item.sent_at_ms;
+    case "event":
+      return u.item.start_ms;
+    case "note":
+      return u.item.modified_ms;
+    case "teams_message":
+      return u.item.sent_at_ms;
+  }
+}
+
+function unassignedLabel(u: UnassignedItem): string {
+  switch (u.kind) {
+    case "email":
+      return u.item.subject || "(no subject)";
+    case "event":
+      return u.item.title || "(untitled meeting)";
+    case "note":
+      return u.item.title || u.item.note_path;
+    case "teams_message":
+      return u.item.body_preview || u.item.chat_topic || "(Teams message)";
+  }
+}
+
+function unassignedSubLabel(u: UnassignedItem): string | null {
+  switch (u.kind) {
+    case "email":
+      return u.item.from_name || u.item.from_email;
+    case "event":
+      return null;
+    case "note":
+      return null;
+    case "teams_message":
+      return u.item.from_name || u.item.from_email || null;
+  }
+}
+
+/// Modal that lists every recent entity (email / event / note /
+/// Teams message) not attached to any workstream, with a per-row
+/// "Attach to workstream…" affordance. Opens via the page header's
+/// "Unassigned (N)" pill (#108).
+function UnassignedFeed({
+  workstreams,
+  onClose,
+  onOpenWorkstream,
+}: {
+  workstreams: Workstream[];
+  onClose: () => void;
+  onOpenWorkstream: (id: string) => void;
+}) {
+  const [items, setItems] = useState<UnassignedItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [pickerFor, setPickerFor] = useState<UnassignedItem | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listUnassignedItems()
+      .then((data) => {
+        if (!cancelled) {
+          setItems(data);
+          setLoading(false);
+        }
+      })
+      .catch((e) => {
+        console.error("listUnassignedItems failed:", e);
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (pickerFor) setPickerFor(null);
+        else onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, pickerFor]);
+
+  const handleAttach = useCallback(
+    async (target: UnassignedItem, workstreamId: string) => {
+      try {
+        await attachSignalToWorkstream(
+          workstreamId,
+          target.kind,
+          unassignedItemId(target),
+        );
+        setItems((curr) =>
+          curr.filter((x) => unassignedKey(x) !== unassignedKey(target)),
+        );
+        window.dispatchEvent(new CustomEvent("margin:unassigned-changed"));
+        setPickerFor(null);
+      } catch (e) {
+        console.error("attachSignalToWorkstream failed:", e);
+        alert("Could not attach. See console.");
+      }
+    },
+    [],
+  );
+
+  return (
+    <div className="ws-modal-backdrop" onClick={onClose}>
+      <div
+        className="ws-modal-card unassigned-modal"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <header className="unassigned-header">
+          <h2>Unassigned ({items.length})</h2>
+          <button
+            type="button"
+            className="ws-modal-close"
+            onClick={onClose}
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </header>
+        <p className="unassigned-hint">
+          Recent entities not attached to any workstream. Pick one and
+          attach it manually — Margin will keep it there on the next
+          synth pass.
+        </p>
+        {loading ? (
+          <p className="unassigned-empty">Loading…</p>
+        ) : items.length === 0 ? (
+          <p className="unassigned-empty">Everything's filed away.</p>
+        ) : (
+          <ul className="unassigned-list">
+            {items.map((u) => (
+              <li key={unassignedKey(u)} className="unassigned-row">
+                <span className={`unassigned-kind unassigned-kind--${u.kind}`}>
+                  {u.kind === "email"
+                    ? "✉"
+                    : u.kind === "event"
+                    ? "◷"
+                    : u.kind === "note"
+                    ? "▣"
+                    : "▾"}
+                </span>
+                <span className="unassigned-when">
+                  {formatShortDateTime(unassignedSortMs(u))}
+                </span>
+                <span className="unassigned-label">
+                  {unassignedLabel(u)}
+                  {unassignedSubLabel(u) && (
+                    <span className="unassigned-sub">
+                      {" — "}
+                      {unassignedSubLabel(u)}
+                    </span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  className="unassigned-attach"
+                  onClick={() => setPickerFor(u)}
+                  title="Attach to workstream…"
+                >
+                  + Attach
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {pickerFor && (
+          <WorkstreamPickerPopover
+            workstreams={workstreams}
+            onPick={(wsId) => void handleAttach(pickerFor, wsId)}
+            onOpenWorkstream={(wsId) => {
+              setPickerFor(null);
+              onOpenWorkstream(wsId);
+            }}
+            onCancel={() => setPickerFor(null)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/// Floating popover that lists every active workstream so the user
+/// can pick one to attach to. No search in v1 — the active list is
+/// small enough that scrolling suffices.
+function WorkstreamPickerPopover({
+  workstreams,
+  onPick,
+  onOpenWorkstream,
+  onCancel,
+}: {
+  workstreams: Workstream[];
+  onPick: (workstreamId: string) => void;
+  onOpenWorkstream?: (workstreamId: string) => void;
+  onCancel: () => void;
+}) {
+  const active = useMemo(
+    () => workstreams.filter((w) => w.status === "active"),
+    [workstreams],
+  );
+
+  return (
+    <div className="ws-picker-backdrop" onClick={onCancel}>
+      <div
+        className="ws-picker"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-label="Pick a workstream"
+      >
+        <h3>Attach to workstream…</h3>
+        {active.length === 0 ? (
+          <p className="ws-picker-empty">No active workstreams.</p>
+        ) : (
+          <ul className="ws-picker-list">
+            {active.map((w) => (
+              <li key={w.id}>
+                <button
+                  type="button"
+                  className="ws-picker-row"
+                  onClick={() => onPick(w.id)}
+                >
+                  {w.title}
+                </button>
+                {onOpenWorkstream && (
+                  <button
+                    type="button"
+                    className="ws-picker-open"
+                    title="Open this workstream"
+                    onClick={() => onOpenWorkstream(w.id)}
+                  >
+                    →
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        <button
+          type="button"
+          className="ws-picker-cancel"
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
 }
 

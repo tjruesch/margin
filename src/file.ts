@@ -1038,6 +1038,51 @@ export async function getWorkstreamDetails(id: string): Promise<WorkstreamDetail
   return invoke<WorkstreamDetail | null>("get_workstream_details", { id });
 }
 
+/** One entity in the "Unassigned" feed (#108). Tagged union matching
+ *  the Rust `UnassignedItem` enum: each row carries its kind + the
+ *  rich payload the workstream detail page would render. */
+export type UnassignedItem =
+  | { kind: "email"; item: EmailMessage }
+  | { kind: "event"; item: CalendarEvent }
+  | { kind: "note"; item: WorkstreamNoteRef }
+  | { kind: "teams_message"; item: TeamsMessage };
+
+/** Recent entities (across email/event/note/teams_message) not
+ *  attached to any workstream, recency-desc. Drives the
+ *  "Unassigned (N)" pill on the Workstreams view. */
+export async function listUnassignedItems(
+  limit = 50,
+): Promise<UnassignedItem[]> {
+  return invoke<UnassignedItem[]>("list_unassigned_items", { limit });
+}
+
+/** Manually attach an entity to a workstream (#108). Idempotent. */
+export async function attachSignalToWorkstream(
+  workstreamId: string,
+  kind: string,
+  itemId: string,
+): Promise<void> {
+  await invoke<void>("attach_signal_to_workstream", {
+    workstreamId,
+    kind,
+    itemId,
+  });
+}
+
+/** Detach an entity from a workstream (#108). The synth may
+ *  re-attach on its next pass; v1 accepts that. */
+export async function detachSignalFromWorkstream(
+  workstreamId: string,
+  kind: string,
+  itemId: string,
+): Promise<void> {
+  await invoke<void>("detach_signal_from_workstream", {
+    workstreamId,
+    kind,
+    itemId,
+  });
+}
+
 // setWorkstreamActionDone / setWorkstreamActionAssignee /
 // deleteWorkstreamAction were removed in #111. Callers should use the
 // unified `setActionDone` / `setActionAssignee` / `deleteAction`

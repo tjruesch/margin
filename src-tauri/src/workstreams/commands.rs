@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 use tauri::AppHandle;
 
+use super::persist::UnassignedItem;
 use super::{persist, synthesizer, ClusterReport, Workstream, WorkstreamDetail, WorkstreamLink};
 
 #[tauri::command]
@@ -222,4 +223,45 @@ pub async fn add_workstream_link_from_url(
         super::link_summarizer::populate_summary(app_clone, link_id, url_clone).await;
     });
     Ok(link)
+}
+
+/// Manually attach an entity to a workstream (#108). Mirrors what
+/// the synthesizer writes, called from the frontend's "Attach to
+/// workstream…" affordance on the Unassigned feed. Idempotent.
+#[tauri::command]
+pub fn attach_signal_to_workstream(
+    workstream_id: String,
+    kind: String,
+    item_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let now = crate::events::current_unix_ms();
+    persist::attach_signal(&c, &workstream_id, &kind, &item_id, now)
+        .map_err(|e| e.to_string())
+}
+
+/// Detach an entity from a workstream (#108). Called from the
+/// per-row Detach button on workstream detail sections.
+#[tauri::command]
+pub fn detach_signal_from_workstream(
+    workstream_id: String,
+    kind: String,
+    item_id: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::detach_signal(&c, &workstream_id, &kind, &item_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Recent entities not currently attached to any workstream (#108).
+/// Drives the "Unassigned (N)" pill on the Workstreams view.
+#[tauri::command]
+pub fn list_unassigned_items(
+    limit: Option<usize>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Vec<UnassignedItem>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    persist::list_unassigned(&c, limit.unwrap_or(50)).map_err(|e| e.to_string())
 }

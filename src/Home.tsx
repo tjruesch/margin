@@ -364,6 +364,28 @@ export function Home({
   const [panelOpen, setPanelOpen] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // Live count of unassigned items for the Workstreams page pill (#108).
+  // Refreshed on workstreams-view enter and whenever the modal fires
+  // `margin:unassigned-changed` (attach / detach moves an item across
+  // the count). One IPC per refresh — list_unassigned_items returns
+  // the rows; we just take .length.
+  const [unassignedCount, setUnassignedCount] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => {
+      void import("./file").then(({ listUnassignedItems }) =>
+        listUnassignedItems().then((items) => {
+          if (!cancelled) setUnassignedCount(items.length);
+        }),
+      );
+    };
+    if (nav === "workstreams") refresh();
+    window.addEventListener("margin:unassigned-changed", refresh);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("margin:unassigned-changed", refresh);
+    };
+  }, [nav]);
   // Counter-style tracking of open detail breadcrumbs. Each
   // `PageHeaderBreadcrumb` mount increments, unmount decrements.
   // Greater than 0 means a detail view is active and the list-scoped
@@ -685,6 +707,7 @@ export function Home({
               actions={renderScopedActions(nav, {
                 onRefreshWorkstreams,
                 synthInFlight,
+                unassignedCount,
               })}
             />
           )
@@ -1020,7 +1043,11 @@ function Greeting({
  *  has its handler already at Home.tsx scope so it's a direct call. */
 function renderScopedActions(
   nav: NavId,
-  ctx: { onRefreshWorkstreams: () => void; synthInFlight: boolean },
+  ctx: {
+    onRefreshWorkstreams: () => void;
+    synthInFlight: boolean;
+    unassignedCount: number;
+  },
 ): React.ReactNode {
   switch (nav) {
     case "team":
@@ -1052,6 +1079,18 @@ function renderScopedActions(
     case "workstreams":
       return (
         <>
+          <button
+            type="button"
+            className="home-section-add"
+            onClick={() =>
+              window.dispatchEvent(
+                new CustomEvent("margin:open-unassigned"),
+              )
+            }
+            title="Recent entities not attached to any workstream"
+          >
+            Unassigned ({ctx.unassignedCount})
+          </button>
           <button
             type="button"
             className="home-section-add"
