@@ -769,6 +769,12 @@ pub(crate) struct RawEvent {
     pub(crate) etag: Option<String>,
     #[serde(rename = "lastModifiedDateTime", default)]
     pub(crate) last_modified: Option<String>,
+    /// Graph's internal id of the master event when this row is an
+    /// occurrence of a recurring series; NULL for one-off meetings
+    /// (#109). Namespaced into `{connector_id}::{seriesMasterId}`
+    /// in `map_event` to match occurrence id namespacing.
+    #[serde(rename = "seriesMasterId", default)]
+    pub(crate) series_master_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -891,6 +897,14 @@ pub(crate) fn map_event(
         });
     }
 
+    // Namespace Graph's series id with the connector id so it matches
+    // the shape of occurrence ids elsewhere — keeps cross-connector
+    // joins consistent if/when a future connector adds calendar.
+    let series_master_id = raw
+        .series_master_id
+        .as_deref()
+        .map(|s| format!("{connector_id}::{s}"));
+
     CalendarEvent {
         id: format!("{connector_id}::{}", raw.id),
         connector_id: connector_id.to_string(),
@@ -909,6 +923,7 @@ pub(crate) fn map_event(
         // "Coming up" strip click handler. `upsert_event` preserves
         // any existing value across re-syncs.
         linked_note_id: None,
+        series_master_id,
         attendees,
     }
 }
@@ -1317,6 +1332,7 @@ mod tests {
             }),
             etag: Some("W/\"abc\"".to_string()),
             last_modified: Some("2026-05-09T12:34:56Z".to_string()),
+            series_master_id: None,
         };
         let members = [mk_member("hk1", "Heike", &[("email", "heike@example.com")])];
         let resolver = AttendeeResolver::new(&members);
@@ -1361,6 +1377,7 @@ mod tests {
             organizer: None,
             etag: None,
             last_modified: None,
+            series_master_id: None,
         };
         raw.is_cancelled = true;
         let resolver = AttendeeResolver::new(&[]);
@@ -1389,10 +1406,45 @@ mod tests {
             organizer: None,
             etag: None,
             last_modified: None,
+            series_master_id: None,
         };
         let resolver = AttendeeResolver::new(&[]);
         let ev = map_event("mg:tj@e.com", raw, &resolver, None);
         assert_eq!(ev.title, "(no subject)");
+    }
+
+    /// Graph's `seriesMasterId` on a recurring occurrence threads
+    /// through to `CalendarEvent.series_master_id`, namespaced with
+    /// the connector id so cross-connector keys stay disjoint (#109).
+    #[test]
+    fn map_event_captures_series_master_id_from_graph() {
+        let raw = RawEvent {
+            id: "occ-1".into(),
+            subject: Some("Weekly standup".into()),
+            start: Some(RawDateTime {
+                date_time: "2026-05-12T09:00:00".into(),
+                time_zone: None,
+            }),
+            end: Some(RawDateTime {
+                date_time: "2026-05-12T09:30:00".into(),
+                time_zone: None,
+            }),
+            is_all_day: false,
+            is_cancelled: false,
+            location: None,
+            body_preview: None,
+            attendees: vec![],
+            organizer: None,
+            etag: None,
+            last_modified: None,
+            series_master_id: Some("AAMkAG-master".into()),
+        };
+        let resolver = AttendeeResolver::new(&[]);
+        let ev = map_event("mg:tj@e.com", raw, &resolver, None);
+        assert_eq!(
+            ev.series_master_id.as_deref(),
+            Some("mg:tj@e.com::AAMkAG-master")
+        );
     }
 
     #[test]

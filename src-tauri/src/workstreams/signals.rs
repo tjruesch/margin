@@ -262,14 +262,24 @@ impl Signal for EventSignal {
         window: SignalWindow,
         cap: usize,
     ) -> rusqlite::Result<Vec<SnapshotItem>> {
-        let mut events =
-            calendar::list_events_in_range(conn, now_ms - window.back_ms, now_ms + window.forward_ms, None)?;
-        events.truncate(cap);
-        Ok(events
+        let events = calendar::list_events_in_range(
+            conn,
+            now_ms - window.back_ms,
+            now_ms + window.forward_ms,
+            None,
+        )?;
+        // Collapse recurring occurrences before the cap (#109). A
+        // daily standup used to contribute 14 [E*] lines; now it
+        // contributes one canonical row per series. Cap then truncates
+        // the post-collapse list — recurring series can no longer
+        // crowd out distinct one-off meetings from the prompt.
+        let mut collapsed = calendar::collapse_recurring(events, now_ms);
+        collapsed.truncate(cap);
+        Ok(collapsed
             .into_iter()
-            .map(|e| SnapshotItem {
-                id: e.id.clone(),
-                payload: SnapshotPayload::Event(e),
+            .map(|c| SnapshotItem {
+                id: c.canonical.id.clone(),
+                payload: SnapshotPayload::Event(c.canonical),
             })
             .collect())
     }
@@ -768,6 +778,11 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN linked_note_path;",
         )
         .unwrap();
+        // #109 added series_master_id to calendar_events.
+        conn.execute_batch(include_str!(
+            "../migrations/033_calendar_series_master_id.sql"
+        ))
+        .unwrap();
         conn.execute_batch(include_str!("../migrations/011_email.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../migrations/012_workstreams.sql"))
@@ -1020,6 +1035,7 @@ mod tests {
             raw_etag: None,
             modified_ms: 1_700_000_000_000,
             linked_note_id: None,
+            series_master_id: None,
             attendees: vec![calendar::CalendarAttendee {
                 email: "bob@x.io".into(),
                 display_name: None,

@@ -1279,6 +1279,7 @@ mod tests {
             raw_etag: None,
             modified_ms: 1_700_000_000_000,
             linked_note_id: None,
+            series_master_id: None,
             attendees: Vec::new(),
         };
         SnapshotItem {

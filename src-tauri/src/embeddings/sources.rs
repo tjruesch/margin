@@ -208,12 +208,23 @@ pub fn collect_work(conn: &Connection, model: &str) -> rusqlite::Result<Vec<Work
     }
 
     // ---- events ----
+    // For recurring series (#109) embed only the earliest occurrence
+    // — Voyage was previously embedding 50+ near-identical rows per
+    // year for a weekly 1:1 with a stable title. The subquery uses
+    // `idx_events_series` (partial index) so it stays cheap.
     let event_rows: Vec<(String, String, Option<String>)> = {
         let mut stmt = conn.prepare(
             "SELECT c.id, c.title, c.description FROM calendar_events c \
              LEFT JOIN embeddings e \
                ON e.ref_kind = 'event' AND e.ref_id = c.id AND e.model = ?1 \
-             WHERE e.indexed_ms IS NULL OR c.modified_ms > e.indexed_ms",
+             WHERE (e.indexed_ms IS NULL OR c.modified_ms > e.indexed_ms) \
+               AND ( \
+                    c.series_master_id IS NULL \
+                 OR c.start_ms = ( \
+                        SELECT MIN(c2.start_ms) FROM calendar_events c2 \
+                         WHERE c2.series_master_id = c.series_master_id \
+                    ) \
+               )",
         )?;
         let rows = stmt.query_map(params![model], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -344,4 +355,61 @@ pub fn drop_unchanged(conn: &Connection, model: &str, items: Vec<WorkItem>) -> r
         kept.push(item);
     }
     Ok(kept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::index::apply_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO connectors(id, kind, display_name, enabled, config_json, created_ms, updated_ms) \
+             VALUES ('mg:test', 'microsoft_graph', 'Test', 1, '{}', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn seed_event(
+        conn: &Connection,
+        id: &str,
+        start: i64,
+        title: &str,
+        series: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO calendar_events(\
+                id, connector_id, external_id, title, start_ms, end_ms, all_day, modified_ms, \
+                series_master_id\
+             ) VALUES (?1, 'mg:test', ?1, ?2, ?3, ?3, 0, ?3, ?4)",
+            params![id, title, start, series],
+        )
+        .unwrap();
+    }
+
+    /// Three occurrences of one series → only the earliest is in the
+    /// work set (#109). The other two are deduped by the
+    /// series_master_id subquery in `collect_work`.
+    #[test]
+    fn embeddings_collect_work_skips_recurring_occurrences() {
+        let conn = open_db();
+        seed_event(&conn, "occ1", 1_000, "Weekly standup", Some("mg:test::master-1"));
+        seed_event(&conn, "occ2", 2_000, "Weekly standup", Some("mg:test::master-1"));
+        seed_event(&conn, "occ3", 3_000, "Weekly standup", Some("mg:test::master-1"));
+        // A one-off meeting comes through unchanged.
+        seed_event(&conn, "oneoff", 4_000, "Hyundai sync", None);
+
+        let work = collect_work(&conn, "voyage-3").unwrap();
+        let event_ids: Vec<&str> = work
+            .iter()
+            .filter(|w| w.ref_kind == "event")
+            .map(|w| w.ref_id.as_str())
+            .collect();
+        let mut sorted = event_ids;
+        sorted.sort();
+        assert_eq!(sorted, vec!["occ1", "oneoff"]);
+    }
 }

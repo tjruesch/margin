@@ -402,6 +402,10 @@ fn map_event(
         // User-set on first click of the "Coming up" strip; persisted
         // by `upsert_event`'s ON CONFLICT clause.
         linked_note_id: None,
+        // Google's recurrence model uses `recurringEventId` rather
+        // than Microsoft's `seriesMasterId`; not surfaced in v1 of
+        // this connector, so all rows are treated as singletons.
+        series_master_id: None,
         attendees,
     }
 }

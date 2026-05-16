@@ -33,6 +33,12 @@ pub struct CalendarEvent {
     /// preserved across re-syncs (#62). Null until the user opens the
     /// event for the first time.
     pub linked_note_id: Option<String>,
+    /// Graph's master event id (namespaced `{connector_id}::{...}`)
+    /// when this row is an occurrence of a recurring series; None for
+    /// one-off meetings (#109). Powers `collapse_recurring` so the
+    /// synth prompt / CO_ATTENDED counts / embeddings worker stop
+    /// multi-counting weekly standups and recurring 1:1s.
+    pub series_master_id: Option<String>,
     pub attendees: Vec<CalendarAttendee>,
 }
 
@@ -150,8 +156,8 @@ fn upsert_event(tx: &rusqlite::Transaction<'_>, e: &CalendarEvent) -> rusqlite::
         "INSERT INTO calendar_events(\
             id, connector_id, external_id, title, start_ms, end_ms, all_day, \
             location, description, source_calendar, status, raw_etag, modified_ms, \
-            linked_note_id\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            linked_note_id, series_master_id\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
          ON CONFLICT(id) DO UPDATE SET \
             title = excluded.title, \
             start_ms = excluded.start_ms, \
@@ -162,7 +168,8 @@ fn upsert_event(tx: &rusqlite::Transaction<'_>, e: &CalendarEvent) -> rusqlite::
             source_calendar = excluded.source_calendar, \
             status = excluded.status, \
             raw_etag = excluded.raw_etag, \
-            modified_ms = excluded.modified_ms",
+            modified_ms = excluded.modified_ms, \
+            series_master_id = excluded.series_master_id",
         params![
             e.id,
             e.connector_id,
@@ -178,6 +185,7 @@ fn upsert_event(tx: &rusqlite::Transaction<'_>, e: &CalendarEvent) -> rusqlite::
             e.raw_etag,
             e.modified_ms,
             e.linked_note_id,
+            e.series_master_id,
         ],
     )?;
 
@@ -218,7 +226,7 @@ pub fn list_events_in_range(
         Some(_) => {
             "SELECT id, connector_id, external_id, title, start_ms, end_ms, all_day, \
                     location, description, source_calendar, status, raw_etag, modified_ms, \
-                    linked_note_id \
+                    linked_note_id, series_master_id \
              FROM calendar_events \
              WHERE start_ms BETWEEN ?1 AND ?2 AND connector_id = ?3 \
              ORDER BY start_ms ASC"
@@ -226,7 +234,7 @@ pub fn list_events_in_range(
         None => {
             "SELECT id, connector_id, external_id, title, start_ms, end_ms, all_day, \
                     location, description, source_calendar, status, raw_etag, modified_ms, \
-                    linked_note_id \
+                    linked_note_id, series_master_id \
              FROM calendar_events \
              WHERE start_ms BETWEEN ?1 AND ?2 \
              ORDER BY start_ms ASC"
@@ -250,6 +258,7 @@ pub fn list_events_in_range(
             raw_etag: r.get(11)?,
             modified_ms: r.get(12)?,
             linked_note_id: r.get(13)?,
+            series_master_id: r.get(14)?,
             attendees: Vec::new(),
         })
     };
@@ -329,7 +338,7 @@ pub fn get_event_details(
     let mut stmt = conn.prepare(
         "SELECT id, connector_id, external_id, title, start_ms, end_ms, all_day, \
                 location, description, source_calendar, status, raw_etag, modified_ms, \
-                linked_note_id \
+                linked_note_id, series_master_id \
          FROM calendar_events WHERE id = ?1",
     )?;
     let mut event: Option<CalendarEvent> = stmt
@@ -349,6 +358,7 @@ pub fn get_event_details(
                 raw_etag: r.get(11)?,
                 modified_ms: r.get(12)?,
                 linked_note_id: r.get(13)?,
+                series_master_id: r.get(14)?,
                 attendees: Vec::new(),
             })
         })
@@ -361,6 +371,81 @@ pub fn get_event_details(
         }
     }
     Ok(event)
+}
+
+/// One collapsed group from `collapse_recurring` (#109). The canonical
+/// instance follows the issue's rule: prefer the next future
+/// occurrence (smallest `start_ms >= now_ms`); else the most-recent
+/// past one. `instance_count == 1` for one-off meetings.
+#[derive(Debug, Clone)]
+pub struct CollapsedEvent {
+    pub canonical: CalendarEvent,
+    pub instance_count: usize,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+/// Group events by `series_master_id` (singletons fall through with
+/// `instance_count = 1`) and pick a canonical instance per group. The
+/// output is sorted by `canonical.start_ms` ASC. Used by the workstream
+/// synth prompt, the CO_ATTENDED edge pass (indirectly — its SQL
+/// dedupes via `COALESCE(series_master_id, id)`), and the embeddings
+/// worker so a single weekly standup counts once, not N times (#109).
+pub fn collapse_recurring(events: Vec<CalendarEvent>, now_ms: i64) -> Vec<CollapsedEvent> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<CalendarEvent>> = HashMap::new();
+    let mut singletons: Vec<CalendarEvent> = Vec::new();
+    for ev in events {
+        match ev.series_master_id.clone() {
+            Some(master) => groups.entry(master).or_default().push(ev),
+            None => singletons.push(ev),
+        }
+    }
+    let mut out: Vec<CollapsedEvent> = Vec::new();
+    for ev in singletons {
+        let ts = ev.start_ms;
+        out.push(CollapsedEvent {
+            canonical: ev,
+            instance_count: 1,
+            first_seen_ms: ts,
+            last_seen_ms: ts,
+        });
+    }
+    for (_, mut occurrences) in groups {
+        if occurrences.is_empty() {
+            continue;
+        }
+        // Future-leaning canonical: smallest start_ms >= now_ms, else
+        // the largest start_ms < now_ms. Picks "the next meeting" as
+        // the row the prompt / UI sees while the embeddings worker
+        // separately uses the earliest occurrence.
+        let canonical_idx = occurrences
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.start_ms >= now_ms)
+            .min_by_key(|(_, e)| e.start_ms)
+            .map(|(i, _)| i)
+            .or_else(|| {
+                occurrences
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, e)| e.start_ms)
+                    .map(|(i, _)| i)
+            })
+            .unwrap_or(0);
+        let first_seen_ms = occurrences.iter().map(|e| e.start_ms).min().unwrap_or(0);
+        let last_seen_ms = occurrences.iter().map(|e| e.start_ms).max().unwrap_or(0);
+        let instance_count = occurrences.len();
+        let canonical = occurrences.swap_remove(canonical_idx);
+        out.push(CollapsedEvent {
+            canonical,
+            instance_count,
+            first_seen_ms,
+            last_seen_ms,
+        });
+    }
+    out.sort_by_key(|c| c.canonical.start_ms);
+    out
 }
 
 fn load_attendees_for<'a, I>(
@@ -451,6 +536,12 @@ mod tests {
              ALTER TABLE calendar_events DROP COLUMN linked_note_path;",
         )
         .unwrap();
+        // #109 added series_master_id; apply the migration so the
+        // hydrating SELECT paths can return the new column.
+        conn.execute_batch(include_str!(
+            "../migrations/033_calendar_series_master_id.sql"
+        ))
+        .unwrap();
         conn
     }
 
@@ -500,6 +591,7 @@ mod tests {
             raw_etag: None,
             modified_ms: start_ms,
             linked_note_id: None,
+            series_master_id: None,
             attendees: attendee_emails
                 .iter()
                 .map(|e| CalendarAttendee {
@@ -555,6 +647,28 @@ mod tests {
         let a = rows.iter().find(|e| e.external_id == "a").unwrap();
         assert_eq!(a.attendees.len(), 1);
         assert_eq!(a.attendees[0].email, "alice@example.com");
+    }
+
+    /// `series_master_id` round-trips through the INSERT and the
+    /// hydrating SELECT paths (#109).
+    #[test]
+    fn upsert_window_persists_series_master_id() {
+        let mut conn = open_test_db();
+        let mut event = make_event("recurring", 5_000, &[]);
+        event.series_master_id = Some("mg:test::master-1".into());
+        upsert_window(&mut conn, "mg:test", &[event], 0, 100_000).unwrap();
+
+        let got = get_event_details(&conn, "mg:test::recurring")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.series_master_id.as_deref(), Some("mg:test::master-1"));
+
+        let in_range = list_events_in_range(&conn, 0, 100_000, Some("mg:test")).unwrap();
+        assert_eq!(in_range.len(), 1);
+        assert_eq!(
+            in_range[0].series_master_id.as_deref(),
+            Some("mg:test::master-1")
+        );
     }
 
     #[test]
@@ -675,6 +789,7 @@ mod tests {
             raw_etag: None,
             modified_ms: 5_000,
             linked_note_id: None,
+            series_master_id: None,
             attendees: vec![
                 CalendarAttendee {
                     email: "me@x.io".into(),
@@ -741,6 +856,7 @@ mod tests {
             raw_etag: None,
             modified_ms: 5_000,
             linked_note_id: None,
+            series_master_id: None,
             attendees: vec![CalendarAttendee {
                 email: "vendor@external.com".into(),
                 display_name: None,
@@ -754,5 +870,83 @@ mod tests {
 
         set_linked_note_id(&mut conn, "mg:test::e2", "/tmp/notes/ext.md").unwrap();
         assert_eq!(cp_meeting_count(&conn), 0);
+    }
+
+    // ---------- collapse_recurring (#109) ---------------------------------
+
+    fn ev_in_series(id: &str, start_ms: i64, series: Option<&str>) -> CalendarEvent {
+        let mut e = make_event(id, start_ms, &[]);
+        e.series_master_id = series.map(|s| s.to_string());
+        e
+    }
+
+    /// Singletons (`series_master_id IS NULL`) pass through with
+    /// `instance_count = 1`. Output is sorted by canonical start_ms.
+    #[test]
+    fn collapse_recurring_returns_events_unchanged_when_no_series() {
+        let a = ev_in_series("a", 1_000, None);
+        let b = ev_in_series("b", 3_000, None);
+        let c = ev_in_series("c", 2_000, None);
+        let out = collapse_recurring(vec![a, b, c], 5_000);
+        assert_eq!(out.len(), 3);
+        let starts: Vec<i64> = out.iter().map(|e| e.canonical.start_ms).collect();
+        assert_eq!(starts, vec![1_000, 2_000, 3_000]);
+        assert!(out.iter().all(|e| e.instance_count == 1));
+    }
+
+    /// When at least one occurrence is in the future, the next future
+    /// one becomes the canonical row.
+    #[test]
+    fn collapse_recurring_keeps_next_future_occurrence_for_recurring_series() {
+        // now = 5_000; one past, two future. Canonical = future #1.
+        let past = ev_in_series("past", 1_000, Some("mg:test::m1"));
+        let future1 = ev_in_series("f1", 7_000, Some("mg:test::m1"));
+        let future2 = ev_in_series("f2", 9_000, Some("mg:test::m1"));
+        let out = collapse_recurring(vec![past, future1, future2], 5_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].canonical.external_id, "f1");
+        assert_eq!(out[0].instance_count, 3);
+        assert_eq!(out[0].first_seen_ms, 1_000);
+        assert_eq!(out[0].last_seen_ms, 9_000);
+    }
+
+    /// All occurrences in the past → the most-recent past one is
+    /// canonical (largest start_ms < now_ms).
+    #[test]
+    fn collapse_recurring_falls_back_to_most_recent_past_when_no_future_occurrence() {
+        // now = 10_000; everything past.
+        let earliest = ev_in_series("p1", 1_000, Some("mg:test::m1"));
+        let middle = ev_in_series("p2", 4_000, Some("mg:test::m1"));
+        let latest_past = ev_in_series("p3", 7_000, Some("mg:test::m1"));
+        let out = collapse_recurring(vec![earliest, middle, latest_past], 10_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].canonical.external_id, "p3");
+        assert_eq!(out[0].instance_count, 3);
+    }
+
+    /// Mixed input: two recurring series + a singleton → three groups
+    /// in the output, each carrying its own count.
+    #[test]
+    fn collapse_recurring_handles_multiple_series_independently() {
+        let m1_a = ev_in_series("m1-a", 1_000, Some("mg:test::m1"));
+        let m1_b = ev_in_series("m1-b", 4_000, Some("mg:test::m1"));
+        let m2_a = ev_in_series("m2-a", 2_000, Some("mg:test::m2"));
+        let m2_b = ev_in_series("m2-b", 3_000, Some("mg:test::m2"));
+        let m2_c = ev_in_series("m2-c", 5_000, Some("mg:test::m2"));
+        let singleton = ev_in_series("solo", 6_000, None);
+        let out = collapse_recurring(
+            vec![m1_a, m1_b, m2_a, m2_b, m2_c, singleton],
+            10_000,
+        );
+        assert_eq!(out.len(), 3);
+        // Sorted by canonical start_ms ASC.
+        let labels: Vec<(&str, usize)> = out
+            .iter()
+            .map(|c| (c.canonical.external_id.as_str(), c.instance_count))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![("m1-b", 2), ("m2-c", 3), ("solo", 1)]
+        );
     }
 }

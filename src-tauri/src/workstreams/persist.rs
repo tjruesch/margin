@@ -1623,6 +1623,11 @@ mod tests {
         // 031 adds the auto-resolve hysteresis columns (#124).
         conn.execute_batch(include_str!("../migrations/031_auto_resolve_hysteresis.sql"))
             .unwrap();
+        // 033 adds calendar_events.series_master_id (#109).
+        conn.execute_batch(include_str!(
+            "../migrations/033_calendar_series_master_id.sql"
+        ))
+        .unwrap();
         conn
     }
 

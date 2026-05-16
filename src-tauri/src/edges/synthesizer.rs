@@ -306,18 +306,22 @@ fn run_co_attended_pass(
     let n = tx
         .execute(
             "WITH attendances AS ( \
-                SELECT ca.team_member_id AS p, ce.id AS event_id, ce.start_ms \
+                SELECT ca.team_member_id AS p, \
+                       ce.id              AS event_id, \
+                       COALESCE(ce.series_master_id, ce.id) AS series_key, \
+                       ce.start_ms \
                 FROM calendar_attendees ca \
                 JOIN calendar_events ce ON ce.id = ca.event_id \
                 WHERE ca.team_member_id IS NOT NULL AND ce.start_ms >= ?1 \
              ), \
              pairs AS ( \
                 SELECT a1.p AS a, a2.p AS b, \
-                       COUNT(*) AS shared, \
+                       COUNT(DISTINCT a1.series_key) AS shared, \
                        min(a1.start_ms) AS first_ms, \
                        max(a1.start_ms) AS last_ms \
                 FROM attendances a1 \
-                JOIN attendances a2 ON a1.event_id = a2.event_id AND a1.p <> a2.p \
+                JOIN attendances a2 \
+                  ON a1.series_key = a2.series_key AND a1.p <> a2.p \
                 GROUP BY a1.p, a2.p \
                 HAVING shared >= ?2 \
              ) \
@@ -740,12 +744,23 @@ mod tests {
     }
 
     fn seed_event_attended(conn: &Connection, id: &str, members: &[&str], start: i64) {
+        seed_event_attended_in_series(conn, id, members, start, None);
+    }
+
+    fn seed_event_attended_in_series(
+        conn: &Connection,
+        id: &str,
+        members: &[&str],
+        start: i64,
+        series_master_id: Option<&str>,
+    ) {
         seed_connector(conn, "mg:test");
         conn.execute(
             "INSERT INTO calendar_events(\
-                id, connector_id, external_id, title, start_ms, end_ms, all_day, modified_ms\
-             ) VALUES (?1, 'mg:test', ?1, 'Sync', ?2, ?2, 0, ?2)",
-            params![id, start],
+                id, connector_id, external_id, title, start_ms, end_ms, all_day, modified_ms, \
+                series_master_id\
+             ) VALUES (?1, 'mg:test', ?1, 'Sync', ?2, ?2, 0, ?2, ?3)",
+            params![id, start, series_master_id],
         )
         .unwrap();
         for m in members {
@@ -921,6 +936,42 @@ mod tests {
         let mut report = EdgeSynthReport::default();
         run_co_attended_pass(&mut conn, now, &mut report).unwrap();
         assert_eq!(count_edges(&conn, "CO_ATTENDED"), 0);
+    }
+
+    /// Three occurrences of one weekly standup count as one shared
+    /// meeting, not three (#109). Without the fix the pair would
+    /// cross the 2-meeting CO_ATTENDED threshold off a single
+    /// logical commitment.
+    #[test]
+    fn co_attended_counts_series_once_not_per_occurrence() {
+        let mut conn = open_db();
+        seed_self_and_teammate(&conn);
+        let now = current_unix_ms();
+        // Three occurrences of the same series — one shared meeting
+        // logically. With CO_ATTENDED_MIN_MEETINGS == 2, the edge
+        // must NOT fire on series count alone.
+        seed_event_attended_in_series(
+            &conn, "occ1", &["tm_self", "tm_alice"], now - 1_000, Some("mg:test::master-1"),
+        );
+        seed_event_attended_in_series(
+            &conn, "occ2", &["tm_self", "tm_alice"], now - 2_000, Some("mg:test::master-1"),
+        );
+        seed_event_attended_in_series(
+            &conn, "occ3", &["tm_self", "tm_alice"], now - 3_000, Some("mg:test::master-1"),
+        );
+        let mut report = EdgeSynthReport::default();
+        run_co_attended_pass(&mut conn, now, &mut report).unwrap();
+        assert_eq!(
+            count_edges(&conn, "CO_ATTENDED"),
+            0,
+            "series counts once, not per occurrence"
+        );
+
+        // Add a distinct one-off meeting → now there are two real
+        // shared events (the series + the one-off), edge fires.
+        seed_event_attended(&conn, "oneoff", &["tm_self", "tm_alice"], now - 5_000);
+        run_co_attended_pass(&mut conn, now, &mut report).unwrap();
+        assert_eq!(count_edges(&conn, "CO_ATTENDED"), 2);
     }
 
     #[test]
