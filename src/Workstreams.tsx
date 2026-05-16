@@ -16,6 +16,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AliasKind,
   type ActionListItem,
+  type CalendarEvent,
   type OpenQuestionItem,
   resolveOpenQuestion,
   reopenOpenQuestion,
@@ -2803,6 +2804,107 @@ function MessagesSection({
   );
 }
 
+/// Top-level row in the workstream's Meetings list. Either a one-off
+/// meeting (`single`) or a recurring series collapsed onto its
+/// canonical occurrence (`series`) — #127 builds these from the flat
+/// `CalendarEvent[]` the backend returns by grouping on
+/// `series_master_id`.
+type MeetingRow =
+  | { kind: "single"; event: CalendarEvent }
+  | {
+      kind: "series";
+      seriesId: string;
+      canonical: CalendarEvent;
+      occurrences: CalendarEvent[];
+    };
+
+/// Group events by `series_master_id`; pick a future-leaning canonical
+/// per series (next future, else most-recent past — matches the Rust
+/// `collapse_recurring` rule in `connectors/calendar.rs`). A "series"
+/// with only one occurrence in the workstream's window falls through
+/// as a singleton — showing "1 occurrence" would confuse.
+function buildMeetingRows(events: CalendarEvent[], nowMs: number): MeetingRow[] {
+  const singletons: CalendarEvent[] = [];
+  const groups = new Map<string, CalendarEvent[]>();
+  for (const e of events) {
+    if (e.series_master_id == null) {
+      singletons.push(e);
+    } else {
+      const arr = groups.get(e.series_master_id) ?? [];
+      arr.push(e);
+      groups.set(e.series_master_id, arr);
+    }
+  }
+  const rows: MeetingRow[] = singletons.map((event) => ({ kind: "single", event }));
+  for (const [seriesId, occ] of groups) {
+    if (occ.length < 2) {
+      rows.push({ kind: "single", event: occ[0] });
+      continue;
+    }
+    occ.sort((a, b) => b.start_ms - a.start_ms);
+    const futureAsc = occ
+      .filter((e) => e.start_ms >= nowMs)
+      .sort((a, b) => a.start_ms - b.start_ms);
+    const canonical = futureAsc.length > 0 ? futureAsc[0] : occ[0];
+    rows.push({ kind: "series", seriesId, canonical, occurrences: occ });
+  }
+  rows.sort((a, b) => {
+    const aMs = a.kind === "single" ? a.event.start_ms : a.canonical.start_ms;
+    const bMs = b.kind === "single" ? b.event.start_ms : b.canonical.start_ms;
+    return bMs - aMs;
+  });
+  return rows;
+}
+
+function MeetingRow({
+  event,
+  onOpenEvent,
+  onDetach,
+}: {
+  event: CalendarEvent;
+  onOpenEvent: (eventId: string) => void | Promise<void>;
+  onDetach?: (itemId: string) => void;
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        className="workstream-meeting-row"
+        onClick={() => void onOpenEvent(event.id)}
+      >
+        <span className="workstream-meeting-date">
+          {formatShortDateTime(event.start_ms)}
+        </span>
+        <span className="workstream-meeting-title">{event.title}</span>
+        {event.attendees.length > 0 ? (
+          <span className="workstream-meeting-attendees">
+            {event.attendees
+              .slice(0, 4)
+              .map((a) => a.display_name || a.email)
+              .join(", ")}
+            {event.attendees.length > 4
+              ? ` +${event.attendees.length - 4}`
+              : ""}
+          </span>
+        ) : null}
+      </button>
+      {onDetach && (
+        <button
+          type="button"
+          className="ws-detach-btn"
+          title="Detach from this workstream"
+          onClick={(ev) => {
+            ev.stopPropagation();
+            onDetach(event.id);
+          }}
+        >
+          Detach
+        </button>
+      )}
+    </li>
+  );
+}
+
 function MeetingsSection({
   events,
   onOpenEvent,
@@ -2812,49 +2914,64 @@ function MeetingsSection({
   onOpenEvent: (eventId: string) => void | Promise<void>;
   onDetach?: (itemId: string) => void;
 }) {
-  if (events.length === 0) return null;
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const rows = useMemo(() => buildMeetingRows(events, Date.now()), [events]);
+
+  if (rows.length === 0) return null;
   return (
     <section className="workstream-section">
-      <h2 className="workstream-section-title">Meetings ({events.length})</h2>
+      <h2 className="workstream-section-title">Meetings ({rows.length})</h2>
       <ul className="workstream-meetings">
-        {events.map((e) => (
-          <li key={e.id}>
-            <button
-              type="button"
-              className="workstream-meeting-row"
-              onClick={() => void onOpenEvent(e.id)}
-            >
-              <span className="workstream-meeting-date">
-                {formatShortDateTime(e.start_ms)}
-              </span>
-              <span className="workstream-meeting-title">{e.title}</span>
-              {e.attendees.length > 0 ? (
-                <span className="workstream-meeting-attendees">
-                  {e.attendees
-                    .slice(0, 4)
-                    .map((a) => a.display_name || a.email)
-                    .join(", ")}
-                  {e.attendees.length > 4
-                    ? ` +${e.attendees.length - 4}`
-                    : ""}
-                </span>
-              ) : null}
-            </button>
-            {onDetach && (
+        {rows.map((row) => {
+          if (row.kind === "single") {
+            return (
+              <MeetingRow
+                key={row.event.id}
+                event={row.event}
+                onOpenEvent={onOpenEvent}
+                onDetach={onDetach}
+              />
+            );
+          }
+          const isOpen = !!expanded[row.seriesId];
+          return (
+            <li key={row.seriesId} className="workstream-meeting-series">
               <button
                 type="button"
-                className="ws-detach-btn"
-                title="Detach from this workstream"
-                onClick={(ev) => {
-                  ev.stopPropagation();
-                  onDetach(e.id);
-                }}
+                className="workstream-meeting-row workstream-meeting-series-summary"
+                aria-expanded={isOpen}
+                onClick={() =>
+                  setExpanded((s) => ({ ...s, [row.seriesId]: !isOpen }))
+                }
               >
-                Detach
+                <span className="workstream-meeting-series-toggle">
+                  {isOpen ? "▾" : "▸"}
+                </span>
+                <span className="workstream-meeting-date">
+                  {formatShortDateTime(row.canonical.start_ms)}
+                </span>
+                <span className="workstream-meeting-title">
+                  {row.canonical.title}
+                </span>
+                <span className="workstream-meeting-series-count">
+                  {row.occurrences.length} occurrences
+                </span>
               </button>
-            )}
-          </li>
-        ))}
+              {isOpen && (
+                <ul className="workstream-meeting-occurrences">
+                  {row.occurrences.map((occ) => (
+                    <MeetingRow
+                      key={occ.id}
+                      event={occ}
+                      onOpenEvent={onOpenEvent}
+                      onDetach={onDetach}
+                    />
+                  ))}
+                </ul>
+              )}
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

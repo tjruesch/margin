@@ -755,6 +755,11 @@ export type CalendarEvent = {
    *  first click of the event card). Null until linked. Survives
    *  re-syncs of the same event. */
   linked_note_path: string | null;
+  /** Graph's master event id (namespaced `{connector_id}::{...}`)
+   *  when this row is an occurrence of a recurring series; null for
+   *  one-off meetings (#109). Powers the MeetingsSection collapse on
+   *  the workstream detail page (#127). */
+  series_master_id: string | null;
   attendees: CalendarAttendee[];
 };
 
