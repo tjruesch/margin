@@ -164,6 +164,17 @@ export const IconCalendar = (p: Props) => (
     <path d="M8 3v4M16 3v4M3.5 10h17" />
   </Icon>
 );
+export const IconMail = (p: Props) => (
+  <Icon {...p}>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <path d="M3.5 6.5l8.5 6.5 8.5-6.5" />
+  </Icon>
+);
+export const IconChat = (p: Props) => (
+  <Icon {...p}>
+    <path d="M4 5h16a1 1 0 011 1v10a1 1 0 01-1 1h-9l-4 3v-3H4a1 1 0 01-1-1V6a1 1 0 011-1z" />
+  </Icon>
+);
 export const IconPlus = (p: Props) => (
   <Icon {...p}>
     <path d="M12 5v14M5 12h14" />

@@ -34,12 +34,15 @@ import {
   IconArchive,
   IconBell,
   IconBriefcase,
+  IconCalendar,
+  IconChat,
   IconCheck,
   IconChecklist,
   IconChevRight,
   IconFileText,
   IconHelp,
   IconHome,
+  IconMail,
   IconMic,
   IconMore,
   IconPlus,
@@ -242,6 +245,24 @@ function formatHm(ms: number): string {
     hour: "numeric",
     minute: "2-digit",
   }).format(new Date(ms));
+}
+
+/// Past-only relative time for action-row sublines (#123). The
+/// existing `formatRelative` is future-focused (due dates); this one
+/// clamps to >= 0 so old timestamps render as "2d ago" rather than
+/// "in -2 days".
+function timeAgo(ms: number, nowMs: number): string {
+  const dt = Math.max(0, nowMs - ms);
+  const m = Math.floor(dt / 60_000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}d ago`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo}mo ago`;
+  return `${Math.floor(mo / 12)}y ago`;
 }
 
 function formatRelative(startMs: number, nowMs: number): string {
@@ -1417,6 +1438,13 @@ export function ActionRow({
     ? stripLeadingOwnerPrefix(it.text)
     : it.text;
   const isSynth = it.origin_kind === "synth";
+  const isWaiting =
+    it.origin_synth_kind === "email_waiting"
+    || it.origin_synth_kind === "teams_waiting"
+    || it.origin_synth_kind === "meeting_waiting";
+  const counterparty = isWaiting && it.subject_member_id
+    ? members.find((m) => m.id === it.subject_member_id) ?? null
+    : null;
   const openTarget = () => {
     // Origin drives the primary navigation target: note-origin rows
     // open their source note; synth-origin rows open the attached
@@ -1481,6 +1509,49 @@ export function ActionRow({
                 </span>
               </>
             )}
+          </div>
+        )}
+        {isWaiting && (
+          <div className="home-action-waiting">
+            {it.origin_synth_kind === "email_waiting" && (
+              <IconMail size={10} sw={1.7} />
+            )}
+            {it.origin_synth_kind === "teams_waiting" && (
+              <IconChat size={10} sw={1.7} />
+            )}
+            {it.origin_synth_kind === "meeting_waiting" && (
+              <IconCalendar size={10} sw={1.7} />
+            )}
+            {counterparty ? (
+              <>
+                <span className="home-action-waiting-label">from</span>
+                <button
+                  type="button"
+                  className="home-action-waiting-name"
+                  title={`Open ${counterparty.display_name}'s profile`}
+                  onClick={(e) => {
+                    // Stop the row's outer click so we navigate to the
+                    // member instead of the row's origin target.
+                    e.stopPropagation();
+                    window.dispatchEvent(
+                      new CustomEvent("margin:open-team-member", {
+                        detail: { memberId: counterparty.id },
+                      }),
+                    );
+                  }}
+                >
+                  {counterparty.display_name}
+                </button>
+              </>
+            ) : (
+              <span className="home-action-waiting-label">
+                from this person
+              </span>
+            )}
+            <span className="home-action-origin-sep">·</span>
+            <span className="home-action-waiting-time">
+              {timeAgo(it.created_ms, Date.now())}
+            </span>
           </div>
         )}
         {typeof it.auto_resolved_ms === "number" && onUndoAutoResolved && (
