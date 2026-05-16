@@ -613,4 +613,341 @@ mod tests {
         assert_eq!(ft.len(), 1);
         assert!(ft.contains("e3"));
     }
+
+    // ---------- actions-table sync path (#122) -------------------------
+
+    use crate::profiles::persist::ProfileSnapshotBody;
+    use rusqlite::params;
+
+    fn open_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::apply_migrations(&conn).unwrap();
+        conn
+    }
+
+    fn seed_member(conn: &rusqlite::Connection, id: &str, is_self: bool) {
+        conn.execute(
+            "INSERT INTO team_members \
+                (id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
+             VALUES (?1, ?1, '', '', ?2, 0, 0)",
+            params![id, is_self as i64],
+        )
+        .unwrap();
+    }
+
+    fn waiting(kind: &str, ref_id: &str, desc: &str) -> WaitingItem {
+        WaitingItem {
+            description: desc.into(),
+            source_kind: kind.into(),
+            source_ref_id: ref_id.into(),
+            since_ms: 1_000,
+        }
+    }
+
+    fn count_actions(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn action_text(conn: &rusqlite::Connection, id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT text FROM actions WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn action_done(conn: &rusqlite::Connection, id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT done FROM actions WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    #[test]
+    fn waiting_action_id_is_stable_across_inputs() {
+        let a = waiting_action_id("teams_waiting", "msg1", "tm_self");
+        let b = waiting_action_id("teams_waiting", "msg1", "tm_self");
+        assert_eq!(a, b, "same inputs must produce same id");
+        // Each component must influence the hash.
+        assert_ne!(a, waiting_action_id("email_waiting", "msg1", "tm_self"));
+        assert_ne!(a, waiting_action_id("teams_waiting", "msg2", "tm_self"));
+        assert_ne!(a, waiting_action_id("teams_waiting", "msg1", "tm_alice"));
+    }
+
+    #[test]
+    fn upsert_creates_new_row() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "send the file"),
+            "tm_self",
+            "tm_alice",
+            5_000,
+        )
+        .unwrap()
+        .expect("upsert returns id");
+        tx.commit().unwrap();
+
+        assert_eq!(count_actions(&conn), 1);
+        let row: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT origin_kind, origin_synth_kind, origin_synth_id, text, \
+                        assignee_id, subject_member_id, done, manual_override \
+                   FROM actions WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?,
+                        r.get(5)?, r.get(6)?, r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, "synth");
+        assert_eq!(row.1, "teams_waiting");
+        assert_eq!(row.2, "msg1");
+        assert_eq!(row.3, "send the file");
+        assert_eq!(row.4, "tm_self");
+        assert_eq!(row.5, "tm_alice");
+        assert_eq!(row.6, 0);
+        assert_eq!(row.7, 0);
+    }
+
+    #[test]
+    fn upsert_is_idempotent() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let w = waiting("teams", "msg1", "x");
+        upsert_waiting_action(&tx, &w, "tm_self", "tm_alice", 1_000).unwrap();
+        upsert_waiting_action(&tx, &w, "tm_self", "tm_alice", 2_000).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count_actions(&conn), 1);
+    }
+
+    #[test]
+    fn upsert_refreshes_text_when_not_overridden() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "first"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+        upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "second"),
+            "tm_self",
+            "tm_alice",
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(action_text(&conn, &id).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn upsert_leaves_overridden_row_untouched() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "original"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+        tx.execute(
+            "UPDATE actions SET manual_override = 1 WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        let id2 = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "rewritten"),
+            "tm_self",
+            "tm_alice",
+            2_000,
+        )
+        .unwrap()
+        .unwrap();
+        tx.commit().unwrap();
+
+        // Same id returned (so the caller can collect it into the live
+        // set for auto_resolve_missing's check), but text is unchanged.
+        assert_eq!(id, id2);
+        assert_eq!(action_text(&conn, &id).as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn upsert_skips_dismissed_source() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO dismissed_action_sources \
+                (origin_synth_kind, origin_synth_id, assignee_id, dismissed_ms) \
+             VALUES ('teams_waiting', 'msg1', 'tm_self', 999)",
+            [],
+        )
+        .unwrap();
+        let res = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "x"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(res.is_none(), "dismissed source returns None");
+        assert_eq!(count_actions(&conn), 0);
+    }
+
+    #[test]
+    fn auto_resolve_marks_missing_done() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let live_id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "live", "x"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+        let missing_id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "missing", "y"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+
+        let mut live = std::collections::HashSet::new();
+        live.insert(live_id.clone());
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 2_000).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(action_done(&conn, &live_id), Some(0));
+        assert_eq!(action_done(&conn, &missing_id), Some(1));
+    }
+
+    #[test]
+    fn auto_resolve_respects_manual_override() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "x"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+        tx.execute(
+            "UPDATE actions SET manual_override = 1 WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        let live = std::collections::HashSet::new(); // intentionally empty
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 2_000).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            action_done(&conn, &id),
+            Some(0),
+            "manual_override blocks auto-resolve"
+        );
+    }
+
+    #[test]
+    fn sync_waiting_actions_round_trip() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let body = ProfileSnapshotBody {
+            waiting_from_me: vec![
+                waiting("teams", "msg1", "send the file"),
+                waiting("email", "em1", "reply to budget thread"),
+            ],
+            waiting_for_them: vec![waiting("teams", "msg2", "their architecture write-up")],
+            ..Default::default()
+        };
+        sync_waiting_actions(&tx, "tm_alice", &body, 5_000).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(count_actions(&conn), 3);
+        let on_you: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions \
+                  WHERE assignee_id = 'tm_self' AND subject_member_id = 'tm_alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(on_you, 2);
+        let on_them: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions \
+                  WHERE assignee_id = 'tm_alice' AND subject_member_id = 'tm_self'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(on_them, 1);
+    }
+
+    #[test]
+    fn sync_waiting_actions_noops_without_self_member() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_alice", false);
+        // No is_self=1 row.
+        let tx = conn.transaction().unwrap();
+        let body = ProfileSnapshotBody {
+            waiting_from_me: vec![waiting("teams", "msg1", "x")],
+            ..Default::default()
+        };
+        sync_waiting_actions(&tx, "tm_alice", &body, 5_000).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(count_actions(&conn), 0);
+    }
 }
