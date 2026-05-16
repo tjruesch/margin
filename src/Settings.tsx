@@ -21,12 +21,17 @@ import {
   setVoyageApiKey,
   startOAuthConnector,
   syncConnectorNow,
+  type ChatTurnMetric,
+  listChatTurnMetrics,
 } from "./file";
+import { PromptInspector } from "./PromptInspector";
+import type { ChatMessageView } from "./ChatMessage";
 import {
   IconChevLeft,
   IconEdit,
   IconHome,
   IconLink,
+  IconSearch,
   IconSettings,
   IconSparkle,
 } from "./icons";
@@ -46,7 +51,8 @@ type Section =
   | "connectors"
   | "editor"
   | "shortcuts"
-  | "data";
+  | "data"
+  | "diagnostics";
 
 export type EditorPrefs = {
   tabSize: number;
@@ -78,6 +84,7 @@ const SECTIONS: {
   { id: "editor", label: "Editor", icon: <IconEdit size={14} sw={1.7} /> },
   { id: "shortcuts", label: "Shortcuts", icon: <IconHome size={14} sw={1.7} /> },
   { id: "data", label: "Data", icon: <IconSettings size={14} sw={1.7} /> },
+  { id: "diagnostics", label: "Diagnostics", icon: <IconSearch size={14} sw={1.7} /> },
 ];
 
 const SECTION_TITLE: Record<Section, string> = {
@@ -87,6 +94,7 @@ const SECTION_TITLE: Record<Section, string> = {
   editor: "Editor",
   shortcuts: "Shortcuts",
   data: "Data",
+  diagnostics: "Diagnostics",
 };
 
 export function Settings({
@@ -278,6 +286,8 @@ export function Settings({
         )}
 
         {active === "data" && <DataSection />}
+
+        {active === "diagnostics" && <DiagnosticsSection />}
         </div>
       </main>
     </div>
@@ -1108,3 +1118,207 @@ function ThemeCard({
 
 export type { Theme };
 export { getTheme };
+
+// ----- Diagnostics (#135) -----------------------------------------------
+
+function DiagnosticsSection() {
+  const [metrics, setMetrics] = useState<ChatTurnMetric[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [inspectFor, setInspectFor] = useState<ChatTurnMetric | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const rows = await listChatTurnMetrics(100);
+        if (!cancelled) {
+          setMetrics(rows);
+          setLoading(false);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          console.error("[diagnostics] listChatTurnMetrics failed:", e);
+          setLoading(false);
+        }
+      }
+    };
+    void refresh();
+    const id = window.setInterval(() => void refresh(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  return (
+    <section className="settings-section">
+      <h2>Diagnostics</h2>
+      <p className="settings-section-intro">
+        Per-turn telemetry for the AI chat. Useful for spotting stale answers,
+        long tool dispatches, or zero-citation responses. Data is captured
+        locally — nothing is uploaded.
+      </p>
+      <DiagnosticsAggregates metrics={metrics} />
+      {loading ? (
+        <p className="settings-placeholder">Loading…</p>
+      ) : metrics.length === 0 ? (
+        <p className="settings-placeholder">
+          No turns recorded yet. Send a message in the chat — turns from
+          this version forward will appear here.
+        </p>
+      ) : (
+        <DiagnosticsTable
+          metrics={metrics}
+          onInspect={(m) => setInspectFor(m)}
+        />
+      )}
+      {inspectFor && (
+        <PromptInspector
+          message={metricToSyntheticMessage(inspectFor)}
+          emittedLabels={inspectFor.citations}
+          onClose={() => setInspectFor(null)}
+        />
+      )}
+    </section>
+  );
+}
+
+function DiagnosticsAggregates({ metrics }: { metrics: ChatTurnMetric[] }) {
+  const total = metrics.length;
+  const avgLatency =
+    total === 0
+      ? 0
+      : Math.round(
+          metrics.reduce((acc, m) => acc + m.latency_ms, 0) / total,
+        );
+  const withTools = metrics.filter((m) => m.tool_call_count > 0).length;
+  const noCitations = metrics.filter(
+    (m) => m.citations.length === 0 && m.assistant_text_chars > 0,
+  ).length;
+  const pct = (n: number) =>
+    total === 0 ? "—" : `${Math.round((100 * n) / total)}%`;
+  return (
+    <div className="diagnostics-aggregates">
+      <AggCard label="Turns" value={total.toLocaleString()} />
+      <AggCard label="Avg latency" value={`${avgLatency.toLocaleString()} ms`} />
+      <AggCard label="Used tools" value={pct(withTools)} />
+      <AggCard label="No citations" value={pct(noCitations)} />
+    </div>
+  );
+}
+
+function AggCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="diagnostics-aggregate-card">
+      <div className="diagnostics-aggregate-value">{value}</div>
+      <div className="diagnostics-aggregate-label">{label}</div>
+    </div>
+  );
+}
+
+function DiagnosticsTable({
+  metrics,
+  onInspect,
+}: {
+  metrics: ChatTurnMetric[];
+  onInspect: (m: ChatTurnMetric) => void;
+}) {
+  return (
+    <div className="diagnostics-table-wrap">
+      <table className="diagnostics-table">
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Query</th>
+            <th className="diagnostics-num">Srcs</th>
+            <th className="diagnostics-num">Cite</th>
+            <th className="diagnostics-num">Tools</th>
+            <th className="diagnostics-num">Tokens</th>
+            <th className="diagnostics-num">Latency</th>
+          </tr>
+        </thead>
+        <tbody>
+          {metrics.map((m) => (
+            <DiagnosticsRow key={m.turn_id} metric={m} onInspect={onInspect} />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function DiagnosticsRow({
+  metric,
+  onInspect,
+}: {
+  metric: ChatTurnMetric;
+  onInspect: (m: ChatTurnMetric) => void;
+}) {
+  const time = new Date(metric.created_ms).toLocaleString();
+  const compactTime = new Date(metric.created_ms).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  const query = metric.query || "(no query stored)";
+  const truncatedQuery = query.length > 80 ? query.slice(0, 77) + "…" : query;
+  const tokens =
+    metric.tokens_out != null
+      ? `${formatTokens(metric.tokens_in)}/${formatTokens(metric.tokens_out)}`
+      : "—";
+  const noCitations =
+    metric.citations.length === 0 && metric.assistant_text_chars > 0;
+  const srcsTooltip = Object.entries(metric.sources_by_kind)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join(" · ");
+  return (
+    <tr
+      className={
+        "diagnostics-row" +
+        (metric.had_error_dispatch ? " diagnostics-row-warn" : "") +
+        (noCitations ? " diagnostics-row-no-citations" : "")
+      }
+      onClick={() => onInspect(metric)}
+      title={time}
+    >
+      <td className="diagnostics-time">{compactTime}</td>
+      <td className="diagnostics-query">
+        {truncatedQuery}
+        {metric.had_error_dispatch && (
+          <span className="diagnostics-warn-icon" title="A tool dispatch errored">
+            {" ⚠"}
+          </span>
+        )}
+      </td>
+      <td className="diagnostics-num" title={srcsTooltip}>
+        {metric.sources_total}
+      </td>
+      <td className="diagnostics-num">{metric.citations.length}</td>
+      <td className="diagnostics-num">{metric.tool_call_count}</td>
+      <td className="diagnostics-num">{tokens}</td>
+      <td className="diagnostics-num">
+        {(metric.latency_ms / 1000).toFixed(metric.latency_ms < 1000 ? 2 : 1)}s
+      </td>
+    </tr>
+  );
+}
+
+function formatTokens(n: number | null): string {
+  if (n == null) return "—";
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return n.toString();
+}
+
+/// Construct a minimal ChatMessageView from a metric row so the
+/// existing PromptInspector can render the citations check. The
+/// inspector's `emittedLabels` override means we don't need the
+/// assistant text itself — just the parsed labels (which the metric
+/// row already carries).
+function metricToSyntheticMessage(m: ChatTurnMetric): ChatMessageView {
+  return {
+    id: `metric-${m.turn_id}`,
+    role: "assistant",
+    parts: [{ kind: "text", value: "" }],
+    status: "done",
+    turnId: m.turn_id,
+  };
+}

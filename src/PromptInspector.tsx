@@ -14,9 +14,14 @@ import { joinText, type ChatMessageView, chipVariant } from "./ChatMessage";
 type Props = {
   message: ChatMessageView;
   onClose: () => void;
+  /** Optional override for the labels the model emitted — used by the
+   *  Diagnostics row click path (#135) where the chat message text
+   *  isn't needed but the citations array is already in the metric
+   *  row. When omitted, citations are derived from `message.parts`. */
+  emittedLabels?: string[];
 };
 
-export function PromptInspector({ message, onClose }: Props) {
+export function PromptInspector({ message, onClose, emittedLabels }: Props) {
   const [dump, setDump] = useState<PromptDump | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -85,7 +90,7 @@ export function PromptInspector({ message, onClose }: Props) {
             {!message.turnId && " (Pre-#134 history.)"}
           </div>
         ) : (
-          <InspectorBody dump={dump} message={message} />
+          <InspectorBody dump={dump} message={message} emittedLabels={emittedLabels} />
         )}
       </div>
     </div>
@@ -95,20 +100,24 @@ export function PromptInspector({ message, onClose }: Props) {
 function InspectorBody({
   dump,
   message,
+  emittedLabels: providedLabels,
 }: {
   dump: PromptDump;
   message: ChatMessageView;
+  emittedLabels?: string[];
 }) {
   // Citations the model actually emitted in its prose. Same regex as
-  // ChatMessage.tsx — handles [N], [E<N>], [W<N>], [T<N>].
+  // ChatMessage.tsx — handles [N], [E<N>], [W<N>], [T<N>]. Skipped when
+  // the caller supplies a pre-parsed list (e.g. Diagnostics row click).
   const emittedLabels = useMemo(() => {
+    if (providedLabels) return providedLabels;
     const text = joinText(message.parts);
     const out = new Set<string>();
     const re = /\[([WET]?\d{1,3})\]/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) out.add(m[1]);
     return Array.from(out);
-  }, [message.parts]);
+  }, [providedLabels, message.parts]);
 
   const sourceLabels = useMemo(() => {
     const out = new Set<string>();

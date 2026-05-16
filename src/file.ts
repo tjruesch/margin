@@ -752,7 +752,35 @@ export type PromptDump = {
   dispatches: PromptDispatch[];
   latency_ms: number;
   created_ms: number;
+  query: string;
+  tokens_in: number | null;
+  tokens_out: number | null;
 };
+
+/** Per-turn telemetry row for the Settings → Diagnostics view (#135).
+ *  Joins prompt_dumps with the assistant chat_messages row to surface
+ *  query, response length, citations, and counts in one shape. */
+export type ChatTurnMetric = {
+  turn_id: string;
+  conversation_id: string | null;
+  created_ms: number;
+  latency_ms: number;
+  query: string;
+  assistant_text_chars: number;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  sources_total: number;
+  sources_by_kind: Record<string, number>;
+  citations: string[];
+  tool_call_count: number;
+  had_error_dispatch: boolean;
+};
+
+export async function listChatTurnMetrics(
+  limit?: number,
+): Promise<ChatTurnMetric[]> {
+  return invoke<ChatTurnMetric[]>("list_chat_turn_metrics", { limit });
+}
 
 /** Fetch the structured prompt dump for an assistant turn. Returns
  *  `null` if no dump was recorded (errored turn, or pre-#134 history).

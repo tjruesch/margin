@@ -246,6 +246,35 @@ pub struct PromptDumpView {
     pub dispatches: serde_json::Value,
     pub latency_ms: i64,
     pub created_ms: i64,
+    pub query: String,
+    pub tokens_in: Option<i64>,
+    pub tokens_out: Option<i64>,
+}
+
+/// Per-turn telemetry row for the Settings → Diagnostics view (#135).
+/// Joins `prompt_dumps` with the assistant `chat_messages` row so the
+/// table can render the original query, the model's response length,
+/// citations, and counts in one go.
+#[derive(Serialize)]
+pub struct ChatTurnMetric {
+    pub turn_id: String,
+    pub conversation_id: Option<String>,
+    pub created_ms: i64,
+    pub latency_ms: i64,
+    pub query: String,
+    /// Length of the assistant message; 0 when no row joined (errored
+    /// turn or a dump landing without its assistant message).
+    pub assistant_text_chars: i64,
+    pub tokens_in: Option<i64>,
+    pub tokens_out: Option<i64>,
+    pub sources_total: i64,
+    /// `{"note": 200, "event": 50, "workstream": 30, "teams_message": 200}`
+    pub sources_by_kind: serde_json::Value,
+    /// Labels (`["T1", "E2", ...]`) the model actually emitted in the
+    /// assistant text. Parsed via the same regex the frontend uses.
+    pub citations: Vec<String>,
+    pub tool_call_count: i64,
+    pub had_error_dispatch: bool,
 }
 
 const SYSTEM_PROMPT: &str = "You are answering questions about the user's personal notes (meeting \
@@ -546,6 +575,7 @@ pub async fn start(
     let app_bg = app.clone();
     let turn_id_bg = turn_id.clone();
     let sources_for_dump = sources.clone();
+    let query_for_dump = query.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(msg) = run_loop(
             &app_bg,
@@ -559,6 +589,7 @@ pub async fn start(
             &teams_messages,
             &user_message,
             &sources_for_dump,
+            &query_for_dump,
         )
         .await
         {
@@ -650,13 +681,23 @@ async fn run_loop(
     // Captured for the prompt-inspector dump (#134). The assembled
     // user-message string and the full source surface go straight to
     // `prompt_dumps` at turn end so the UI can show "what did the AI see?"
-    // post-hoc. Live streaming doesn't need either.
+    // post-hoc. Live streaming doesn't need either. `query` is the raw
+    // user question — stored separately from `prompt` so the diagnostics
+    // view (#135) can render the original text without parsing it back
+    // out of the assembled section dump.
     prompt: &str,
     sources: &[AskSource],
+    query: &str,
 ) -> Result<(), String> {
     let tools = tool_definitions();
     let run_start = std::time::Instant::now();
     let mut dispatches: Vec<DispatchRecord> = Vec::new();
+    // Token accumulators (#135). Multi-pass turns re-send the full
+    // history each pass so input_tokens double-counts repeated context;
+    // it's a directional indicator for the diagnostics view, not a
+    // precise billing metric. The UI labels it accordingly.
+    let mut total_tokens_in: i64 = 0;
+    let mut total_tokens_out: i64 = 0;
 
     for _ in 0..MAX_TOOL_ITERATIONS {
         let body = ApiRequest {
@@ -673,6 +714,8 @@ async fn run_loop(
         };
 
         let pass = stream_pass(app, turn_id, api_key, &body).await?;
+        total_tokens_in += pass.tokens_in;
+        total_tokens_out += pass.tokens_out;
 
         if pass.pending_tool_calls.is_empty() {
             // No tool calls — the model is done with this turn.
@@ -689,6 +732,9 @@ async fn run_loop(
                 sources,
                 &dispatches,
                 run_start.elapsed().as_millis() as i64,
+                query,
+                Some(total_tokens_in),
+                Some(total_tokens_out),
             );
             return Ok(());
         }
@@ -800,7 +846,9 @@ async fn run_loop(
         messages: &messages,
         tools: None,
     };
-    let _ = stream_pass(app, turn_id, api_key, &final_body).await?;
+    let final_pass = stream_pass(app, turn_id, api_key, &final_body).await?;
+    total_tokens_in += final_pass.tokens_in;
+    total_tokens_out += final_pass.tokens_out;
     let _ = app.emit(
         "ai-stream",
         StreamEvent::Done {
@@ -814,6 +862,9 @@ async fn run_loop(
         sources,
         &dispatches,
         run_start.elapsed().as_millis() as i64,
+        query,
+        Some(total_tokens_in),
+        Some(total_tokens_out),
     );
     Ok(())
 }
@@ -952,6 +1003,13 @@ fn tool_definitions() -> serde_json::Value {
 struct PassResult {
     assistant_blocks: Vec<ContentBlock>,
     pending_tool_calls: Vec<PendingToolCall>,
+    /// `usage.input_tokens` from the SSE `message_start` event (#135).
+    /// One pass = one HTTP request, so this is the input cost for that
+    /// specific request. `run_loop` sums across passes.
+    tokens_in: i64,
+    /// `usage.output_tokens` from the SSE `message_delta` event (#135).
+    /// Anthropic streams cumulative counts; the last value wins.
+    tokens_out: i64,
 }
 
 struct PendingToolCall {
@@ -1007,6 +1065,11 @@ async fn stream_pass(
     let mut buf = String::new();
     let mut blocks: std::collections::BTreeMap<u64, BlockState> =
         std::collections::BTreeMap::new();
+    // Token counters for the prompt-inspector telemetry view (#135).
+    // input_tokens comes once on message_start; output_tokens streams
+    // cumulatively on message_delta so the last value is the final.
+    let mut tokens_in: i64 = 0;
+    let mut tokens_out: i64 = 0;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("stream chunk: {e}"))?;
@@ -1115,11 +1178,29 @@ async fn stream_pass(
                     // to do here. The accumulated state finalizes once
                     // the stream ends.
                 }
+                "message_start" => {
+                    // Initial usage payload: `input_tokens` is fixed for
+                    // this request (no output yet). #135 telemetry.
+                    if let Some(t) = parsed
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(|n| n.as_i64())
+                    {
+                        tokens_in = t;
+                    }
+                }
                 "message_delta" => {
-                    // Carries stop_reason on the final delta. We don't
-                    // need to act on it here — pending_tool_calls being
-                    // non-empty is what drives the outer loop's next
-                    // iteration.
+                    // Carries `stop_reason` on the final delta. Also
+                    // carries cumulative `usage.output_tokens` — last
+                    // value wins for #135 telemetry.
+                    if let Some(t) = parsed
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|n| n.as_i64())
+                    {
+                        tokens_out = t;
+                    }
                 }
                 "message_stop" => {
                     // End of this pass; further chunks (if any) won't
@@ -1134,7 +1215,7 @@ async fn stream_pass(
                         .to_string();
                     return Err(msg);
                 }
-                _ => {} // message_start, ping, etc.
+                _ => {} // ping, etc.
             }
         }
     }
@@ -1173,6 +1254,8 @@ async fn stream_pass(
     Ok(PassResult {
         assistant_blocks,
         pending_tool_calls,
+        tokens_in,
+        tokens_out,
     })
 }
 
@@ -2096,6 +2179,9 @@ fn persist_prompt_dump(
     sources: &[AskSource],
     dispatches: &[DispatchRecord],
     latency_ms: i64,
+    query: &str,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
 ) {
     let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
     let conn = match conn_state.lock() {
@@ -2113,6 +2199,9 @@ fn persist_prompt_dump(
         dispatches,
         latency_ms,
         current_unix_ms(),
+        query,
+        tokens_in,
+        tokens_out,
     ) {
         eprintln!("[ask] prompt_dump write failed: {e}");
     }
@@ -2128,6 +2217,9 @@ fn write_prompt_dump(
     dispatches: &[DispatchRecord],
     latency_ms: i64,
     now_ms: i64,
+    query: &str,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
 ) -> rusqlite::Result<()> {
     let tool_names_json =
         serde_json::to_string(TOOL_NAMES).unwrap_or_else(|_| "[]".to_string());
@@ -2137,15 +2229,19 @@ fn write_prompt_dump(
         serde_json::to_string(dispatches).unwrap_or_else(|_| "[]".to_string());
     conn.execute(
         "INSERT INTO prompt_dumps(turn_id, prompt, system_prompt, tool_names_json, \
-                                  sources_json, dispatches_json, latency_ms, created_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                                  sources_json, dispatches_json, latency_ms, created_ms, \
+                                  query, tokens_in, tokens_out) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
          ON CONFLICT(turn_id) DO UPDATE SET \
             prompt = excluded.prompt, \
             system_prompt = excluded.system_prompt, \
             tool_names_json = excluded.tool_names_json, \
             sources_json = excluded.sources_json, \
             dispatches_json = excluded.dispatches_json, \
-            latency_ms = excluded.latency_ms",
+            latency_ms = excluded.latency_ms, \
+            query = excluded.query, \
+            tokens_in = excluded.tokens_in, \
+            tokens_out = excluded.tokens_out",
         rusqlite::params![
             turn_id,
             prompt,
@@ -2155,6 +2251,9 @@ fn write_prompt_dump(
             dispatches_json,
             latency_ms,
             now_ms,
+            query,
+            tokens_in,
+            tokens_out,
         ],
     )?;
     Ok(())
@@ -2170,7 +2269,7 @@ fn read_prompt_dump(
     use rusqlite::OptionalExtension as _;
     conn.query_row(
         "SELECT turn_id, prompt, system_prompt, tool_names_json, sources_json, \
-                dispatches_json, latency_ms, created_ms \
+                dispatches_json, latency_ms, created_ms, query, tokens_in, tokens_out \
          FROM prompt_dumps WHERE turn_id = ?1",
         rusqlite::params![turn_id],
         |r| {
@@ -2189,6 +2288,9 @@ fn read_prompt_dump(
                 dispatches,
                 latency_ms: r.get(6)?,
                 created_ms: r.get(7)?,
+                query: r.get(8)?,
+                tokens_in: r.get(9)?,
+                tokens_out: r.get(10)?,
             })
         },
     )
@@ -2204,6 +2306,141 @@ pub fn get_prompt_dump(
 ) -> Result<Option<PromptDumpView>, String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
     read_prompt_dump(&c, &turn_id).map_err(|e| e.to_string())
+}
+
+/// Parse citation labels (`[N]`, `[E2]`, `[W3]`, `[T7]`) out of the
+/// assistant's response text. Mirrors the regex used frontend-side in
+/// `ChatMessage.tsx` (`/\[([WET]?\d{1,3})\]/g`). Returns labels in
+/// first-appearance order, dedup'd. Hand-rolled to avoid adding the
+/// `regex` crate for one tiny pattern.
+fn extract_citations(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        // Optional single letter prefix (W/E/T).
+        if j < bytes.len() && (bytes[j] == b'W' || bytes[j] == b'E' || bytes[j] == b'T') {
+            j += 1;
+        }
+        // 1..=3 digits.
+        let digit_start = j;
+        while j < bytes.len() && j - digit_start < 3 && bytes[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == digit_start || j >= bytes.len() || bytes[j] != b']' {
+            i += 1;
+            continue;
+        }
+        // `text[start..j]` is the label between the brackets.
+        let label = match std::str::from_utf8(&bytes[start..j]) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                i = j + 1;
+                continue;
+            }
+        };
+        if seen.insert(label.clone()) {
+            out.push(label);
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Aggregate the source list by `kind` for the diagnostics view (#135).
+fn count_sources_by_kind(sources: &serde_json::Value) -> serde_json::Value {
+    let mut by_kind: std::collections::BTreeMap<String, i64> =
+        std::collections::BTreeMap::new();
+    if let Some(arr) = sources.as_array() {
+        for s in arr {
+            if let Some(kind) = s.get("kind").and_then(|v| v.as_str()) {
+                *by_kind.entry(kind.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    serde_json::to_value(by_kind).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// One row of the per-turn telemetry table. Joins `prompt_dumps` with
+/// the assistant `chat_messages` row.
+fn read_chat_turn_metrics(
+    conn: &rusqlite::Connection,
+    limit: usize,
+) -> rusqlite::Result<Vec<ChatTurnMetric>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.turn_id, cm.conversation_id, p.created_ms, p.latency_ms, p.query, \
+                COALESCE(LENGTH(cm.text), 0) AS assistant_text_chars, \
+                p.tokens_in, p.tokens_out, p.sources_json, p.dispatches_json, \
+                cm.text \
+           FROM prompt_dumps p \
+           LEFT JOIN chat_messages cm \
+                  ON cm.turn_id = p.turn_id AND cm.role = 'assistant' \
+          ORDER BY p.created_ms DESC \
+          LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![limit as i64], |r| {
+        let sources_json: String = r.get(8)?;
+        let sources: serde_json::Value =
+            serde_json::from_str(&sources_json).unwrap_or_else(|_| serde_json::json!([]));
+        let dispatches_json: String = r.get(9)?;
+        let dispatches: serde_json::Value =
+            serde_json::from_str(&dispatches_json).unwrap_or_else(|_| serde_json::json!([]));
+        let assistant_text: Option<String> = r.get(10)?;
+        let citations = match assistant_text.as_deref() {
+            Some(t) => extract_citations(t),
+            None => Vec::new(),
+        };
+        let sources_total = sources
+            .as_array()
+            .map(|a| a.len() as i64)
+            .unwrap_or(0);
+        let sources_by_kind = count_sources_by_kind(&sources);
+        let (tool_call_count, had_error) = match dispatches.as_array() {
+            Some(arr) => (
+                arr.len() as i64,
+                arr.iter().any(|d| {
+                    d.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false)
+                }),
+            ),
+            None => (0, false),
+        };
+        Ok(ChatTurnMetric {
+            turn_id: r.get(0)?,
+            conversation_id: r.get(1)?,
+            created_ms: r.get(2)?,
+            latency_ms: r.get(3)?,
+            query: r.get(4)?,
+            assistant_text_chars: r.get(5)?,
+            tokens_in: r.get(6)?,
+            tokens_out: r.get(7)?,
+            sources_total,
+            sources_by_kind,
+            citations,
+            tool_call_count,
+            had_error_dispatch: had_error,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+}
+
+/// List recent chat turns with derived telemetry for the Diagnostics
+/// view (#135). Default cap of 100 rows; bumpable via the optional
+/// `limit` param. All compute happens server-side per row — cheap at
+/// the scale we're operating (single-user, thousands of turns lifetime).
+#[tauri::command]
+pub fn list_chat_turn_metrics(
+    limit: Option<usize>,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<ChatTurnMetric>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    read_chat_turn_metrics(&c, limit.unwrap_or(100)).map_err(|e| e.to_string())
 }
 
 fn truncate_chars(s: &str, cap: usize) -> String {
@@ -3601,6 +3838,24 @@ mod tests {
         .unwrap();
         conn.execute_batch(include_str!("migrations/036_prompt_dumps.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("migrations/037_prompt_dumps_telemetry.sql"))
+            .unwrap();
+        // `list_chat_turn_metrics` joins `chat_messages`; create a
+        // minimal schema (no FK, simpler than running migration 035)
+        // so the LEFT JOIN has a target even when no rows are seeded.
+        conn.execute_batch(
+            "CREATE TABLE chat_messages (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                sources_json TEXT,
+                tool_calls_json TEXT,
+                turn_id TEXT,
+                created_ms INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
         conn
     }
 
@@ -3633,14 +3888,28 @@ mod tests {
         let conn = dump_test_db();
         let sources = vec![make_source(AskSourceKind::Note, "1", "Note A")];
         let dispatches = vec![make_dispatch("read_note", "body of note", false)];
-        write_prompt_dump(&conn, "turn_x", "the prompt body", &sources, &dispatches, 1234, 9_000)
-            .unwrap();
+        write_prompt_dump(
+            &conn,
+            "turn_x",
+            "the prompt body",
+            &sources,
+            &dispatches,
+            1234,
+            9_000,
+            "what's up",
+            Some(500),
+            Some(120),
+        )
+        .unwrap();
 
         let dump = read_prompt_dump(&conn, "turn_x").unwrap().expect("row");
         assert_eq!(dump.turn_id, "turn_x");
         assert_eq!(dump.prompt, "the prompt body");
         assert_eq!(dump.latency_ms, 1234);
         assert_eq!(dump.created_ms, 9_000);
+        assert_eq!(dump.query, "what's up");
+        assert_eq!(dump.tokens_in, Some(500));
+        assert_eq!(dump.tokens_out, Some(120));
         assert!(dump.system_prompt.contains("personal notes"), "system_prompt captured");
         assert!(dump.tool_names.iter().any(|n| n == "read_teams_message"), "tool names list");
         assert_eq!(dump.sources[0]["label"].as_str(), Some("1"));
@@ -3659,8 +3928,15 @@ mod tests {
         let conn = dump_test_db();
         let sources_a = vec![make_source(AskSourceKind::Note, "1", "First")];
         let sources_b = vec![make_source(AskSourceKind::Note, "2", "Second")];
-        write_prompt_dump(&conn, "turn_x", "first attempt", &sources_a, &[], 100, 1_000).unwrap();
-        write_prompt_dump(&conn, "turn_x", "second attempt", &sources_b, &[], 200, 2_000).unwrap();
+        write_prompt_dump(
+            &conn, "turn_x", "first attempt", &sources_a, &[], 100, 1_000, "q1", None, None,
+        )
+        .unwrap();
+        write_prompt_dump(
+            &conn, "turn_x", "second attempt", &sources_b, &[], 200, 2_000, "q2",
+            Some(900), Some(50),
+        )
+        .unwrap();
         let dump = read_prompt_dump(&conn, "turn_x").unwrap().expect("row");
         assert_eq!(dump.prompt, "second attempt");
         assert_eq!(dump.latency_ms, 200);
@@ -3693,5 +3969,113 @@ mod tests {
         let listed: std::collections::HashSet<String> =
             TOOL_NAMES.iter().map(|n| n.to_string()).collect();
         assert_eq!(defined, listed, "TOOL_NAMES out of sync with tool_definitions()");
+    }
+
+    // ----- #135 telemetry -------------------------------------------------
+
+    #[test]
+    fn extract_citations_picks_up_all_label_shapes() {
+        let text = "First note [1] then event [E12] then workstream [W3] then teams [T7].";
+        assert_eq!(extract_citations(text), vec!["1", "E12", "W3", "T7"]);
+    }
+
+    #[test]
+    fn extract_citations_dedupes_in_first_appearance_order() {
+        let text = "Cite [1] again [E2] and again [1] and [E2] and finally [W9].";
+        assert_eq!(extract_citations(text), vec!["1", "E2", "W9"]);
+    }
+
+    #[test]
+    fn extract_citations_skips_malformed_brackets() {
+        // No digits, too many digits, missing closing bracket, lowercase prefix.
+        let text = "[] [1234] [E12 [w9] [T999]";
+        assert_eq!(extract_citations(text), vec!["T999"]);
+    }
+
+    /// Seed a `chat_messages` row associated with a prompt dump's
+    /// turn_id so the metrics join produces a complete row.
+    fn seed_chat_message_for_metric(
+        conn: &rusqlite::Connection,
+        turn_id: &str,
+        text: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO chat_messages(id, conversation_id, role, text, turn_id, created_ms) \
+             VALUES (?1, 'conv_1', 'assistant', ?2, ?3, 1000)",
+            rusqlite::params![format!("msg_{turn_id}"), text, turn_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_chat_turn_metrics_joins_and_orders_correctly() {
+        let conn = dump_test_db();
+        // Two dumps at different times + matching chat messages.
+        let sources = vec![make_source(AskSourceKind::Note, "1", "A")];
+        write_prompt_dump(
+            &conn, "turn_a", "p1", &sources, &[], 50, 1_000, "q-a", Some(100), Some(20),
+        )
+        .unwrap();
+        write_prompt_dump(
+            &conn, "turn_b", "p2", &sources, &[], 75, 2_000, "q-b", Some(200), Some(30),
+        )
+        .unwrap();
+        seed_chat_message_for_metric(&conn, "turn_a", "see [1]");
+        seed_chat_message_for_metric(&conn, "turn_b", "no citations here");
+
+        let metrics = read_chat_turn_metrics(&conn, 10).unwrap();
+        assert_eq!(metrics.len(), 2);
+        // DESC by created_ms.
+        assert_eq!(metrics[0].turn_id, "turn_b");
+        assert_eq!(metrics[1].turn_id, "turn_a");
+        assert_eq!(metrics[1].citations, vec!["1"]);
+        assert!(metrics[0].citations.is_empty());
+        assert_eq!(metrics[0].assistant_text_chars, "no citations here".len() as i64);
+        assert_eq!(metrics[0].query, "q-b");
+        assert_eq!(metrics[0].tokens_in, Some(200));
+    }
+
+    #[test]
+    fn list_chat_turn_metrics_handles_missing_chat_message() {
+        let conn = dump_test_db();
+        write_prompt_dump(
+            &conn, "orphan", "p", &[], &[], 10, 1_000, "q", Some(5), Some(2),
+        )
+        .unwrap();
+        // No matching chat_messages row → assistant_text_chars = 0,
+        // citations = [], but the dump fields still come through.
+        let metrics = read_chat_turn_metrics(&conn, 10).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].turn_id, "orphan");
+        assert_eq!(metrics[0].assistant_text_chars, 0);
+        assert!(metrics[0].citations.is_empty());
+        assert_eq!(metrics[0].query, "q");
+    }
+
+    #[test]
+    fn list_chat_turn_metrics_counts_sources_and_dispatches() {
+        let conn = dump_test_db();
+        let sources = vec![
+            make_source(AskSourceKind::Note, "1", "A"),
+            make_source(AskSourceKind::Note, "2", "B"),
+            make_source(AskSourceKind::Event, "E1", "X"),
+            make_source(AskSourceKind::TeamsMessage, "T1", "Y"),
+        ];
+        let dispatches = vec![
+            make_dispatch("read_note", "body", false),
+            make_dispatch("read_event_details", "evt", true),  // error!
+        ];
+        write_prompt_dump(
+            &conn, "turn_z", "p", &sources, &dispatches, 100, 1_000, "q",
+            None, None,
+        )
+        .unwrap();
+        let metrics = read_chat_turn_metrics(&conn, 10).unwrap();
+        assert_eq!(metrics[0].sources_total, 4);
+        assert_eq!(metrics[0].sources_by_kind["note"], 2);
+        assert_eq!(metrics[0].sources_by_kind["event"], 1);
+        assert_eq!(metrics[0].sources_by_kind["teams_message"], 1);
+        assert_eq!(metrics[0].tool_call_count, 2);
+        assert!(metrics[0].had_error_dispatch);
     }
 }

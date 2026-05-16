@@ -8279,3 +8279,105 @@ button.workstream-external-chip:hover {
   max-height: 50vh;
   overflow-y: auto;
 }
+
+/* ----- Settings → Diagnostics (#135) ------------------------------------ */
+
+.diagnostics-aggregates {
+  display: flex;
+  gap: 12px;
+  margin: 8px 0 16px;
+  flex-wrap: wrap;
+}
+.diagnostics-aggregate-card {
+  flex: 1 1 0;
+  min-width: 120px;
+  padding: 12px 14px;
+  border: 0.5px solid var(--home-line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.diagnostics-aggregate-value {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.diagnostics-aggregate-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+  margin-top: 2px;
+}
+
+.diagnostics-table-wrap {
+  border: 0.5px solid var(--home-line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.diagnostics-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.diagnostics-table th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+  padding: 8px 10px;
+  background: var(--home-chip);
+  border-bottom: 0.5px solid var(--home-line);
+  position: sticky;
+  top: 0;
+}
+.diagnostics-table td {
+  padding: 8px 10px;
+  border-bottom: 0.5px solid color-mix(in srgb, var(--home-line) 60%, transparent);
+  vertical-align: middle;
+}
+.diagnostics-table tr:last-child td {
+  border-bottom: none;
+}
+.diagnostics-num {
+  text-align: right;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.diagnostics-time {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+.diagnostics-query {
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diagnostics-row {
+  cursor: pointer;
+  transition: background 80ms ease;
+}
+.diagnostics-row:hover {
+  background: var(--home-chip);
+}
+.diagnostics-row-warn {
+  background: color-mix(in srgb, #c44a1f 6%, transparent);
+}
+.diagnostics-row-warn:hover {
+  background: color-mix(in srgb, #c44a1f 12%, transparent);
+}
+.diagnostics-row-no-citations {
+  background: color-mix(in srgb, var(--fg-muted) 6%, transparent);
+}
+.diagnostics-row-no-citations:hover {
+  background: color-mix(in srgb, var(--fg-muted) 12%, transparent);
+}
+.diagnostics-warn-icon {
+  color: #c44a1f;
+  font-weight: 600;
+}

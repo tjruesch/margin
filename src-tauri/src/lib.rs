@@ -587,6 +587,7 @@ pub fn run() {
             chat::append_chat_message,
             chat::clear_active_conversation,
             ask::get_prompt_dump,
+            ask::list_chat_turn_metrics,
             edges::commands::synthesize_edges,
             workstreams::commands::list_workstreams,
             workstreams::commands::create_workstream,
