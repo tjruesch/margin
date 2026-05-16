@@ -8,8 +8,9 @@
 //! profile". Older rows are kept for history.
 //!
 //! Reconcile (#48) and AI ask both read attendee/team context from
-//! the latest snapshot per person instead of the obsolete
-//! `team_members.profile_md_path` files (post-#112).
+//! the latest snapshot per person — the legacy
+//! `team_members.profile_md_path` column and on-disk files were
+//! retired by #117.
 //!
 //! Architecture:
 //! - `persist` — schema row shapes, get_latest/get_latest_map,

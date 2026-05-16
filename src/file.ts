@@ -1149,7 +1149,6 @@ export type TeamMember = {
   display_name: string;
   role: string;
   aliases: TypedAlias[];
-  profile_md_path: string;
   is_self: boolean;
   created_ms: number;
   updated_ms: number;

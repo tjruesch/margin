@@ -669,8 +669,8 @@ mod tests {
     fn seed_member(conn: &rusqlite::Connection, id: &str, is_self: bool) {
         conn.execute(
             "INSERT INTO team_members \
-                (id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES (?1, ?1, '', '', ?2, 0, 0)",
+                (id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES (?1, ?1, '', ?2, 0, 0)",
             params![id, is_self as i64],
         )
         .unwrap();

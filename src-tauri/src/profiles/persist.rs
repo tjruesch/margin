@@ -316,13 +316,12 @@ mod tests {
     }
 
     fn seed_member(conn: &Connection, id: &str, is_self: bool) {
-        // The `aliases` JSON column was dropped in migration 017
-        // (typed_aliases); aliases now live in `team_member_aliases`.
+        // `aliases` dropped in #017 (typed_aliases); `profile_md_path`
+        // dropped in #117 (DB-backed snapshots replace the on-disk file).
         conn.execute(
             "INSERT INTO team_members(id, display_name, role, \
-                                       profile_md_path, is_self, \
-                                       created_ms, updated_ms) \
-             VALUES (?1, ?1, '', '', ?2, 0, 0)",
+                                       is_self, created_ms, updated_ms) \
+             VALUES (?1, ?1, '', ?2, 0, 0)",
             params![id, is_self as i64],
         )
         .unwrap();

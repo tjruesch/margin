@@ -364,8 +364,8 @@ mod tests {
 
     fn seed_self(conn: &Connection, id: &str, email: &str) {
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES (?1, 'Me', '', '/x/self.md', 1, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES (?1, 'Me', '', 1, 0, 0)",
             params![id],
         )
         .unwrap();
@@ -378,8 +378,8 @@ mod tests {
 
     fn seed_teammate(conn: &Connection, id: &str, email: &str, display_name: &str) {
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES (?1, ?2, '', '/x/m.md', 0, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES (?1, ?2, '', 0, 0, 0)",
             params![id, display_name],
         )
         .unwrap();

@@ -700,14 +700,14 @@ mod tests {
 
     fn seed_self_and_teammate(conn: &Connection) {
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES ('tm_self', 'Me', '', '/x/self.md', 1, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES ('tm_self', 'Me', '', 1, 0, 0)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES ('tm_alice', 'Alice Smith', '', '/x/a.md', 0, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES ('tm_alice', 'Alice Smith', '', 0, 0, 0)",
             [],
         )
         .unwrap();
@@ -981,8 +981,8 @@ mod tests {
         // distinct from "o" / "ss" — that's a documented limitation of
         // fold_for_match. We test the standard combining-mark case here.)
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES ('tm_soren', 'Soren', '', '/x/s.md', 0, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES ('tm_soren', 'Soren', '', 0, 0, 0)",
             [],
         )
         .unwrap();
@@ -1046,7 +1046,6 @@ mod tests {
                 kind: "name".into(),
                 value: "Alice".into(),
             }],
-            profile_md_path: String::new(),
             is_self: false,
             created_ms: 0,
             updated_ms: 0,

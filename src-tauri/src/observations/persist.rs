@@ -180,9 +180,9 @@ mod tests {
     fn seed_member(conn: &Connection, id: &str, display: &str) {
         conn.execute(
             "INSERT INTO team_members \
-                (id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES (?1, ?2, '', ?3, 0, 0, 0)",
-            params![id, display, format!("/x/{id}.md")],
+                (id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES (?1, ?2, '', 0, 0, 0)",
+            params![id, display],
         )
         .unwrap();
     }

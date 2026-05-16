@@ -64,8 +64,8 @@ mod tests {
         // Seed the team_member referenced by actor_id; events.actor_id
         // has an FK to team_members(id).
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES ('tm_self', 'Me', '', '/x/self.md', 1, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES ('tm_self', 'Me', '', 1, 0, 0)",
             [],
         )
         .unwrap();

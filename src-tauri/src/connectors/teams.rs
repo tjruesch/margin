@@ -479,16 +479,15 @@ mod tests {
         assert_eq!(n, 1);
     }
 
-    /// Seed a team_members row. `aliases` was dropped in migration 017
-    /// so the post-migration schema is (id, display_name, role,
-    /// profile_md_path, is_self, created_ms, updated_ms).
+    /// Seed a team_members row. Post-migration schema (after #017 +
+    /// #117) is (id, display_name, role, is_self, created_ms, updated_ms).
     fn seed_member(conn: &Connection, id: &str, name: &str, is_self: bool) {
         conn.execute(
             "INSERT INTO team_members(\
-                id, display_name, role, profile_md_path, \
+                id, display_name, role, \
                 is_self, created_ms, updated_ms\
-             ) VALUES (?1, ?2, '', ?3, ?4, 0, 0)",
-            params![id, name, format!("/tmp/{}.md", id), is_self as i64],
+             ) VALUES (?1, ?2, '', ?3, 0, 0)",
+            params![id, name, is_self as i64],
         )
         .unwrap();
     }

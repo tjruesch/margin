@@ -667,9 +667,9 @@ mod tests {
     fn seed_member(conn: &Connection, id: &str) {
         conn.execute(
             "INSERT INTO team_members \
-                (id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES (?1, ?1, '', ?2, 0, 0, 0)",
-            params![id, format!("/x/{id}.md")],
+                (id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES (?1, ?1, '', 0, 0, 0)",
+            params![id],
         )
         .unwrap();
     }

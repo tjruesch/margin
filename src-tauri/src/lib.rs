@@ -426,6 +426,12 @@ pub fn run() {
             if let Err(e) = team::bootstrap_self_if_missing(&mut conn) {
                 eprintln!("team bootstrap failed at boot: {e}");
             }
+            // #117: one-shot sweep of orphan ~/.margin/team/<id>/profile.md
+            // files. Gated by the profile_md_purged meta flag so it
+            // only runs once per install.
+            if let Err(e) = team::purge_profile_md_if_pending(&conn) {
+                eprintln!("profile.md purge failed at boot: {e}");
+            }
 
             // Connector registry: holds kind-factory mappings + live
             // connector instances. Real connector modules register

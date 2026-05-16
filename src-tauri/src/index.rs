@@ -62,7 +62,8 @@ const SCHEMA_V28: &str = include_str!("migrations/028_profile_snapshots.sql");
 const SCHEMA_V29: &str = include_str!("migrations/029_profile_observations.sql");
 const SCHEMA_V30: &str = include_str!("migrations/030_action_waiting.sql");
 const SCHEMA_V31: &str = include_str!("migrations/031_auto_resolve_hysteresis.sql");
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_V32: &str = include_str!("migrations/032_drop_profile_md_path.sql");
+const SCHEMA_VERSION: i64 = 32;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -279,6 +280,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 30 {
         conn.execute_batch(SCHEMA_V31)?;
         version = 31;
+    }
+    if version == 31 {
+        conn.execute_batch(SCHEMA_V32)?;
+        version = 32;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
@@ -1733,14 +1738,14 @@ mod tests {
     /// every backfill test below.
     fn seed_self_and_teammate(conn: &Connection) {
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES ('tm_self', 'Me', '', '/x/self.md', 1, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES ('tm_self', 'Me', '', 1, 0, 0)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, created_ms, updated_ms) \
-             VALUES ('tm_bob', 'Bob', '', '/x/bob.md', 0, 0, 0)",
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES ('tm_bob', 'Bob', '', 0, 0, 0)",
             [],
         )
         .unwrap();

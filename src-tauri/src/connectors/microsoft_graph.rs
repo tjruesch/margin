@@ -1268,7 +1268,6 @@ mod tests {
                     value: (*v).to_string(),
                 })
                 .collect(),
-            profile_md_path: String::new(),
             is_self: false,
             created_ms: 0,
             updated_ms: 0,

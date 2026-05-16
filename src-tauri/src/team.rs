@@ -1,24 +1,19 @@
 //! Team-member CRUD, the `meeting_attendees` join, and `actions.assignee_id`
 //! writes.
 //!
-//! Profile bodies live on disk as `~/.margin/team/<member_id>/profile.md`,
-//! outside the notes index. The `team_members.profile_md_path` column
-//! stores the absolute path so the frontend can read/write the body via
-//! the generic `read_file` / `write_file` commands.
-//!
-//! Self bootstrap runs once at app start (see `lib.rs::setup`), inserting
-//! a single `is_self = 1` row if none exists. The partial unique index
-//! `idx_team_self` guarantees there can never be more than one Self.
+//! Profile bodies live in the DB (`profile_snapshots`, #107) after the
+//! legacy on-disk `profile.md` files were retired by #117. The Self
+//! bootstrap below runs once at app start (see `lib.rs::setup`),
+//! inserting a single `is_self = 1` row if none exists. The partial
+//! unique index `idx_team_self` guarantees there can never be more
+//! than one Self.
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
-
-use crate::paths;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TeamMember {
@@ -26,7 +21,6 @@ pub struct TeamMember {
     pub display_name: String,
     pub role: String,
     pub aliases: Vec<TypedAlias>,
-    pub profile_md_path: String,
     pub is_self: bool,
     pub created_ms: i64,
     pub updated_ms: i64,
@@ -54,29 +48,10 @@ fn now_ms() -> i64 {
     chrono::Local::now().timestamp_millis()
 }
 
-fn member_dir(id: &str) -> PathBuf {
-    paths::team_dir().join(id)
-}
-
-fn profile_path_for(id: &str) -> PathBuf {
-    member_dir(id).join("profile.md")
-}
-
-fn write_stub_profile(profile_path: &Path, display_name: &str) -> Result<(), String> {
-    if let Some(parent) = profile_path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    if !profile_path.exists() {
-        fs::write(profile_path, format!("# {}\n", display_name)).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 fn row_to_member(
     id: String,
     display_name: String,
     role: String,
-    profile_md_path: String,
     is_self: i64,
     created_ms: i64,
     updated_ms: i64,
@@ -88,14 +63,13 @@ fn row_to_member(
         // Aliases are joined separately to avoid a JSON column. Callers
         // populate this Vec via `attach_aliases` after the main query.
         aliases: Vec::new(),
-        profile_md_path,
         is_self: is_self != 0,
         created_ms,
         updated_ms,
     }
 }
 
-const SELECT_MEMBER_COLS: &str = "id, display_name, role, profile_md_path, is_self, \
+const SELECT_MEMBER_COLS: &str = "id, display_name, role, is_self, \
                                   created_ms, updated_ms";
 
 /// Read all alias rows for the given member ids in a single query, then
@@ -153,7 +127,6 @@ fn fetch_one(conn: &Connection, id: &str) -> Result<TeamMember, String> {
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
-                r.get(6)?,
             ))
         })
         .optional()
@@ -195,13 +168,53 @@ pub fn bootstrap_self_if_missing(conn: &mut Connection) -> Result<(), String> {
 
     let id = uuid::Uuid::new_v4().to_string();
     let display_name = default_self_display_name();
-    let profile_md_path = profile_path_for(&id);
-    write_stub_profile(&profile_md_path, &display_name)?;
     let now = now_ms();
     conn.execute(
-        "INSERT INTO team_members(id, display_name, role, profile_md_path, is_self, \
-         created_ms, updated_ms) VALUES (?1, ?2, '', ?3, 1, ?4, ?4)",
-        params![id, display_name, profile_md_path.to_string_lossy().to_string(), now],
+        "INSERT INTO team_members(id, display_name, role, is_self, \
+         created_ms, updated_ms) VALUES (?1, ?2, '', 1, ?3, ?3)",
+        params![id, display_name, now],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// One-shot boot sweep: delete every orphan `~/.margin/team/<id>/profile.md`
+/// left behind by pre-#107 installs (#117). Gated on the
+/// `profile_md_purged` meta flag so it only runs once per install.
+/// Failures are logged, never fatal — the column-drop migration is
+/// authoritative; the on-disk cleanup is best-effort.
+pub fn purge_profile_md_if_pending(conn: &Connection) -> Result<(), String> {
+    let done: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'profile_md_purged'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "1".into());
+    if done == "1" {
+        return Ok(());
+    }
+    let ids: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM team_members")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(Result::ok).collect()
+    };
+    let team_root = crate::paths::team_dir();
+    for id in ids {
+        let path = team_root.join(&id).join("profile.md");
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(&path) {
+                eprintln!("[#117] could not remove {}: {e}", path.display());
+            }
+        }
+    }
+    conn.execute(
+        "UPDATE meta SET value = '1' WHERE key = 'profile_md_purged'",
+        [],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -226,7 +239,6 @@ pub(crate) fn list_team_members_raw(conn: &Connection) -> Result<Vec<TeamMember>
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
-                r.get(6)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -331,22 +343,14 @@ pub fn create_team_member(
         return Err("display_name is required".to_string());
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let profile_md_path = profile_path_for(&id);
-    write_stub_profile(&profile_md_path, trimmed)?;
     let now = now_ms();
     {
         let mut c = conn.lock().map_err(|e| e.to_string())?;
         let tx = c.transaction().map_err(|e| e.to_string())?;
         tx.execute(
-            "INSERT INTO team_members(id, display_name, role, profile_md_path, \
-             is_self, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5)",
-            params![
-                id,
-                trimmed,
-                role,
-                profile_md_path.to_string_lossy().to_string(),
-                now,
-            ],
+            "INSERT INTO team_members(id, display_name, role, \
+             is_self, created_ms, updated_ms) VALUES (?1, ?2, ?3, 0, ?4, ?4)",
+            params![id, trimmed, role, now],
         )
         .map_err(|e| e.to_string())?;
         write_aliases(&tx, &id, &aliases).map_err(|e| e.to_string())?;
@@ -457,12 +461,13 @@ pub fn delete_team_member(
         c.execute("DELETE FROM team_members WHERE id = ?1", params![id])
             .map_err(|e| e.to_string())?;
     }
-    let dir = member_dir(&id);
+    // Best-effort bundle cleanup. The bundle is now legacy (the
+    // profile.md it once held was pruned in #117), but the directory
+    // may still exist on older installs — remove it when the member
+    // is deleted to keep the team_dir tidy.
+    let dir = crate::paths::team_dir().join(&id);
     if dir.exists() {
         if let Err(e) = fs::remove_dir_all(&dir) {
-            // DB row is already gone; surface a soft error so the user
-            // knows the bundle leaked but the operation otherwise
-            // succeeded.
             eprintln!("team: failed to remove {}: {e}", dir.display());
         }
     }
@@ -527,7 +532,6 @@ pub(crate) fn list_meeting_attendees(
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
-                r.get(6)?,
             ))
         })
         .map_err(|e| e.to_string())?;
@@ -564,7 +568,6 @@ mod tests {
                     value: (*v).to_string(),
                 })
                 .collect(),
-            profile_md_path: String::new(),
             is_self: false,
             created_ms: 0,
             updated_ms: 0,

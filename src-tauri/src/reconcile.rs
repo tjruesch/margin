@@ -943,7 +943,6 @@ mod tests {
                     value: (*v).to_string(),
                 })
                 .collect(),
-            profile_md_path: format!("/tmp/{}.md", name),
             is_self,
             created_ms: 0,
             updated_ms: 0,
