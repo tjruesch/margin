@@ -4343,6 +4343,60 @@ input.nh-title {
   font-size: 12.5px;
 }
 
+/* ----- Profile snapshot diff (#118) ----- */
+.team-profile-compare {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.team-profile-compare-select {
+  font-size: 12px;
+  padding: 2px 8px;
+}
+.team-profile-compare-empty {
+  font-size: 12px;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+/* Prev value when a field changed between the compared snapshots.
+   Strikethrough + muted color; stacks above the current value. */
+.team-profile-diff-prev {
+  display: inline-block;
+  margin-right: 6px;
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--fg) 30%, transparent);
+  color: var(--fg-muted);
+  font-weight: normal;
+}
+.team-profile-summary-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.team-profile-summary-block .team-profile-diff-prev {
+  font-size: 14px;
+  display: block;
+  margin: 0;
+}
+/* Chip that appeared in the latest snapshot but not the comparison. */
+.team-profile-chip--added {
+  border: 1px dashed color-mix(in srgb, #4ade80 55%, transparent);
+}
+/* Chip that existed in the comparison but is gone now. */
+.team-profile-chip--removed {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--fg) 30%, transparent);
+  color: var(--fg-muted);
+  border: 1px dashed color-mix(in srgb, var(--fg) 25%, transparent);
+}
+.team-profile-diff-rank {
+  font-size: 10px;
+  opacity: 0.7;
+  margin-left: 4px;
+}
+
 /* ----- Suggestions tab (#52) ----- */
 
 .team-suggestions {

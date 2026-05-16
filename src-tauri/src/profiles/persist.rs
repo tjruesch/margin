@@ -82,6 +82,28 @@ pub struct ProfileSnapshot {
     pub source_hash: String,
 }
 
+/// Hydrate a row from `profile_snapshots` into a `ProfileSnapshot`.
+/// A malformed `body_json` shouldn't take callers down — log + return
+/// an empty body. The worker will recompute on the next eligible pass.
+fn hydrate_snapshot(
+    person_id: &str,
+    computed_ms: i64,
+    body_json: String,
+    source_hash: String,
+) -> ProfileSnapshot {
+    let body = serde_json::from_str::<ProfileSnapshotBody>(&body_json)
+        .unwrap_or_else(|e| {
+            eprintln!("[profiles] body_json parse failed for {person_id}: {e}");
+            ProfileSnapshotBody::default()
+        });
+    ProfileSnapshot {
+        person_id: person_id.to_string(),
+        computed_ms,
+        body,
+        source_hash,
+    }
+}
+
 /// Most-recent snapshot for `person_id`, or `None` when never
 /// computed.
 pub fn get_latest_for_person(
@@ -99,24 +121,62 @@ pub fn get_latest_for_person(
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let (computed_ms, body_json, source_hash) = match row {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    // A malformed body_json shouldn't take down callers — log + return
-    // an empty body. The worker will recompute on the next eligible
-    // pass.
-    let body = serde_json::from_str::<ProfileSnapshotBody>(&body_json)
-        .unwrap_or_else(|e| {
-            eprintln!("[profiles] body_json parse failed for {person_id}: {e}");
-            ProfileSnapshotBody::default()
-        });
-    Ok(Some(ProfileSnapshot {
-        person_id: person_id.to_string(),
-        computed_ms,
-        body,
-        source_hash,
-    }))
+    Ok(row.map(|(ms, json, hash)| hydrate_snapshot(person_id, ms, json, hash)))
+}
+
+/// Latest snapshot strictly older than `before_ms` for `person_id` (#118).
+/// Drives the "Compared to: 7d / 30d ago" affordance — index-backed
+/// via `idx_profile_person_time (person_id, computed_ms DESC)`.
+pub fn get_snapshot_before(
+    conn: &Connection,
+    person_id: &str,
+    before_ms: i64,
+) -> rusqlite::Result<Option<ProfileSnapshot>> {
+    let row: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT computed_ms, body_json, source_hash \
+               FROM profile_snapshots \
+              WHERE person_id = ?1 AND computed_ms < ?2 \
+              ORDER BY computed_ms DESC \
+              LIMIT 1",
+            params![person_id, before_ms],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(ms, json, hash)| hydrate_snapshot(person_id, ms, json, hash)))
+}
+
+/// Oldest snapshot ever stored for `person_id` (#118). Used by the
+/// "Compared to: first snapshot" dropdown option.
+pub fn get_first_snapshot(
+    conn: &Connection,
+    person_id: &str,
+) -> rusqlite::Result<Option<ProfileSnapshot>> {
+    let row: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT computed_ms, body_json, source_hash \
+               FROM profile_snapshots \
+              WHERE person_id = ?1 \
+              ORDER BY computed_ms ASC \
+              LIMIT 1",
+            params![person_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(ms, json, hash)| hydrate_snapshot(person_id, ms, json, hash)))
+}
+
+/// Count of snapshots for `person_id` (#118). Drives the empty-state
+/// copy on the Profile tab when only one snapshot has been recorded.
+pub fn count_snapshots_for(
+    conn: &Connection,
+    person_id: &str,
+) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM profile_snapshots WHERE person_id = ?1",
+        params![person_id],
+        |r| r.get(0),
+    )
 }
 
 /// Bulk-fetch the latest snapshot for each id in `member_ids`. Ids
@@ -513,5 +573,60 @@ mod tests {
         seed_event(&conn, "tm_bob", 9_000);
         assert_eq!(last_event_ms_for(&conn, "tm_alice").unwrap(), Some(2_000));
         assert_eq!(last_event_ms_for(&conn, "tm_bob").unwrap(), Some(9_000));
+    }
+
+    /// `get_snapshot_before` returns the most-recent row that
+    /// predates the cutoff — drives the 7d/30d-ago compare path.
+    #[test]
+    fn get_snapshot_before_returns_most_recent_predating_cutoff() {
+        let mut conn = fresh_conn();
+        seed_member(&conn, "tm_a", false);
+        let body = ProfileSnapshotBody::default();
+        ins(&mut conn, "tm_a", 1_000, &body, "h-1").unwrap();
+        ins(&mut conn, "tm_a", 2_000, &body, "h-2").unwrap();
+        ins(&mut conn, "tm_a", 3_000, &body, "h-3").unwrap();
+        let got = get_snapshot_before(&conn, "tm_a", 2_500).unwrap().unwrap();
+        assert_eq!(got.computed_ms, 2_000);
+    }
+
+    /// Cutoff older than every recorded snapshot → None.
+    #[test]
+    fn get_snapshot_before_returns_none_when_all_newer() {
+        let mut conn = fresh_conn();
+        seed_member(&conn, "tm_a", false);
+        let body = ProfileSnapshotBody::default();
+        ins(&mut conn, "tm_a", 5_000, &body, "h-5").unwrap();
+        assert!(get_snapshot_before(&conn, "tm_a", 1_000).unwrap().is_none());
+    }
+
+    /// `get_first_snapshot` returns the oldest row — drives the
+    /// "Compare to: first snapshot" dropdown option.
+    #[test]
+    fn get_first_snapshot_returns_oldest() {
+        let mut conn = fresh_conn();
+        seed_member(&conn, "tm_a", false);
+        let body = ProfileSnapshotBody::default();
+        ins(&mut conn, "tm_a", 1_000, &body, "h-1").unwrap();
+        ins(&mut conn, "tm_a", 2_000, &body, "h-2").unwrap();
+        ins(&mut conn, "tm_a", 3_000, &body, "h-3").unwrap();
+        let got = get_first_snapshot(&conn, "tm_a").unwrap().unwrap();
+        assert_eq!(got.computed_ms, 1_000);
+    }
+
+    /// `count_snapshots_for` returns the total, including zero.
+    #[test]
+    fn count_snapshots_for_returns_total() {
+        let mut conn = fresh_conn();
+        seed_member(&conn, "tm_a", false);
+        seed_member(&conn, "tm_b", false);
+        assert_eq!(count_snapshots_for(&conn, "tm_a").unwrap(), 0);
+        let body = ProfileSnapshotBody::default();
+        ins(&mut conn, "tm_a", 1_000, &body, "h-1").unwrap();
+        ins(&mut conn, "tm_a", 2_000, &body, "h-2").unwrap();
+        ins(&mut conn, "tm_a", 3_000, &body, "h-3").unwrap();
+        // Per-person isolation.
+        ins(&mut conn, "tm_b", 4_000, &body, "h-4").unwrap();
+        assert_eq!(count_snapshots_for(&conn, "tm_a").unwrap(), 3);
+        assert_eq!(count_snapshots_for(&conn, "tm_b").unwrap(), 1);
     }
 }

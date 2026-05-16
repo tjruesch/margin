@@ -157,6 +157,34 @@ export async function forceRecomputeProfile(
   return invoke<ProfileSnapshot>("force_recompute_profile", { memberId });
 }
 
+/** Latest snapshot strictly older than `beforeMs` (#118). Drives the
+ *  "Compared to: 7d / 30d ago" dropdown on the Profile tab. */
+export async function getProfileSnapshotAt(
+  memberId: string,
+  beforeMs: number,
+): Promise<ProfileSnapshot | null> {
+  return invoke<ProfileSnapshot | null>("get_profile_snapshot_at", {
+    memberId,
+    beforeMs,
+  });
+}
+
+/** Oldest snapshot ever recorded for `memberId` (#118). Used by the
+ *  "Compared to: first snapshot" dropdown option. */
+export async function getFirstProfileSnapshot(
+  memberId: string,
+): Promise<ProfileSnapshot | null> {
+  return invoke<ProfileSnapshot | null>("get_first_profile_snapshot", {
+    memberId,
+  });
+}
+
+/** Total snapshots stored for `memberId` (#118). The Profile tab
+ *  renders an empty-state when this is <= 1 since nothing to diff. */
+export async function countProfileSnapshots(memberId: string): Promise<number> {
+  return invoke<number>("count_profile_snapshots", { memberId });
+}
+
 export type TeamWaitingCounts = {
   from_me: number;
   for_them: number;

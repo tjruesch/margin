@@ -10,15 +10,19 @@ import {
   type ActionListItem,
   type ProfileObservation,
   type ProfileSnapshot,
+  type ProfileSnapshotBody,
   type TeamMember,
   type TeamWaitingCounts,
   type TypedAlias,
   acceptProfileObservation,
+  countProfileSnapshots,
   createTeamMember,
   deleteTeamMember,
   dismissWaitingAction,
   forceRecomputeProfile,
+  getFirstProfileSnapshot,
   getProfileSnapshot,
+  getProfileSnapshotAt,
   listActions,
   listProfileObservations,
   listTeamMembers,
@@ -919,6 +923,49 @@ function ProfileSnapshotPane({
   );
 }
 
+// ---------- Profile snapshot diff helpers (#118) -------------------------
+
+type CompareTo = "none" | "7d" | "30d" | "first";
+
+/// Set-diff a pair of keyed arrays into added / removed / unchanged
+/// + rank-shifted items (#118). Rank shifts trigger only when an
+/// item exists in both arrays at materially different positions
+/// (delta >= 2) — anything tighter is noise from small reorderings.
+function diffByKey<T>(
+  prev: readonly T[],
+  next: readonly T[],
+  key: (t: T) => string,
+): {
+  added: T[];
+  removed: T[];
+  unchanged: T[];
+  rankByKey: Map<string, { prevRank: number; nextRank: number }>;
+} {
+  const prevByKey = new Map(prev.map((p, i) => [key(p), { item: p, rank: i }]));
+  const nextByKey = new Map(next.map((n, i) => [key(n), { item: n, rank: i }]));
+  const added: T[] = [];
+  const removed: T[] = [];
+  const unchanged: T[] = [];
+  const rankByKey = new Map<string, { prevRank: number; nextRank: number }>();
+  for (const n of next) {
+    const k = key(n);
+    if (prevByKey.has(k)) {
+      unchanged.push(n);
+      const prevRank = prevByKey.get(k)!.rank;
+      const nextRank = nextByKey.get(k)!.rank;
+      if (Math.abs(prevRank - nextRank) >= 2) {
+        rankByKey.set(k, { prevRank, nextRank });
+      }
+    } else {
+      added.push(n);
+    }
+  }
+  for (const p of prev) {
+    if (!nextByKey.has(key(p))) removed.push(p);
+  }
+  return { added, removed, unchanged, rankByKey };
+}
+
 function ProfileSnapshotView({
   snap,
   members,
@@ -954,6 +1001,67 @@ function ProfileSnapshotView({
 
   const { body, computed_ms, person_id } = snap;
   const subject = memberById.get(person_id);
+
+  // Compare-to state (#118). When `compareTo !== 'none'`, fetch the
+  // older snapshot and diff per field. Empty-state when only one
+  // snapshot exists for this member.
+  const [compareTo, setCompareTo] = useState<CompareTo>("none");
+  const [compareSnap, setCompareSnap] = useState<ProfileSnapshot | null>(null);
+  const [snapshotCount, setSnapshotCount] = useState<number>(1);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const n = await countProfileSnapshots(person_id);
+        if (!cancelled) setSnapshotCount(n);
+      } catch (e) {
+        console.error("countProfileSnapshots failed:", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [person_id]);
+
+  // Reset compareTo when navigating to a different member.
+  useEffect(() => {
+    setCompareTo("none");
+    setCompareSnap(null);
+  }, [person_id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (compareTo === "none") {
+      setCompareSnap(null);
+      return;
+    }
+    void (async () => {
+      try {
+        let result: ProfileSnapshot | null = null;
+        if (compareTo === "first") {
+          result = await getFirstProfileSnapshot(person_id);
+          // Only useful if the first snapshot is actually older than
+          // the current one.
+          if (result && result.computed_ms >= computed_ms) result = null;
+        } else {
+          const days = compareTo === "7d" ? 7 : 30;
+          const cutoff = Date.now() - days * 24 * 3600 * 1000;
+          result = await getProfileSnapshotAt(person_id, cutoff);
+        }
+        if (!cancelled) setCompareSnap(result);
+      } catch (e) {
+        console.error("getProfileSnapshotAt failed:", e);
+        if (!cancelled) setCompareSnap(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [compareTo, person_id, computed_ms]);
+
+  const compareBody: ProfileSnapshotBody | null = compareSnap?.body ?? null;
+
   // The team_members.role is already shown in the page header. Suppress
   // the snapshot's observed-role echo when it agrees; only surface it
   // when the AI has noticed a drift.
@@ -970,6 +1078,45 @@ function ProfileSnapshotView({
     return m != null && !m.is_self;
   });
   const focus = body.recent_focus ?? [];
+
+  // Per-field diffs (#118). When compareBody is null, every diff is
+  // empty — the existing render is the unchanged path through the
+  // same JSX.
+  const focusDiff = useMemo(
+    () =>
+      diffByKey(
+        compareBody?.recent_focus ?? [],
+        focus,
+        (f) => f.workstream_id,
+      ),
+    [compareBody, focus],
+  );
+  const collabDiff = useMemo(
+    () =>
+      diffByKey(
+        (compareBody?.frequent_collaborators ?? []).filter((c) => {
+          const m = memberById.get(c.person_id);
+          return m != null && !m.is_self;
+        }),
+        collaborators,
+        (c) => c.person_id,
+      ),
+    [compareBody, collaborators, memberById],
+  );
+  const roleChanged =
+    compareBody != null &&
+    (compareBody.role_observed ?? "") !== (body.role_observed ?? "");
+  const styleChanged =
+    compareBody != null &&
+    (compareBody.communication_style_notes ?? "") !==
+      (body.communication_style_notes ?? "");
+  const summaryChanged =
+    compareBody != null &&
+    (compareBody.summary_prose ?? "") !== (body.summary_prose ?? "");
+  const workingHoursChanged =
+    compareBody != null &&
+    JSON.stringify(compareBody.working_hours_observed ?? null) !==
+      JSON.stringify(body.working_hours_observed ?? null);
   // Resolve cited observation ids to their full ProfileObservation rows;
   // silently skip ids that no longer match an accepted observation
   // (rejected/deleted since the snapshot was computed — stale cite).
@@ -997,11 +1144,22 @@ function ProfileSnapshotView({
           <div className="team-profile-strip">
             {observedRoleDiffers && body.role_observed && (
               <span className="team-profile-strip-emphasis">
-                {body.role_observed}
+                {roleChanged && compareBody?.role_observed && (
+                  <span className="team-profile-diff-prev">
+                    {compareBody.role_observed}
+                  </span>
+                )}
+                <span>{body.role_observed}</span>
               </span>
             )}
             {body.working_hours_observed && (
               <span className="team-profile-strip-item">
+                {workingHoursChanged && compareBody?.working_hours_observed && (
+                  <span className="team-profile-diff-prev">
+                    {compareBody.working_hours_observed.start_local} →{" "}
+                    {compareBody.working_hours_observed.end_local}
+                  </span>
+                )}
                 {body.working_hours_observed.start_local} →{" "}
                 {body.working_hours_observed.end_local}
               </span>
@@ -1014,7 +1172,14 @@ function ProfileSnapshotView({
           </div>
         )}
         {body.summary_prose ? (
-          <p className="team-profile-summary">{body.summary_prose}</p>
+          <div className="team-profile-summary-block">
+            {summaryChanged && compareBody?.summary_prose && (
+              <p className="team-profile-summary team-profile-diff-prev">
+                {compareBody.summary_prose}
+              </p>
+            )}
+            <p className="team-profile-summary">{body.summary_prose}</p>
+          </div>
         ) : (
           <p className="team-profile-summary team-profile-summary--placeholder">
             A short portrait of {firstName} appears here once Margin has
@@ -1086,16 +1251,43 @@ function ProfileSnapshotView({
           hero without competing with it. Sections only render when
           their data is non-empty. */}
       <div className="team-profile-glance">
-        {focus.length > 0 && (
+        {(focus.length > 0 || focusDiff.removed.length > 0) && (
           <section className="team-profile-glance-row">
             <h4 className="team-profile-glance-label">Working on</h4>
             <div className="team-profile-chips">
-              {focus.map((f) => (
+              {focus.map((f) => {
+                const isAdded =
+                  compareBody != null &&
+                  focusDiff.added.some(
+                    (x) => x.workstream_id === f.workstream_id,
+                  );
+                const shift = focusDiff.rankByKey.get(f.workstream_id);
+                return (
+                  <button
+                    key={f.workstream_id}
+                    type="button"
+                    className={
+                      "team-profile-chip" +
+                      (isAdded ? " team-profile-chip--added" : "")
+                    }
+                    onClick={() => onOpenWorkstream(f.workstream_id)}
+                  >
+                    <span>{f.title}</span>
+                    {shift && (
+                      <span className="team-profile-diff-rank">
+                        {shift.nextRank < shift.prevRank ? "↑" : "↓"}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              {focusDiff.removed.map((f) => (
                 <button
-                  key={f.workstream_id}
+                  key={`-${f.workstream_id}`}
                   type="button"
-                  className="team-profile-chip"
+                  className="team-profile-chip team-profile-chip--removed"
                   onClick={() => onOpenWorkstream(f.workstream_id)}
+                  title="Dropped since the comparison snapshot"
                 >
                   <span>{f.title}</span>
                 </button>
@@ -1104,20 +1296,48 @@ function ProfileSnapshotView({
           </section>
         )}
 
-        {collaborators.length > 0 && (
+        {(collaborators.length > 0 || collabDiff.removed.length > 0) && (
           <section className="team-profile-glance-row">
             <h4 className="team-profile-glance-label">Often with</h4>
             <div className="team-profile-chips">
               {collaborators.map((c) => {
                 const m = memberById.get(c.person_id);
                 if (!m) return null;
+                const isAdded =
+                  compareBody != null &&
+                  collabDiff.added.some((x) => x.person_id === c.person_id);
+                const shift = collabDiff.rankByKey.get(c.person_id);
                 return (
                   <button
                     key={c.person_id}
                     type="button"
-                    className="team-profile-chip team-profile-chip--avatar"
+                    className={
+                      "team-profile-chip team-profile-chip--avatar" +
+                      (isAdded ? " team-profile-chip--added" : "")
+                    }
                     title={c.evidence}
                     onClick={() => onSelectMember(c.person_id)}
+                  >
+                    <Avatar member={m} size={18} />
+                    <span>{m.display_name}</span>
+                    {shift && (
+                      <span className="team-profile-diff-rank">
+                        {shift.nextRank < shift.prevRank ? "↑" : "↓"}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+              {collabDiff.removed.map((c) => {
+                const m = memberById.get(c.person_id);
+                if (!m) return null;
+                return (
+                  <button
+                    key={`-${c.person_id}`}
+                    type="button"
+                    className="team-profile-chip team-profile-chip--avatar team-profile-chip--removed"
+                    onClick={() => onSelectMember(c.person_id)}
+                    title="No longer cited as a frequent collaborator"
                   >
                     <Avatar member={m} size={18} />
                     <span>{m.display_name}</span>
@@ -1131,6 +1351,11 @@ function ProfileSnapshotView({
         {body.communication_style_notes && (
           <section className="team-profile-glance-row">
             <h4 className="team-profile-glance-label">Communication style</h4>
+            {styleChanged && compareBody?.communication_style_notes && (
+              <p className="team-profile-style team-profile-diff-prev">
+                {compareBody.communication_style_notes}
+              </p>
+            )}
             <p className="team-profile-style">
               {body.communication_style_notes}
             </p>
@@ -1159,6 +1384,30 @@ function ProfileSnapshotView({
 
       <div className="team-profile-meta">
         <span>Computed {formatRelative(computed_ms)}</span>
+        {snapshotCount > 1 ? (
+          <label className="team-profile-compare">
+            Compare to:
+            <select
+              className="settings-btn team-profile-compare-select"
+              value={compareTo}
+              onChange={(e) => setCompareTo(e.target.value as CompareTo)}
+            >
+              <option value="none">Latest only</option>
+              <option value="7d">7 days ago</option>
+              <option value="30d">30 days ago</option>
+              <option value="first">First snapshot</option>
+            </select>
+          </label>
+        ) : (
+          <span className="team-profile-compare-empty">
+            Only one snapshot — give the worker time to record changes.
+          </span>
+        )}
+        {compareTo !== "none" && compareSnap == null && (
+          <span className="team-profile-compare-empty">
+            No earlier snapshot available.
+          </span>
+        )}
         <button
           type="button"
           className="settings-btn"
