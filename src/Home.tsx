@@ -27,6 +27,7 @@ import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
 import { type NotificationRecord, unreadCount } from "./notifications";
 import { NotificationsPanel } from "./NotificationsPanel";
+import { ChatPage } from "./ChatPage";
 import { SearchPalette } from "./SearchPalette";
 import { TeamView } from "./Team";
 import { WorkstreamsView } from "./Workstreams";
@@ -128,6 +129,7 @@ type Props = {
 
 type NavId =
   | "home"
+  | "chat"
   | "actions"
   | "openquestions"
   | "workstreams"
@@ -484,6 +486,7 @@ export function Home({
   useEffect(() => {
     const VALID: NavId[] = [
       "home",
+      "chat",
       "actions",
       "workstreams",
       "favorites",
@@ -700,6 +703,9 @@ export function Home({
             onNewNote={onNewNote}
             onNewMeeting={onNewMeeting}
           />
+        ) : nav === "chat" ? (
+          // ChatPage renders its own header with a Clear button.
+          null
         ) : (
           detailOpenCount > 0 ? null : (
             <PageHeader
@@ -717,7 +723,12 @@ export function Home({
           <UpcomingStrip events={upcoming} onOpen={openEventNote} />
         )}
 
-        {nav === "team" ? (
+        {nav === "chat" ? (
+          <ChatPage
+            onOpenNote={onOpen}
+            onOpenWorkstream={openWorkstream}
+          />
+        ) : nav === "team" ? (
           <TeamView
             onOpenNote={onOpen}
             onOpenWorkstream={openWorkstream}
@@ -849,6 +860,12 @@ function Sidebar({
           label="Home"
           active={active === "home"}
           onClick={() => onSelect("home")}
+        />
+        <NavItem
+          icon={<IconSparkle size={14} sw={1.7} />}
+          label="Chat"
+          active={active === "chat"}
+          onClick={() => onSelect("chat")}
         />
         <NavItem
           icon={<IconChecklist size={14} sw={1.7} />}
@@ -1116,6 +1133,7 @@ function renderScopedActions(
     case "favorites":
     case "archive":
     case "home":
+    case "chat":
       return null;
   }
 }
@@ -1138,6 +1156,9 @@ function pageHeaderTitle(nav: NavId): string {
       // Home renders the Greeting variant; this branch is unreachable
       // from the call site but kept exhaustive for the compiler.
       return "Margin";
+    case "chat":
+      // Chat renders its own header; unreachable from the call site.
+      return "Chat";
   }
 }
 

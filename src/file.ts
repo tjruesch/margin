@@ -573,7 +573,7 @@ export async function searchNotes(query: string, limit = 20): Promise<SearchHit[
 
 // --- AI Q&A (#31 follow-up) ---------------------------------------------
 
-export type AskSourceKind = "note" | "event" | "workstream";
+export type AskSourceKind = "note" | "event" | "workstream" | "teams_message";
 
 /** A single citation source the model can reference. Notes use `[N]`
  *  labels (e.g. `"3"`), events use `[E<N>]` labels (e.g. `"E2"`),
@@ -593,9 +593,14 @@ export type AskSource = {
   /** Set when `kind === "event"`. Click handler invokes
    *  `openOrCreateEventNote(event_id)` (#62). */
   event_id?: string;
-  /** Set when `kind === "workstream"`. Click handler dispatches
-   *  `margin:open-workstream` with this id (#72). */
+  /** Set when `kind === "workstream"`, or when `kind === "teams_message"`
+   *  and the message is attached to a workstream (so the chip click has
+   *  a destination). Dispatches `margin:open-workstream`. */
   workstream_id?: string;
+  /** Set when `kind === "teams_message"` (#136). Carried for a future
+   *  dedicated message-viewer surface; not used by the v1 chip click
+   *  (which falls through to `workstream_id`). */
+  teams_message_id?: string;
 };
 
 export type ChatTurn = {
@@ -653,6 +658,79 @@ export async function askNotesStart(
   model?: string,
 ): Promise<void> {
   return invoke<void>("ask_notes_start", { turnId, query, history, model });
+}
+
+// --- Persistent chat conversations (#chat-page) --------------------------
+
+/** Shape of a tool call we stored alongside an assistant message — what
+ *  the `ai-stream` `tool_use_start` + `_done` events together produce.
+ *  Render-only metadata; the model doesn't see this on replay. */
+export type ChatToolCall = {
+  tool_id: string;
+  name: string;
+  target_label: string;
+  target_title: string;
+  target_kind: AskSourceKind;
+  status: "ok" | "error" | "running";
+};
+
+export type ChatConversation = {
+  id: string;
+  title: string | null;
+  created_ms: number;
+  last_message_ms: number;
+};
+
+export type ChatMessageRow = {
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant";
+  text: string;
+  created_ms: number;
+  turn_id: string | null;
+  sources: AskSource[];
+  tool_calls: ChatToolCall[];
+};
+
+/** Most-recent active conversation; lazy-creates if none exists. */
+export async function getActiveConversation(): Promise<ChatConversation> {
+  return invoke<ChatConversation>("get_active_conversation");
+}
+
+/** Chronological (oldest-first) messages, capped at `limit` newest. */
+export async function listChatMessages(
+  conversationId: string,
+  limit?: number,
+): Promise<ChatMessageRow[]> {
+  return invoke<ChatMessageRow[]>("list_chat_messages", {
+    conversationId,
+    limit,
+  });
+}
+
+/** Persist one message. Pass `sources`/`toolCalls` for assistant rows
+ *  so the chip strip and tool pills survive a reload. */
+export async function appendChatMessage(
+  conversationId: string,
+  role: "user" | "assistant",
+  text: string,
+  sources?: AskSource[],
+  toolCalls?: ChatToolCall[],
+  turnId?: string,
+): Promise<ChatMessageRow> {
+  return invoke<ChatMessageRow>("append_chat_message", {
+    conversationId,
+    role,
+    text,
+    sources: sources ?? null,
+    toolCalls: toolCalls ?? null,
+    turnId: turnId ?? null,
+  });
+}
+
+/** Archive the current active conversation and return a fresh one. */
+export async function clearActiveConversation(): Promise<ChatConversation> {
+  return invoke<ChatConversation>("clear_active_conversation");
 }
 
 // --- Voice mode (#57) ----------------------------------------------------

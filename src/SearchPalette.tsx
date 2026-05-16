@@ -1,12 +1,6 @@
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
-  type AiStreamEvent,
-  type AskSource,
-  askNotesStart,
-  type MessagePart,
-  openOrCreateEventNote,
   searchNotes,
   SEARCH_HIGHLIGHT_CLOSE,
   SEARCH_HIGHLIGHT_OPEN,
@@ -15,15 +9,15 @@ import {
   stopVoiceRecording,
 } from "./file";
 import { LevelMeter } from "./LevelMeter";
-import { render as renderMarkdown } from "./markdown";
 import {
   IconArrowRight,
-  IconCheck,
   IconFileText,
   IconMic,
   IconSearch,
   IconSparkle,
 } from "./icons";
+import { Conversation } from "./ChatMessage";
+import { useChat } from "./ChatProvider";
 
 type Props = {
   open: boolean;
@@ -37,35 +31,11 @@ type Props = {
 
 const QUERY_DEBOUNCE_MS = 120;
 
-type ChatMessage = {
-  id: string;
-  role: "user" | "assistant";
-  /** Ordered list of parts. User messages always have a single text
-   *  part (the user can't trigger tools directly). Assistant messages
-   *  interleave text deltas and tool-use markers in the order the
-   *  model emitted them. */
-  parts: MessagePart[];
-  /** Assistant-only — populated by the `sources` event before any
-   *  `delta` arrives so chips can render alongside the streaming text. */
-  sources?: AskSource[];
-  status: "streaming" | "done" | "error";
-  error?: string;
-  /** The turn_id returned by `ask_notes_start`; used to filter the
-   *  Tauri `ai-stream` channel to events for this message. Only set on
-   *  assistant messages. */
-  turnId?: string;
-};
-
-/// Concatenate all text parts of a message, ignoring tool parts. Used
-/// for citation parsing (regex over the whole prose) and for shipping
-/// history back to the backend (which only stores plain text content).
-function joinText(parts: MessagePart[]): string {
-  let out = "";
-  for (const p of parts) {
-    if (p.kind === "text") out += p.value;
-  }
-  return out;
-}
+type VoiceState =
+  | { kind: "off" }
+  | { kind: "recording" }
+  | { kind: "transcribing" }
+  | { kind: "didnt-catch"; message?: string };
 
 /// Search palette + AI Q&A surface (#31).
 ///
@@ -76,22 +46,20 @@ function joinText(parts: MessagePart[]): string {
 ///     Plain Enter submits the next turn.
 ///
 /// Cmd+Enter from search escalates to chat (sends the current input as
-/// the first user turn). Esc closes and resets everything.
-type VoiceState =
-  | { kind: "off" }
-  | { kind: "recording" }
-  | { kind: "transcribing" }
-  | { kind: "didnt-catch"; message?: string };
-
+/// the first user turn). Esc closes and resets the search-mode UI
+/// state, but the chat transcript persists across opens via
+/// `useChat()` — the same conversation is rendered on the dedicated
+/// Chat page.
 export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: Props) {
   const [mode, setMode] = useState<"search" | "chat">("search");
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [loading, setLoading] = useState(false);
   const [activeIdx, setActiveIdx] = useState(0);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [voiceState, setVoiceState] = useState<VoiceState>({ kind: "off" });
   const voiceModeActive = voiceState.kind !== "off";
+
+  const { messages, isStreaming, sendMessage } = useChat();
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
@@ -101,13 +69,13 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
   // from a slower keystroke must not overwrite a newer one's results.
   const queryGen = useRef(0);
 
-  // Reset everything on close. Focus the input on open.
+  // Reset search-mode UI state on close. Chat transcript lives in the
+  // provider and intentionally survives open/close cycles (#chat-page).
   useEffect(() => {
     if (!open) {
       setMode("search");
       setQuery("");
       setHits([]);
-      setMessages([]);
       setLoading(false);
       setActiveIdx(0);
       setVoiceState({ kind: "off" });
@@ -170,12 +138,10 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
       if (e.key !== "Escape") return;
       e.preventDefault();
       if (voiceState.kind === "recording") {
-        // Best-effort cancel; don't await.
         void stopVoiceRecording().catch(() => {});
       }
       if (voiceState.kind !== "off") {
         setVoiceState({ kind: "off" });
-        // Returns to whichever non-voice mode (search/chat) was active.
         return;
       }
       onClose();
@@ -201,90 +167,6 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
     conversationRef.current.scrollTop = conversationRef.current.scrollHeight;
   }, [mode, messages]);
 
-  // Tauri `ai-stream` subscription. Active only while open and in chat
-  // mode (search-only sessions don't need the listener). Cleanup
-  // unsubscribes; the listener filters on turn_id so events from a
-  // closed palette can't mutate state for a fresh open.
-  useEffect(() => {
-    if (!open || mode !== "chat") return;
-    let unlisten: UnlistenFn | null = null;
-    let cancelled = false;
-    (async () => {
-      const fn = await listen<AiStreamEvent>("ai-stream", (event) => {
-        const ev = event.payload;
-        setMessages((prev) =>
-          prev.map((m) => {
-            if (m.role !== "assistant" || m.turnId !== ev.turn_id) return m;
-            if (ev.kind === "sources") {
-              return { ...m, sources: ev.sources };
-            }
-            if (ev.kind === "delta") {
-              // Append to the trailing text part if there is one,
-              // otherwise push a new text part. Crucial for ordering:
-              // a tool pill in the middle of streaming text must not
-              // get its trailing text appended onto its `value`.
-              const last = m.parts[m.parts.length - 1];
-              if (last && last.kind === "text") {
-                const updated: MessagePart[] = [...m.parts];
-                updated[updated.length - 1] = {
-                  kind: "text",
-                  value: last.value + ev.text,
-                };
-                return { ...m, parts: updated };
-              }
-              return {
-                ...m,
-                parts: [...m.parts, { kind: "text", value: ev.text }],
-              };
-            }
-            if (ev.kind === "tool_use_start") {
-              return {
-                ...m,
-                parts: [
-                  ...m.parts,
-                  {
-                    kind: "tool",
-                    toolId: ev.tool_id,
-                    name: ev.name,
-                    targetN: ev.target_n,
-                    targetTitle: ev.target_title,
-                    targetLabel: ev.target_label,
-                    targetKind: ev.target_kind,
-                    status: "running",
-                  },
-                ],
-              };
-            }
-            if (ev.kind === "tool_use_done") {
-              const updated: MessagePart[] = m.parts.map((p) =>
-                p.kind === "tool" && p.toolId === ev.tool_id
-                  ? { ...p, status: ev.ok ? "ok" : "error" }
-                  : p,
-              );
-              return { ...m, parts: updated };
-            }
-            if (ev.kind === "done") {
-              return { ...m, status: "done" };
-            }
-            if (ev.kind === "error") {
-              return { ...m, status: "error", error: ev.message };
-            }
-            return m;
-          }),
-        );
-      });
-      if (cancelled) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    })();
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
-    };
-  }, [open, mode]);
-
   // While voice is recording (from a button mousedown), watch for a
   // window-level mouseup to end recording — the mic button itself
   // unmounts as soon as state flips to "recording" (replaced by the
@@ -296,13 +178,10 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
     const onUp = () => void endVoice();
     window.addEventListener("mouseup", onUp);
     return () => window.removeEventListener("mouseup", onUp);
-    // endVoice closes over voiceState via React's state updater
-    // functions, so ESLint exhaustive-deps would flag it; safe to skip.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [voiceState.kind]);
 
   const beginVoice = async () => {
-    // Idempotent: already-armed presses are no-ops.
     if (voiceState.kind === "recording" || voiceState.kind === "transcribing") {
       return;
     }
@@ -328,16 +207,11 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
         setVoiceState({ kind: "didnt-catch", message: r.text });
         return;
       }
-      // Append rather than replace so a user who started typing then
-      // voiced the rest gets composite input. Trim avoids double spaces
-      // when the existing query already ends with whitespace.
       setQuery((prev) => {
         const sep = prev.length > 0 && !prev.endsWith(" ") ? " " : "";
         return prev + sep + r.text;
       });
       setVoiceState({ kind: "off" });
-      // Defer focus: the input is being re-enabled, the focus call has
-      // to land after React applies the disabled=false update.
       setTimeout(() => inputRef.current?.focus(), 0);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -346,14 +220,7 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
   };
 
   // CustomEvent bridge for Home.tsx's space-hold listener. Must be
-  // registered on MOUNT (not gated on `open`) because Home.tsx
-  // dispatches the event synchronously inside the keydown handler that
-  // also calls setPaletteOpen — if registration were gated on open,
-  // the listener wouldn't exist yet when the event fires.
-  //
-  // Refs let the listener always invoke the latest closure of
-  // beginVoice/endVoice (which read voiceState etc. directly) without
-  // re-registering on every render.
+  // registered on MOUNT (not gated on `open`).
   const beginVoiceRef = useRef(beginVoice);
   const endVoiceRef = useRef(endVoice);
   beginVoiceRef.current = beginVoice;
@@ -371,64 +238,19 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
 
   if (!open) return null;
 
-  const isAnyStreaming = messages.some(
-    (m) => m.role === "assistant" && m.status === "streaming",
-  );
-
   const submitChatTurn = async (text: string) => {
     const trimmed = text.trim();
-    if (trimmed.length === 0 || isAnyStreaming) return;
-    const userMsg: ChatMessage = {
-      id: cryptoId(),
-      role: "user",
-      parts: [{ kind: "text", value: trimmed }],
-      status: "done",
-    };
-    // Generate turn_id up-front so it lands on the message before the
-    // backend's `Sources` event can arrive at the listener.
-    const turnId = cryptoId();
-    const assistantMsg: ChatMessage = {
-      id: cryptoId(),
-      role: "assistant",
-      parts: [],
-      status: "streaming",
-      turnId,
-    };
-    // History: every prior message at the moment of submit, in send
-    // order. Tool parts are dropped — the model only sees prose
-    // history. Backend stores history as plain {role, content} strings.
-    const history = messages.map((m) => ({
-      role: m.role,
-      content: joinText(m.parts),
-    }));
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+    if (trimmed.length === 0 || isStreaming) return;
     setQuery("");
     setMode("chat");
-    try {
-      await askNotesStart(turnId, trimmed, history);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantMsg.id
-            ? { ...m, status: "error", error: message }
-            : m,
-        ),
-      );
-    }
+    await sendMessage(trimmed);
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
       e.preventDefault();
-      // Esc in voice mode cancels back to the prior search/chat mode
-      // rather than closing the whole palette — gives the user a way
-      // to back out of a misfired ⇧⌘K.
       if (voiceModeActive) {
         if (voiceState.kind === "recording") {
-          // Best-effort: tell the backend to stop and discard the
-          // recording. We don't await — the UI returns to off
-          // immediately.
           void stopVoiceRecording().catch(() => {});
         }
         setVoiceState({ kind: "off" });
@@ -439,7 +261,6 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
     }
     if (mode === "search") {
       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-        // Escalate to AI ask.
         e.preventDefault();
         if (query.trim().length > 0) submitChatTurn(query);
         return;
@@ -460,7 +281,6 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
         }
       }
     } else {
-      // chat mode — Enter sends a follow-up turn.
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         if (query.trim().length > 0) submitChatTurn(query);
@@ -470,7 +290,7 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
 
   const placeholder =
     mode === "chat"
-      ? isAnyStreaming
+      ? isStreaming
         ? "Waiting for answer…"
         : "Ask a follow-up…"
       : "Search notes — ⌘↵ to ask AI";
@@ -510,7 +330,7 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
               placeholder={placeholder}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              disabled={mode === "chat" && isAnyStreaming}
+              disabled={mode === "chat" && isStreaming}
               spellCheck={false}
               autoCorrect="off"
               autoCapitalize="off"
@@ -520,10 +340,6 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
               className="palette-mic"
               aria-label="Hold to record voice query"
               title="Hold to record (or hold space)"
-              // Hold-to-record. mousedown/touchstart begin, the
-              // matching up/cancel events end. Pointer events would
-              // unify these but onMouseDown / onMouseUp work fine on
-              // both desktop platforms we ship to.
               onMouseDown={(e) => {
                 e.preventDefault();
                 void beginVoice();
@@ -536,7 +352,7 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
                 type="button"
                 className="palette-send"
                 aria-label="Send message"
-                disabled={query.trim().length === 0 || isAnyStreaming}
+                disabled={query.trim().length === 0 || isStreaming}
                 onClick={() => submitChatTurn(query)}
               >
                 <IconArrowRight size={13} sw={1.7} />
@@ -666,286 +482,6 @@ function SearchResults({
   );
 }
 
-function Conversation({
-  ref,
-  messages,
-  onOpenNote,
-  onOpenWorkstream,
-}: {
-  ref: React.RefObject<HTMLDivElement | null>;
-  messages: ChatMessage[];
-  onOpenNote: (path: string) => void;
-  onOpenWorkstream: (workstreamId: string) => void;
-}) {
-  return (
-    <div className="palette-conversation" ref={ref}>
-      {messages.map((m) => (
-        <MessageBubble
-          key={m.id}
-          message={m}
-          onOpenNote={onOpenNote}
-          onOpenWorkstream={onOpenWorkstream}
-        />
-      ))}
-    </div>
-  );
-}
-
-function MessageBubble({
-  message,
-  onOpenNote,
-  onOpenWorkstream,
-}: {
-  message: ChatMessage;
-  onOpenNote: (path: string) => void;
-  onOpenWorkstream: (workstreamId: string) => void;
-}) {
-  if (message.role === "user") {
-    return (
-      <div className="palette-msg palette-msg-user">
-        <div className="palette-msg-bubble">{joinText(message.parts)}</div>
-      </div>
-    );
-  }
-  // Assistant
-  if (message.status === "error") {
-    return (
-      <div className="palette-msg palette-msg-assistant">
-        <div className="palette-msg-bubble palette-msg-error">
-          {message.error || "Something went wrong."}
-        </div>
-      </div>
-    );
-  }
-  const sources = message.sources || [];
-  const fullText = joinText(message.parts);
-  // Render chips only for labels the model actually cited across all
-  // text parts. The full directory + schedule + workstreams can be
-  // hundreds of entries — showing all of them would be a wall of
-  // chips. `[N]` (notes), `[E<N>]` (events), and `[W<N>]`
-  // (workstreams) all match.
-  const citedSources = useMemo(() => {
-    if (sources.length === 0) return [];
-    const cited = new Set<string>();
-    const re = /\[([WE]?\d{1,3})\]/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(fullText)) !== null) {
-      cited.add(m[1]);
-    }
-    return sources.filter((s) => cited.has(s.label));
-  }, [sources, fullText]);
-
-  const isEmptyAndStreaming =
-    message.parts.length === 0 && message.status === "streaming";
-
-  return (
-    <div className="palette-msg palette-msg-assistant">
-      <div className="palette-msg-bubble">
-        {isEmptyAndStreaming ? (
-          <span className="palette-msg-typing">
-            <span></span>
-            <span></span>
-            <span></span>
-          </span>
-        ) : (
-          message.parts.map((part, i) =>
-            part.kind === "text" ? (
-              <CitedText
-                key={i}
-                text={part.value}
-                sources={sources}
-                onOpenNote={onOpenNote}
-                onOpenWorkstream={onOpenWorkstream}
-              />
-            ) : (
-              <ToolPill
-                key={i}
-                part={part}
-                onOpen={() => {
-                  // Resolve the source by label and open the right
-                  // surface — note path for [N], the linked event
-                  // bundle for [E<N>] (created on demand via
-                  // openOrCreateEventNote from #62), or the
-                  // Workstreams detail view for [W<N>] via the custom
-                  // event in onOpenWorkstream.
-                  const src = sources.find((s) => s.label === part.targetLabel);
-                  if (!src) return;
-                  void openSource(src, onOpenNote, onOpenWorkstream);
-                }}
-              />
-            ),
-          )
-        )}
-      </div>
-      {citedSources.length > 0 && (
-        <div className="palette-sources">
-          <div className="palette-sources-label">Sources</div>
-          <div className="palette-sources-list">
-            {citedSources.map((s) => (
-              <button
-                key={s.label}
-                type="button"
-                className={`palette-source-chip ${chipVariant(s.kind)}`}
-                title={s.title}
-                onClick={() => void openSource(s, onOpenNote, onOpenWorkstream)}
-              >
-                <span className="palette-source-num">{s.label}</span>
-                <span className="palette-source-title">{s.title}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ToolPill({
-  part,
-  onOpen,
-}: {
-  part: Extract<MessagePart, { kind: "tool" }>;
-  onOpen: () => void;
-}) {
-  const verb =
-    part.name === "read_event_details"
-      ? "Reading event"
-      : part.name === "read_workstream"
-      ? "Reading workstream"
-      : part.name === "read_transcript"
-      ? "Reading transcript"
-      : "Reading";
-  // targetLabel is the new field; fall back to targetN for older
-  // events that might still be in flight from a stale runner.
-  const label = part.targetLabel || `${part.targetN}`;
-  const titleAttr = `${part.name}([${label}] ${part.targetTitle})`;
-  return (
-    <button
-      type="button"
-      className={`palette-tool-pill status-${part.status}`}
-      title={titleAttr}
-      onClick={onOpen}
-    >
-      <span className="palette-tool-icon" aria-hidden="true">
-        {part.status === "ok" ? (
-          <IconCheck size={11} sw={2} />
-        ) : part.status === "error" ? (
-          "✗"
-        ) : (
-          <IconSearch size={11} sw={1.7} />
-        )}
-      </span>
-      <span className="palette-tool-text">
-        {verb} <span className="palette-tool-target">[{label}]</span>
-        {part.targetTitle ? ` "${part.targetTitle}"` : ""}
-        {part.status === "running" ? "…" : ""}
-      </span>
-    </button>
-  );
-}
-
-/// CSS variant class for a chip / inline citation, keyed off the
-/// source kind. Centralized so the inline `[N]` markers and the bottom
-/// "Sources" strip stay consistent.
-function chipVariant(kind: AskSource["kind"]): string {
-  switch (kind) {
-    case "event":
-      return "is-event";
-    case "workstream":
-      return "is-workstream";
-    case "note":
-    default:
-      return "is-note";
-  }
-}
-
-/// Open the surface a source points at. Notes go through `onOpenNote`
-/// directly. Events route through `openOrCreateEventNote` (#62) which
-/// creates the linked bundle on first click. Workstreams hand the id
-/// to `onOpenWorkstream`, which switches the sidebar nav and dispatches
-/// `margin:open-workstream` so the detail view selects this one (#72).
-async function openSource(
-  source: AskSource,
-  onOpenNote: (path: string) => void,
-  onOpenWorkstream: (workstreamId: string) => void,
-): Promise<void> {
-  if (source.kind === "note" && source.note_path) {
-    onOpenNote(source.note_path);
-    return;
-  }
-  if (source.kind === "event" && source.event_id) {
-    try {
-      const path = await openOrCreateEventNote(source.event_id);
-      onOpenNote(path);
-    } catch (e) {
-      console.error("[ask] open event note failed:", e);
-    }
-    return;
-  }
-  if (source.kind === "workstream" && source.workstream_id) {
-    onOpenWorkstream(source.workstream_id);
-  }
-}
-
-/// Render assistant text as Markdown with `[N]` markers swapped for
-/// clickable chips that link to the corresponding source note.
-///
-/// Approach: replace each `[N]` in the source with a sentinel `<button>`
-/// element BEFORE markdown rendering, so markdown-it sees the inline
-/// HTML and passes it through untouched. The button carries the
-/// citation number in `data-cite-n`; click handling is delegated on the
-/// wrapping div so React doesn't have to mount one handler per chip.
-///
-/// Streaming partial markdown (incomplete `**bold` etc.) is fine —
-/// markdown-it just renders the partial state literally until the
-/// closing pair arrives in a later delta.
-function CitedText({
-  text,
-  sources,
-  onOpenNote,
-  onOpenWorkstream,
-}: {
-  text: string;
-  sources: AskSource[];
-  onOpenNote: (path: string) => void;
-  onOpenWorkstream: (workstreamId: string) => void;
-}) {
-  const sourceByLabel = useMemo(() => {
-    const m = new Map<string, AskSource>();
-    for (const s of sources) m.set(s.label, s);
-    return m;
-  }, [sources]);
-
-  const html = useMemo(() => {
-    const withCitations = text.replace(/\[([WE]?\d{1,3})\]/g, (full, label) => {
-      const src = sourceByLabel.get(label);
-      // Hallucinated citation label — leave the marker as plain text
-      // rather than emitting a dead chip.
-      if (!src) return full;
-      return `<button type="button" class="palette-cite ${chipVariant(src.kind)}" data-cite-label="${label}">${label}</button>`;
-    });
-    return renderMarkdown(withCitations);
-  }, [text, sourceByLabel]);
-
-  const onClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    const target = e.target as HTMLElement;
-    const cite = target.closest<HTMLElement>(".palette-cite[data-cite-label]");
-    if (!cite) return;
-    const label = cite.getAttribute("data-cite-label");
-    if (!label) return;
-    const source = sourceByLabel.get(label);
-    if (source) void openSource(source, onOpenNote, onOpenWorkstream);
-  };
-
-  return (
-    <div
-      className="palette-md"
-      onClick={onClick}
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  );
-}
-
 function ResultRow({
   hit,
   active,
@@ -960,52 +496,39 @@ function ResultRow({
   onClick: () => void;
 }) {
   return (
-    <div
-      role="option"
-      aria-selected={active}
+    <button
+      type="button"
+      className={"palette-result" + (active ? " is-active" : "")}
       data-row-idx={idx}
-      className={"palette-row" + (active ? " active" : "")}
       onMouseEnter={onMouseEnter}
       onClick={onClick}
     >
-      <span className="palette-row-icon" aria-hidden="true">
-        {hit.source === "transcript" ? (
-          <IconMic size={13} sw={1.6} />
-        ) : (
-          <IconFileText size={13} sw={1.6} />
-        )}
+      <span className="palette-result-icon" aria-hidden="true">
+        <IconFileText size={14} sw={1.7} />
       </span>
-      <span className="palette-row-body">
-        <span className="palette-row-title">
-          <Highlighted text={hit.title} />
-        </span>
-        <span className="palette-row-snippet">
-          <Highlighted text={hit.snippet} />
+      <span className="palette-result-body">
+        <span className="palette-result-title">{hit.title || hit.note_path}</span>
+        <span className="palette-result-snippet">
+          <Highlighted text={hit.snippet || ""} />
         </span>
       </span>
-      <span className={"palette-row-tag tag-" + hit.source}>{labelFor(hit.source)}</span>
-    </div>
+      <span className="palette-result-source">{labelFor(hit.source)}</span>
+    </button>
   );
 }
 
 function labelFor(source: SearchHit["source"]): string {
-  if (source === "title") return "Title";
-  if (source === "body") return "Body";
-  return "Transcript";
+  if (source === "body") return "body";
+  if (source === "title") return "title";
+  return "transcript";
 }
 
 function Highlighted({ text }: { text: string }) {
-  const parts = useMemo(() => splitHighlights(text), [text]);
+  const parts = splitHighlights(text);
   return (
     <>
       {parts.map((p, i) =>
-        p.match ? (
-          <mark key={i} className="palette-highlight">
-            {p.text}
-          </mark>
-        ) : (
-          <span key={i}>{p.text}</span>
-        ),
+        p.match ? <mark key={i}>{p.text}</mark> : <span key={i}>{p.text}</span>,
       )}
     </>
   );
@@ -1020,22 +543,19 @@ function splitHighlights(text: string): { text: string; match: boolean }[] {
       out.push({ text: text.slice(i), match: false });
       break;
     }
-    if (open > i) out.push({ text: text.slice(i, open), match: false });
-    const close = text.indexOf(SEARCH_HIGHLIGHT_CLOSE, open + 1);
+    if (open > i) {
+      out.push({ text: text.slice(i, open), match: false });
+    }
+    const close = text.indexOf(SEARCH_HIGHLIGHT_CLOSE, open + SEARCH_HIGHLIGHT_OPEN.length);
     if (close === -1) {
-      out.push({ text: text.slice(open), match: false });
+      out.push({ text: text.slice(open + SEARCH_HIGHLIGHT_OPEN.length), match: true });
       break;
     }
-    out.push({ text: text.slice(open + 1, close), match: true });
-    i = close + 1;
+    out.push({
+      text: text.slice(open + SEARCH_HIGHLIGHT_OPEN.length, close),
+      match: true,
+    });
+    i = close + SEARCH_HIGHLIGHT_CLOSE.length;
   }
   return out;
-}
-
-function cryptoId(): string {
-  // crypto.randomUUID is available in modern browsers + Tauri webview.
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
-    return crypto.randomUUID();
-  }
-  return Math.random().toString(36).slice(2);
 }

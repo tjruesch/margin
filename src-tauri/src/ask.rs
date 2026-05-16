@@ -64,6 +64,11 @@ const EVENT_DESCRIPTION_CAP: usize = 1500;
 /// Hard cap on synthesized workstreams embedded in the prompt (#72).
 /// Recency-prioritized via `last_activity_ms desc`.
 const WORKSTREAM_CAP: usize = 30;
+/// Recency window for the `# Recent Teams messages` prompt section (#136).
+/// Anything older than this is only reachable via the workstream surface.
+const TEAMS_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
+/// Hard cap on Teams messages embedded in the prompt section (#136).
+const TEAMS_MESSAGE_CAP: usize = 30;
 /// Per-category top-N when expanding a workstream via `read_workstream`
 /// (emails / events / notes returned per call).
 const WORKSTREAM_DETAIL_TOP_N: usize = 5;
@@ -137,6 +142,11 @@ pub enum AskSourceKind {
     Note,
     Event,
     Workstream,
+    /// `[T<N>]` — a recent chat message from the Teams connector (#136).
+    /// Chip click navigates to the first workstream the message is
+    /// attached to (via `workstream_id`); unattached messages are
+    /// soft no-ops in v1.
+    TeamsMessage,
 }
 
 /// One source the model can cite. The full directory of notes plus
@@ -163,10 +173,17 @@ pub struct AskSource {
     /// `openOrCreateEventNote(event_id)` on chip click (#62).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
-    /// Set when `kind == Workstream`. Frontend dispatches a
+    /// Set when `kind == Workstream`, or when `kind == TeamsMessage`
+    /// and the message is attached to a workstream (so the chip click
+    /// can still navigate somewhere — #136). Frontend dispatches a
     /// `margin:open-workstream` event with this id on chip click (#72).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workstream_id: Option<String>,
+    /// Set when `kind == TeamsMessage` (#136). Carried for a future
+    /// dedicated message-viewer surface; not used by the v1 chip click
+    /// (which falls through to `workstream_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teams_message_id: Option<String>,
 }
 
 /// One past turn in the conversation, threaded back to the model.
@@ -179,9 +196,10 @@ pub struct ChatTurn {
 }
 
 const SYSTEM_PROMPT: &str = "You are answering questions about the user's personal notes (meeting \
-notes, hand-typed notes, transcripts), their team profiles, and their calendar.
+notes, hand-typed notes, transcripts), their team profiles, their calendar, and recent Teams chat \
+messages.
 
-The user's message contains up to five sections:
+The user's message contains up to six sections:
 
 1. **Notes directory** — every non-archived note, labeled `[1]`, `[2]`, etc., with title, date, and \
 a short preview. This is the master index; you may cite *any* `[N]` from this directory.
@@ -199,13 +217,18 @@ profiles aren't `[N]`-citable — only notes, events, and workstreams are.
 `[E2]`, etc., covering the last 14 days and the next 14 days. Each entry: title, time range, \
 attendees, location. Cite events with their `[E<N>]` label inline, same shape as note `[N]`s.
 
-5. **Workstreams** — synthesized clusters of related emails, meetings, and notes labeled `[W1]`, \
+5. **Recent Teams messages** — chat messages from connected Microsoft Teams accounts, labeled \
+`[T1]`, `[T2]`, etc., covering the last 14 days (capped at 30 most recent). Each entry: sender, \
+chat name (when set; 1:1 DMs may have none), send time, one-line preview. Cite messages with \
+`[T<N>]` inline. Use these for any question about pings, recent asks, or unanswered messages.
+
+6. **Workstreams** — synthesized clusters of related emails, meetings, and notes labeled `[W1]`, \
 `[W2]`, etc. Each entry has a title, one-line summary, and item counts. Workstreams are the right \
 citation when the answer IS the ongoing thread itself (\"how's the Hyundai POC going?\"); when \
-citing a *specific* item within a workstream, prefer the underlying `[N]` / `[E<N>]` label if one \
-is available.
+citing a *specific* item within a workstream, prefer the underlying `[N]` / `[E<N>]` / `[T<N>]` \
+label if one is available.
 
-You have four tools for digging deeper:
+You have five tools for digging deeper:
 - **`read_note(n)`** — returns the full markdown body of directory entry `[n]`. Use when a preview \
 hints at relevance but you need the body to answer.
 - **`read_transcript(n)`** — returns the meeting transcript text for `[n]`, if it has audio. Use \
@@ -217,6 +240,11 @@ Pass the integer after the `E` as `n` (e.g. for `[E3]` call `read_event_details(
 actions, and the most recent emails / events / notes that belong to it. Use for status questions \
 (\"what's happening with X?\"). Pass the integer after the `W` as `n` (e.g. for `[W2]` call \
 `read_workstream(2)`).
+- **`read_teams_message(n)`** — returns the full body of Teams message `[T<n>]` plus a few \
+surrounding messages from the same chat (3 before + 1 after, chronological), so you can see the \
+thread context around it. Use when a preview hints at an open ask and you need the full text — \
+or to confirm whether the user has already replied. Pass the integer after the `T` as `n` (e.g. \
+for `[T3]` call `read_teams_message(3)`).
 
 Use tools sparingly — most questions can be answered from the directory + top candidates + schedule \
 already in context. Don't speculate; call a tool if you genuinely need the content. Up to 6 tool \
@@ -229,8 +257,8 @@ for a list.
 immediately after each claim that came from one. Multiple citations: `[1][3]` or `[E1][E2]` or \
 `[W2][N1]` or any mix. Never make up citation labels — only use ones you actually received.
 - For \"when did we first…\" questions, identify the *earliest* dated note that matches and cite it.
-- If neither the notes nor the profiles nor the schedule contain the answer, say so clearly. \
-Don't speculate.
+- If neither the notes nor the profiles nor the schedule nor the Teams messages contain the \
+answer, say so clearly. Don't speculate.
 - Don't pad with caveats or restate the question. Open with the answer.
 - When the user's question implies recency (\"today\", \"this week\", \"latest\", \"recent\", \"rn\", \
 \"right now\", \"currently\", \"now\"), and the most recent source you can cite is older than 7 \
@@ -257,11 +285,19 @@ pub async fn start(
     })?;
 
     // Pull the all-notes directory + retrieval set + team roster +
-    // schedule window + active workstreams in one lock. Profile.md
-    // content is read off-lock below.
+    // schedule window + active workstreams + recent Teams messages in
+    // one lock. Profile.md content is read off-lock below.
     let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
     let now_ms = current_unix_ms();
-    let (directory, retrieved_paths, team, schedule, workstreams) = {
+    let (
+        directory,
+        retrieved_paths,
+        team,
+        schedule,
+        workstreams,
+        teams_messages,
+        teams_attached_workstreams,
+    ) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         let directory = crate::index::list_directory(&c, DIRECTORY_CAP)
             .map_err(|e| e.to_string())?;
@@ -281,14 +317,35 @@ pub async fn start(
         let mut workstreams =
             crate::workstreams::persist::list_workstreams_active(&c).unwrap_or_default();
         workstreams.truncate(WORKSTREAM_CAP);
-        (directory, retrieved_paths, team, schedule, workstreams)
+        let teams_messages = crate::connectors::teams::list_messages_in_range(
+            &c,
+            now_ms - TEAMS_WINDOW_BACK_MS,
+            now_ms,
+            TEAMS_MESSAGE_CAP,
+        )
+        .unwrap_or_default();
+        // One batch lookup: for each Teams message id, the most recent
+        // non-tombstoned workstream it's attached to (if any). Powers
+        // the chip-click navigation; unattached messages are soft no-ops.
+        let teams_attached_workstreams =
+            load_teams_message_workstream_map(&c, &teams_messages);
+        (
+            directory,
+            retrieved_paths,
+            team,
+            schedule,
+            workstreams,
+            teams_messages,
+            teams_attached_workstreams,
+        )
     };
 
     // Build the citation surface: every directory entry gets a 1-based
     // [N] label, every schedule entry gets an [E<N>] label, every
     // workstream gets a [W<N>] label.
-    let mut sources: Vec<AskSource> =
-        Vec::with_capacity(directory.len() + schedule.len() + workstreams.len());
+    let mut sources: Vec<AskSource> = Vec::with_capacity(
+        directory.len() + schedule.len() + workstreams.len() + teams_messages.len(),
+    );
     for (i, e) in directory.iter().enumerate() {
         sources.push(AskSource {
             kind: AskSourceKind::Note,
@@ -297,6 +354,7 @@ pub async fn start(
             bundle_id: Some(e.bundle_id.clone()),
             event_id: None,
             workstream_id: None,
+            teams_message_id: None,
             title: e.title.clone(),
             modified_ms: e.modified_ms,
         });
@@ -309,6 +367,7 @@ pub async fn start(
             bundle_id: None,
             event_id: Some(e.id.clone()),
             workstream_id: None,
+            teams_message_id: None,
             title: e.title.clone(),
             modified_ms: e.start_ms,
         });
@@ -321,8 +380,22 @@ pub async fn start(
             bundle_id: None,
             event_id: None,
             workstream_id: Some(w.id.clone()),
+            teams_message_id: None,
             title: w.title.clone(),
             modified_ms: w.last_activity_ms,
+        });
+    }
+    for (i, m) in teams_messages.iter().enumerate() {
+        sources.push(AskSource {
+            kind: AskSourceKind::TeamsMessage,
+            label: format!("T{}", i + 1),
+            note_path: None,
+            bundle_id: None,
+            event_id: None,
+            workstream_id: teams_attached_workstreams.get(&m.id).cloned(),
+            teams_message_id: Some(m.id.clone()),
+            title: teams_chip_title(m),
+            modified_ms: m.sent_at_ms,
         });
     }
 
@@ -390,6 +463,7 @@ pub async fn start(
         &profile_excerpts,
         &schedule,
         &workstreams,
+        &teams_messages,
     );
 
     // Compose `messages[]`: prior history first, then this turn's user
@@ -428,6 +502,7 @@ pub async fn start(
             &directory,
             &schedule,
             &workstreams,
+            &teams_messages,
         )
         .await
         {
@@ -515,6 +590,7 @@ async fn run_loop(
     directory: &[DirectoryEntry],
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
+    teams_messages: &[crate::connectors::teams::TeamsMessage],
 ) -> Result<(), String> {
     let tools = tool_definitions();
 
@@ -595,7 +671,15 @@ async fn run_loop(
                 },
             );
 
-            let result = dispatch_tool(app, &tc.name, &tc.input, directory, schedule, workstreams);
+            let result = dispatch_tool(
+                app,
+                &tc.name,
+                &tc.input,
+                directory,
+                schedule,
+                workstreams,
+                teams_messages,
+            );
 
             let _ = app.emit(
                 "ai-stream",
@@ -702,6 +786,21 @@ fn tool_definitions() -> serde_json::Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "The 1-based [W<N>] label from the Workstreams section."
+                    }
+                },
+                "required": ["n"]
+            }
+        },
+        {
+            "name": "read_teams_message",
+            "description": "Read the full body of a Teams message by its [T<N>] label, plus the 3 messages immediately before and 1 immediately after it in the same chat — for conversational context. Use when a preview hints at an open ask or you need to confirm whether the user has already replied. NOTE: the `n` argument is the integer after the `T` (e.g. for `[T3]` pass `n: 3`).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "The 1-based [T<N>] label from the Recent Teams messages section."
                     }
                 },
                 "required": ["n"]
@@ -1030,6 +1129,7 @@ fn dispatch_tool(
     directory: &[DirectoryEntry],
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
+    teams_messages: &[crate::connectors::teams::TeamsMessage],
 ) -> ToolResult {
     // read_edges takes (node_kind, node_id) strings, not the `n` index
     // every other tool uses. Handle it before the `n` validation.
@@ -1064,6 +1164,11 @@ fn dispatch_tool(
     // mutex to load the joined detail.
     if name == "read_workstream" {
         return dispatch_read_workstream(app, n, workstreams);
+    }
+    // read_teams_message indexes the Teams-messages slice (#136). Bounds
+    // check + chat-context load happen inside the dispatcher.
+    if name == "read_teams_message" {
+        return dispatch_read_teams_message(app, n, teams_messages);
     }
 
     if n > directory.len() {
@@ -1910,6 +2015,7 @@ fn format_user_message(
     profiles: &[(crate::team::TeamMember, String)],
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
+    teams_messages: &[crate::connectors::teams::TeamsMessage],
 ) -> String {
     let mut s = String::new();
 
@@ -1991,6 +2097,10 @@ fn format_user_message(
     }
 
     s.push_str(&format_schedule_section(schedule));
+
+    if !teams_messages.is_empty() {
+        s.push_str(&format_teams_messages_section(teams_messages));
+    }
 
     if !workstreams.is_empty() {
         let team_by_id: std::collections::HashMap<&str, &str> = profiles
@@ -2105,6 +2215,254 @@ fn workstream_one_line_summary(s: &str) -> String {
         out.trim().to_string()
     };
     truncate_chars(&collapsed, WORKSTREAM_SUMMARY_CAP)
+}
+
+/// Render the recent Teams chat messages list as a labeled prompt
+/// section (#136). Each entry: `[T<N>] @sender in "chat" (date) — preview`.
+/// Topic-less chats (DMs) omit the `in "..."` clause. Caller is
+/// responsible for the empty-slice short-circuit; we always emit the
+/// header when called.
+fn format_teams_messages_section(
+    messages: &[crate::connectors::teams::TeamsMessage],
+) -> String {
+    let mut s = String::new();
+    s.push_str("# Recent Teams messages (last 14 days)\n\n");
+    for (i, m) in messages.iter().enumerate() {
+        let label = format!("T{}", i + 1);
+        let when = format_date(m.sent_at_ms);
+        let sender = m
+            .from_name
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .or(m.from_email.as_deref().filter(|e| !e.trim().is_empty()))
+            .unwrap_or("(unknown sender)");
+        let chat_label = match &m.chat_topic {
+            Some(topic) if !topic.trim().is_empty() => {
+                format!(" in \"{}\"", topic.trim())
+            }
+            _ => String::new(),
+        };
+        let preview = preview_one_line(m.body_preview.as_deref().unwrap_or(""));
+        let _ = std::fmt::Write::write_fmt(
+            &mut s,
+            format_args!("[{label}] @{sender}{chat_label} ({when}) — {preview}\n"),
+        );
+    }
+    s.push('\n');
+    s
+}
+
+/// One-line chip title for a Teams message in the `sources` strip
+/// emitted to the frontend (#136). The chip's visible text on hover.
+fn teams_chip_title(m: &crate::connectors::teams::TeamsMessage) -> String {
+    let sender = m
+        .from_name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .or(m.from_email.as_deref().filter(|e| !e.trim().is_empty()))
+        .unwrap_or("unknown");
+    let preview = m
+        .body_preview
+        .as_deref()
+        .map(|s| preview_one_line(s))
+        .unwrap_or_default();
+    if preview.is_empty() {
+        format!("@{sender}")
+    } else {
+        format!("@{sender}: {preview}")
+    }
+}
+
+/// Resolve each Teams message id to the most recent non-tombstoned
+/// workstream it's attached to, if any (#136). Powers the chip-click
+/// navigation; unattached messages have no entry and the chip becomes
+/// a soft no-op on the frontend. One query, one map per turn.
+fn load_teams_message_workstream_map(
+    conn: &rusqlite::Connection,
+    messages: &[crate::connectors::teams::TeamsMessage],
+) -> std::collections::HashMap<String, String> {
+    use rusqlite::OptionalExtension as _;
+    let mut out: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(messages.len());
+    if messages.is_empty() {
+        return out;
+    }
+    // Per-row query keeps the SQL simple and predictable for a small
+    // (≤30) input set. If we ever raise TEAMS_MESSAGE_CAP, switch to a
+    // single IN-clause batch.
+    for m in messages {
+        let ws_id: Option<String> = conn
+            .query_row(
+                "SELECT workstream_id FROM workstream_signals \
+                  WHERE kind = 'teams_message' AND item_id = ?1 \
+                    AND manual_detached_ms IS NULL \
+                  ORDER BY added_ms DESC LIMIT 1",
+                rusqlite::params![m.id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(id) = ws_id {
+            out.insert(m.id.clone(), id);
+        }
+    }
+    out
+}
+
+/// Read the full body of Teams message `[T<n>]` plus a few surrounding
+/// messages in the same chat for conversational context (#136). Splits
+/// the app-state lookup from the rendering so the latter is unit-testable.
+fn dispatch_read_teams_message(
+    app: &AppHandle,
+    n: usize,
+    messages: &[crate::connectors::teams::TeamsMessage],
+) -> ToolResult {
+    if n == 0 || n > messages.len() {
+        return render_teams_tool_output(n, messages, &[], &[]);
+    }
+    let target = &messages[n - 1];
+    let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+    let (before, after) = {
+        let c = match conn_state.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                return ToolResult {
+                    content: "Internal error: connection lock poisoned.".to_string(),
+                    is_error: true,
+                };
+            }
+        };
+        crate::connectors::teams::list_chat_context(
+            &c,
+            &target.chat_id,
+            target.sent_at_ms,
+            3,
+            1,
+        )
+        .unwrap_or_else(|_| (Vec::new(), Vec::new()))
+    };
+    render_teams_tool_output(n, messages, &before, &after)
+}
+
+/// Pure renderer for `read_teams_message` output. Out-of-range `n`
+/// surfaces an `is_error: true` ToolResult; valid `n` formats the
+/// target body plus surrounding context. Split from
+/// `dispatch_read_teams_message` so this is unit-testable without a
+/// Tauri app handle.
+fn render_teams_tool_output(
+    n: usize,
+    messages: &[crate::connectors::teams::TeamsMessage],
+    before: &[crate::connectors::teams::TeamsMessage],
+    after: &[crate::connectors::teams::TeamsMessage],
+) -> ToolResult {
+    if n == 0 || n > messages.len() {
+        return ToolResult {
+            content: format!(
+                "[T{n}] is out of range. Recent Teams messages has {len} entries — valid range is [T1]..[T{len}].",
+                n = n,
+                len = messages.len()
+            ),
+            is_error: true,
+        };
+    }
+    let target = &messages[n - 1];
+
+    let body = target
+        .body_preview
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            target
+                .body_html
+                .as_deref()
+                .map(strip_html_to_text)
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "(empty body)".to_string());
+
+    let sender = target
+        .from_name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .or(target.from_email.as_deref().filter(|e| !e.trim().is_empty()))
+        .unwrap_or("unknown");
+
+    let mut out = format!(
+        "# [T{n}] from @{sender} ({when})\n",
+        n = n,
+        sender = sender,
+        when = format_date(target.sent_at_ms),
+    );
+    if let Some(topic) = target.chat_topic.as_deref().filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("Chat: \"{}\"\n", topic.trim()));
+    }
+    out.push_str("\nBody:\n");
+    out.push_str(body.trim());
+    out.push_str("\n");
+
+    if !before.is_empty() || !after.is_empty() {
+        out.push_str("\nSurrounding messages in this chat (chronological):\n");
+        // before is DESC (newest-first prior); reverse to chronological,
+        // then this message, then after (ASC).
+        let mut chrono: Vec<&crate::connectors::teams::TeamsMessage> = before.iter().rev().collect();
+        chrono.extend(after.iter());
+        for c in chrono {
+            let c_sender = c
+                .from_name
+                .as_deref()
+                .filter(|n| !n.trim().is_empty())
+                .or(c.from_email.as_deref().filter(|e| !e.trim().is_empty()))
+                .unwrap_or("unknown");
+            let c_preview = preview_one_line(c.body_preview.as_deref().unwrap_or(""));
+            out.push_str(&format!(
+                "- {when} @{sender}: {preview}\n",
+                when = format_date(c.sent_at_ms),
+                sender = c_sender,
+                preview = c_preview,
+            ));
+        }
+    }
+
+    ToolResult {
+        content: out,
+        is_error: false,
+    }
+}
+
+/// Minimal HTML-to-text stripper for Teams message bodies. The Graph
+/// API ships HTML with `<div>`, `<p>`, `<a>`, basic formatting; we drop
+/// tags and collapse whitespace. Not a full parser — body_preview is
+/// the preferred source and this is only the fallback.
+fn strip_html_to_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                out.push(' ');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    // Collapse runs of whitespace.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut last_space = false;
+    for ch in out.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                collapsed.push(' ');
+                last_space = true;
+            }
+        } else {
+            collapsed.push(ch);
+            last_space = false;
+        }
+    }
+    collapsed.trim().to_string()
 }
 
 /// Render the upcoming/recent meeting list as a labeled prompt
@@ -2843,5 +3201,180 @@ mod tests {
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W9", &detail, &team_map);
         assert!(!out.contains("## Children"));
+    }
+
+    // ----- Teams messages section (#136) ----------------------------------
+
+    fn make_teams_message(
+        id: &str,
+        chat_id: &str,
+        chat_topic: Option<&str>,
+        from_name: Option<&str>,
+        sent_at_ms: i64,
+        preview: &str,
+    ) -> crate::connectors::teams::TeamsMessage {
+        crate::connectors::teams::TeamsMessage {
+            id: id.to_string(),
+            connector_id: "mg:test".to_string(),
+            external_id: id.to_string(),
+            chat_id: chat_id.to_string(),
+            chat_kind: "group".to_string(),
+            chat_topic: chat_topic.map(|s| s.to_string()),
+            sent_at_ms,
+            from_aad_id: None,
+            from_email: Some("from@example.com".to_string()),
+            from_name: from_name.map(|s| s.to_string()),
+            body_html: None,
+            body_preview: Some(preview.to_string()),
+            reply_to_id: None,
+            modified_ms: sent_at_ms,
+            raw_etag: None,
+        }
+    }
+
+    #[test]
+    fn format_teams_messages_section_renders_labels_and_preview() {
+        let msgs = vec![
+            make_teams_message("m1", "c1", Some("Operations"), Some("Heike"), 100, "hey, ping"),
+            make_teams_message("m2", "c2", None, Some("Markus"), 50, "DM body"),
+            make_teams_message("m3", "c1", Some("Operations"), Some("Heike"), 30, "older one"),
+        ];
+        let out = format_teams_messages_section(&msgs);
+        assert!(out.starts_with("# Recent Teams messages (last 14 days)\n"));
+        assert!(out.contains("[T1]"), "first label missing: {out}");
+        assert!(out.contains("[T2]"), "second label missing: {out}");
+        assert!(out.contains("[T3]"), "third label missing: {out}");
+        assert!(out.contains("@Heike"), "sender missing: {out}");
+        assert!(out.contains("@Markus"), "second sender missing: {out}");
+        assert!(out.contains("in \"Operations\""), "chat topic missing: {out}");
+        assert!(out.contains("hey, ping"), "preview missing: {out}");
+        // Topic-less row should NOT carry an `in "..."` clause.
+        let dm_line = out.lines().find(|l| l.starts_with("[T2]")).unwrap_or("");
+        assert!(
+            !dm_line.contains(" in \""),
+            "topic-less DM row should not have `in \"...\"`: {dm_line}"
+        );
+    }
+
+    #[test]
+    fn format_user_message_includes_teams_section_when_messages_exist() {
+        let directory = vec![DirectoryEntry {
+            note_path: "n1".to_string(),
+            bundle_id: "n1".to_string(),
+            title: "Note A".to_string(),
+            modified_ms: 100,
+            preview: "p".to_string(),
+        }];
+        let retrieved: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let profiles: Vec<(crate::team::TeamMember, String)> = Vec::new();
+        let schedule: Vec<crate::connectors::calendar::CalendarEvent> = Vec::new();
+        let workstreams: Vec<Workstream> = Vec::new();
+        let msgs = vec![make_teams_message(
+            "m1",
+            "c1",
+            Some("Operations"),
+            Some("Heike"),
+            100,
+            "ping",
+        )];
+        let out = format_user_message(
+            "q?", &directory, &retrieved, &profiles, &schedule, &workstreams, &msgs,
+        );
+        assert!(
+            out.contains("# Recent Teams messages"),
+            "expected Teams section, got:\n{out}"
+        );
+        assert!(out.contains("[T1] @Heike"), "expected T1 row: {out}");
+    }
+
+    #[test]
+    fn format_user_message_omits_teams_section_when_empty() {
+        let directory = vec![DirectoryEntry {
+            note_path: "n1".to_string(),
+            bundle_id: "n1".to_string(),
+            title: "Note A".to_string(),
+            modified_ms: 100,
+            preview: "p".to_string(),
+        }];
+        let out = format_user_message(
+            "q?",
+            &directory,
+            &std::collections::HashSet::new(),
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            !out.contains("# Recent Teams messages"),
+            "should omit header when no messages: {out}"
+        );
+    }
+
+    #[test]
+    fn render_teams_tool_output_returns_body_for_valid_n() {
+        let msgs = vec![
+            make_teams_message("m1", "c1", Some("Op"), Some("Heike"), 100, "first"),
+            make_teams_message("m2", "c1", Some("Op"), Some("Heike"), 200, "TARGET"),
+        ];
+        let result = render_teams_tool_output(2, &msgs, &[], &[]);
+        assert!(!result.is_error, "expected ok result");
+        assert!(result.content.contains("[T2]"), "label missing: {}", result.content);
+        assert!(result.content.contains("@Heike"), "sender missing: {}", result.content);
+        assert!(result.content.contains("TARGET"), "body missing: {}", result.content);
+    }
+
+    #[test]
+    fn render_teams_tool_output_errors_on_out_of_range() {
+        let msgs = vec![make_teams_message(
+            "m1", "c1", Some("Op"), Some("Heike"), 100, "only",
+        )];
+        let result = render_teams_tool_output(99, &msgs, &[], &[]);
+        assert!(result.is_error, "expected error result");
+        assert!(
+            result.content.contains("[T99]") && result.content.contains("out of range"),
+            "error string should mention label + range: {}",
+            result.content
+        );
+    }
+
+    #[test]
+    fn render_teams_tool_output_renders_surrounding_context_chronologically() {
+        let target = make_teams_message("m2", "c1", Some("Op"), Some("Heike"), 200, "TARGET");
+        // `before` arrives DESC (the SQL query orders newest-first).
+        let before = vec![
+            make_teams_message("m1b", "c1", Some("Op"), Some("Tom"), 150, "right before"),
+            make_teams_message("m0", "c1", Some("Op"), Some("Heike"), 50, "way before"),
+        ];
+        let after = vec![make_teams_message(
+            "m3", "c1", Some("Op"), Some("Tom"), 250, "ack",
+        )];
+        let result = render_teams_tool_output(1, &[target], &before, &after);
+        assert!(!result.is_error);
+        // Chronological order: way before → right before → after.
+        let pos_way = result.content.find("way before").unwrap();
+        let pos_right = result.content.find("right before").unwrap();
+        let pos_ack = result.content.find("ack").unwrap();
+        assert!(pos_way < pos_right, "before-context order wrong: {}", result.content);
+        assert!(pos_right < pos_ack, "after-context order wrong: {}", result.content);
+    }
+
+    #[test]
+    fn teams_chip_title_handles_missing_sender_and_preview() {
+        let mut m = make_teams_message("m1", "c1", None, Some("Heike"), 100, "");
+        m.body_preview = None;
+        // Sender present, no preview → "@Heike".
+        assert_eq!(teams_chip_title(&m), "@Heike");
+        // No sender name AND no email → falls back to "unknown".
+        let mut bare = make_teams_message("m2", "c2", None, None, 100, "hi");
+        bare.from_email = None;
+        assert!(teams_chip_title(&bare).starts_with("@unknown"));
+    }
+
+    #[test]
+    fn strip_html_to_text_basic() {
+        let html = "<div>Hello <b>world</b><br/>How are <i>you</i>?</div>";
+        let out = strip_html_to_text(html);
+        assert_eq!(out, "Hello world How are you ?");
     }
 }

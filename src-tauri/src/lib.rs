@@ -2,6 +2,7 @@ mod activity;
 mod anthropic;
 mod ask;
 mod audio;
+mod chat;
 mod chunker;
 mod connectors;
 mod dates;
@@ -580,6 +581,10 @@ pub fn run() {
             workstreams::commands::attach_signal_to_workstream,
             workstreams::commands::detach_signal_from_workstream,
             workstreams::commands::list_unassigned_items,
+            chat::get_active_conversation,
+            chat::list_chat_messages,
+            chat::append_chat_message,
+            chat::clear_active_conversation,
             edges::commands::synthesize_edges,
             workstreams::commands::list_workstreams,
             workstreams::commands::create_workstream,

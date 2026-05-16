@@ -5818,22 +5818,59 @@ input.nh-title {
   border-color: color-mix(in srgb, #2f7a4d 30%, transparent);
 }
 
+/* Teams-message citation chips ([T*]) — Microsoft Teams brand purple
+   keeps them distinct from notes / events / workstreams. (#136) */
+.palette-cite.is-teams-message {
+  border-color: color-mix(in srgb, #5b5fc7 30%, transparent);
+  background: color-mix(in srgb, #5b5fc7 12%, transparent);
+  color: #5b5fc7;
+}
+.palette-cite.is-teams-message:hover {
+  background: color-mix(in srgb, #5b5fc7 22%, transparent);
+}
+.palette-source-chip.is-teams-message .palette-source-num {
+  background: color-mix(in srgb, #5b5fc7 14%, transparent);
+  color: #5b5fc7;
+}
+.palette-source-chip.is-teams-message:hover {
+  border-color: color-mix(in srgb, #5b5fc7 30%, transparent);
+}
+
 .palette-sources {
   margin-top: 8px;
   width: 100%;
 }
-.palette-sources-label {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
+.palette-sources-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  padding: 4px 0;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--fg-muted);
-  margin-bottom: 6px;
+  cursor: pointer;
+  transition: color 80ms ease;
+}
+.palette-sources-toggle:hover {
+  color: var(--fg);
+}
+.palette-sources-chev {
+  display: inline-block;
+  font-size: 10px;
+  width: 10px;
+  text-align: center;
+  color: var(--fg-muted);
 }
 .palette-sources-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  margin-top: 6px;
 }
 .palette-source-chip {
   display: inline-flex;
@@ -5857,14 +5894,16 @@ input.nh-title {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
+  min-width: 18px;
   height: 18px;
-  border-radius: 50%;
+  padding: 0 5px;
+  border-radius: 9px;
   background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--accent);
   font-weight: 600;
   font-size: 10.5px;
   flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
 }
 .palette-source-title {
   white-space: nowrap;
@@ -5892,51 +5931,49 @@ input.nh-title {
   color: var(--fg-muted);
 }
 
-/* Tool-use pills inline in assistant message bubble. The model
-   emits these mid-stream when invoking read_note / read_transcript;
-   each pill is clickable to jump to the underlying note. */
-.palette-tool-pill {
+/* Single rolling "Reading [X] 'Title'" indicator below the message
+   bubble while tool calls are in flight. Replaces itself as new tool
+   calls fire (only the most recent is shown); morphs into the
+   collapsed `.palette-sources-toggle` once the message status flips
+   from "streaming" to "done". */
+.palette-tool-status {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  margin: 4px 0;
-  padding: 3px 8px 3px 6px;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 4px 10px 4px 8px;
   border: 0.5px solid var(--home-line);
   border-radius: 12px;
   background: var(--bg);
   color: var(--fg-muted);
+  font: inherit;
   font-size: 11.5px;
   font-style: italic;
-  font-family: inherit;
   cursor: pointer;
-  vertical-align: baseline;
-  transition: background 80ms ease, border-color 80ms ease;
+  text-align: left;
+  max-width: 100%;
+  transition: background 80ms ease, border-color 80ms ease, color 80ms ease;
 }
-.palette-tool-pill:hover {
+.palette-tool-status:hover {
   background: var(--home-card-hover);
   border-color: color-mix(in srgb, var(--accent) 30%, transparent);
 }
-
-.palette-tool-pill.status-running {
+.palette-tool-status.status-running {
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 24%, transparent);
   background: color-mix(in srgb, var(--accent) 6%, transparent);
 }
-.palette-tool-pill.status-running .palette-tool-icon {
-  animation: palette-tool-spin 1.4s linear infinite;
-}
-.palette-tool-pill.status-ok {
+.palette-tool-status.status-ok {
   color: var(--fg-muted);
 }
-.palette-tool-pill.status-ok .palette-tool-icon {
+.palette-tool-status.status-ok .palette-tool-icon {
   color: #1a8a3a;
 }
-.palette-tool-pill.status-error {
+.palette-tool-status.status-error {
   color: #c44a1f;
   border-color: color-mix(in srgb, #c44a1f 24%, transparent);
   background: color-mix(in srgb, #c44a1f 6%, transparent);
 }
-
 .palette-tool-icon {
   display: inline-flex;
   align-items: center;
@@ -5945,7 +5982,20 @@ input.nh-title {
   height: 14px;
   flex-shrink: 0;
 }
-
+.palette-tool-spinner {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  animation: palette-tool-spin 0.9s linear infinite;
+}
+.palette-tool-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .palette-tool-target {
   font-style: normal;
   font-weight: 600;
@@ -6051,6 +6101,151 @@ input.nh-title {
   background: var(--home-chip);
   color: var(--fg-muted);
   margin: 0 2px;
+}
+
+/* ----- Chat page (#chat-page) -------------------------------------------- */
+
+.chat-page {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  height: 100%;
+  min-height: 0;
+}
+.chat-page-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 18px 32px 12px;
+  border-bottom: 0.5px solid var(--home-line);
+}
+.chat-page-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: "Fraunces Variable", "Fraunces", serif;
+  font-size: 28px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  margin: 0;
+  color: var(--fg);
+}
+.chat-page-title-icon {
+  display: inline-flex;
+  color: var(--accent);
+}
+.chat-clear-btn {
+  margin-left: auto;
+  font: inherit;
+  font-size: 13px;
+  padding: 5px 12px;
+  border-radius: 6px;
+  border: 0.5px solid var(--home-line);
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.chat-clear-btn:hover:not(:disabled) {
+  background: var(--home-chip);
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--fg-muted) 35%, transparent);
+}
+.chat-clear-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.chat-transcript {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 24px 32px;
+  scroll-behavior: smooth;
+}
+.chat-transcript .palette-conversation {
+  /* Reuse palette message chrome but widen the column for the
+     full-page surface. The palette is centered+narrow; the page
+     gives the conversation a comfortable reading width. */
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 0;
+}
+.chat-empty-state {
+  max-width: 480px;
+  margin: 80px auto 0;
+  text-align: center;
+  color: var(--fg-muted);
+}
+.chat-empty-state h2 {
+  font-family: "Fraunces Variable", "Fraunces", serif;
+  font-size: 24px;
+  font-weight: 500;
+  margin: 0 0 8px;
+  color: var(--fg);
+}
+.chat-empty-state p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.chat-empty-state kbd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--home-chip);
+  color: var(--fg-muted);
+}
+.chat-composer {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 12px 32px 18px;
+  border-top: 0.5px solid var(--home-line);
+  background: var(--bg);
+}
+.chat-composer-input {
+  flex: 1 1 auto;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  resize: none;
+  border: 0.5px solid var(--home-line);
+  border-radius: 8px;
+  background: var(--bg-elev, var(--home-chip));
+  color: var(--fg);
+  padding: 10px 14px;
+  min-height: 38px;
+  max-height: 180px;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+.chat-composer-input:focus {
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.chat-composer-input:disabled {
+  opacity: 0.6;
+}
+.chat-composer-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  border: none;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  transition: background 120ms ease, opacity 120ms ease;
+  flex-shrink: 0;
+}
+.chat-composer-send:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 88%, black);
+}
+.chat-composer-send:disabled {
+  opacity: 0.35;
+  cursor: default;
 }
 
 /* ----- Workstreams (#71) ------------------------------------------------- */

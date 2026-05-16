@@ -155,18 +155,28 @@ pub fn create_note(
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<NoteRef, String> {
     let id = uuid::Uuid::new_v4().to_string();
-    let now = current_unix_ms();
+    let now_ms = current_unix_ms();
+    // Default title is the creation timestamp, formatted locally
+    // (e.g. "Tuesday, 12.05, 13:20"). The body seeds with the same
+    // string as an H1 so the editor's deriveTitle path picks it up
+    // — typing over the H1 renames the note via the normal save loop.
+    let title = chrono::Local::now()
+        .format("%A, %d.%m, %H:%M")
+        .to_string();
+    let body_md = format!("# {title}\n");
+    let body_size = body_md.len() as i64;
+    let preview = extract_preview(&body_md);
     let c = conn.lock().map_err(|e| e.to_string())?;
     c.execute(
         "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
                            preview, body_size, created_ms) \
-         VALUES (?1, ?1, 'Untitled note', '', ?2, '', 0, ?2)",
-        rusqlite::params![id, now],
+         VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6, ?4)",
+        rusqlite::params![id, title, body_md, now_ms, preview, body_size],
     )
     .map_err(|e| e.to_string())?;
     c.execute(
-        "INSERT INTO notes_fts(note_id, title, body) VALUES (?1, 'Untitled note', '')",
-        rusqlite::params![id],
+        "INSERT INTO notes_fts(note_id, title, body) VALUES (?1, ?2, ?3)",
+        rusqlite::params![id, title, body_md],
     )
     .map_err(|e| e.to_string())?;
     Ok(new_note_ref(id))

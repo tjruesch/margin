@@ -284,6 +284,55 @@ pub fn get_message_details_batch(
     rows.collect::<Result<Vec<_>, _>>()
 }
 
+/// Fetch the messages immediately around `around_sent_at_ms` in the
+/// same chat, for conversational context in `read_teams_message` (#136).
+/// Returns `(before, after)` where:
+///   - `before` is DESC by sent_at_ms (newest of the older messages
+///     first), capped at `before_n`.
+///   - `after` is ASC by sent_at_ms (oldest of the newer messages
+///     first), capped at `after_n`.
+/// Excludes the anchor row itself.
+pub fn list_chat_context(
+    conn: &Connection,
+    chat_id: &str,
+    around_sent_at_ms: i64,
+    before_n: usize,
+    after_n: usize,
+) -> rusqlite::Result<(Vec<TeamsMessage>, Vec<TeamsMessage>)> {
+    let select_cols = "id, connector_id, external_id, chat_id, chat_kind, chat_topic, \
+                       sent_at_ms, from_aad_id, from_email, from_name, \
+                       body_html, body_preview, reply_to_id, modified_ms, raw_etag";
+    let before = {
+        let sql = format!(
+            "SELECT {cols} FROM teams_messages \
+              WHERE chat_id = ?1 AND sent_at_ms < ?2 \
+              ORDER BY sent_at_ms DESC LIMIT ?3",
+            cols = select_cols,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![chat_id, around_sent_at_ms, before_n as i64],
+            row_to_message,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let after = {
+        let sql = format!(
+            "SELECT {cols} FROM teams_messages \
+              WHERE chat_id = ?1 AND sent_at_ms > ?2 \
+              ORDER BY sent_at_ms ASC LIMIT ?3",
+            cols = select_cols,
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![chat_id, around_sent_at_ms, after_n as i64],
+            row_to_message,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    Ok((before, after))
+}
+
 fn row_to_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<TeamsMessage> {
     Ok(TeamsMessage {
         id: r.get(0)?,

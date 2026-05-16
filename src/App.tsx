@@ -245,9 +245,13 @@ export default function App() {
   const [externallyDeleted, setExternallyDeleted] = useState<boolean>(false);
 
   const isOwned = useMemo(() => {
-    if (!path || !notesDir) return false;
-    return path.startsWith(notesDir.endsWith("/") ? notesDir : notesDir + "/");
-  }, [path, notesDir]);
+    if (!path) return false;
+    // Post-#112 note ids (UUIDs, "inbox", etc.) never contain a path
+    // separator; external filesystem files opened via Open dialog
+    // always do. The legacy notesDir.startsWith check broke once
+    // `path` started carrying note ids instead of filesystem paths.
+    return !path.includes("/") && !path.includes("\\");
+  }, [path]);
 
   // Load the attendee list whenever the active note path changes. The
   // backend returns empty for non-meeting notes, which is fine — the
