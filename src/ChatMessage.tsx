@@ -9,7 +9,7 @@
 //! a flat `sources` array used for chip rendering and `[N]` citation
 //! resolution. User messages collapse to a single text part.
 
-import { useMemo, useState } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 import type React from "react";
 
 import {
@@ -19,6 +19,12 @@ import {
 } from "./file";
 import { render as renderMarkdown } from "./markdown";
 import { IconCheck } from "./icons";
+
+// Lazy-import so the inspector's React tree doesn't ship with the
+// initial chat bundle — users open it on demand.
+const PromptInspector = lazy(() =>
+  import("./PromptInspector").then((m) => ({ default: m.PromptInspector })),
+);
 
 /** Display shape — same as the SearchPalette's local `ChatMessage`. */
 export type ChatMessageView = {
@@ -182,6 +188,12 @@ export function MessageBubble({
   // Drives the single-line "Reading X" indicator below the bubble. The
   // latest tool part wins — replaces the previous as the model moves on.
   const latestTool = toolParts.length > 0 ? toolParts[toolParts.length - 1] : null;
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  // 🔍 button shows only on done assistant turns that have a turn_id
+  // (pre-#134 history might lack one). Hidden while streaming because
+  // the dump isn't persisted until the terminal `done` event.
+  const canInspect =
+    !isStreaming && message.status === "done" && !!message.turnId;
 
   return (
     <div className="palette-msg palette-msg-assistant">
@@ -203,6 +215,17 @@ export function MessageBubble({
             />
           ))
         )}
+        {canInspect && (
+          <button
+            type="button"
+            className="palette-msg-inspect"
+            title="Inspect what the AI saw for this turn"
+            aria-label="Open prompt inspector"
+            onClick={() => setInspectorOpen(true)}
+          >
+            🔍
+          </button>
+        )}
       </div>
       {isStreaming && latestTool ? (
         <ToolStatus
@@ -219,6 +242,14 @@ export function MessageBubble({
           onOpen={(s) => void openSource(s, onOpenNote, onOpenWorkstream)}
         />
       ) : null}
+      {inspectorOpen && (
+        <Suspense fallback={null}>
+          <PromptInspector
+            message={message}
+            onClose={() => setInspectorOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

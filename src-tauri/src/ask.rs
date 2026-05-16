@@ -74,6 +74,26 @@ const TEAMS_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
 /// 200 mirrors `DIRECTORY_CAP`; previews are one line each so the token
 /// cost is bounded.
 const TEAMS_MESSAGE_CAP: usize = 200;
+/// Per-dispatch content cap when storing tool output in `prompt_dumps`
+/// (#134). Tool outputs like `read_note` of a long meeting transcript
+/// can be 50KB+; truncating in the dump keeps a session's dump rows
+/// small while still showing enough context for inspection.
+const DISPATCH_CONTENT_CAP: usize = 4096;
+
+/// Names of every tool exposed to the model in `tool_definitions()`.
+/// Stored alongside the prompt dump so the inspector can list "what
+/// the model could have called" even if it called none. Kept as a
+/// const slice rather than re-derived from `tool_definitions()` so the
+/// inspector doesn't have to round-trip through serde_json.
+const TOOL_NAMES: &[&str] = &[
+    "read_note",
+    "read_transcript",
+    "read_event_details",
+    "read_workstream",
+    "read_teams_message",
+    "search_similar",
+    "read_edges",
+];
 /// Per-category top-N when expanding a workstream via `read_workstream`
 /// (emails / events / notes returned per call).
 const WORKSTREAM_DETAIL_TOP_N: usize = 5;
@@ -198,6 +218,34 @@ pub struct AskSource {
 pub struct ChatTurn {
     pub role: String,
     pub content: String,
+}
+
+/// One tool dispatch's input + output, captured for the prompt
+/// inspector (#134). `content` is truncated to `DISPATCH_CONTENT_CAP`
+/// so a giant `read_note` body doesn't bloat the dump row.
+#[derive(Serialize, Clone)]
+struct DispatchRecord {
+    tool_name: String,
+    input: serde_json::Value,
+    content: String,
+    is_error: bool,
+    duration_ms: i64,
+}
+
+/// One row from `prompt_dumps`, hydrated for the inspector (#134).
+/// `sources` and `dispatches` come back as raw JSON so the frontend
+/// reshapes them with its own TS types instead of needing matching
+/// serde structs on the Rust side.
+#[derive(Serialize)]
+pub struct PromptDumpView {
+    pub turn_id: String,
+    pub prompt: String,
+    pub system_prompt: String,
+    pub tool_names: Vec<String>,
+    pub sources: serde_json::Value,
+    pub dispatches: serde_json::Value,
+    pub latency_ms: i64,
+    pub created_ms: i64,
 }
 
 const SYSTEM_PROMPT: &str = "You are answering questions about the user's personal notes (meeting \
@@ -487,7 +535,7 @@ pub async fn start(
     messages.push(ApiMessage {
         role: "user".to_string(),
         content: vec![ContentBlock::Text {
-            text: user_message,
+            text: user_message.clone(),
         }],
     });
 
@@ -497,6 +545,7 @@ pub async fn start(
     // and exit; success emits deltas + a final `done` event.
     let app_bg = app.clone();
     let turn_id_bg = turn_id.clone();
+    let sources_for_dump = sources.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(msg) = run_loop(
             &app_bg,
@@ -508,6 +557,8 @@ pub async fn start(
             &schedule,
             &workstreams,
             &teams_messages,
+            &user_message,
+            &sources_for_dump,
         )
         .await
         {
@@ -596,8 +647,16 @@ async fn run_loop(
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
     teams_messages: &[crate::connectors::teams::TeamsMessage],
+    // Captured for the prompt-inspector dump (#134). The assembled
+    // user-message string and the full source surface go straight to
+    // `prompt_dumps` at turn end so the UI can show "what did the AI see?"
+    // post-hoc. Live streaming doesn't need either.
+    prompt: &str,
+    sources: &[AskSource],
 ) -> Result<(), String> {
     let tools = tool_definitions();
+    let run_start = std::time::Instant::now();
+    let mut dispatches: Vec<DispatchRecord> = Vec::new();
 
     for _ in 0..MAX_TOOL_ITERATIONS {
         let body = ApiRequest {
@@ -622,6 +681,14 @@ async fn run_loop(
                 StreamEvent::Done {
                     turn_id: turn_id.to_string(),
                 },
+            );
+            persist_prompt_dump(
+                app,
+                turn_id,
+                prompt,
+                sources,
+                &dispatches,
+                run_start.elapsed().as_millis() as i64,
             );
             return Ok(());
         }
@@ -676,6 +743,7 @@ async fn run_loop(
                 },
             );
 
+            let dispatch_start = std::time::Instant::now();
             let result = dispatch_tool(
                 app,
                 &tc.name,
@@ -685,6 +753,17 @@ async fn run_loop(
                 workstreams,
                 teams_messages,
             );
+            let dispatch_duration_ms = dispatch_start.elapsed().as_millis() as i64;
+
+            // Snapshot the dispatch for the prompt-inspector (#134) before
+            // moving `result.content` into the tool_result block below.
+            dispatches.push(DispatchRecord {
+                tool_name: tc.name.clone(),
+                input: tc.input.clone(),
+                content: truncate_chars(&result.content, DISPATCH_CONTENT_CAP),
+                is_error: result.is_error,
+                duration_ms: dispatch_duration_ms,
+            });
 
             let _ = app.emit(
                 "ai-stream",
@@ -727,6 +806,14 @@ async fn run_loop(
         StreamEvent::Done {
             turn_id: turn_id.to_string(),
         },
+    );
+    persist_prompt_dump(
+        app,
+        turn_id,
+        prompt,
+        sources,
+        &dispatches,
+        run_start.elapsed().as_millis() as i64,
     );
     Ok(())
 }
@@ -1997,6 +2084,126 @@ fn read_note_body(note_path: &std::path::Path) -> String {
     };
     let (_yaml, body) = crate::notes::split_frontmatter(&raw);
     truncate_chars(body.trim(), PER_NOTE_BODY_CAP)
+}
+
+/// Write one row into `prompt_dumps` capturing what the AI saw for
+/// this turn (#134). Best-effort: failures are logged and swallowed —
+/// the diagnostic dump must never break the user-visible response.
+fn persist_prompt_dump(
+    app: &AppHandle,
+    turn_id: &str,
+    prompt: &str,
+    sources: &[AskSource],
+    dispatches: &[DispatchRecord],
+    latency_ms: i64,
+) {
+    let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+    let conn = match conn_state.lock() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ask] prompt_dump: conn lock poisoned: {e}");
+            return;
+        }
+    };
+    if let Err(e) = write_prompt_dump(
+        &conn,
+        turn_id,
+        prompt,
+        sources,
+        dispatches,
+        latency_ms,
+        current_unix_ms(),
+    ) {
+        eprintln!("[ask] prompt_dump write failed: {e}");
+    }
+}
+
+/// Pure DB writer for the prompt dump — split from `persist_prompt_dump`
+/// so it's unit-testable with a bare `&Connection` (no Tauri state).
+fn write_prompt_dump(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+    prompt: &str,
+    sources: &[AskSource],
+    dispatches: &[DispatchRecord],
+    latency_ms: i64,
+    now_ms: i64,
+) -> rusqlite::Result<()> {
+    let tool_names_json =
+        serde_json::to_string(TOOL_NAMES).unwrap_or_else(|_| "[]".to_string());
+    let sources_json =
+        serde_json::to_string(sources).unwrap_or_else(|_| "[]".to_string());
+    let dispatches_json =
+        serde_json::to_string(dispatches).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO prompt_dumps(turn_id, prompt, system_prompt, tool_names_json, \
+                                  sources_json, dispatches_json, latency_ms, created_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(turn_id) DO UPDATE SET \
+            prompt = excluded.prompt, \
+            system_prompt = excluded.system_prompt, \
+            tool_names_json = excluded.tool_names_json, \
+            sources_json = excluded.sources_json, \
+            dispatches_json = excluded.dispatches_json, \
+            latency_ms = excluded.latency_ms",
+        rusqlite::params![
+            turn_id,
+            prompt,
+            SYSTEM_PROMPT,
+            tool_names_json,
+            sources_json,
+            dispatches_json,
+            latency_ms,
+            now_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Hydrate a prompt-dump row for the inspector UI (#134). Returns
+/// `None` for turn ids without a stored dump (errored turns, or
+/// historical turns from before this issue landed).
+fn read_prompt_dump(
+    conn: &rusqlite::Connection,
+    turn_id: &str,
+) -> rusqlite::Result<Option<PromptDumpView>> {
+    use rusqlite::OptionalExtension as _;
+    conn.query_row(
+        "SELECT turn_id, prompt, system_prompt, tool_names_json, sources_json, \
+                dispatches_json, latency_ms, created_ms \
+         FROM prompt_dumps WHERE turn_id = ?1",
+        rusqlite::params![turn_id],
+        |r| {
+            let tool_names: Vec<String> = serde_json::from_str(&r.get::<_, String>(3)?)
+                .unwrap_or_default();
+            let sources: serde_json::Value = serde_json::from_str(&r.get::<_, String>(4)?)
+                .unwrap_or_else(|_| serde_json::json!([]));
+            let dispatches: serde_json::Value = serde_json::from_str(&r.get::<_, String>(5)?)
+                .unwrap_or_else(|_| serde_json::json!([]));
+            Ok(PromptDumpView {
+                turn_id: r.get(0)?,
+                prompt: r.get(1)?,
+                system_prompt: r.get(2)?,
+                tool_names,
+                sources,
+                dispatches,
+                latency_ms: r.get(6)?,
+                created_ms: r.get(7)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Fetch the structured prompt dump for an assistant turn (#134).
+/// Powers the 🔍 inspector on assistant message bubbles.
+#[tauri::command]
+pub fn get_prompt_dump(
+    turn_id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Option<PromptDumpView>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    read_prompt_dump(&c, &turn_id).map_err(|e| e.to_string())
 }
 
 fn truncate_chars(s: &str, cap: usize) -> String {
@@ -3381,5 +3588,110 @@ mod tests {
         let html = "<div>Hello <b>world</b><br/>How are <i>you</i>?</div>";
         let out = strip_html_to_text(html);
         assert_eq!(out, "Hello world How are you ?");
+    }
+
+    // ----- Prompt-inspector dumps (#134) ----------------------------------
+
+    fn dump_test_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL); \
+             INSERT INTO meta(key, value) VALUES ('schema_version', '35');",
+        )
+        .unwrap();
+        conn.execute_batch(include_str!("migrations/036_prompt_dumps.sql"))
+            .unwrap();
+        conn
+    }
+
+    fn make_source(kind: AskSourceKind, label: &str, title: &str) -> AskSource {
+        AskSource {
+            kind,
+            label: label.to_string(),
+            title: title.to_string(),
+            modified_ms: 100,
+            note_path: None,
+            bundle_id: None,
+            event_id: None,
+            workstream_id: None,
+            teams_message_id: None,
+        }
+    }
+
+    fn make_dispatch(name: &str, content: &str, is_error: bool) -> DispatchRecord {
+        DispatchRecord {
+            tool_name: name.to_string(),
+            input: serde_json::json!({"n": 1}),
+            content: content.to_string(),
+            is_error,
+            duration_ms: 42,
+        }
+    }
+
+    #[test]
+    fn write_prompt_dump_round_trips() {
+        let conn = dump_test_db();
+        let sources = vec![make_source(AskSourceKind::Note, "1", "Note A")];
+        let dispatches = vec![make_dispatch("read_note", "body of note", false)];
+        write_prompt_dump(&conn, "turn_x", "the prompt body", &sources, &dispatches, 1234, 9_000)
+            .unwrap();
+
+        let dump = read_prompt_dump(&conn, "turn_x").unwrap().expect("row");
+        assert_eq!(dump.turn_id, "turn_x");
+        assert_eq!(dump.prompt, "the prompt body");
+        assert_eq!(dump.latency_ms, 1234);
+        assert_eq!(dump.created_ms, 9_000);
+        assert!(dump.system_prompt.contains("personal notes"), "system_prompt captured");
+        assert!(dump.tool_names.iter().any(|n| n == "read_teams_message"), "tool names list");
+        assert_eq!(dump.sources[0]["label"].as_str(), Some("1"));
+        assert_eq!(
+            dump.dispatches[0]["tool_name"].as_str(),
+            Some("read_note")
+        );
+        assert_eq!(
+            dump.dispatches[0]["content"].as_str(),
+            Some("body of note")
+        );
+    }
+
+    #[test]
+    fn write_prompt_dump_overwrites_on_retry() {
+        let conn = dump_test_db();
+        let sources_a = vec![make_source(AskSourceKind::Note, "1", "First")];
+        let sources_b = vec![make_source(AskSourceKind::Note, "2", "Second")];
+        write_prompt_dump(&conn, "turn_x", "first attempt", &sources_a, &[], 100, 1_000).unwrap();
+        write_prompt_dump(&conn, "turn_x", "second attempt", &sources_b, &[], 200, 2_000).unwrap();
+        let dump = read_prompt_dump(&conn, "turn_x").unwrap().expect("row");
+        assert_eq!(dump.prompt, "second attempt");
+        assert_eq!(dump.latency_ms, 200);
+        assert_eq!(dump.sources[0]["label"].as_str(), Some("2"));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM prompt_dumps", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "ON CONFLICT keeps a single row per turn_id");
+    }
+
+    #[test]
+    fn read_prompt_dump_returns_none_for_missing_turn() {
+        let conn = dump_test_db();
+        assert!(read_prompt_dump(&conn, "no_such_turn").unwrap().is_none());
+    }
+
+    #[test]
+    fn tool_names_const_matches_definitions() {
+        // Guards against drift: every name in TOOL_NAMES must appear
+        // as a tool in tool_definitions(), and vice versa. The
+        // inspector lists TOOL_NAMES as "what the model could have
+        // called"; if the lists diverge the inspector lies.
+        let defs = tool_definitions();
+        let defined: std::collections::HashSet<String> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_string())
+            .collect();
+        let listed: std::collections::HashSet<String> =
+            TOOL_NAMES.iter().map(|n| n.to_string()).collect();
+        assert_eq!(defined, listed, "TOOL_NAMES out of sync with tool_definitions()");
     }
 }

@@ -733,6 +733,34 @@ export async function clearActiveConversation(): Promise<ChatConversation> {
   return invoke<ChatConversation>("clear_active_conversation");
 }
 
+// --- Prompt inspector (#134) --------------------------------------------
+
+export type PromptDispatch = {
+  tool_name: string;
+  input: Record<string, unknown>;
+  content: string;
+  is_error: boolean;
+  duration_ms: number;
+};
+
+export type PromptDump = {
+  turn_id: string;
+  prompt: string;
+  system_prompt: string;
+  tool_names: string[];
+  sources: AskSource[];
+  dispatches: PromptDispatch[];
+  latency_ms: number;
+  created_ms: number;
+};
+
+/** Fetch the structured prompt dump for an assistant turn. Returns
+ *  `null` if no dump was recorded (errored turn, or pre-#134 history).
+ *  Powers the 🔍 inspector. */
+export async function getPromptDump(turnId: string): Promise<PromptDump | null> {
+  return invoke<PromptDump | null>("get_prompt_dump", { turnId });
+}
+
 // --- Voice mode (#57) ----------------------------------------------------
 
 /** Result of a voice-query stop. `ok` carries the transcribed text;

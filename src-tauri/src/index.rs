@@ -66,7 +66,8 @@ const SCHEMA_V32: &str = include_str!("migrations/032_drop_profile_md_path.sql")
 const SCHEMA_V33: &str = include_str!("migrations/033_calendar_series_master_id.sql");
 const SCHEMA_V34: &str = include_str!("migrations/034_workstream_signal_tombstone.sql");
 const SCHEMA_V35: &str = include_str!("migrations/035_chat_conversations.sql");
-const SCHEMA_VERSION: i64 = 35;
+const SCHEMA_V36: &str = include_str!("migrations/036_prompt_dumps.sql");
+const SCHEMA_VERSION: i64 = 36;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -299,6 +300,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 34 {
         conn.execute_batch(SCHEMA_V35)?;
         version = 35;
+    }
+    if version == 35 {
+        conn.execute_batch(SCHEMA_V36)?;
+        version = 36;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
