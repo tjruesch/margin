@@ -263,6 +263,21 @@ pub fn ttl_eligible_members(
     Ok(out)
 }
 
+/// Most recent `events.ts_ms` where this person is the actor (#119).
+/// Returns `None` when the person has zero events on record — typical
+/// for a freshly-added teammate before any sync. Index-backed via
+/// `idx_events_actor (actor_id, ts_ms DESC)`.
+pub fn last_event_ms_for(
+    conn: &rusqlite::Connection,
+    person_id: &str,
+) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT MAX(ts_ms) FROM events WHERE actor_id = ?1",
+        rusqlite::params![person_id],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+}
+
 /// Drop a fresh row into `profile_snapshots`. Always INSERTs a new
 /// row — history retention is part of the contract; UPDATEs would
 /// defeat that. Returns the inserted row hydrated as a
@@ -465,5 +480,39 @@ mod tests {
         // No snapshot, no events — first-pass case.
         let elig = ttl_eligible_members(&conn, 5000, 24 * 3600 * 1000, false).unwrap();
         assert_eq!(elig, vec!["tm_a".to_string()]);
+    }
+
+    /// MAX(ts_ms) wins over insertion order — the helper sorts on the
+    /// timestamp value, not the rowid.
+    #[test]
+    fn last_event_ms_for_returns_max_ts_for_actor() {
+        let conn = fresh_conn();
+        seed_member(&conn, "tm_alice", false);
+        seed_event(&conn, "tm_alice", 1_000);
+        seed_event(&conn, "tm_alice", 5_000);
+        seed_event(&conn, "tm_alice", 3_000);
+        assert_eq!(last_event_ms_for(&conn, "tm_alice").unwrap(), Some(5_000));
+    }
+
+    /// A freshly-added teammate with no events returns None — drives
+    /// the Profile tab's existing `last_seen_active_ms != null` gate.
+    #[test]
+    fn last_event_ms_for_returns_none_when_no_events() {
+        let conn = fresh_conn();
+        seed_member(&conn, "tm_alice", false);
+        assert_eq!(last_event_ms_for(&conn, "tm_alice").unwrap(), None);
+    }
+
+    /// The `WHERE actor_id = ?1` clause isolates per person — Bob's
+    /// later activity must not leak into Alice's last-seen value.
+    #[test]
+    fn last_event_ms_for_isolates_by_actor() {
+        let conn = fresh_conn();
+        seed_member(&conn, "tm_alice", false);
+        seed_member(&conn, "tm_bob", false);
+        seed_event(&conn, "tm_alice", 2_000);
+        seed_event(&conn, "tm_bob", 9_000);
+        assert_eq!(last_event_ms_for(&conn, "tm_alice").unwrap(), Some(2_000));
+        assert_eq!(last_event_ms_for(&conn, "tm_bob").unwrap(), Some(9_000));
     }
 }

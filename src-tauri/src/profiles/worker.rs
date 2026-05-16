@@ -314,6 +314,17 @@ async fn recompute_one(
         );
     }
 
+    // Deterministic override (#119). The schema doc asks the model
+    // for last_seen_active_ms but the model has no events index —
+    // overwrite from SQL so the value is always fresh and accurate.
+    // Short-lived read lock; drops at the brace before the write tx.
+    {
+        let conn_state = app.state::<std::sync::Mutex<Connection>>();
+        let c = conn_state.lock().map_err(|e| e.to_string())?;
+        body.last_seen_active_ms =
+            persist::last_event_ms_for(&c, person_id).map_err(|e| e.to_string())?;
+    }
+
     {
         let conn_state = app.state::<std::sync::Mutex<Connection>>();
         let mut c = conn_state.lock().map_err(|e| e.to_string())?;
