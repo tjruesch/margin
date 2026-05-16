@@ -86,9 +86,9 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0) AS ec, \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0) AS evc, \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0) AS nc, \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0) AS ec, \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0) AS evc, \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0) AS nc, \
                 COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0) AS ac, \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) AS lc, \
                 w.parent_workstream_id \
@@ -136,9 +136,9 @@ pub fn list_workstreams_archived(
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
@@ -191,9 +191,9 @@ pub fn list_workstreams_for_synthesis(
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
@@ -328,9 +328,9 @@ pub fn list_children_of(
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
@@ -502,9 +502,9 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
     let mut stmt = conn.prepare(
         "SELECT w.id, w.title, w.summary, w.status, w.last_activity_ms, w.created_ms, w.updated_ms, \
                 w.user_notes, w.archived_at_ms, w.reopened_at_ms, w.owner_member_id, \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event'), 0), \
-                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note'), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
+                COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
@@ -582,6 +582,7 @@ fn attach_members(
             FROM workstream_signals ws \
             JOIN email_recipients er ON er.message_id = ws.item_id \
             WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
               AND er.team_member_id IS NOT NULL \
             UNION \
             SELECT ws.workstream_id, tma.member_id AS member_id \
@@ -590,6 +591,7 @@ fn attach_members(
             JOIN team_member_aliases tma \
               ON tma.kind = 'email' AND LOWER(tma.value) = LOWER(er.email) \
             WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
               AND er.team_member_id IS NULL \
             UNION \
             SELECT ws.workstream_id, tma.member_id AS member_id \
@@ -598,11 +600,13 @@ fn attach_members(
             JOIN team_member_aliases tma \
               ON tma.kind = 'email' AND LOWER(tma.value) = LOWER(em.from_email) \
             WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
             UNION \
             SELECT ws.workstream_id, ca.team_member_id AS member_id \
             FROM workstream_signals ws \
             JOIN calendar_attendees ca ON ca.event_id = ws.item_id \
             WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
               AND ca.team_member_id IS NOT NULL \
             UNION \
             SELECT ws.workstream_id, tma.member_id AS member_id \
@@ -611,6 +615,7 @@ fn attach_members(
             JOIN team_member_aliases tma \
               ON tma.kind = 'email' AND LOWER(tma.value) = LOWER(ca.email) \
             WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
               AND ca.team_member_id IS NULL \
          ) ORDER BY workstream_id"
     );
@@ -690,6 +695,7 @@ fn attach_external_participants(
             FROM workstream_signals ws \
             JOIN email_recipients er ON er.message_id = ws.item_id \
             WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
               AND er.team_member_id IS NULL \
               AND NOT EXISTS ( \
                 SELECT 1 FROM team_member_aliases tma \
@@ -700,6 +706,7 @@ fn attach_external_participants(
             FROM workstream_signals ws \
             JOIN email_messages em ON em.id = ws.item_id \
             WHERE ws.kind = 'email' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
               AND NOT EXISTS ( \
                 SELECT 1 FROM team_member_aliases tma \
                 WHERE tma.kind = 'email' AND LOWER(tma.value) = LOWER(em.from_email) \
@@ -709,6 +716,7 @@ fn attach_external_participants(
             FROM workstream_signals ws \
             JOIN calendar_attendees ca ON ca.event_id = ws.item_id \
             WHERE ws.kind = 'event' AND ws.workstream_id IN ({placeholders}) \
+              AND ws.manual_detached_ms IS NULL \
               AND ca.team_member_id IS NULL \
               AND NOT EXISTS ( \
                 SELECT 1 FROM team_member_aliases tma \
@@ -885,8 +893,15 @@ pub fn write_workstream(
     // Replace signals wholesale (#85). One DELETE + one INSERT loop
     // covers every kind. Smaller than diffing for the typical
     // dozens-of-items per workstream.
+    //
+    // #129: the DELETE explicitly skips tombstoned rows
+    // (`manual_detached_ms IS NOT NULL`). When Claude re-clusters a
+    // user-detached item into the same workstream, INSERT OR IGNORE
+    // below collides on the PK and silently leaves the tombstone in
+    // place — the synth has no path to revive a manual detachment.
     tx.execute(
-        "DELETE FROM workstream_signals WHERE workstream_id = ?1",
+        "DELETE FROM workstream_signals \
+          WHERE workstream_id = ?1 AND manual_detached_ms IS NULL",
         params![id],
     )?;
     {
@@ -1408,11 +1423,10 @@ pub fn cleanup_orphan_signals(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Manual attach (#108). Mirrors the synthesizer's `workstream_signals`
-/// write but called from the frontend's "Attach to workstream…"
-/// affordance. INSERT OR IGNORE makes the call idempotent — the
-/// synth's bias toward existing memberships means a manual
-/// attachment naturally survives the next pass.
+/// Manual attach (#108). UPSERT: on a fresh attach this is the usual
+/// INSERT; on a re-attach after manual detach (#129) it clears the
+/// tombstone and bumps `added_ms`. Either way the row ends up
+/// attached (`manual_detached_ms IS NULL`).
 pub fn attach_signal(
     conn: &Connection,
     workstream_id: &str,
@@ -1421,27 +1435,38 @@ pub fn attach_signal(
     now_ms: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO workstream_signals \
-            (workstream_id, kind, item_id, added_ms) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO workstream_signals \
+            (workstream_id, kind, item_id, added_ms, manual_detached_ms) \
+         VALUES (?1, ?2, ?3, ?4, NULL) \
+         ON CONFLICT(workstream_id, kind, item_id) DO UPDATE SET \
+            added_ms = excluded.added_ms, \
+            manual_detached_ms = NULL",
         params![workstream_id, kind, item_id, now_ms],
     )?;
     Ok(())
 }
 
-/// Manual detach (#108). The synth may re-attach on its next pass;
-/// v1 accepts that. If users complain a `manual_detached_ms` column
-/// can gate re-attach in a follow-up.
+/// Manual detach (#108 + #129). Tombstones the row rather than
+/// deleting it: `manual_detached_ms = now`. Reads filter tombstoned
+/// rows out (so the item moves back to Unassigned and disappears
+/// from the workstream's detail), and the synth's `save_workstream`
+/// preserves tombstones across its wholesale-replace pass — so the
+/// next cluster cycle cannot revive the user-rejected attachment.
+/// The `manual_detached_ms IS NULL` guard makes double-detach a
+/// no-op and preserves the original tombstone timestamp.
 pub fn detach_signal(
     conn: &Connection,
     workstream_id: &str,
     kind: &str,
     item_id: &str,
+    now_ms: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "DELETE FROM workstream_signals \
-          WHERE workstream_id = ?1 AND kind = ?2 AND item_id = ?3",
-        params![workstream_id, kind, item_id],
+        "UPDATE workstream_signals \
+            SET manual_detached_ms = ?4 \
+          WHERE workstream_id = ?1 AND kind = ?2 AND item_id = ?3 \
+            AND manual_detached_ms IS NULL",
+        params![workstream_id, kind, item_id, now_ms],
     )?;
     Ok(())
 }
@@ -1480,13 +1505,15 @@ pub fn list_unassigned(
            FROM email_messages em \
           WHERE NOT EXISTS ( \
                 SELECT 1 FROM workstream_signals ws \
-                 WHERE ws.kind = 'email' AND ws.item_id = em.id) \
+                 WHERE ws.kind = 'email' AND ws.item_id = em.id \
+                   AND ws.manual_detached_ms IS NULL) \
          UNION ALL \
          SELECT 'event', ce.id, ce.start_ms \
            FROM calendar_events ce \
           WHERE NOT EXISTS ( \
                 SELECT 1 FROM workstream_signals ws \
-                 WHERE ws.kind = 'event' AND ws.item_id = ce.id) \
+                 WHERE ws.kind = 'event' AND ws.item_id = ce.id \
+                   AND ws.manual_detached_ms IS NULL) \
             AND ( \
                 ce.series_master_id IS NULL \
              OR ce.start_ms = ( \
@@ -1499,13 +1526,15 @@ pub fn list_unassigned(
            FROM notes n \
           WHERE n.archived = 0 AND NOT EXISTS ( \
                 SELECT 1 FROM workstream_signals ws \
-                 WHERE ws.kind = 'note' AND ws.item_id = n.id) \
+                 WHERE ws.kind = 'note' AND ws.item_id = n.id \
+                   AND ws.manual_detached_ms IS NULL) \
          UNION ALL \
          SELECT 'teams_message', tm.id, tm.sent_at_ms \
            FROM teams_messages tm \
           WHERE NOT EXISTS ( \
                 SELECT 1 FROM workstream_signals ws \
-                 WHERE ws.kind = 'teams_message' AND ws.item_id = tm.id) \
+                 WHERE ws.kind = 'teams_message' AND ws.item_id = tm.id \
+                   AND ws.manual_detached_ms IS NULL) \
          ORDER BY sort_ms DESC \
          LIMIT ?1",
     )?;
@@ -1786,6 +1815,11 @@ mod tests {
         // 033 adds calendar_events.series_master_id (#109).
         conn.execute_batch(include_str!(
             "../migrations/033_calendar_series_master_id.sql"
+        ))
+        .unwrap();
+        // 034 adds workstream_signals.manual_detached_ms (#129).
+        conn.execute_batch(include_str!(
+            "../migrations/034_workstream_signal_tombstone.sql"
         ))
         .unwrap();
         conn
@@ -3600,8 +3634,9 @@ mod tests {
         assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 1);
     }
 
-    /// Re-attaching the same (workstream, kind, item) is a no-op
-    /// thanks to INSERT OR IGNORE on the primary key.
+    /// Re-attaching the same (workstream, kind, item) yields one row
+    /// thanks to the UPSERT (#129: was INSERT OR IGNORE, now ON
+    /// CONFLICT DO UPDATE to clear any tombstone).
     #[test]
     fn attach_signal_is_idempotent() {
         let conn = open_test_db();
@@ -3612,27 +3647,109 @@ mod tests {
         assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 1);
     }
 
-    /// Detach removes the pivot row; surviving rows are untouched.
+    /// Direct read of `manual_detached_ms` for a (ws, kind, item).
+    /// Returns `Some(None)` when the row exists and is attached,
+    /// `Some(Some(ts))` when tombstoned, `None` when no row.
+    fn tombstone_ms(
+        conn: &Connection,
+        ws: &str,
+        kind: &str,
+        item: &str,
+    ) -> Option<Option<i64>> {
+        conn.query_row(
+            "SELECT manual_detached_ms FROM workstream_signals \
+              WHERE workstream_id = ?1 AND kind = ?2 AND item_id = ?3",
+            params![ws, kind, item],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn added_ms_of(
+        conn: &Connection,
+        ws: &str,
+        kind: &str,
+        item: &str,
+    ) -> i64 {
+        conn.query_row(
+            "SELECT added_ms FROM workstream_signals \
+              WHERE workstream_id = ?1 AND kind = ?2 AND item_id = ?3",
+            params![ws, kind, item],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Detach tombstones the row (UPDATE, not DELETE). Other rows
+    /// for the same workstream are untouched (#129).
     #[test]
-    fn detach_signal_removes_pivot_row() {
+    fn detach_signal_stamps_manual_detached_ms() {
         let conn = open_test_db();
         seed_ws_active(&conn, "ws1");
         seed_email(&conn, "em:1", 1_000);
         seed_email(&conn, "em:2", 2_000);
         attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
         attach_signal(&conn, "ws1", "email", "em:2", 5_000).unwrap();
-        detach_signal(&conn, "ws1", "email", "em:1").unwrap();
-        assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 0);
-        assert_eq!(count_signals(&conn, "ws1", "email", "em:2"), 1);
+        detach_signal(&conn, "ws1", "email", "em:1", 9_000).unwrap();
+        // Row still present, but tombstoned.
+        assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 1);
+        assert_eq!(tombstone_ms(&conn, "ws1", "email", "em:1"), Some(Some(9_000)));
+        // Sibling row untouched.
+        assert_eq!(tombstone_ms(&conn, "ws1", "email", "em:2"), Some(None));
     }
 
-    /// Detaching a non-existent pivot row is a no-op (zero rows
-    /// affected), never an error.
+    /// The original `added_ms` survives a detach (only
+    /// `manual_detached_ms` is set). Important for any future
+    /// "when was this first attached" UX (#129).
+    #[test]
+    fn detach_signal_preserves_added_ms() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 1_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        detach_signal(&conn, "ws1", "email", "em:1", 9_000).unwrap();
+        assert_eq!(added_ms_of(&conn, "ws1", "email", "em:1"), 5_000);
+    }
+
+    /// A second detach on an already-tombstoned row leaves the
+    /// original `manual_detached_ms` in place — the IS NULL guard
+    /// in the UPDATE WHERE preserves the first-detach timestamp
+    /// (#129).
+    #[test]
+    fn detach_signal_idempotent_doesnt_clobber_ms() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 1_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        detach_signal(&conn, "ws1", "email", "em:1", 9_000).unwrap();
+        detach_signal(&conn, "ws1", "email", "em:1", 12_000).unwrap();
+        assert_eq!(tombstone_ms(&conn, "ws1", "email", "em:1"), Some(Some(9_000)));
+    }
+
+    /// Detaching a non-existent pivot row is a no-op, never an
+    /// error. UPDATE matches zero rows; no INSERT happens.
     #[test]
     fn detach_signal_noop_when_absent() {
         let conn = open_test_db();
         seed_ws_active(&conn, "ws1");
-        detach_signal(&conn, "ws1", "email", "em:missing").unwrap();
+        detach_signal(&conn, "ws1", "email", "em:missing", 9_000).unwrap();
+        assert_eq!(count_signals(&conn, "ws1", "email", "em:missing"), 0);
+    }
+
+    /// Manual re-attach via the picker clears the tombstone and
+    /// bumps `added_ms` (#129). After this the synth is free to
+    /// keep the item attached.
+    #[test]
+    fn attach_signal_clears_tombstone_on_reattach() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 1_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        detach_signal(&conn, "ws1", "email", "em:1", 9_000).unwrap();
+        attach_signal(&conn, "ws1", "email", "em:1", 12_000).unwrap();
+        assert_eq!(tombstone_ms(&conn, "ws1", "email", "em:1"), Some(None));
+        assert_eq!(added_ms_of(&conn, "ws1", "email", "em:1"), 12_000);
     }
 
     /// Items already attached to any workstream are excluded from
@@ -3698,6 +3815,174 @@ mod tests {
             })
             .collect();
         assert_eq!(notes, vec!["n:live"]);
+    }
+
+    /// Headline #129 behavior: a detached item moves *back* into the
+    /// Unassigned feed even though its pivot row still exists
+    /// (now tombstoned). The NOT EXISTS subqueries filter on
+    /// `manual_detached_ms IS NULL`.
+    #[test]
+    fn list_unassigned_includes_detached_item() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 5_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        // Pre-detach: email is attached, not in Unassigned.
+        let pre: Vec<String> = list_unassigned(&conn, 100)
+            .unwrap()
+            .iter()
+            .filter_map(|u| match u {
+                UnassignedItem::Email(m) => Some(m.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(pre.is_empty());
+
+        detach_signal(&conn, "ws1", "email", "em:1", 9_000).unwrap();
+
+        // Post-detach: email surfaces in Unassigned. Pivot row
+        // still exists, just tombstoned.
+        let post: Vec<String> = list_unassigned(&conn, 100)
+            .unwrap()
+            .iter()
+            .filter_map(|u| match u {
+                UnassignedItem::Email(m) => Some(m.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(post, vec!["em:1"]);
+        assert_eq!(count_signals(&conn, "ws1", "email", "em:1"), 1);
+    }
+
+    /// `get_workstream_detail` hydrates emails/events/notes/teams via
+    /// `signals::load_and_hydrate_for_workstream`, which now skips
+    /// tombstoned rows. A detached email must not appear in the
+    /// workstream's detail view (#129).
+    #[test]
+    fn get_workstream_detail_excludes_detached_items() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:keep", 1_000);
+        seed_email(&conn, "em:drop", 2_000);
+        attach_signal(&conn, "ws1", "email", "em:keep", 5_000).unwrap();
+        attach_signal(&conn, "ws1", "email", "em:drop", 5_000).unwrap();
+        detach_signal(&conn, "ws1", "email", "em:drop", 9_000).unwrap();
+        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
+        let ids: Vec<&str> = detail.emails.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["em:keep"]);
+    }
+
+    /// Per-kind COUNT in the sidebar/list view filters tombstoned
+    /// rows out — three attaches, one detach, count is two (#129).
+    #[test]
+    fn list_workstreams_active_counts_skip_detached() {
+        let conn = open_test_db();
+        seed_ws_active(&conn, "ws1");
+        seed_email(&conn, "em:1", 1_000);
+        seed_email(&conn, "em:2", 2_000);
+        seed_email(&conn, "em:3", 3_000);
+        attach_signal(&conn, "ws1", "email", "em:1", 5_000).unwrap();
+        attach_signal(&conn, "ws1", "email", "em:2", 5_000).unwrap();
+        attach_signal(&conn, "ws1", "email", "em:3", 5_000).unwrap();
+        detach_signal(&conn, "ws1", "email", "em:2", 9_000).unwrap();
+        let active = list_workstreams_active(&conn).unwrap();
+        let ws = active.iter().find(|w| w.id == "ws1").unwrap();
+        assert_eq!(ws.email_count, 2);
+    }
+
+    /// Core regression test for #129: when the synth re-clusters the
+    /// same item back into the workstream after a manual detach, the
+    /// tombstone survives the wholesale-replace pass in
+    /// `write_workstream` and the item stays out of the detail view.
+    #[test]
+    fn write_workstream_preserves_tombstone_across_resynth() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "em:1", 1_000);
+
+        // Initial synth attach via write_workstream (the real path).
+        let tx = conn.transaction().unwrap();
+        let ws = make_ws(
+            Some("ws_resynth"),
+            "Q3 planning",
+            &["em:1"],
+            &[],
+            &[],
+            vec![],
+        );
+        write_workstream(&tx, &ws, 5_000).unwrap();
+        tx.commit().unwrap();
+        assert_eq!(tombstone_ms(&conn, "ws_resynth", "email", "em:1"), Some(None));
+
+        // User detaches.
+        detach_signal(&conn, "ws_resynth", "email", "em:1", 9_000).unwrap();
+
+        // Synth re-clusters with the SAME item — exactly the bug
+        // #129 fixes. With the pre-fix wholesale DELETE this would
+        // wipe the tombstone; post-fix the DELETE skips tombstoned
+        // rows and INSERT OR IGNORE leaves the row alone.
+        let tx = conn.transaction().unwrap();
+        let ws_again = make_ws(
+            Some("ws_resynth"),
+            "Q3 planning",
+            &["em:1"],
+            &[],
+            &[],
+            vec![],
+        );
+        write_workstream(&tx, &ws_again, 15_000).unwrap();
+        tx.commit().unwrap();
+
+        // Tombstone intact, detail view excludes the item.
+        assert_eq!(
+            tombstone_ms(&conn, "ws_resynth", "email", "em:1"),
+            Some(Some(9_000))
+        );
+        let detail = get_workstream_detail(&conn, "ws_resynth").unwrap().unwrap();
+        assert!(detail.emails.is_empty());
+    }
+
+    /// `write_workstream`'s tombstone-aware DELETE still replaces
+    /// non-tombstoned rows: re-syncing with a fresh membership set
+    /// drops the old attached row and adds the new one, while a
+    /// tombstoned (unrelated-but-same-workstream) row survives.
+    #[test]
+    fn write_workstream_replaces_non_tombstoned_rows_only() {
+        let mut conn = open_test_db();
+        seed_email(&conn, "em:tombstoned", 1_000);
+        seed_email(&conn, "em:old", 2_000);
+        seed_email(&conn, "em:fresh", 3_000);
+
+        // First synth pass attaches em:tombstoned and em:old.
+        let tx = conn.transaction().unwrap();
+        let ws = make_ws(
+            Some("ws_x"),
+            "X",
+            &["em:tombstoned", "em:old"],
+            &[],
+            &[],
+            vec![],
+        );
+        write_workstream(&tx, &ws, 5_000).unwrap();
+        tx.commit().unwrap();
+
+        // User detaches the first one — tombstone laid down.
+        detach_signal(&conn, "ws_x", "email", "em:tombstoned", 6_000).unwrap();
+
+        // Next synth pass: cluster only em:fresh (Claude moved on).
+        let tx = conn.transaction().unwrap();
+        let ws2 = make_ws(Some("ws_x"), "X", &["em:fresh"], &[], &[], vec![]);
+        write_workstream(&tx, &ws2, 15_000).unwrap();
+        tx.commit().unwrap();
+
+        // Tombstoned row survives, untouched.
+        assert_eq!(
+            tombstone_ms(&conn, "ws_x", "email", "em:tombstoned"),
+            Some(Some(6_000))
+        );
+        // Old non-tombstoned row was DELETE'd.
+        assert_eq!(count_signals(&conn, "ws_x", "email", "em:old"), 0);
+        // Fresh row attached.
+        assert_eq!(tombstone_ms(&conn, "ws_x", "email", "em:fresh"), Some(None));
     }
 
     /// Recurring occurrences collapse to the earliest in the feed

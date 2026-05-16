@@ -241,8 +241,9 @@ pub fn attach_signal_to_workstream(
         .map_err(|e| e.to_string())
 }
 
-/// Detach an entity from a workstream (#108). Called from the
-/// per-row Detach button on workstream detail sections.
+/// Detach an entity from a workstream (#108 + #129). Tombstones the
+/// pivot row with `manual_detached_ms = now` so the synth's next
+/// cluster pass cannot revive it.
 #[tauri::command]
 pub fn detach_signal_from_workstream(
     workstream_id: String,
@@ -251,7 +252,8 @@ pub fn detach_signal_from_workstream(
     conn: tauri::State<'_, Mutex<Connection>>,
 ) -> Result<(), String> {
     let c = conn.lock().map_err(|e| e.to_string())?;
-    persist::detach_signal(&c, &workstream_id, &kind, &item_id)
+    let now = crate::events::current_unix_ms();
+    persist::detach_signal(&c, &workstream_id, &kind, &item_id, now)
         .map_err(|e| e.to_string())
 }
 

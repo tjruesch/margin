@@ -1005,6 +1005,7 @@ pub fn list_open_questions_for(
            LEFT JOIN notes              n  ON n.id = q.origin_note_id \
            LEFT JOIN workstream_signals ws ON ws.kind = 'note' \
                                           AND ws.item_id = q.origin_note_id \
+                                          AND ws.manual_detached_ms IS NULL \
            LEFT JOIN workstreams        w  ON w.id   = ws.workstream_id \
                                           AND w.status = 'active' \
            LEFT JOIN team_members       t  ON t.id   = q.asked_of_id \

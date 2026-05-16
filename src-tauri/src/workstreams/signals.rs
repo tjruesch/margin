@@ -714,6 +714,7 @@ pub fn load_and_hydrate_for_workstream(
     let mut stmt = conn.prepare(
         "SELECT kind, item_id FROM workstream_signals \
          WHERE workstream_id = ?1 \
+           AND manual_detached_ms IS NULL \
          ORDER BY kind, added_ms DESC",
     )?;
     let mut by_kind: HashMap<String, Vec<String>> = HashMap::new();
@@ -797,6 +798,11 @@ mod tests {
             .unwrap();
         conn.execute_batch(include_str!("../migrations/016_workstream_signals.sql"))
             .unwrap();
+        // 034 adds workstream_signals.manual_detached_ms (#129).
+        conn.execute_batch(include_str!(
+            "../migrations/034_workstream_signal_tombstone.sql"
+        ))
+        .unwrap();
         conn
     }
 
