@@ -280,15 +280,45 @@ pub fn list_events_in_range(
 /// Update an event's `linked_note_id`. Called after the user clicks
 /// an event card in the "Coming up" strip and we've created (or
 /// rediscovered) the linked note bundle.
+///
+/// Linking a note is unambiguously a self action — only the user
+/// can drive this from the UI. We emit one `counterparty_replied`
+/// event per non-self attendee so the profile worker marks them
+/// dirty (#121); their "past meeting without note" waiting action
+/// then clears on the next tick.
 pub fn set_linked_note_id(
-    conn: &Connection,
+    conn: &mut Connection,
     event_id: &str,
     note_path: &str,
 ) -> rusqlite::Result<()> {
-    conn.execute(
+    let tx = conn.transaction()?;
+    tx.execute(
         "UPDATE calendar_events SET linked_note_id = ?1 WHERE id = ?2",
         params![note_path, event_id],
     )?;
+    let cp_ids: Vec<String> = {
+        let mut cp_stmt = tx.prepare(
+            "SELECT DISTINCT team_member_id FROM calendar_attendees \
+              WHERE event_id = ?1 \
+                AND is_self = 0 \
+                AND team_member_id IS NOT NULL",
+        )?;
+        let rows = cp_stmt.query_map(params![event_id], |r| r.get::<_, String>(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
+    let now = crate::events::current_unix_ms();
+    for cp_id in cp_ids {
+        crate::events::emit(
+            &tx,
+            now,
+            "counterparty_replied",
+            Some(&cp_id),
+            "meeting",
+            event_id,
+            &serde_json::json!({ "source": "meeting" }),
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -586,7 +616,7 @@ mod tests {
         upsert_window(&mut conn, "mg:test", &[event.clone()], 0, 100_000).unwrap();
 
         // User clicks the event → set linked path.
-        set_linked_note_id(&conn, &event.id, "/tmp/notes/x/note.md").unwrap();
+        set_linked_note_id(&mut conn, &event.id, "/tmp/notes/x/note.md").unwrap();
         let after_link = get_event_details(&conn, &event.id).unwrap().unwrap();
         assert_eq!(after_link.linked_note_id.as_deref(), Some("/tmp/notes/x/note.md"));
 
@@ -606,5 +636,123 @@ mod tests {
             Some("/tmp/notes/x/note.md"),
             "linked_note_id must survive a re-sync that doesn't carry it"
         );
+    }
+
+    fn cp_meeting_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events \
+              WHERE kind = 'counterparty_replied' AND ref_kind = 'meeting'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Linking a note to a meeting marks every non-self attendee
+    /// with a resolved `team_member_id` dirty (#121).
+    #[test]
+    fn set_linked_note_id_emits_counterparty_replied_per_attendee() {
+        let mut conn = open_test_db();
+        conn.execute(
+            "INSERT INTO team_members(id, is_self) VALUES \
+                ('tm:self', 1), ('tm:alice', 0), ('tm:bob', 0)",
+            [],
+        )
+        .unwrap();
+
+        let event = CalendarEvent {
+            id: "mg:test::e1".into(),
+            connector_id: "mg:test".into(),
+            external_id: "e1".into(),
+            title: "Sync".into(),
+            start_ms: 5_000,
+            end_ms: 6_000,
+            all_day: false,
+            location: None,
+            description: None,
+            source_calendar: None,
+            status: Some("confirmed".into()),
+            raw_etag: None,
+            modified_ms: 5_000,
+            linked_note_id: None,
+            attendees: vec![
+                CalendarAttendee {
+                    email: "me@x.io".into(),
+                    display_name: None,
+                    response_status: None,
+                    is_self: true,
+                    is_organizer: true,
+                    team_member_id: Some("tm:self".into()),
+                },
+                CalendarAttendee {
+                    email: "alice@x.io".into(),
+                    display_name: None,
+                    response_status: None,
+                    is_self: false,
+                    is_organizer: false,
+                    team_member_id: Some("tm:alice".into()),
+                },
+                CalendarAttendee {
+                    email: "bob@x.io".into(),
+                    display_name: None,
+                    response_status: None,
+                    is_self: false,
+                    is_organizer: false,
+                    team_member_id: Some("tm:bob".into()),
+                },
+            ],
+        };
+        upsert_window(&mut conn, "mg:test", &[event], 0, 100_000).unwrap();
+
+        set_linked_note_id(&mut conn, "mg:test::e1", "/tmp/notes/sync.md").unwrap();
+
+        let mut actors: Vec<String> = conn
+            .prepare(
+                "SELECT actor_id FROM events \
+                  WHERE kind = 'counterparty_replied' AND ref_kind = 'meeting'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        actors.sort();
+        assert_eq!(actors, vec!["tm:alice".to_string(), "tm:bob".to_string()]);
+    }
+
+    /// External attendees (no `team_member_id`) must not produce
+    /// `counterparty_replied` rows.
+    #[test]
+    fn set_linked_note_id_skips_external_attendees() {
+        let mut conn = open_test_db();
+
+        let event = CalendarEvent {
+            id: "mg:test::e2".into(),
+            connector_id: "mg:test".into(),
+            external_id: "e2".into(),
+            title: "External meeting".into(),
+            start_ms: 5_000,
+            end_ms: 6_000,
+            all_day: false,
+            location: None,
+            description: None,
+            source_calendar: None,
+            status: Some("confirmed".into()),
+            raw_etag: None,
+            modified_ms: 5_000,
+            linked_note_id: None,
+            attendees: vec![CalendarAttendee {
+                email: "vendor@external.com".into(),
+                display_name: None,
+                response_status: None,
+                is_self: false,
+                is_organizer: false,
+                team_member_id: None,
+            }],
+        };
+        upsert_window(&mut conn, "mg:test", &[event], 0, 100_000).unwrap();
+
+        set_linked_note_id(&mut conn, "mg:test::e2", "/tmp/notes/ext.md").unwrap();
+        assert_eq!(cp_meeting_count(&conn), 0);
     }
 }

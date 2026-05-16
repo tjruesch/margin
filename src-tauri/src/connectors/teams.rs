@@ -108,6 +108,46 @@ pub fn upsert_messages(
                 &m.id,
                 &payload,
             )?;
+            // When self sends, mark every other team_member in the chat
+            // dirty so their profile worker picks them up on the next
+            // tick (#121). Without this the waiting-action surface
+            // depends on the 24h TTL to clear stale entries — replies
+            // would otherwise sit visible until tomorrow.
+            let actor_is_self: bool = match actor_id.as_deref() {
+                Some(id) => tx
+                    .query_row(
+                        "SELECT is_self FROM team_members WHERE id = ?1",
+                        params![id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    != 0,
+                None => false,
+            };
+            if actor_is_self {
+                let cp_ids: Vec<String> = {
+                    let mut cp_stmt = tx.prepare(
+                        "SELECT DISTINCT team_member_id FROM teams_chat_members \
+                          WHERE chat_id = ?1 \
+                            AND is_self = 0 \
+                            AND team_member_id IS NOT NULL",
+                    )?;
+                    let rows = cp_stmt
+                        .query_map(params![&m.chat_id], |r| r.get::<_, String>(0))?;
+                    rows.filter_map(Result::ok).collect()
+                };
+                for cp_id in cp_ids {
+                    crate::events::emit(
+                        &tx,
+                        m.sent_at_ms,
+                        "counterparty_replied",
+                        Some(&cp_id),
+                        "teams_message",
+                        &m.id,
+                        &serde_json::json!({ "source": "teams" }),
+                    )?;
+                }
+            }
             report.added += 1;
         }
     }
@@ -437,6 +477,177 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    /// Seed a team_members row. `aliases` was dropped in migration 017
+    /// so the post-migration schema is (id, display_name, role,
+    /// profile_md_path, is_self, created_ms, updated_ms).
+    fn seed_member(conn: &Connection, id: &str, name: &str, is_self: bool) {
+        conn.execute(
+            "INSERT INTO team_members(\
+                id, display_name, role, profile_md_path, \
+                is_self, created_ms, updated_ms\
+             ) VALUES (?1, ?2, '', ?3, ?4, 0, 0)",
+            params![id, name, format!("/tmp/{}.md", id), is_self as i64],
+        )
+        .unwrap();
+    }
+
+    fn cp_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events \
+              WHERE kind = 'counterparty_replied' AND ref_kind = 'teams_message'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Self-sent message in a chat with self + Alice + Bob emits one
+    /// `counterparty_replied` per non-self member (#121).
+    #[test]
+    fn self_sent_emits_counterparty_replied_per_other_member() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm:self", "Me", true);
+        seed_member(&conn, "tm:alice", "Alice", false);
+        seed_member(&conn, "tm:bob", "Bob", false);
+        upsert_chat_members(
+            &mut conn,
+            "chat-1",
+            &[
+                TeamsChatMember {
+                    chat_id: "chat-1".into(),
+                    aad_id: "aad-self".into(),
+                    email: Some("me@x.io".into()),
+                    display_name: Some("Me".into()),
+                    team_member_id: Some("tm:self".into()),
+                    is_self: true,
+                },
+                TeamsChatMember {
+                    chat_id: "chat-1".into(),
+                    aad_id: "aad-alice".into(),
+                    email: Some("alice@x.io".into()),
+                    display_name: Some("Alice".into()),
+                    team_member_id: Some("tm:alice".into()),
+                    is_self: false,
+                },
+                TeamsChatMember {
+                    chat_id: "chat-1".into(),
+                    aad_id: "aad-bob".into(),
+                    email: Some("bob@x.io".into()),
+                    display_name: Some("Bob".into()),
+                    team_member_id: Some("tm:bob".into()),
+                    is_self: false,
+                },
+            ],
+        )
+        .unwrap();
+        let mut m = sample_message(
+            "microsoft_graph:test@x.io::teams::m-self",
+            "chat-1",
+            1_000,
+            "ping",
+        );
+        m.from_aad_id = Some("aad-self".into());
+        upsert_messages(&mut conn, &[m]).unwrap();
+
+        let mut actors: Vec<String> = conn
+            .prepare(
+                "SELECT actor_id FROM events \
+                  WHERE kind = 'counterparty_replied' AND ref_kind = 'teams_message'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        actors.sort();
+        assert_eq!(actors, vec!["tm:alice".to_string(), "tm:bob".to_string()]);
+    }
+
+    /// Inbound message (Alice → self) must not emit any
+    /// `counterparty_replied` rows — only outbound self-actions
+    /// dirty counterparties.
+    #[test]
+    fn inbound_message_does_not_emit_counterparty_replied() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm:self", "Me", true);
+        seed_member(&conn, "tm:alice", "Alice", false);
+        upsert_chat_members(
+            &mut conn,
+            "chat-1",
+            &[
+                TeamsChatMember {
+                    chat_id: "chat-1".into(),
+                    aad_id: "aad-self".into(),
+                    email: Some("me@x.io".into()),
+                    display_name: Some("Me".into()),
+                    team_member_id: Some("tm:self".into()),
+                    is_self: true,
+                },
+                TeamsChatMember {
+                    chat_id: "chat-1".into(),
+                    aad_id: "aad-alice".into(),
+                    email: Some("alice@x.io".into()),
+                    display_name: Some("Alice".into()),
+                    team_member_id: Some("tm:alice".into()),
+                    is_self: false,
+                },
+            ],
+        )
+        .unwrap();
+        let mut m = sample_message(
+            "microsoft_graph:test@x.io::teams::m-in",
+            "chat-1",
+            1_000,
+            "hi",
+        );
+        m.from_aad_id = Some("aad-alice".into());
+        upsert_messages(&mut conn, &[m]).unwrap();
+        assert_eq!(cp_count(&conn), 0);
+    }
+
+    /// Re-upserting the same self-sent message must not duplicate
+    /// `counterparty_replied` rows — emission is gated on
+    /// `pre_existed == 0` like the parent `message_sent` event.
+    #[test]
+    fn pre_existing_message_does_not_re_emit() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm:self", "Me", true);
+        seed_member(&conn, "tm:alice", "Alice", false);
+        upsert_chat_members(
+            &mut conn,
+            "chat-1",
+            &[
+                TeamsChatMember {
+                    chat_id: "chat-1".into(),
+                    aad_id: "aad-self".into(),
+                    email: Some("me@x.io".into()),
+                    display_name: Some("Me".into()),
+                    team_member_id: Some("tm:self".into()),
+                    is_self: true,
+                },
+                TeamsChatMember {
+                    chat_id: "chat-1".into(),
+                    aad_id: "aad-alice".into(),
+                    email: Some("alice@x.io".into()),
+                    display_name: Some("Alice".into()),
+                    team_member_id: Some("tm:alice".into()),
+                    is_self: false,
+                },
+            ],
+        )
+        .unwrap();
+        let mut m = sample_message(
+            "microsoft_graph:test@x.io::teams::m-once",
+            "chat-1",
+            1_000,
+            "again",
+        );
+        m.from_aad_id = Some("aad-self".into());
+        upsert_messages(&mut conn, &[m.clone()]).unwrap();
+        upsert_messages(&mut conn, &[m]).unwrap();
+        assert_eq!(cp_count(&conn), 1, "second upsert must not re-emit");
     }
 
     #[test]

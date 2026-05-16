@@ -302,7 +302,7 @@ pub fn open_or_create_event_note(
         }
     }
     tx.commit().map_err(|e| e.to_string())?;
-    super::calendar::set_linked_note_id(&c, &event.id, &new_id)
+    super::calendar::set_linked_note_id(&mut c, &event.id, &new_id)
         .map_err(|e| e.to_string())?;
 
     Ok(new_id)

@@ -128,6 +128,38 @@ pub fn upsert_messages(
                 &msg.id,
                 &payload,
             )?;
+            // When self sends, mark every team_member recipient dirty
+            // (#121). The waiting-action surface depends on the
+            // profile worker re-running for each counterparty so any
+            // outstanding "Waiting on you" entries clear on the next
+            // tick instead of the 24h TTL. Filter excludes the sender
+            // (cc-self) and any external recipient with no resolved
+            // team_member_id.
+            if kind == "email_sent" {
+                let sender = sender_id.as_deref().unwrap_or("");
+                let cp_ids: Vec<String> = {
+                    let mut cp_stmt = tx.prepare(
+                        "SELECT DISTINCT team_member_id FROM email_recipients \
+                          WHERE message_id = ?1 \
+                            AND team_member_id IS NOT NULL \
+                            AND team_member_id != ?2",
+                    )?;
+                    let rows = cp_stmt
+                        .query_map(params![&msg.id, sender], |r| r.get::<_, String>(0))?;
+                    rows.filter_map(Result::ok).collect()
+                };
+                for cp_id in cp_ids {
+                    crate::events::emit(
+                        &tx,
+                        msg.sent_at_ms,
+                        "counterparty_replied",
+                        Some(&cp_id),
+                        "email",
+                        &msg.id,
+                        &serde_json::json!({ "source": "email" }),
+                    )?;
+                }
+            }
             report.added += 1;
         }
     }
@@ -686,5 +718,173 @@ mod tests {
 
         let none = get_message_origin(&conn, "mg:test::missing").unwrap();
         assert!(none.is_none());
+    }
+
+    /// Seed `team_members(id, is_self)` + a single email alias used by
+    /// the sender-resolution JOIN inside `upsert_messages`.
+    fn seed_member_with_email(
+        conn: &Connection,
+        id: &str,
+        email: &str,
+        is_self: bool,
+    ) {
+        // Test fixture's team_members table only has (id, is_self).
+        conn.execute(
+            "INSERT OR IGNORE INTO team_members(id, is_self) VALUES (?1, ?2)",
+            params![id, is_self as i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO team_member_aliases(member_id, kind, value) \
+             VALUES (?1, 'email', ?2)",
+            params![id, email.to_lowercase()],
+        )
+        .unwrap();
+    }
+
+    fn cp_email_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events \
+              WHERE kind = 'counterparty_replied' AND ref_kind = 'email'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn make_msg_from(
+        external_id: &str,
+        thread_id: &str,
+        sent_at_ms: i64,
+        from_email: &str,
+        recipients: Vec<EmailRecipient>,
+    ) -> EmailMessage {
+        let mut m = make_msg(external_id, thread_id, sent_at_ms, recipients);
+        m.from_email = from_email.to_string();
+        m
+    }
+
+    /// Outbound mail (self → Alice + Bob) emits one
+    /// `counterparty_replied` per resolved team_member recipient (#121).
+    #[test]
+    fn outbound_emits_counterparty_replied_per_recipient() {
+        let mut conn = open_test_db();
+        seed_member_with_email(&conn, "tm:self", "me@x.io", true);
+        // tm:heike pre-seeded by the fixture; add an alias for it.
+        conn.execute(
+            "INSERT INTO team_member_aliases(member_id, kind, value) \
+             VALUES ('tm:heike', 'email', 'heike@x.io')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO team_members(id, is_self) VALUES ('tm:bob', 0)",
+            [],
+        )
+        .unwrap();
+
+        let msg = make_msg_from(
+            "out-1",
+            "t-1",
+            1_000,
+            "me@x.io",
+            vec![
+                rcpt("heike@x.io", "to", Some("tm:heike")),
+                rcpt("bob@x.io", "cc", Some("tm:bob")),
+            ],
+        );
+        upsert_messages(&mut conn, "mg:test", &[msg]).unwrap();
+
+        let mut actors: Vec<String> = conn
+            .prepare(
+                "SELECT actor_id FROM events \
+                  WHERE kind = 'counterparty_replied' AND ref_kind = 'email'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        actors.sort();
+        assert_eq!(actors, vec!["tm:bob".to_string(), "tm:heike".to_string()]);
+    }
+
+    /// Inbound mail (Heike → self) must not emit counterparty_replied.
+    #[test]
+    fn inbound_does_not_emit_counterparty_replied() {
+        let mut conn = open_test_db();
+        seed_member_with_email(&conn, "tm:self", "me@x.io", true);
+        conn.execute(
+            "INSERT INTO team_member_aliases(member_id, kind, value) \
+             VALUES ('tm:heike', 'email', 'heike@x.io')",
+            [],
+        )
+        .unwrap();
+
+        let msg = make_msg_from(
+            "in-1",
+            "t-1",
+            1_000,
+            "heike@x.io",
+            vec![rcpt("me@x.io", "to", Some("tm:self"))],
+        );
+        upsert_messages(&mut conn, "mg:test", &[msg]).unwrap();
+        assert_eq!(cp_email_count(&conn), 0);
+    }
+
+    /// External recipients (no resolved `team_member_id`) must not
+    /// produce counterparty_replied rows.
+    #[test]
+    fn outbound_skips_external_recipients() {
+        let mut conn = open_test_db();
+        seed_member_with_email(&conn, "tm:self", "me@x.io", true);
+
+        let msg = make_msg_from(
+            "out-ext",
+            "t-1",
+            1_000,
+            "me@x.io",
+            vec![rcpt("vendor@external.com", "to", None)],
+        );
+        upsert_messages(&mut conn, "mg:test", &[msg]).unwrap();
+        assert_eq!(cp_email_count(&conn), 0);
+    }
+
+    /// Self CC'd to own outbound mail must not produce a
+    /// counterparty_replied row pointing at self.
+    #[test]
+    fn outbound_skips_self_cc() {
+        let mut conn = open_test_db();
+        seed_member_with_email(&conn, "tm:self", "me@x.io", true);
+        conn.execute(
+            "INSERT INTO team_member_aliases(member_id, kind, value) \
+             VALUES ('tm:heike', 'email', 'heike@x.io')",
+            [],
+        )
+        .unwrap();
+
+        let msg = make_msg_from(
+            "out-selfcc",
+            "t-1",
+            1_000,
+            "me@x.io",
+            vec![
+                rcpt("heike@x.io", "to", Some("tm:heike")),
+                rcpt("me@x.io", "cc", Some("tm:self")),
+            ],
+        );
+        upsert_messages(&mut conn, "mg:test", &[msg]).unwrap();
+
+        let actors: Vec<String> = conn
+            .prepare(
+                "SELECT actor_id FROM events \
+                  WHERE kind = 'counterparty_replied' AND ref_kind = 'email'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(actors, vec!["tm:heike".to_string()]);
     }
 }
