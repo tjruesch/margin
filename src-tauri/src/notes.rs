@@ -107,6 +107,11 @@ pub struct ActionListItem {
     /// stops auto-modifying it after that. Avoids the user-unchecks /
     /// worker-rechecks loop.
     pub manual_override: bool,
+    /// Stamped by the worker (NOT the user) when auto-resolve flipped
+    /// `done` after the hysteresis threshold (#124). Drives the
+    /// "Margin auto-resolved" pill on the action row; clicking the
+    /// pill calls `undo_auto_resolved_action` to reopen + lock.
+    pub auto_resolved_ms: Option<i64>,
 }
 
 #[derive(Deserialize, Default, Clone, Copy)]
@@ -782,6 +787,21 @@ pub fn set_action_done(
         &conn,
         |line| Ok(Some(toggle_checkbox_marker(line, done))),
     )
+}
+
+/// Undo a worker auto-resolution (#124). Reopens the row, locks it
+/// with `manual_override = 1` so the worker can't re-resolve, and
+/// clears the hysteresis bookkeeping. Guarded by
+/// `auto_resolved_ms IS NOT NULL` so misfires from the frontend
+/// can't accidentally reopen a user-completed action.
+#[tauri::command]
+pub fn undo_auto_resolved_action(
+    id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    crate::workstreams::persist::undo_auto_resolved_action(&c, &id)
+        .map_err(|e| e.to_string())
 }
 
 /// Reassign an action item to a different team member, or unassign

@@ -50,6 +50,7 @@ import {
   setActionDone,
   setActionWorkstream,
   deleteAction,
+  undoAutoResolvedAction,
   setMeetingAttendees,
   getMeetingAttendees,
   setNoteTags,
@@ -1636,6 +1637,29 @@ export default function App() {
     }
   }, []);
 
+  // Reopen + lock a worker auto-resolved row (#124). Optimistic:
+  // strip `auto_resolved_ms` + flip `done` immediately so the pill
+  // vanishes and the row reappears in the open bucket without
+  // waiting for the refetch. On failure, refetch to reconcile.
+  const onUndoAutoResolved = useCallback(async (id: string) => {
+    setActions((curr) =>
+      curr.map((a) =>
+        a.id === id ? { ...a, done: false, auto_resolved_ms: null } : a,
+      ),
+    );
+    try {
+      await undoAutoResolvedAction(id);
+      await refreshActions();
+    } catch (err) {
+      console.error("undoAutoResolvedAction failed:", err);
+      alert("Could not reopen the action. See console for details.");
+      try {
+        const fresh = await listActions("open");
+        setActions(fresh);
+      } catch {}
+    }
+  }, [refreshActions]);
+
   // Delete an action item. Confirms first, optimistically drops the
   // row from local state, then writes through to the unified
   // `deleteAction` IPC which dispatches on origin_kind (#111). On
@@ -2064,6 +2088,7 @@ export default function App() {
             members={members}
             onReassignAction={onReassignAction}
             onReattachActionWorkstream={onReattachActionWorkstream}
+            onUndoAutoResolved={onUndoAutoResolved}
             notifications={notifications}
             onMarkAllNotificationsRead={markNotificationsRead}
             workstreams={workstreams}

@@ -38,6 +38,13 @@ const BATCH_PER_TICK: usize = 3;
 
 const RATE_LIMIT_BACKOFF_MS: i64 = 5 * 60 * 1000;
 
+/// Consecutive recomputes a waiting action must be absent from the
+/// LLM's live output before `auto_resolve_missing` flips it `done=1`
+/// (#124). A single bad LLM pass (truncated context, transient
+/// hallucination) shouldn't silently drop a real ask; the counter
+/// gates the flip until ~two ticks corroborate.
+const AUTO_RESOLVE_THRESHOLD: i64 = 2;
+
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static RATE_LIMIT_BACKOFF_UNTIL_MS: AtomicI64 = AtomicI64::new(0);
 
@@ -473,38 +480,61 @@ fn upsert_waiting_action(
     Ok(Some(action_id))
 }
 
-/// For every `_waiting` action row touching this person (either as
-/// assignee or subject), if its id isn't in the LLM's current live
-/// set and `manual_override = 0`, mark it done. This is the auto-
-/// resolution path — the LLM judges something resolved by simply
-/// omitting it from the next snapshot's output.
+/// For every `_waiting` action row touching this person, decide
+/// whether the LLM's omission counts toward auto-resolution.
+///
+/// Hysteresis (#124): require `AUTO_RESOLVE_THRESHOLD` consecutive
+/// omissions before flipping `done=1`. Each tick that re-emits the
+/// id resets the counter; each tick that omits it bumps the counter
+/// and, at the threshold, also stamps `auto_resolved_ms` so the
+/// frontend can render the "Margin auto-resolved" pill + Undo.
 fn auto_resolve_missing(
     tx: &rusqlite::Transaction<'_>,
     person_id: &str,
     self_id: &str,
     live_ids: &std::collections::HashSet<String>,
-    _now_ms: i64,
+    now_ms: i64,
 ) -> rusqlite::Result<()> {
-    let mut stmt = tx.prepare(
-        "SELECT id FROM actions \
-          WHERE origin_kind = 'synth' \
-            AND origin_synth_kind IN ('email_waiting', 'teams_waiting', 'meeting_waiting') \
-            AND manual_override = 0 \
-            AND done = 0 \
-            AND ( \
-                (assignee_id = ?1 AND subject_member_id = ?2) \
-                OR (assignee_id = ?2 AND subject_member_id = ?1) \
-            )",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![self_id, person_id], |r| {
-        r.get::<_, String>(0)
-    })?;
-    let existing: Vec<String> = rows.filter_map(Result::ok).collect();
+    let existing: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM actions \
+              WHERE origin_kind = 'synth' \
+                AND origin_synth_kind IN ('email_waiting', 'teams_waiting', 'meeting_waiting') \
+                AND manual_override = 0 \
+                AND done = 0 \
+                AND ( \
+                    (assignee_id = ?1 AND subject_member_id = ?2) \
+                    OR (assignee_id = ?2 AND subject_member_id = ?1) \
+                )",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![self_id, person_id], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.filter_map(Result::ok).collect()
+    };
+
     for id in existing {
         if live_ids.contains(&id) {
-            continue;
+            // Re-emitted by the LLM this tick — reset hysteresis.
+            tx.execute(
+                "UPDATE actions SET auto_resolve_omissions = 0 \
+                  WHERE id = ?1 AND auto_resolve_omissions > 0",
+                rusqlite::params![id],
+            )?;
+        } else {
+            // Omitted. Bump counter; flip `done` only at threshold.
+            // SQLite reads `auto_resolve_omissions` as the OLD value in
+            // both the SET expression and the CASE; threshold compare
+            // uses (old + 1) for both columns to stay consistent.
+            tx.execute(
+                "UPDATE actions \
+                    SET auto_resolve_omissions = auto_resolve_omissions + 1, \
+                        done = CASE WHEN auto_resolve_omissions + 1 >= ?2 THEN 1 ELSE done END, \
+                        auto_resolved_ms = CASE WHEN auto_resolve_omissions + 1 >= ?2 THEN ?3 ELSE auto_resolved_ms END \
+                  WHERE id = ?1",
+                rusqlite::params![id, AUTO_RESOLVE_THRESHOLD, now_ms],
+            )?;
         }
-        tx.execute("UPDATE actions SET done = 1 WHERE id = ?1", rusqlite::params![id])?;
     }
     Ok(())
 }
@@ -667,6 +697,27 @@ mod tests {
         )
         .optional()
         .unwrap()
+    }
+
+    fn action_omissions(conn: &rusqlite::Connection, id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT auto_resolve_omissions FROM actions WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn action_auto_resolved_ms(conn: &rusqlite::Connection, id: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT auto_resolved_ms FROM actions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
     }
 
     #[test]
@@ -834,38 +885,96 @@ mod tests {
         assert_eq!(count_actions(&conn), 0);
     }
 
+    /// First omission bumps the hysteresis counter but does NOT flip
+    /// `done`. A single bad LLM pass shouldn't silently lose a real
+    /// outstanding ask.
     #[test]
-    fn auto_resolve_marks_missing_done() {
+    fn auto_resolve_increments_counter_on_first_omission() {
         let mut conn = open_db();
         seed_member(&conn, "tm_self", true);
         seed_member(&conn, "tm_alice", false);
         let tx = conn.transaction().unwrap();
-        let live_id = upsert_waiting_action(
+        let id = upsert_waiting_action(
             &tx,
-            &waiting("teams", "live", "x"),
+            &waiting("teams", "msg1", "x"),
             "tm_self",
             "tm_alice",
             1_000,
         )
         .unwrap()
         .unwrap();
-        let missing_id = upsert_waiting_action(
-            &tx,
-            &waiting("teams", "missing", "y"),
-            "tm_self",
-            "tm_alice",
-            1_000,
-        )
-        .unwrap()
-        .unwrap();
-
-        let mut live = std::collections::HashSet::new();
-        live.insert(live_id.clone());
+        let live = std::collections::HashSet::new();
         auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 2_000).unwrap();
         tx.commit().unwrap();
 
-        assert_eq!(action_done(&conn, &live_id), Some(0));
-        assert_eq!(action_done(&conn, &missing_id), Some(1));
+        assert_eq!(action_done(&conn, &id), Some(0));
+        assert_eq!(action_omissions(&conn, &id), Some(1));
+        assert_eq!(action_auto_resolved_ms(&conn, &id), None);
+    }
+
+    /// Two consecutive omissions cross the threshold — the row flips
+    /// to `done=1` and `auto_resolved_ms` is stamped with the tick's
+    /// `now_ms` so the frontend can render the audit pill.
+    #[test]
+    fn auto_resolve_flips_done_at_threshold() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "x"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+        let live = std::collections::HashSet::new();
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 2_000).unwrap();
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 3_000).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(action_done(&conn, &id), Some(1));
+        assert_eq!(action_auto_resolved_ms(&conn, &id), Some(3_000));
+    }
+
+    /// A re-emitted id resets the counter — partial-progress noise
+    /// doesn't accumulate into an unintended flip later.
+    #[test]
+    fn auto_resolve_resets_counter_when_back_in_live() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "x"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+        let empty = std::collections::HashSet::new();
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &empty, 2_000).unwrap();
+        let after_first: i64 = tx
+            .query_row(
+                "SELECT auto_resolve_omissions FROM actions WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_first, 1, "counter must bump before re-emit");
+
+        let mut live = std::collections::HashSet::new();
+        live.insert(id.clone());
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 3_000).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(action_done(&conn, &id), Some(0));
+        assert_eq!(action_omissions(&conn, &id), Some(0));
+        assert_eq!(action_auto_resolved_ms(&conn, &id), None);
     }
 
     #[test]

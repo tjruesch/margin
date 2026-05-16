@@ -2313,6 +2313,7 @@ mod tests {
             assignee_display_name: None,
             subject_member_id: None,
             manual_override: false,
+            auto_resolved_ms: None,
         }
     }
 

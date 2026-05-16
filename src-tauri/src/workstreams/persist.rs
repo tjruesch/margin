@@ -1153,10 +1153,18 @@ pub fn set_action_done(
         )
         .unwrap_or(0);
     // Bump `manual_override` so the profile worker stops auto-touching
-    // this row (#120 follow-up). Harmless for non-waiting synth rows
-    // because the worker only checks the flag on `_waiting` variants.
+    // this row (#120 follow-up). Also clear the hysteresis state
+    // (#124): a user-touched row shouldn't carry a stale
+    // auto-resolved stamp or omission counter — the pill must vanish
+    // on manual check, and a manual uncheck should reset cleanly so
+    // the next worker tick starts the counter from zero.
     conn.execute(
-        "UPDATE actions SET done = ?2, manual_override = 1 WHERE id = ?1",
+        "UPDATE actions \
+            SET done = ?2, \
+                manual_override = 1, \
+                auto_resolved_ms = NULL, \
+                auto_resolve_omissions = 0 \
+          WHERE id = ?1",
         params![action_id, done as i64],
     )?;
     // Live action_completed event on a 0→1 transition (#106). Skipped
@@ -1194,6 +1202,29 @@ pub fn set_action_done(
         )?;
         tx.commit()?;
     }
+    Ok(())
+}
+
+/// Undo a worker auto-resolution (#124). Reopens the row, locks it
+/// against further auto-resolve, and clears the hysteresis state.
+/// Guarded by `auto_resolved_ms IS NOT NULL` so the path is a no-op
+/// on rows the user (rather than the worker) marked done — those
+/// reopen via `set_action_done(_, false)` instead.
+pub fn undo_auto_resolved_action(
+    conn: &Connection,
+    action_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE actions \
+            SET done = 0, \
+                manual_override = 1, \
+                auto_resolved_ms = NULL, \
+                auto_resolve_omissions = 0 \
+          WHERE id = ?1 \
+            AND origin_kind = 'synth' \
+            AND auto_resolved_ms IS NOT NULL",
+        params![action_id],
+    )?;
     Ok(())
 }
 
@@ -1588,6 +1619,9 @@ mod tests {
         // to `actions`, plus the `dismissed_action_sources` table —
         // required by the waiting-action upsert path (#120 follow-up).
         conn.execute_batch(include_str!("../migrations/030_action_waiting.sql"))
+            .unwrap();
+        // 031 adds the auto-resolve hysteresis columns (#124).
+        conn.execute_batch(include_str!("../migrations/031_auto_resolve_hysteresis.sql"))
             .unwrap();
         conn
     }
@@ -2035,6 +2069,94 @@ mod tests {
         set_action_done(&conn, &aid, false).unwrap();
         let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
         assert!(!detail.actions[0].done);
+    }
+
+    /// Helper: seed a synth waiting action with the worker's
+    /// auto-resolved state. Mirrors what `auto_resolve_missing` would
+    /// leave behind once the threshold is crossed.
+    fn seed_auto_resolved_action(conn: &Connection, id: &str, ts_ms: i64) {
+        conn.execute(
+            "INSERT INTO actions \
+                (id, text, done, created_ms, \
+                 origin_kind, origin_synth_kind, origin_synth_id, \
+                 manual_override, auto_resolve_omissions, auto_resolved_ms) \
+             VALUES (?1, 'desc', 1, 0, \
+                     'synth', 'teams_waiting', 'src1', \
+                     0, 2, ?2)",
+            params![id, ts_ms],
+        )
+        .unwrap();
+    }
+
+    /// User unchecks a worker-auto-resolved row via the normal toggle:
+    /// `set_action_done(_, false)` must clear the pill state.
+    #[test]
+    fn set_action_done_clears_auto_resolved_ms_on_uncheck() {
+        let conn = open_test_db();
+        seed_auto_resolved_action(&conn, "a:x", 1_000);
+        set_action_done(&conn, "a:x", false).unwrap();
+        let (done, mo, ms, om): (i64, i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT done, manual_override, auto_resolved_ms, auto_resolve_omissions \
+                   FROM actions WHERE id = 'a:x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(done, 0);
+        assert_eq!(mo, 1);
+        assert!(ms.is_none(), "auto_resolved_ms must clear on user-uncheck");
+        assert_eq!(om, 0);
+    }
+
+    /// Undo path reopens the row, locks it against the worker, and
+    /// clears the hysteresis state in one transaction.
+    #[test]
+    fn undo_auto_resolved_action_reopens_and_locks() {
+        let conn = open_test_db();
+        seed_auto_resolved_action(&conn, "a:x", 1_000);
+        undo_auto_resolved_action(&conn, "a:x").unwrap();
+        let (done, mo, ms, om): (i64, i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT done, manual_override, auto_resolved_ms, auto_resolve_omissions \
+                   FROM actions WHERE id = 'a:x'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(done, 0);
+        assert_eq!(mo, 1);
+        assert!(ms.is_none());
+        assert_eq!(om, 0);
+    }
+
+    /// Undo on a user-checked row (no `auto_resolved_ms`) is a no-op —
+    /// the WHERE guard prevents the frontend from accidentally
+    /// resurrecting a manually-completed action.
+    #[test]
+    fn undo_auto_resolved_action_is_noop_on_user_checked_row() {
+        let conn = open_test_db();
+        // User-checked row: done=1 but auto_resolved_ms IS NULL.
+        conn.execute(
+            "INSERT INTO actions \
+                (id, text, done, created_ms, \
+                 origin_kind, origin_synth_kind, origin_synth_id, \
+                 manual_override, auto_resolve_omissions, auto_resolved_ms) \
+             VALUES ('a:user', 'desc', 1, 0, \
+                     'synth', 'teams_waiting', 'src1', \
+                     1, 0, NULL)",
+            [],
+        )
+        .unwrap();
+        undo_auto_resolved_action(&conn, "a:user").unwrap();
+        let done: i64 = conn
+            .query_row(
+                "SELECT done FROM actions WHERE id = 'a:user'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, 1, "user-completed row must not reopen via Undo path");
     }
 
     #[test]

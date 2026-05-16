@@ -101,6 +101,9 @@ type Props = {
     actionId: string,
     workstreamId: string | null,
   ) => Promise<void>;
+  /** Reopen + lock a worker-auto-resolved action (#124). Optimistic
+   *  upstream — the upstream refetch sweeps `auto_resolved_ms = null`. */
+  onUndoAutoResolved: (id: string) => Promise<void>;
   /** In-app notification queue surfaced by the bell button (#37). */
   notifications: NotificationRecord[];
   /** Stamp `read_at` on every unread notification. Called when the
@@ -324,6 +327,7 @@ export function Home({
   members,
   onReassignAction,
   onReattachActionWorkstream,
+  onUndoAutoResolved,
   notifications,
   onMarkAllNotificationsRead,
   workstreams,
@@ -697,6 +701,9 @@ export function Home({
             workstreams={workstreams}
             onReassign={onReassignAction}
             onReattachWorkstream={onReattachActionWorkstream}
+            onUndoAutoResolved={(id) => {
+              void onUndoAutoResolved(id);
+            }}
           />
         ) : nav === "openquestions" ? (
           <OpenQuestionsFeed
@@ -1373,6 +1380,7 @@ export function ActionRow({
   workstreams,
   onReassign,
   onReattachWorkstream,
+  onUndoAutoResolved,
 }: {
   it: ActionListItem;
   onToggle: (id: string, nextDone: boolean) => void;
@@ -1396,6 +1404,10 @@ export function ActionRow({
     actionId: string,
     workstreamId: string | null,
   ) => void;
+  /** Click target for the "Margin auto-resolved" pill (#124). When
+   *  omitted, the pill is still rendered but read-only — used by
+   *  surfaces that don't expose the Undo action. */
+  onUndoAutoResolved?: (id: string) => void;
 }) {
   // When the action has a resolved assignee, hide the literal
   // `Owner — ` prefix in the displayed text — the chip already
@@ -1470,6 +1482,19 @@ export function ActionRow({
               </>
             )}
           </div>
+        )}
+        {typeof it.auto_resolved_ms === "number" && onUndoAutoResolved && (
+          <button
+            type="button"
+            className="home-auto-resolved"
+            title="Auto-resolved because the model judged it complete. Click to reopen."
+            onClick={(e) => {
+              e.stopPropagation();
+              onUndoAutoResolved(it.id);
+            }}
+          >
+            Auto-resolved · undo
+          </button>
         )}
       </div>
       <DueChip dueMs={it.due_ms} />
@@ -1635,6 +1660,7 @@ function ActionsFeed({
   workstreams,
   onReassign,
   onReattachWorkstream,
+  onUndoAutoResolved,
 }: {
   actions: ActionListItem[];
   onToggle: (id: string, nextDone: boolean) => void;
@@ -1649,6 +1675,8 @@ function ActionsFeed({
     actionId: string,
     workstreamId: string | null,
   ) => void;
+  /** Reopen + lock a worker auto-resolved row (#124). */
+  onUndoAutoResolved: (id: string) => void;
 }) {
   const [composerOpen, setComposerOpen] = useState(false);
   const [filter, setFilter] = useState<ActionsFilter>({ kind: "all" });
@@ -1800,6 +1828,7 @@ function ActionsFeed({
                   workstreams={workstreams}
                   onReassign={onReassign}
                   onReattachWorkstream={onReattachWorkstream}
+                  onUndoAutoResolved={onUndoAutoResolved}
                 />
               ))}
             </div>
@@ -1824,6 +1853,7 @@ function ActionsFeed({
                 onOpenWorkstream={onOpenWorkstream}
                 members={members}
                 onReassign={onReassign}
+                onUndoAutoResolved={onUndoAutoResolved}
               />
             ))}
           </div>

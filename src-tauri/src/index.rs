@@ -61,7 +61,8 @@ const SCHEMA_V27: &str = include_str!("migrations/027_open_questions.sql");
 const SCHEMA_V28: &str = include_str!("migrations/028_profile_snapshots.sql");
 const SCHEMA_V29: &str = include_str!("migrations/029_profile_observations.sql");
 const SCHEMA_V30: &str = include_str!("migrations/030_action_waiting.sql");
-const SCHEMA_VERSION: i64 = 30;
+const SCHEMA_V31: &str = include_str!("migrations/031_auto_resolve_hysteresis.sql");
+const SCHEMA_VERSION: i64 = 31;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -275,6 +276,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V30)?;
         version = 30;
     }
+    if version == 30 {
+        conn.execute_batch(SCHEMA_V31)?;
+        version = 31;
+    }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
@@ -379,7 +384,7 @@ pub fn list_actions(
                 n.title AS note_title, \
                 w.title AS workstream_title, \
                 t.display_name AS assignee_display_name, \
-                a.subject_member_id, a.manual_override, \
+                a.subject_member_id, a.manual_override, a.auto_resolved_ms, \
                 COALESCE(n.modified_ms, w.last_activity_ms, a.created_ms) AS order_ms \
            FROM actions a \
            LEFT JOIN notes        n ON n.id        = a.origin_note_id \
@@ -417,6 +422,7 @@ pub fn list_actions(
                 assignee_display_name: r.get(14)?,
                 subject_member_id: r.get(15)?,
                 manual_override: r.get::<_, i64>(16)? != 0,
+                auto_resolved_ms: r.get(17)?,
             })
         },
     )?;

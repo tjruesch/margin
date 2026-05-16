@@ -540,6 +540,7 @@ pub fn run() {
             notes::set_favorite,
             notes::list_actions,
             notes::set_action_done,
+            notes::undo_auto_resolved_action,
             notes::set_action_assignee,
             notes::set_action_workstream,
             notes::delete_action,

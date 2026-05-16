@@ -2242,6 +2242,30 @@ select.settings-input {
   font-weight: 500;
   color: var(--fg-muted);
 }
+/* Worker auto-resolved waiting actions wear this pill so the user
+   can see — and reverse — the machine's decision (#124). Muted to
+   avoid competing with DueChip; interactive on hover. */
+.home-auto-resolved {
+  margin-top: 4px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--fg) 7%, transparent);
+  color: var(--fg-muted);
+  border: 0;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+  align-self: flex-start;
+}
+.home-auto-resolved:hover {
+  background: color-mix(in srgb, var(--fg) 14%, transparent);
+  color: var(--fg);
+}
 .home-due {
   flex-shrink: 0;
   align-self: flex-start;

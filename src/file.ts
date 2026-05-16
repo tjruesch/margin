@@ -332,6 +332,11 @@ export type ActionListItem = {
    *  (toggled done, reassigned). The profile worker stops auto-
    *  modifying the row after that. */
   manual_override: boolean;
+  /** Stamped by the worker (NOT the user) when auto-resolve flipped
+   *  `done` after the hysteresis threshold (#124). Non-null means the
+   *  row was machine-resolved and should render a "Margin
+   *  auto-resolved" pill with an Undo affordance. */
+  auto_resolved_ms: number | null;
 };
 
 export type ListActionsFilters = {
@@ -369,6 +374,13 @@ export async function listActions(
 
 export async function setActionDone(id: string, done: boolean): Promise<void> {
   await invoke<void>("set_action_done", { id, done });
+}
+
+/** Undo a worker auto-resolution (#124). Reopens the action and
+ *  locks it with `manual_override = 1` so the profile worker can't
+ *  re-resolve it. No-op when called on a user-checked row. */
+export async function undoAutoResolvedAction(id: string): Promise<void> {
+  await invoke<void>("undo_auto_resolved_action", { id });
 }
 
 export async function deleteAction(id: string): Promise<void> {
