@@ -407,6 +407,16 @@ Waiting analysis:\n\
 - The user message includes `waiting_candidates: { from_me, for_them }`. Each candidate is `{ source_kind, source_ref_id, since_ms, preview, conversation_tail }`.\n\
 - `from_me` candidates are things this person is waiting on the user for; `for_them` are things the user is waiting on this person for.\n\
 - `conversation_tail` is up to 5 follow-up messages in the same thread/chat, ordered oldest-first, each `{ms, from_kind, preview}` where `from_kind` is \"self\" or \"them\". USE IT to decide resolution.\n\
+- `chat_participants` is only present for Teams candidates in group chats (> 2 distinct members). When present, each entry is `{display_name, is_self}` and the list includes the user. Use it to judge whether a Teams message was directed at the user specifically or addressed the group broadly. Heuristics:\n\
+    KEEP (specific to user):\n\
+      * The user's name or an @-mention appears in the preview.\n\
+      * The ask targets something the rest of the snapshot says the user owns or is responsible for.\n\
+      * The user already replied earlier in the conversation_tail.\n\
+    DROP (group-broad):\n\
+      * Plural addressees (\"Hey team\", \"Wer kann …?\", \"Can anyone …\", \"Does anybody …\").\n\
+      * Another non-self participant has already answered in the tail.\n\
+      * Generic FYI or chatter in a long stream of group messages.\n\
+  Teams candidates without `chat_participants` (one-on-one chats) are implicitly addressed to the user — the existing resolution rules apply.\n\
 - For each candidate that's still pending, emit one WaitingItem with:\n\
     description     — one short sentence (e.g. \"Confirm the Q3 budget\" not \"Re: Re: budget thread\"). If committed-not-delivered, include the commitment context (e.g. \"Send the bridge access list (committed Tuesday)\").\n\
     source_kind     — copy verbatim from the candidate.\n\

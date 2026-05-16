@@ -18,7 +18,7 @@
 //! are sub-capped so they can't crowd out higher-signal email/Teams
 //! items.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 pub const RECENCY_WINDOW_MS: i64 = 30 * 24 * 3_600 * 1_000;
@@ -27,7 +27,7 @@ pub const MEETING_SUBCAP: usize = 5;
 pub const TAIL_CAP: usize = 5;
 pub const TAIL_PREVIEW_CHARS: usize = 200;
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct WaitingCandidate {
     pub source_kind: String,
     pub source_ref_id: String,
@@ -39,6 +39,14 @@ pub struct WaitingCandidate {
     /// meeting candidates (their "tail" is the meeting note, which
     /// we surface via the note-linked-action subsystem).
     pub conversation_tail: Vec<TailEntry>,
+    /// Populated by `hydrate_chat_participants` for Teams candidates
+    /// in chats with > 2 distinct members (#125). Empty for one-on-one
+    /// Teams chats (the question is implicitly addressed to the user)
+    /// and for email/meeting candidates (their recipient context is
+    /// explicit elsewhere). `skip_serializing_if` keeps the JSON
+    /// payload size flat for 1:1 chats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat_participants: Vec<ChatParticipant>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -46,6 +54,12 @@ pub struct TailEntry {
     pub ms: i64,
     pub from_kind: String, // "self" | "them"
     pub preview: String,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChatParticipant {
+    pub display_name: String,
+    pub is_self: bool,
 }
 
 /// Drop a candidate when its preview is a social ack or sign-off
@@ -167,6 +181,7 @@ pub fn candidates_from_me(
     )?);
     sort_and_cap(&mut out, CANDIDATES_PER_DIRECTION_CAP);
     hydrate_tails(conn, &mut out)?;
+    hydrate_chat_participants(conn, &mut out)?;
     Ok(out)
 }
 
@@ -187,6 +202,7 @@ pub fn candidates_for_them(
     )?);
     sort_and_cap(&mut out, CANDIDATES_PER_DIRECTION_CAP);
     hydrate_tails(conn, &mut out)?;
+    hydrate_chat_participants(conn, &mut out)?;
     Ok(out)
 }
 
@@ -290,6 +306,7 @@ fn row_to_email_candidate(r: &rusqlite::Row<'_>) -> rusqlite::Result<WaitingCand
         since_ms: r.get(1)?,
         preview: r.get(2)?,
         conversation_tail: Vec::new(),
+        chat_participants: Vec::new(),
     })
 }
 
@@ -378,6 +395,7 @@ fn row_to_teams_candidate(r: &rusqlite::Row<'_>) -> rusqlite::Result<WaitingCand
         since_ms: r.get(1)?,
         preview: r.get(2)?,
         conversation_tail: Vec::new(),
+        chat_participants: Vec::new(),
     })
 }
 
@@ -414,6 +432,7 @@ fn meeting_past_without_note(
                 since_ms: r.get(1)?,
                 preview: r.get(2)?,
                 conversation_tail: Vec::new(),
+                chat_participants: Vec::new(),
             })
         },
     )?;
@@ -454,6 +473,7 @@ fn meeting_future_unaccepted(
             since_ms: r.get(1)?,
             preview: r.get(2)?,
             conversation_tail: Vec::new(),
+            chat_participants: Vec::new(),
         })
     })?;
     collect_rows(rows)
@@ -479,6 +499,58 @@ fn hydrate_tails(
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// For Teams candidates in group chats (> 2 distinct members), attach
+/// the participant list so the resolution LLM can judge whether a
+/// message was directed at the user specifically or addressed the
+/// group broadly (#125). 1:1 chats and non-Teams candidates leave
+/// `chat_participants` empty — `skip_serializing_if` then omits the
+/// field from the prompt payload entirely.
+fn hydrate_chat_participants(
+    conn: &Connection,
+    candidates: &mut [WaitingCandidate],
+) -> rusqlite::Result<()> {
+    for c in candidates.iter_mut() {
+        if c.source_kind != "teams" {
+            continue;
+        }
+        let chat_id: Option<String> = conn
+            .query_row(
+                "SELECT chat_id FROM teams_messages WHERE id = ?1",
+                params![&c.source_ref_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(chat_id) = chat_id else { continue };
+
+        let n_members: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT aad_id) FROM teams_chat_members WHERE chat_id = ?1",
+                params![&chat_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if n_members <= 2 {
+            continue;
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(tm.display_name, tcm.display_name, '') AS name, tcm.is_self \
+               FROM teams_chat_members tcm \
+               LEFT JOIN team_members tm ON tm.id = tcm.team_member_id \
+              WHERE tcm.chat_id = ?1 \
+              ORDER BY tcm.is_self DESC, name ASC",
+        )?;
+        let rows = stmt.query_map(params![&chat_id], |r| {
+            Ok(ChatParticipant {
+                display_name: r.get::<_, String>(0)?,
+                is_self: r.get::<_, i64>(1)? != 0,
+            })
+        })?;
+        c.chat_participants = rows.filter_map(Result::ok).collect();
     }
     Ok(())
 }
@@ -1078,5 +1150,121 @@ mod tests {
         assert!(kinds.contains(&"meeting"));
         // Recency-desc ordering: email (1k ago) before teams (2k ago) before meeting (5k ago).
         assert_eq!(got[0].source_kind, "email");
+    }
+
+    /// Direct INSERT for tests that need to control `chat_kind`
+    /// (the shared `seed_teams_msg` hardcodes 'oneOnOne').
+    fn seed_teams_msg_with_kind(
+        conn: &Connection,
+        id: &str,
+        chat: &str,
+        chat_kind: &str,
+        sent_at: i64,
+        preview: &str,
+    ) {
+        seed_connector(conn);
+        conn.execute(
+            "INSERT INTO teams_messages(id, connector_id, external_id, chat_id, chat_kind, \
+                                          sent_at_ms, from_aad_id, body_preview, modified_ms) \
+             VALUES (?1, 'mg:test', ?1, ?2, ?3, ?4, 'aad-alice', ?5, ?4)",
+            params![id, chat, chat_kind, sent_at, preview],
+        )
+        .unwrap();
+    }
+
+    /// Group chat (4 members) → candidate is hydrated with all
+    /// participants, self listed first.
+    #[test]
+    fn hydrate_chat_participants_includes_group_members() {
+        let conn = open_db();
+        seed_self(&conn, "tm_self", "me@x.io");
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        seed_teammate(&conn, "tm_bob", "bob@x.io");
+        seed_teammate(&conn, "tm_carol", "carol@x.io");
+        seed_teams_chat_member(&conn, "c-grp", "aad-self", Some("me@x.io"), Some("tm_self"), true);
+        seed_teams_chat_member(&conn, "c-grp", "aad-alice", Some("alice@x.io"), Some("tm_alice"), false);
+        seed_teams_chat_member(&conn, "c-grp", "aad-bob", Some("bob@x.io"), Some("tm_bob"), false);
+        seed_teams_chat_member(&conn, "c-grp", "aad-carol", Some("carol@x.io"), Some("tm_carol"), false);
+        seed_teams_msg_with_kind(&conn, "m-grp", "c-grp", "group", 1_000, "Hey team, wer kann das übernehmen?");
+
+        let mut cands = vec![WaitingCandidate {
+            source_kind: "teams".into(),
+            source_ref_id: "m-grp".into(),
+            since_ms: 1_000,
+            preview: "Hey team, wer kann das übernehmen?".into(),
+            conversation_tail: Vec::new(),
+            chat_participants: Vec::new(),
+        }];
+        hydrate_chat_participants(&conn, &mut cands).unwrap();
+
+        assert_eq!(cands[0].chat_participants.len(), 4);
+        assert!(cands[0].chat_participants[0].is_self,
+            "self must sort to the front so the LLM scans it first");
+        let names: Vec<&str> = cands[0].chat_participants[1..]
+            .iter()
+            .map(|p| p.display_name.as_str())
+            .collect();
+        // Non-self entries are alphabetical by display_name.
+        assert_eq!(names, vec!["tm_alice", "tm_bob", "tm_carol"]);
+    }
+
+    /// 1:1 chat (2 members) → hydration is a no-op so the prompt
+    /// payload stays compact and `skip_serializing_if` drops the key.
+    #[test]
+    fn hydrate_chat_participants_skips_one_on_one_chats() {
+        let conn = open_db();
+        seed_self(&conn, "tm_self", "me@x.io");
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        seed_teams_chat_member(&conn, "c-1on1", "aad-self", Some("me@x.io"), Some("tm_self"), true);
+        seed_teams_chat_member(&conn, "c-1on1", "aad-alice", Some("alice@x.io"), Some("tm_alice"), false);
+        seed_teams_msg_with_kind(&conn, "m-d1", "c-1on1", "oneOnOne", 1_000, "Hi!");
+
+        let mut cands = vec![WaitingCandidate {
+            source_kind: "teams".into(),
+            source_ref_id: "m-d1".into(),
+            since_ms: 1_000,
+            preview: "Hi!".into(),
+            conversation_tail: Vec::new(),
+            chat_participants: Vec::new(),
+        }];
+        hydrate_chat_participants(&conn, &mut cands).unwrap();
+        assert!(cands[0].chat_participants.is_empty());
+    }
+
+    /// Email and meeting candidates already carry recipient context
+    /// elsewhere; the hydration path must skip them entirely so we
+    /// don't pollute prompts with irrelevant Teams data.
+    #[test]
+    fn hydrate_chat_participants_is_noop_for_email_and_meeting_candidates() {
+        let conn = open_db();
+        seed_self(&conn, "tm_self", "me@x.io");
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        // Existence of a Teams group chat in the DB shouldn't matter —
+        // these candidates aren't Teams.
+        seed_teams_chat_member(&conn, "c-grp", "aad-self", Some("me@x.io"), Some("tm_self"), true);
+        seed_teams_chat_member(&conn, "c-grp", "aad-alice", Some("alice@x.io"), Some("tm_alice"), false);
+        seed_teams_chat_member(&conn, "c-grp", "aad-bob", Some("bob@x.io"), None, false);
+
+        let mut cands = vec![
+            WaitingCandidate {
+                source_kind: "email".into(),
+                source_ref_id: "e1".into(),
+                since_ms: 1_000,
+                preview: "?".into(),
+                conversation_tail: Vec::new(),
+                chat_participants: Vec::new(),
+            },
+            WaitingCandidate {
+                source_kind: "meeting".into(),
+                source_ref_id: "mp".into(),
+                since_ms: 1_000,
+                preview: "M".into(),
+                conversation_tail: Vec::new(),
+                chat_participants: Vec::new(),
+            },
+        ];
+        hydrate_chat_participants(&conn, &mut cands).unwrap();
+        assert!(cands[0].chat_participants.is_empty());
+        assert!(cands[1].chat_participants.is_empty());
     }
 }
