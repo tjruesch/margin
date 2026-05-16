@@ -232,6 +232,12 @@ immediately after each claim that came from one. Multiple citations: `[1][3]` or
 - If neither the notes nor the profiles nor the schedule contain the answer, say so clearly. \
 Don't speculate.
 - Don't pad with caveats or restate the question. Open with the answer.
+- When the user's question implies recency (\"today\", \"this week\", \"latest\", \"recent\", \"rn\", \
+\"right now\", \"currently\", \"now\"), and the most recent source you can cite is older than 7 \
+days, explicitly note the gap. For example: \"The most recent message I can see from Heike is 2 \
+weeks old; I may be missing newer activity.\" This caveat goes at the END of your answer, not the \
+beginning — answer first, then disclose the staleness. Don't fire this caveat when recent sources \
+*are* available, or when the question is timeless (\"what is X's role?\", \"how does Y work?\").
 - Don't echo note titles back as a heading; cite them inline.";
 
 /// Public entry point — the Tauri command lives in lib.rs and forwards
@@ -1391,8 +1397,15 @@ fn dispatch_search_similar(app: &AppHandle, input: &serde_json::Value) -> ToolRe
     let opts = crate::embeddings::RetrieveOpts { kinds, limit };
     let app_clone = app.clone();
     let query_for_call = query.clone();
-    let result = tauri::async_runtime::block_on(async move {
-        crate::embeddings::retrieve(&app_clone, &query_for_call, opts).await
+    // `dispatch_tool` is sync but is called from inside `run_loop`,
+    // which is async (i.e. we're on a tokio worker). A bare `block_on`
+    // here panics with "Cannot start a runtime from within a runtime".
+    // `block_in_place` parks this worker so other tasks keep
+    // progressing, then nested `block_on` is safe.
+    let result = tokio::task::block_in_place(move || {
+        tauri::async_runtime::block_on(async move {
+            crate::embeddings::retrieve(&app_clone, &query_for_call, opts).await
+        })
     });
 
     match result {
