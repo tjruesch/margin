@@ -348,6 +348,147 @@ pub fn set_message_body_html(
     Ok(())
 }
 
+/// AI ask follow-up filter (#137). Real-world inboxes — especially
+/// when the user works through Front, which doesn't sync read state
+/// back to the underlying mail store — are ~98% unread by `is_read`,
+/// so the obvious filter is useless. The signal we surface to the
+/// model instead is "looks like a human wrote this and it's not bulk."
+///
+/// Two stages:
+///
+/// 1. **Hard sender-token noise**: the local-part of `from_email`
+///    contains or tokenizes to a known automation marker (noreply,
+///    notification, alerts, marketing, newsletter, growth, uptime,
+///    monitoring, ordersender, mailer, automated, bounces, postmaster).
+///    Tunable via `NOISE_TOKENS` + `NOISE_SUBSTRINGS` below.
+/// 2. **Bulk volume**: a sender with `>= bulk_threshold` messages in
+///    the window where every message is its own thread (no
+///    conversation depth) — catches `buchhaltung@`, security digests,
+///    and similar high-volume one-shot senders that don't trip the
+///    token list.
+///
+/// Self is dropped too (we don't surface the user's own outbound,
+/// even though today's connector doesn't sync Sent anyway).
+///
+/// Returns messages recency-desc, capped at `limit`. Sort priority
+/// stays simple: pure recency. Tier-based ordering (mapped colleagues
+/// first) is left to the prompt-section formatter so this layer stays
+/// dependency-free.
+pub fn list_messages_for_followup(
+    conn: &Connection,
+    self_email_lower: Option<&str>,
+    sent_from_ms: i64,
+    sent_to_ms: i64,
+    bulk_threshold: usize,
+    limit: usize,
+) -> rusqlite::Result<Vec<EmailMessage>> {
+    // Two passes over the window: first to find bulk senders, then to
+    // fetch the actual rows with both filters applied. Two SELECTs over
+    // the same indexed range are fine — `idx_email_sent` keeps it O(n).
+    let mut bulk_stmt = conn.prepare(
+        "SELECT from_email, COUNT(*) AS msgs, COUNT(DISTINCT thread_id) AS threads \
+         FROM email_messages \
+         WHERE sent_at_ms BETWEEN ?1 AND ?2 \
+         GROUP BY from_email \
+         HAVING msgs >= ?3 AND msgs = threads",
+    )?;
+    let bulk_senders: std::collections::HashSet<String> = bulk_stmt
+        .query_map(
+            params![sent_from_ms, sent_to_ms, bulk_threshold as i64],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect();
+
+    let mut stmt = conn.prepare(
+        "SELECT id, connector_id, external_id, thread_id, subject, from_email, from_name, \
+                sent_at_ms, body_preview, body_html, has_attachments, is_read, raw_etag, modified_ms \
+         FROM email_messages \
+         WHERE sent_at_ms BETWEEN ?1 AND ?2 \
+         ORDER BY sent_at_ms DESC",
+    )?;
+    let rows = stmt.query_map(params![sent_from_ms, sent_to_ms], row_to_message)?;
+
+    let mut out: Vec<EmailMessage> = Vec::new();
+    for msg in rows {
+        let msg = msg?;
+        let from_lower = msg.from_email.to_ascii_lowercase();
+        if let Some(self_lower) = self_email_lower {
+            if from_lower == self_lower {
+                continue;
+            }
+        }
+        if is_noise_sender(&from_lower) {
+            continue;
+        }
+        if bulk_senders.contains(&msg.from_email) {
+            continue;
+        }
+        out.push(msg);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    attach_recipients(conn, &mut out)?;
+    Ok(out)
+}
+
+/// Local-part token list — exact match after splitting on common
+/// separators (`.`, `-`, `_`, `+`). Add a token here when a new
+/// noreply-style pattern shows up; resist the urge to add short
+/// generic tokens (`team`, `info`, `support`, `news`) — they live in
+/// human inboxes too.
+const NOISE_TOKENS: &[&str] = &[
+    "noreply",
+    "donotreply",
+    "notification",
+    "notifications",
+    "notify",
+    "alert",
+    "alerts",
+    "alerting",
+    "marketing",
+    "newsletter",
+    "newsletters",
+    "mailer",
+    "mailings",
+    "mailerdaemon",
+    "automated",
+    "bounces",
+    "bounce",
+    "postmaster",
+    "growth",
+    "uptime",
+    "monitoring",
+    "ordersender",
+];
+/// Substring fallback for the hyphenated noreply forms that survive
+/// tokenization (`no-reply` → ["no","reply"]; `do-not-reply` → ["do","not","reply"]).
+/// Kept tiny so a stray substring match doesn't kill a legit sender.
+const NOISE_SUBSTRINGS: &[&str] = &["noreply", "donotreply", "no-reply", "do-not-reply"];
+
+/// Predicate behind `list_messages_for_followup`. Public-in-crate so
+/// the ask-prompt builder and the unit tests share one definition.
+pub fn is_noise_sender(from_email_lower: &str) -> bool {
+    let local = from_email_lower
+        .split('@')
+        .next()
+        .unwrap_or("");
+    for needle in NOISE_SUBSTRINGS {
+        if local.contains(needle) {
+            return true;
+        }
+    }
+    let tokens = local.split(|c: char| c == '.' || c == '-' || c == '_' || c == '+');
+    for tok in tokens {
+        if NOISE_TOKENS.contains(&tok) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Fetch `(connector_id, external_id)` for a message. Used by
 /// `get_email_body` to locate the upstream record before issuing the
 /// lazy Graph fetch.
@@ -886,5 +1027,157 @@ mod tests {
             .filter_map(Result::ok)
             .collect();
         assert_eq!(actors, vec!["tm:heike".to_string()]);
+    }
+
+    // ---- #137: follow-up filter (noise + bulk) ----------------------
+
+    #[test]
+    fn is_noise_sender_catches_common_automation_patterns() {
+        for s in [
+            "noreply@x.com",
+            "no-reply@x.com",
+            "donotreply@x.com",
+            "do-not-reply@example.org",
+            "notifications@github.com",
+            "notification@something.io",
+            "notify@mail.notion.so",
+            "alert@grafana.io",
+            "alerts@alerts.betterstack.com",
+            "marketing@csa-research.com",
+            "newsletter@mobbin.com",
+            "news.alerts@something.io", // 'alerts' tokenized
+            "growth@growth.twilio.com",
+            "uptime@elanlanguages.ai",
+            "monitoring@datadog.com",
+            "ordersender-prod@ansmtp.ariba.com",
+            "mailer@x.io",
+            "automated@billing.io",
+            "bounces@list.io",
+            "postmaster@x.com",
+        ] {
+            assert!(
+                is_noise_sender(&s.to_ascii_lowercase()),
+                "expected noise: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_noise_sender_keeps_human_looking_senders() {
+        for s in [
+            "h.epple@elanlanguages.com",
+            "florian.vanzwieten@elanlanguages.com",
+            "tj.ruesch@elanlanguages.com",
+            "sami@saverflow.ai",
+            "carl@ruby-workspaces.com",
+            // 'news' as a substring of 'newsroom' must NOT trigger — we
+            // only catch exact tokens, and 'newsroom' is not in the list.
+            "newsroom@reuters.com",
+            // 'team' / 'support' / 'info' / 'hello' / 'hey' are
+            // intentionally NOT in the noise list — too many false
+            // positives. Bulk filter catches the bulky ones.
+            "team@qdrant.com",
+            "hello@cal.com",
+            "info@xexor.com",
+        ] {
+            assert!(
+                !is_noise_sender(&s.to_ascii_lowercase()),
+                "expected NOT noise: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn list_messages_for_followup_drops_noise_self_and_bulk() {
+        let mut conn = open_test_db();
+        // Self
+        let mut self_msg = make_msg_from("s1", "ts1", 5_000, "me@x.io", vec![]);
+        self_msg.from_name = Some("Me".into());
+        // Noise (noreply)
+        let noise = make_msg_from("n1", "tn1", 4_000, "noreply@vendor.io", vec![]);
+        // Bulk: 5 different threads from same sender; threshold = 5.
+        let bulk: Vec<EmailMessage> = (0..5)
+            .map(|i| {
+                make_msg_from(
+                    &format!("b{i}"),
+                    &format!("tb{i}"),
+                    3_000 + i,
+                    "buchhaltung@accounts.io",
+                    vec![],
+                )
+            })
+            .collect();
+        // Real human, low volume — should survive.
+        let human = make_msg_from("h1", "th1", 6_000, "alice@example.com", vec![]);
+        // Conversation depth (3 messages, 1 thread) — not bulk even
+        // though `>= threshold`. Should survive.
+        let convo: Vec<EmailMessage> = (0..5)
+            .map(|i| {
+                make_msg_from(
+                    &format!("c{i}"),
+                    "shared-thread",
+                    1_000 + i,
+                    "bob@example.com",
+                    vec![],
+                )
+            })
+            .collect();
+
+        let mut all = vec![self_msg, noise, human];
+        all.extend(bulk);
+        all.extend(convo);
+        upsert_messages(&mut conn, "mg:test", &all).unwrap();
+
+        let out = list_messages_for_followup(
+            &conn,
+            Some("me@x.io"),
+            0,
+            10_000,
+            5, // bulk threshold
+            50,
+        )
+        .unwrap();
+
+        let kept: Vec<&str> = out.iter().map(|m| m.from_email.as_str()).collect();
+        assert!(
+            kept.contains(&"alice@example.com"),
+            "alice should pass: {kept:?}"
+        );
+        assert!(
+            kept.contains(&"bob@example.com"),
+            "bob (real conversation) should pass: {kept:?}"
+        );
+        assert!(!kept.contains(&"me@x.io"), "self must be dropped: {kept:?}");
+        assert!(
+            !kept.contains(&"noreply@vendor.io"),
+            "noreply must be dropped: {kept:?}"
+        );
+        assert!(
+            !kept.contains(&"buchhaltung@accounts.io"),
+            "bulk must be dropped: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn list_messages_for_followup_respects_cap_and_recency_order() {
+        let mut conn = open_test_db();
+        let msgs: Vec<EmailMessage> = (0..10)
+            .map(|i| {
+                make_msg_from(
+                    &format!("m{i}"),
+                    &format!("t{i}"),
+                    1_000 + i * 100,
+                    &format!("user{i}@ok.io"),
+                    vec![],
+                )
+            })
+            .collect();
+        upsert_messages(&mut conn, "mg:test", &msgs).unwrap();
+
+        let out = list_messages_for_followup(&conn, None, 0, 10_000, 50, 3).unwrap();
+        assert_eq!(out.len(), 3);
+        // recency-desc: highest sent_at first
+        assert!(out[0].sent_at_ms > out[1].sent_at_ms);
+        assert!(out[1].sent_at_ms > out[2].sent_at_ms);
     }
 }

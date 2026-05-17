@@ -5876,6 +5876,25 @@ input.nh-title {
   border-color: color-mix(in srgb, #5b5fc7 30%, transparent);
 }
 
+/* Email citation chips ([U*]) — mail-orange tint, distinct from
+   the Teams purple, the workstream/event/note family, and the
+   note-default. (#137) */
+.palette-cite.is-email {
+  border-color: color-mix(in srgb, #d97706 30%, transparent);
+  background: color-mix(in srgb, #d97706 12%, transparent);
+  color: #b45309;
+}
+.palette-cite.is-email:hover {
+  background: color-mix(in srgb, #d97706 22%, transparent);
+}
+.palette-source-chip.is-email .palette-source-num {
+  background: color-mix(in srgb, #d97706 14%, transparent);
+  color: #b45309;
+}
+.palette-source-chip.is-email:hover {
+  border-color: color-mix(in srgb, #d97706 30%, transparent);
+}
+
 .palette-sources {
   margin-top: 8px;
   width: 100%;

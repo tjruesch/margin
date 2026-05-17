@@ -74,6 +74,19 @@ const TEAMS_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
 /// 200 mirrors `DIRECTORY_CAP`; previews are one line each so the token
 /// cost is bounded.
 const TEAMS_MESSAGE_CAP: usize = 200;
+/// Recency window for the `# Recent emails awaiting attention` section (#137).
+const EMAIL_FOLLOWUP_WINDOW_BACK_MS: i64 = 14 * 24 * 3600 * 1000;
+/// Cap on emails in the follow-up section (#137). 30 mirrors the issue
+/// spec; the noise + bulk filter in `email::list_messages_for_followup`
+/// usually returns well under this for typical inboxes (~20-30 for a
+/// 500+/14d firehose dominated by automated senders).
+const EMAIL_FOLLOWUP_CAP: usize = 30;
+/// Sender-volume threshold for the bulk filter (#137). Any sender with
+/// `>= N` messages in the window where every message is its own thread
+/// (no conversation depth) is treated as automated. 20 catches obvious
+/// firehoses (`buchhaltung@` at 125/14d) without nuking a real
+/// human/team contact who happens to have sent a lot of one-offs.
+const EMAIL_FOLLOWUP_BULK_THRESHOLD: usize = 20;
 /// Per-dispatch content cap when storing tool output in `prompt_dumps`
 /// (#134). Tool outputs like `read_note` of a long meeting transcript
 /// can be 50KB+; truncating in the dump keeps a session's dump rows
@@ -91,6 +104,7 @@ const TOOL_NAMES: &[&str] = &[
     "read_event_details",
     "read_workstream",
     "read_teams_message",
+    "read_email",
     "search_similar",
     "read_edges",
 ];
@@ -111,17 +125,18 @@ const PROMPT_SECTION_KINDS: &[&str] = &[
     "note",          // `# Notes directory` + `# Top candidates`
     "event",         // `# Schedule (last 14 days, next 14 days)`
     "teams_message", // `# Recent Teams messages (last 14 days)`
+    "email",         // `# Recent emails awaiting attention (last 14 days)` (#137)
 ];
 /// Kinds resolvable through a `dispatch_tool` tool-call result. Note that
-/// `read_workstream` surfaces a workstream's bundled `Recent emails`,
+/// `read_workstream` also surfaces a workstream's bundled `Recent emails`,
 /// `Recent meetings`, `Recent notes`, and `Recent Teams messages`
-/// (see `format_workstream_detail`), so the email kind is reachable via
-/// that path even though there is no dedicated `read_email` tool.
+/// (see `format_workstream_detail`) — those kinds remain reachable via
+/// that path even when their dedicated tool isn't called.
 const TOOL_RESOLVABLE_KINDS: &[&str] = &[
     "note",          // `read_note(n)`
     "event",         // `read_event_details(n)`
     "teams_message", // `read_teams_message(n)` + bundled in `read_workstream`
-    "email",         // bundled in `read_workstream` ("Recent emails (top N of M)")
+    "email",         // `read_email(n)` (#137) + bundled in `read_workstream`
 ];
 /// Per-category top-N when expanding a workstream via `read_workstream`
 /// (emails / events / notes returned per call).
@@ -201,6 +216,11 @@ pub enum AskSourceKind {
     /// attached to (via `workstream_id`); unattached messages are
     /// soft no-ops in v1.
     TeamsMessage,
+    /// `[U<N>]` — a recent inbound email surfaced through the noise +
+    /// bulk follow-up filter (#137). Chip click navigates to the
+    /// message's attached workstream if any (no dedicated email viewer
+    /// yet); unattached emails are soft no-ops.
+    Email,
 }
 
 /// One source the model can cite. The full directory of notes plus
@@ -238,6 +258,11 @@ pub struct AskSource {
     /// (which falls through to `workstream_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub teams_message_id: Option<String>,
+    /// Set when `kind == Email` (#137). Carried so a future dedicated
+    /// email viewer can resolve the chip click; v1 chip click falls
+    /// through to `workstream_id` when the email is attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email_id: Option<String>,
 }
 
 /// One past turn in the conversation, threaded back to the model.
@@ -348,7 +373,7 @@ citation when the answer IS the ongoing thread itself (\"how's the Hyundai POC g
 citing a *specific* item within a workstream, prefer the underlying `[N]` / `[E<N>]` / `[T<N>]` \
 label if one is available.
 
-You have five tools for digging deeper:
+You have six tools for digging deeper:
 - **`read_note(n)`** — returns the full markdown body of directory entry `[n]`. Use when a preview \
 hints at relevance but you need the body to answer.
 - **`read_transcript(n)`** — returns the meeting transcript text for `[n]`, if it has audio. Use \
@@ -365,6 +390,13 @@ surrounding messages from the same chat (3 before + 1 after, chronological), so 
 thread context around it. Use when a preview hints at an open ask and you need the full text — \
 or to confirm whether the user has already replied. Pass the integer after the `T` as `n` (e.g. \
 for `[T3]` call `read_teams_message(3)`).
+- **`read_email(n)`** — returns the full body of inbound email `[U<n>]` plus the rest of the \
+thread it belongs to (chronological), so you can see whether the user already replied and what \
+the sender is actually asking. The `# Recent emails awaiting attention` list is pre-filtered to \
+drop automated senders and bulk-sender firehoses — but the user's read state may be unreliable \
+(many users work through clients that don't sync read status), so don't assume an unread mark means \
+they haven't seen it; check the thread instead. Pass the integer after the `U` as `n` (e.g. for \
+`[U3]` call `read_email(3)`).
 
 Use tools sparingly — most questions can be answered from the directory + top candidates + schedule \
 already in context. Don't speculate; call a tool if you genuinely need the content. Up to 6 tool \
@@ -373,9 +405,10 @@ calls per question; after that you must answer with what you have.
 Rules:
 - Answer in natural prose. Be specific and concise — 1-4 short paragraphs unless the question asks \
 for a list.
-- Cite sources inline with `[N]` (notes), `[E<N>]` (events), or `[W<N>]` (workstreams) \
-immediately after each claim that came from one. Multiple citations: `[1][3]` or `[E1][E2]` or \
-`[W2][N1]` or any mix. Never make up citation labels — only use ones you actually received.
+- Cite sources inline with `[N]` (notes), `[E<N>]` (events), `[W<N>]` (workstreams), \
+`[T<N>]` (Teams messages), or `[U<N>]` (emails) immediately after each claim that came from one. \
+Multiple citations: `[1][3]` or `[E1][E2]` or `[W2][U1]` or any mix. Never make up citation labels \
+— only use ones you actually received.
 - For \"when did we first…\" questions, identify the *earliest* dated note that matches and cite it.
 - If neither the notes nor the profiles nor the schedule nor the Teams messages contain the \
 answer, say so clearly. Don't speculate.
@@ -417,6 +450,8 @@ pub async fn start(
         workstreams,
         teams_messages,
         teams_attached_workstreams,
+        unread_emails,
+        email_attached_workstreams,
     ) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         let directory = crate::index::list_directory(&c, DIRECTORY_CAP)
@@ -449,6 +484,24 @@ pub async fn start(
         // the chip-click navigation; unattached messages are soft no-ops.
         let teams_attached_workstreams =
             load_teams_message_workstream_map(&c, &teams_messages);
+        // #137: surface inbound mail through the noise + bulk filter.
+        // `is_read` is unreliable when the user works through a separate
+        // client (Front, etc.) that doesn't sync read state back; the
+        // filter is sender-shape based instead. Self-email lookup is
+        // best-effort — if no team_member is marked `is_self` yet, the
+        // filter still works (it just doesn't suppress outbound, which
+        // today's connector doesn't sync anyway).
+        let self_email = lookup_self_email(&c);
+        let unread_emails = crate::connectors::email::list_messages_for_followup(
+            &c,
+            self_email.as_deref(),
+            now_ms - EMAIL_FOLLOWUP_WINDOW_BACK_MS,
+            now_ms,
+            EMAIL_FOLLOWUP_BULK_THRESHOLD,
+            EMAIL_FOLLOWUP_CAP,
+        )
+        .unwrap_or_default();
+        let email_attached_workstreams = load_email_workstream_map(&c, &unread_emails);
         (
             directory,
             retrieved_paths,
@@ -457,6 +510,8 @@ pub async fn start(
             workstreams,
             teams_messages,
             teams_attached_workstreams,
+            unread_emails,
+            email_attached_workstreams,
         )
     };
 
@@ -464,7 +519,11 @@ pub async fn start(
     // [N] label, every schedule entry gets an [E<N>] label, every
     // workstream gets a [W<N>] label.
     let mut sources: Vec<AskSource> = Vec::with_capacity(
-        directory.len() + schedule.len() + workstreams.len() + teams_messages.len(),
+        directory.len()
+            + schedule.len()
+            + workstreams.len()
+            + teams_messages.len()
+            + unread_emails.len(),
     );
     for (i, e) in directory.iter().enumerate() {
         sources.push(AskSource {
@@ -475,6 +534,7 @@ pub async fn start(
             event_id: None,
             workstream_id: None,
             teams_message_id: None,
+            email_id: None,
             title: e.title.clone(),
             modified_ms: e.modified_ms,
         });
@@ -488,6 +548,7 @@ pub async fn start(
             event_id: Some(e.id.clone()),
             workstream_id: None,
             teams_message_id: None,
+            email_id: None,
             title: e.title.clone(),
             modified_ms: e.start_ms,
         });
@@ -501,6 +562,7 @@ pub async fn start(
             event_id: None,
             workstream_id: Some(w.id.clone()),
             teams_message_id: None,
+            email_id: None,
             title: w.title.clone(),
             modified_ms: w.last_activity_ms,
         });
@@ -514,8 +576,23 @@ pub async fn start(
             event_id: None,
             workstream_id: teams_attached_workstreams.get(&m.id).cloned(),
             teams_message_id: Some(m.id.clone()),
+            email_id: None,
             title: teams_chip_title(m),
             modified_ms: m.sent_at_ms,
+        });
+    }
+    for (i, e) in unread_emails.iter().enumerate() {
+        sources.push(AskSource {
+            kind: AskSourceKind::Email,
+            label: format!("U{}", i + 1),
+            note_path: None,
+            bundle_id: None,
+            event_id: None,
+            workstream_id: email_attached_workstreams.get(&e.id).cloned(),
+            teams_message_id: None,
+            email_id: Some(e.id.clone()),
+            title: email_chip_title(e),
+            modified_ms: e.sent_at_ms,
         });
     }
 
@@ -584,6 +661,7 @@ pub async fn start(
         &schedule,
         &workstreams,
         &teams_messages,
+        &unread_emails,
     );
 
     // Compose `messages[]`: prior history first, then this turn's user
@@ -643,6 +721,7 @@ pub async fn start(
             &schedule,
             &workstreams,
             &teams_messages,
+            &unread_emails,
             &user_message,
             &sources_for_dump,
             &query_for_dump,
@@ -757,6 +836,7 @@ async fn run_loop(
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
     teams_messages: &[crate::connectors::teams::TeamsMessage],
+    unread_emails: &[crate::connectors::email::EmailMessage],
     // Captured for the prompt-inspector dump (#134). The assembled
     // user-message string and the full source surface go straight to
     // `prompt_dumps` at turn end so the UI can show "what did the AI see?"
@@ -858,6 +938,21 @@ async fn run_loop(
                     format!("W{}", target_n),
                     AskSourceKind::Workstream,
                 ),
+                "read_email" => (
+                    unread_emails
+                        .get(idx)
+                        .map(|e| {
+                            let s = e.subject.trim();
+                            if s.is_empty() {
+                                e.from_email.clone()
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .unwrap_or_default(),
+                    format!("U{}", target_n),
+                    AskSourceKind::Email,
+                ),
                 _ => (
                     directory.get(idx).map(|e| e.title.clone()).unwrap_or_default(),
                     target_n.to_string(),
@@ -887,6 +982,7 @@ async fn run_loop(
                 schedule,
                 workstreams,
                 teams_messages,
+                unread_emails,
             );
             let dispatch_duration_ms = dispatch_start.elapsed().as_millis() as i64;
 
@@ -1046,6 +1142,21 @@ fn tool_definitions() -> serde_json::Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "The 1-based [T<N>] label from the Recent Teams messages section."
+                    }
+                },
+                "required": ["n"]
+            }
+        },
+        {
+            "name": "read_email",
+            "description": "Read the full body of an inbound email by its [U<N>] label, plus the rest of the thread it belongs to (chronological). Use when a preview hints at an open ask or you need to see whether the user has already replied. The `is_read` flag in the underlying mail store is unreliable for users who work through clients (Front, etc.) that don't sync read state — so don't infer 'not yet read' from the absence of a read mark; check the thread for an outbound reply instead. NOTE: the `n` argument is the integer after the `U` (e.g. for `[U3]` pass `n: 3`).",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "The 1-based [U<N>] label from the Recent emails awaiting attention section."
                     }
                 },
                 "required": ["n"]
@@ -1437,6 +1548,7 @@ fn dispatch_tool(
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
     teams_messages: &[crate::connectors::teams::TeamsMessage],
+    unread_emails: &[crate::connectors::email::EmailMessage],
 ) -> ToolResult {
     // read_edges takes (node_kind, node_id) strings, not the `n` index
     // every other tool uses. Handle it before the `n` validation.
@@ -1476,6 +1588,10 @@ fn dispatch_tool(
     // check + chat-context load happen inside the dispatcher.
     if name == "read_teams_message" {
         return dispatch_read_teams_message(app, n, teams_messages);
+    }
+    // read_email indexes the inbound-email follow-up slice (#137).
+    if name == "read_email" {
+        return dispatch_read_email(app, n, unread_emails);
     }
 
     if n > directory.len() {
@@ -2613,6 +2729,7 @@ fn format_user_message(
     schedule: &[crate::connectors::calendar::CalendarEvent],
     workstreams: &[crate::workstreams::Workstream],
     teams_messages: &[crate::connectors::teams::TeamsMessage],
+    unread_emails: &[crate::connectors::email::EmailMessage],
 ) -> String {
     let mut s = String::new();
 
@@ -2697,6 +2814,25 @@ fn format_user_message(
 
     if !teams_messages.is_empty() {
         s.push_str(&format_teams_messages_section(teams_messages));
+    }
+
+    if !unread_emails.is_empty() {
+        // Build a small map of team_member email aliases so the section
+        // formatter can append a `(team)` marker on senders the user
+        // already knows — gives the model an immediate "this is a real
+        // colleague" cue without needing a profile lookup. Built here
+        // from the already-loaded `profiles` slice so we don't re-query
+        // the team table inside the formatter.
+        let mut team_emails: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for (m, _) in profiles {
+            for a in &m.aliases {
+                if a.kind == "email" {
+                    team_emails.insert(a.value.to_ascii_lowercase());
+                }
+            }
+        }
+        s.push_str(&format_unread_emails_section(unread_emails, &team_emails));
     }
 
     if !workstreams.is_empty() {
@@ -2849,6 +2985,62 @@ fn format_teams_messages_section(
     s
 }
 
+/// Render the inbound-email follow-up list as a labeled prompt section
+/// (#137). Each entry: `[U<N>] from {Sender} (date) — "Subject" — preview`.
+/// The `(team)` marker is appended on senders that resolve to a
+/// `team_members` row via the supplied alias set, so the model gets an
+/// immediate "real colleague" cue without a profile lookup.
+///
+/// The section title intentionally says "awaiting attention" rather than
+/// "unread" — the underlying `is_read` flag is unreliable for users who
+/// work through clients (Front, etc.) that don't sync read state, so the
+/// filter is sender-shape based (`is_noise_sender` + bulk-sender drop)
+/// not `is_read = 0`. The model is told this in the header so it
+/// reasons about the list correctly.
+fn format_unread_emails_section(
+    messages: &[crate::connectors::email::EmailMessage],
+    team_emails_lower: &std::collections::HashSet<String>,
+) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "# Recent emails awaiting attention (last 14 days, automated senders filtered)\n\n",
+    );
+    for (i, m) in messages.iter().enumerate() {
+        let label = format!("U{}", i + 1);
+        let when = format_date(m.sent_at_ms);
+        let sender_display = m
+            .from_name
+            .as_deref()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or(m.from_email.as_str());
+        let team_marker = if team_emails_lower.contains(&m.from_email.to_ascii_lowercase()) {
+            " (team)"
+        } else {
+            ""
+        };
+        let subject = m.subject.trim();
+        let subject_clause = if subject.is_empty() {
+            String::new()
+        } else {
+            format!(" — \"{subject}\"")
+        };
+        let preview = preview_one_line(m.body_preview.as_deref().unwrap_or(""));
+        let preview_clause = if preview.is_empty() {
+            String::new()
+        } else {
+            format!(" — {preview}")
+        };
+        let _ = std::fmt::Write::write_fmt(
+            &mut s,
+            format_args!(
+                "[{label}] from {sender_display}{team_marker} ({when}){subject_clause}{preview_clause}\n"
+            ),
+        );
+    }
+    s.push('\n');
+    s
+}
+
 /// One-line chip title for a Teams message in the `sources` strip
 /// emitted to the frontend (#136). The chip's visible text on hover.
 fn teams_chip_title(m: &crate::connectors::teams::TeamsMessage) -> String {
@@ -2868,6 +3060,78 @@ fn teams_chip_title(m: &crate::connectors::teams::TeamsMessage) -> String {
     } else {
         format!("@{sender}: {preview}")
     }
+}
+
+/// One-line chip title for an email in the `sources` strip (#137).
+/// Sender name (or address) + subject keeps the chip useful when the
+/// model cites `[U<N>]` mid-sentence.
+fn email_chip_title(m: &crate::connectors::email::EmailMessage) -> String {
+    let sender = m
+        .from_name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or(m.from_email.as_str());
+    let subject = m.subject.trim();
+    if subject.is_empty() {
+        format!("@{sender}")
+    } else {
+        format!("@{sender}: {subject}")
+    }
+}
+
+/// Same shape as `load_teams_message_workstream_map`: resolve each
+/// surfaced email id to a workstream attachment so the `[U<N>]` chip
+/// has somewhere to navigate (#137). One query per email — input set
+/// is capped at EMAIL_FOLLOWUP_CAP (=30) so this stays cheap.
+fn load_email_workstream_map(
+    conn: &rusqlite::Connection,
+    messages: &[crate::connectors::email::EmailMessage],
+) -> std::collections::HashMap<String, String> {
+    use rusqlite::OptionalExtension as _;
+    let mut out: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(messages.len());
+    if messages.is_empty() {
+        return out;
+    }
+    for m in messages {
+        let ws_id: Option<String> = conn
+            .query_row(
+                "SELECT workstream_id FROM workstream_signals \
+                  WHERE kind = 'email' AND item_id = ?1 \
+                    AND manual_detached_ms IS NULL \
+                  ORDER BY added_ms DESC LIMIT 1",
+                rusqlite::params![m.id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(id) = ws_id {
+            out.insert(m.id.clone(), id);
+        }
+    }
+    out
+}
+
+/// Self email address (lowercased) from the `team_members` row marked
+/// `is_self = 1`. Used by the follow-up filter to drop the user's own
+/// outbound mail — even though today's connector only syncs inbound,
+/// keeping the filter symmetric protects against future Sent-Items
+/// support. `None` when no `is_self` row or no email alias exists.
+fn lookup_self_email(conn: &rusqlite::Connection) -> Option<String> {
+    use rusqlite::OptionalExtension as _;
+    conn.query_row(
+        "SELECT LOWER(tma.value) \
+         FROM team_member_aliases tma \
+         JOIN team_members tm ON tm.id = tma.member_id \
+         WHERE tm.is_self = 1 AND tma.kind = 'email' \
+         LIMIT 1",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
 }
 
 /// Resolve each Teams message id to the most recent non-tombstoned
@@ -3017,6 +3281,128 @@ fn render_teams_tool_output(
                 when = format_date(c.sent_at_ms),
                 sender = c_sender,
                 preview = c_preview,
+            ));
+        }
+    }
+
+    ToolResult {
+        content: out,
+        is_error: false,
+    }
+}
+
+/// Read the full body of inbound email `[U<n>]` plus the rest of its
+/// thread, chronological (#137). Body comes from `body_html` when set
+/// (HTML-stripped) and falls back to `body_preview` — bodies are lazy-
+/// loaded post-sync, so an unseen message may only have the preview at
+/// this point. Splits the conn lookup from the formatter so the latter
+/// is unit-testable via `render_email_tool_output`.
+fn dispatch_read_email(
+    app: &AppHandle,
+    n: usize,
+    messages: &[crate::connectors::email::EmailMessage],
+) -> ToolResult {
+    if n == 0 || n > messages.len() {
+        return render_email_tool_output(n, messages, &[]);
+    }
+    let target = &messages[n - 1];
+    let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+    let thread = {
+        let c = match conn_state.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                return ToolResult {
+                    content: "Internal error: connection lock poisoned.".to_string(),
+                    is_error: true,
+                };
+            }
+        };
+        crate::connectors::email::list_messages_by_thread(&c, &target.thread_id)
+            .unwrap_or_default()
+    };
+    render_email_tool_output(n, messages, &thread)
+}
+
+/// Pure renderer for `read_email` output. Out-of-range `n` returns an
+/// error result. `thread` is oldest-first (the contract of
+/// `list_messages_by_thread`); the target's own body is highlighted,
+/// surrounding messages are condensed to one line each so the model
+/// can see whether the user already replied without burning tokens on
+/// every body. Split for testability.
+fn render_email_tool_output(
+    n: usize,
+    messages: &[crate::connectors::email::EmailMessage],
+    thread: &[crate::connectors::email::EmailMessage],
+) -> ToolResult {
+    if n == 0 || n > messages.len() {
+        return ToolResult {
+            content: format!(
+                "[U{n}] is out of range. Recent emails awaiting attention has {len} entries — valid range is [U1]..[U{len}].",
+                n = n,
+                len = messages.len()
+            ),
+            is_error: true,
+        };
+    }
+    let target = &messages[n - 1];
+
+    let body_text = target
+        .body_html
+        .as_deref()
+        .map(strip_html_to_text)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            target
+                .body_preview
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            "(body not yet fetched — preview only available; the lazy-load \
+             may not have run for this message)"
+                .to_string()
+        });
+
+    let sender = target
+        .from_name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or(target.from_email.as_str());
+
+    let subject = if target.subject.trim().is_empty() {
+        "(no subject)".to_string()
+    } else {
+        target.subject.trim().to_string()
+    };
+
+    let mut out = format!(
+        "# [U{n}] from {sender} <{addr}> ({when})\n",
+        n = n,
+        sender = sender,
+        addr = target.from_email,
+        when = format_date(target.sent_at_ms),
+    );
+    out.push_str(&format!("Subject: {subject}\n"));
+    out.push_str("\nBody:\n");
+    out.push_str(body_text.trim());
+    out.push('\n');
+
+    if thread.len() > 1 {
+        out.push_str("\nThread (chronological, target marked with ►):\n");
+        for m in thread {
+            let marker = if m.id == target.id { "►" } else { "·" };
+            let m_sender = m
+                .from_name
+                .as_deref()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(m.from_email.as_str());
+            let m_preview = preview_one_line(m.body_preview.as_deref().unwrap_or(""));
+            out.push_str(&format!(
+                "{marker} {when} from {sender}: {preview}\n",
+                marker = marker,
+                when = format_date(m.sent_at_ms),
+                sender = m_sender,
+                preview = m_preview,
             ));
         }
     }
@@ -3934,7 +4320,7 @@ mod tests {
             "ping",
         )];
         let out = format_user_message(
-            "q?", &directory, &retrieved, &profiles, &schedule, &workstreams, &msgs,
+            "q?", &directory, &retrieved, &profiles, &schedule, &workstreams, &msgs, &[],
         );
         assert!(
             out.contains("# Recent Teams messages"),
@@ -3956,6 +4342,7 @@ mod tests {
             "q?",
             &directory,
             &std::collections::HashSet::new(),
+            &[],
             &[],
             &[],
             &[],
@@ -4079,6 +4466,7 @@ mod tests {
             event_id: None,
             workstream_id: None,
             teams_message_id: None,
+            email_id: None,
         }
     }
 
@@ -4406,5 +4794,139 @@ mod tests {
         assert!(s.contains("\"cache_control\":{\"type\":\"ephemeral\"}"), "got: {s}");
         // is_error=false is skipped per the existing serde attr.
         assert!(!s.contains("is_error"), "is_error=false should be omitted: {s}");
+    }
+
+    // ----- Unread emails section + tool (#137) ----------------------------
+
+    fn make_email_for_test(
+        id: &str,
+        thread_id: &str,
+        from_email: &str,
+        from_name: Option<&str>,
+        subject: &str,
+        sent_at_ms: i64,
+        preview: &str,
+    ) -> crate::connectors::email::EmailMessage {
+        crate::connectors::email::EmailMessage {
+            id: id.to_string(),
+            connector_id: "mg:test".to_string(),
+            external_id: id.to_string(),
+            thread_id: thread_id.to_string(),
+            subject: subject.to_string(),
+            from_email: from_email.to_string(),
+            from_name: from_name.map(|s| s.to_string()),
+            sent_at_ms,
+            body_preview: Some(preview.to_string()),
+            body_html: None,
+            has_attachments: false,
+            is_read: false,
+            raw_etag: None,
+            modified_ms: sent_at_ms,
+            recipients: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn format_unread_emails_section_renders_labels_subjects_and_previews() {
+        let msgs = vec![
+            make_email_for_test(
+                "e1",
+                "t1",
+                "heike@x.io",
+                Some("Heike Epple"),
+                "Workspace Migration",
+                100,
+                "needs to move by friday",
+            ),
+            make_email_for_test(
+                "e2",
+                "t2",
+                "ext@vendor.com",
+                None,
+                "Quote request",
+                50,
+                "attached",
+            ),
+        ];
+        let mut team_emails: std::collections::HashSet<String> = std::collections::HashSet::new();
+        team_emails.insert("heike@x.io".to_string());
+        let out = format_unread_emails_section(&msgs, &team_emails);
+        assert!(
+            out.starts_with("# Recent emails awaiting attention (last 14 days,"),
+            "section header missing: {out}"
+        );
+        assert!(out.contains("[U1] from Heike Epple (team)"), "U1 team marker: {out}");
+        assert!(out.contains("\"Workspace Migration\""), "subject missing: {out}");
+        assert!(out.contains("needs to move by friday"), "preview missing: {out}");
+        // Non-team sender — no `(team)` marker.
+        assert!(out.contains("[U2] from ext@vendor.com ("), "U2 fallback sender: {out}");
+        assert!(!out.contains("[U2] from ext@vendor.com (team)"), "no team for U2");
+    }
+
+    #[test]
+    fn format_unread_emails_section_handles_missing_subject_and_preview() {
+        let msgs = vec![make_email_for_test(
+            "e1", "t1", "x@y.io", Some("X"), "", 100, "",
+        )];
+        let team_emails: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let out = format_unread_emails_section(&msgs, &team_emails);
+        // Subject + preview clauses elided when both empty.
+        let line = out.lines().find(|l| l.starts_with("[U1]")).unwrap_or("");
+        assert!(line.starts_with("[U1] from X ("), "expected sender prefix: {line}");
+        assert!(!line.contains("\"\""), "should not emit empty subject quotes: {line}");
+    }
+
+    #[test]
+    fn render_email_tool_output_returns_body_for_valid_n() {
+        let msgs = vec![
+            make_email_for_test("a", "t1", "alice@x.io", Some("Alice"), "First", 100, "p1"),
+            make_email_for_test("b", "t2", "bob@x.io", Some("Bob"), "TARGET", 200, "p2"),
+        ];
+        let result = render_email_tool_output(2, &msgs, &[]);
+        assert!(!result.is_error, "expected ok result");
+        assert!(result.content.contains("[U2]"), "label: {}", result.content);
+        assert!(result.content.contains("Subject: TARGET"), "subject: {}", result.content);
+        assert!(result.content.contains("p2"), "body (preview fallback): {}", result.content);
+    }
+
+    #[test]
+    fn render_email_tool_output_errors_on_out_of_range() {
+        let msgs = vec![make_email_for_test(
+            "a", "t1", "alice@x.io", Some("Alice"), "Hi", 100, "p1",
+        )];
+        let r = render_email_tool_output(0, &msgs, &[]);
+        assert!(r.is_error, "n=0 should error");
+        let r = render_email_tool_output(5, &msgs, &[]);
+        assert!(r.is_error, "out-of-range n should error");
+        assert!(r.content.contains("[U5]"), "error message references label: {}", r.content);
+    }
+
+    #[test]
+    fn render_email_tool_output_includes_thread_with_target_marker() {
+        let msgs = vec![make_email_for_test(
+            "b", "t1", "bob@x.io", Some("Bob"), "Re: Plan", 200, "current",
+        )];
+        let thread = vec![
+            make_email_for_test("a", "t1", "tj@x.io", Some("TJ"), "Plan", 100, "first"),
+            make_email_for_test("b", "t1", "bob@x.io", Some("Bob"), "Re: Plan", 200, "current"),
+            make_email_for_test("c", "t1", "tj@x.io", Some("TJ"), "Re: Plan", 300, "ack"),
+        ];
+        let r = render_email_tool_output(1, &msgs, &thread);
+        assert!(!r.is_error);
+        assert!(
+            r.content.contains("Thread (chronological"),
+            "thread block missing: {}",
+            r.content
+        );
+        assert!(r.content.contains("► "), "target marker missing: {}", r.content);
+        assert!(r.content.contains("from TJ"), "thread sender missing: {}", r.content);
+    }
+
+    #[test]
+    fn email_chip_title_falls_back_to_email_when_name_missing() {
+        let m = make_email_for_test("e1", "t1", "x@y.io", None, "Hello", 1, "p");
+        assert_eq!(email_chip_title(&m), "@x@y.io: Hello");
+        let m2 = make_email_for_test("e2", "t2", "a@b.io", Some("Alice"), "", 1, "");
+        assert_eq!(email_chip_title(&m2), "@Alice");
     }
 }

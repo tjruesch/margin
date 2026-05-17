@@ -59,6 +59,8 @@ export function chipVariant(kind: AskSource["kind"]): string {
       return "is-workstream";
     case "teams_message":
       return "is-teams-message";
+    case "email":
+      return "is-email";
     case "note":
     default:
       return "is-note";
@@ -96,6 +98,16 @@ export async function openSource(
     // v1: route to the message's attached workstream when available;
     // unattached messages are a soft no-op until we have a dedicated
     // Teams-message viewer (#136 follow-up).
+    if (source.workstream_id) {
+      onOpenWorkstream(source.workstream_id);
+    }
+    return;
+  }
+  if (source.kind === "email") {
+    // Same v1 strategy as Teams messages (#137): route to the attached
+    // workstream if any; unattached emails are a soft no-op until we
+    // have a dedicated email viewer. Chip still renders + shows the
+    // sender + subject on hover.
     if (source.workstream_id) {
       onOpenWorkstream(source.workstream_id);
     }
@@ -171,11 +183,11 @@ export function MessageBubble({
   // Render chips only for labels the model actually cited across all
   // text parts. The full source surface can be hundreds of entries;
   // showing all of them would be a wall of chips. Matches `[N]`,
-  // `[E<N>]`, and `[W<N>]`.
+  // `[E<N>]`, `[W<N>]`, `[T<N>]`, and `[U<N>]`.
   const citedSources = useMemo(() => {
     if (sources.length === 0) return [];
     const cited = new Set<string>();
-    const re = /\[([WET]?\d{1,3})\]/g;
+    const re = /\[([WETU]?\d{1,3})\]/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(fullText)) !== null) {
       cited.add(m[1]);
@@ -272,7 +284,11 @@ function ToolStatus({
         ? "Reading workstream"
         : part.name === "read_transcript"
           ? "Reading transcript"
-          : "Reading";
+          : part.name === "read_teams_message"
+            ? "Reading message"
+            : part.name === "read_email"
+              ? "Reading email"
+              : "Reading";
   const label = part.targetLabel || `${part.targetN}`;
   const titleAttr = `${part.name}([${label}] ${part.targetTitle})`;
   return (
@@ -365,7 +381,7 @@ function CitedText({
   }, [sources]);
 
   const html = useMemo(() => {
-    const withCitations = text.replace(/\[([WET]?\d{1,3})\]/g, (full, label) => {
+    const withCitations = text.replace(/\[([WETU]?\d{1,3})\]/g, (full, label) => {
       const src = sourceByLabel.get(label);
       if (!src) return full;
       return `<button type="button" class="palette-cite ${chipVariant(src.kind)}" data-cite-label="${label}">${label}</button>`;

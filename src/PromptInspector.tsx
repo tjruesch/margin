@@ -107,13 +107,14 @@ function InspectorBody({
   emittedLabels?: string[];
 }) {
   // Citations the model actually emitted in its prose. Same regex as
-  // ChatMessage.tsx — handles [N], [E<N>], [W<N>], [T<N>]. Skipped when
-  // the caller supplies a pre-parsed list (e.g. Diagnostics row click).
+  // ChatMessage.tsx — handles [N], [E<N>], [W<N>], [T<N>], [U<N>].
+  // Skipped when the caller supplies a pre-parsed list (e.g.
+  // Diagnostics row click).
   const emittedLabels = useMemo(() => {
     if (providedLabels) return providedLabels;
     const text = joinText(message.parts);
     const out = new Set<string>();
-    const re = /\[([WET]?\d{1,3})\]/g;
+    const re = /\[([WETU]?\d{1,3})\]/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) out.add(m[1]);
     return Array.from(out);

@@ -573,17 +573,23 @@ export async function searchNotes(query: string, limit = 20): Promise<SearchHit[
 
 // --- AI Q&A (#31 follow-up) ---------------------------------------------
 
-export type AskSourceKind = "note" | "event" | "workstream" | "teams_message";
+export type AskSourceKind =
+  | "note"
+  | "event"
+  | "workstream"
+  | "teams_message"
+  | "email";
 
 /** A single citation source the model can reference. Notes use `[N]`
  *  labels (e.g. `"3"`), events use `[E<N>]` labels (e.g. `"E2"`),
- *  workstreams use `[W<N>]` labels (e.g. `"W2"`). Frontend picks chip
- *  styling and click destination from `kind`. */
+ *  workstreams use `[W<N>]` labels (e.g. `"W2"`), Teams messages use
+ *  `[T<N>]`, inbound emails use `[U<N>]`. Frontend picks chip styling
+ *  and click destination from `kind`. */
 export type AskSource = {
   kind: AskSourceKind;
   /** Citation label as it appears between the brackets in the model's
    *  output. Notes: `"3"` / `"12"`. Events: `"E1"` / `"E14"`.
-   *  Workstreams: `"W1"` / `"W14"`. */
+   *  Workstreams: `"W1"` / `"W14"`. Teams messages: `"T1"`. Emails: `"U1"`. */
   label: string;
   title: string;
   modified_ms: number;
@@ -594,13 +600,16 @@ export type AskSource = {
    *  `openOrCreateEventNote(event_id)` (#62). */
   event_id?: string;
   /** Set when `kind === "workstream"`, or when `kind === "teams_message"`
-   *  and the message is attached to a workstream (so the chip click has
-   *  a destination). Dispatches `margin:open-workstream`. */
+   *  or `kind === "email"` and the item is attached to a workstream (so
+   *  the chip click has a destination). Dispatches `margin:open-workstream`. */
   workstream_id?: string;
   /** Set when `kind === "teams_message"` (#136). Carried for a future
    *  dedicated message-viewer surface; not used by the v1 chip click
    *  (which falls through to `workstream_id`). */
   teams_message_id?: string;
+  /** Set when `kind === "email"` (#137). Carried for a future dedicated
+   *  email viewer; v1 chip click falls through to `workstream_id`. */
+  email_id?: string;
 };
 
 export type ChatTurn = {
