@@ -331,6 +331,56 @@ pub fn set_linked_note_id(
     Ok(())
 }
 
+/// All known occurrences of a recurring series, oldest-first, with
+/// attendees attached. Used by the AI ask `read_event_series` tool and
+/// the `series_summary` block on `read_event_details` (#128). Bounded
+/// by whatever the calendar connector has actually synced — the index
+/// on `series_master_id` (#109 migration 033) keeps the lookup cheap
+/// even on multi-year stores.
+pub fn list_events_by_series_id(
+    conn: &Connection,
+    series_master_id: &str,
+) -> rusqlite::Result<Vec<CalendarEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, connector_id, external_id, title, start_ms, end_ms, all_day, \
+                location, description, source_calendar, status, raw_etag, modified_ms, \
+                linked_note_id, series_master_id \
+         FROM calendar_events \
+         WHERE series_master_id = ?1 \
+         ORDER BY start_ms ASC",
+    )?;
+    let rows = stmt.query_map(params![series_master_id], |r| {
+        Ok(CalendarEvent {
+            id: r.get(0)?,
+            connector_id: r.get(1)?,
+            external_id: r.get(2)?,
+            title: r.get(3)?,
+            start_ms: r.get(4)?,
+            end_ms: r.get(5)?,
+            all_day: r.get::<_, i64>(6)? != 0,
+            location: r.get(7)?,
+            description: r.get(8)?,
+            source_calendar: r.get(9)?,
+            status: r.get(10)?,
+            raw_etag: r.get(11)?,
+            modified_ms: r.get(12)?,
+            linked_note_id: r.get(13)?,
+            series_master_id: r.get(14)?,
+            attendees: Vec::new(),
+        })
+    })?;
+    let mut events: Vec<CalendarEvent> = rows.collect::<Result<Vec<_>, _>>()?;
+    if !events.is_empty() {
+        let by_event = load_attendees_for(conn, events.iter().map(|e| e.id.as_str()))?;
+        for ev in &mut events {
+            if let Some(att) = by_event.get(&ev.id) {
+                ev.attendees = att.clone();
+            }
+        }
+    }
+    Ok(events)
+}
+
 pub fn get_event_details(
     conn: &Connection,
     event_id: &str,
@@ -870,6 +920,46 @@ mod tests {
 
         set_linked_note_id(&mut conn, "mg:test::e2", "/tmp/notes/ext.md").unwrap();
         assert_eq!(cp_meeting_count(&conn), 0);
+    }
+
+    // ---------- list_events_by_series_id (#128) ---------------------------
+
+    #[test]
+    fn list_events_by_series_id_returns_occurrences_with_attendees() {
+        let mut conn = open_test_db();
+        let mut master_a1 = make_event("a1", 1_000, &["alice@x.io"]);
+        master_a1.series_master_id = Some("master-A".to_string());
+        let mut master_a2 = make_event("a2", 2_000, &["alice@x.io", "bob@x.io"]);
+        master_a2.series_master_id = Some("master-A".to_string());
+        let oneoff = make_event("z", 3_000, &["eve@x.io"]); // unrelated singleton
+        let mut master_b = make_event("b1", 4_000, &["x@x.io"]);
+        master_b.series_master_id = Some("master-B".to_string());
+
+        upsert_window(
+            &mut conn,
+            "mg:test",
+            &[master_a1, master_a2, oneoff, master_b],
+            0,
+            10_000,
+        )
+        .unwrap();
+
+        let rows = list_events_by_series_id(&conn, "master-A").unwrap();
+        assert_eq!(rows.len(), 2, "two A occurrences");
+        // Ordered by start_ms ASC.
+        assert_eq!(rows[0].external_id, "a1");
+        assert_eq!(rows[1].external_id, "a2");
+        // Attendees loaded per row.
+        let a2_emails: Vec<&str> = rows[1].attendees.iter().map(|a| a.email.as_str()).collect();
+        assert!(a2_emails.contains(&"alice@x.io"));
+        assert!(a2_emails.contains(&"bob@x.io"));
+    }
+
+    #[test]
+    fn list_events_by_series_id_returns_empty_for_unknown_master() {
+        let conn = open_test_db();
+        let rows = list_events_by_series_id(&conn, "no-such-master").unwrap();
+        assert!(rows.is_empty());
     }
 
     // ---------- collapse_recurring (#109) ---------------------------------

@@ -102,12 +102,21 @@ const TOOL_NAMES: &[&str] = &[
     "read_note",
     "read_transcript",
     "read_event_details",
+    "read_event_series",
     "read_workstream",
     "read_teams_message",
     "read_email",
     "search_similar",
     "read_edges",
 ];
+/// Per-event-series cap on occurrences returned by `read_event_series`
+/// (#128). A weekly meeting that's been running 3 years has ~150 rows;
+/// 300 leaves headroom for a 6y series at weekly cadence without
+/// risking a 1k+-row dump if a connector synced an outlier.
+const SERIES_OCCURRENCE_CAP: usize = 300;
+/// Threshold for "attendees_present_in_most" on `series_summary`
+/// (#128). 50% catches steady members without flagging one-offs.
+const SERIES_STEADY_MEMBER_RATIO: f32 = 0.5;
 
 /// Coverage assertion: every `workstreams::signals::registry` kind must
 /// have a path into the AI prompt — either a labeled section here in
@@ -373,14 +382,22 @@ citation when the answer IS the ongoing thread itself (\"how's the Hyundai POC g
 citing a *specific* item within a workstream, prefer the underlying `[N]` / `[E<N>]` / `[T<N>]` \
 label if one is available.
 
-You have six tools for digging deeper:
+You have seven tools for digging deeper:
 - **`read_note(n)`** — returns the full markdown body of directory entry `[n]`. Use when a preview \
 hints at relevance but you need the body to answer.
 - **`read_transcript(n)`** — returns the meeting transcript text for `[n]`, if it has audio. Use \
 when the question is likely about something said in a meeting but not captured in the typed body.
 - **`read_event_details(n)`** — returns the full attendee list, description, location, and exact \
-times for event `[E<n>]`. Use when answering questions about meeting participants or content. \
-Pass the integer after the `E` as `n` (e.g. for `[E3]` call `read_event_details(3)`).
+times for event `[E<n>]`. When the event belongs to a recurring series, also includes a series \
+summary (occurrence count, first/last seen, steady members). Use when answering questions about a \
+single meeting's participants or content. Pass the integer after the `E` as `n` (e.g. for `[E3]` \
+call `read_event_details(3)`).
+- **`read_event_series(n)`** — returns every known occurrence of the recurring series that `[E<n>]` \
+belongs to, each with its own attendee list and linked-note pointer. Use for cadence / history \
+questions: \"which of the last 4 standups did Alice miss?\", \"tell me about our weekly Bridge \
+sync\", \"how often does this meeting actually happen?\". Errors if the event isn't recurring. \
+Pass the integer after the `E` as `n` — the dispatcher resolves it to the series master id \
+internally.
 - **`read_workstream(n)`** — returns the workstream's full summary, all open + recently completed \
 actions, and the most recent emails / events / notes that belong to it. Use for status questions \
 (\"what's happening with X?\"). Pass the integer after the `W` as `n` (e.g. for `[W2]` call \
@@ -925,7 +942,7 @@ async fn run_loop(
                 .unwrap_or(0) as u32;
             let idx = target_n.saturating_sub(1) as usize;
             let (target_title, target_label, target_kind) = match tc.name.as_str() {
-                "read_event_details" => (
+                "read_event_details" | "read_event_series" => (
                     schedule.get(idx).map(|e| e.title.clone()).unwrap_or_default(),
                     format!("E{}", target_n),
                     AskSourceKind::Event,
@@ -1112,6 +1129,21 @@ fn tool_definitions() -> serde_json::Value {
                         "type": "integer",
                         "minimum": 1,
                         "description": "The 1-based [E<N>] label from the Schedule section."
+                    }
+                },
+                "required": ["n"]
+            }
+        },
+        {
+            "name": "read_event_series",
+            "description": "Read every known occurrence of the recurring series that event [E<N>] belongs to. Each occurrence includes its own start time, attendee list (with response statuses), and linked-note pointer. Use for cadence and history questions: 'which of the last 4 standups did Alice miss?', 'tell me about our weekly sync', 'how often does this meeting actually happen?'. Errors if [E<N>] is a one-off (not part of a series). NOTE: the `n` argument is the integer after the `E` (e.g. for `[E3]` pass `n: 3`); the dispatcher resolves it to the series master id.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "The 1-based [E<N>] label of any occurrence in the series."
                     }
                 },
                 "required": ["n"]
@@ -1577,7 +1609,13 @@ fn dispatch_tool(
     // Handled before the notes-directory bounds check so an out-of-range
     // event call gives the model a useful error.
     if name == "read_event_details" {
-        return dispatch_read_event_details(n, schedule);
+        return dispatch_read_event_details(app, n, schedule);
+    }
+    // read_event_series indexes the schedule as well; the dispatcher
+    // resolves [En] → series_master_id and loads every occurrence
+    // (#128). Needs the conn for the series fetch.
+    if name == "read_event_series" {
+        return dispatch_read_event_series(app, n, schedule);
     }
     // read_workstream indexes the workstreams slice; needs the conn
     // mutex to load the joined detail.
@@ -2324,6 +2362,7 @@ fn format_workstream_detail(
 /// model can quote from. Includes attendees with response statuses,
 /// the linked-note pointer (if any), and a truncated description.
 fn dispatch_read_event_details(
+    app: &AppHandle,
     n: usize,
     schedule: &[crate::connectors::calendar::CalendarEvent],
 ) -> ToolResult {
@@ -2402,6 +2441,233 @@ fn dispatch_read_event_details(
         s.push('\n');
     }
 
+    // #128: when the event belongs to a recurring series, fold in a
+    // compact series summary so the model can place this occurrence in
+    // its cadence without needing a second tool call. The full per-
+    // occurrence list is still one `read_event_series` away when the
+    // question is actually about history.
+    if let Some(master_id) = event.series_master_id.as_deref() {
+        let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+        let series: Vec<crate::connectors::calendar::CalendarEvent> = match conn_state.lock() {
+            Ok(c) => crate::connectors::calendar::list_events_by_series_id(&c, master_id)
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        s.push_str(&format_series_summary(&series));
+    }
+
+    ToolResult {
+        content: s,
+        is_error: false,
+    }
+}
+
+/// Compact summary line / block for a recurring series (#128). Drops a
+/// section header so the model can quote from it; computes "steady"
+/// members (present in >= SERIES_STEADY_MEMBER_RATIO of occurrences)
+/// from the union of attendee emails across all known occurrences.
+/// Returns an empty string for an empty input — the caller has already
+/// decided to render it; the empty fallback is defensive.
+fn format_series_summary(series: &[crate::connectors::calendar::CalendarEvent]) -> String {
+    if series.is_empty() {
+        return String::new();
+    }
+    let total = series.len();
+    let first = series.iter().map(|e| e.start_ms).min().unwrap_or(0);
+    let last = series.iter().map(|e| e.start_ms).max().unwrap_or(0);
+
+    // Per-attendee occurrence count keyed by lowercased email. Lowercase
+    // because Graph occasionally varies casing across occurrences of
+    // the same series and we don't want to split the count.
+    let mut counts: std::collections::HashMap<String, (String, usize)> =
+        std::collections::HashMap::new();
+    for ev in series {
+        for a in &ev.attendees {
+            if a.is_self || a.email.trim().is_empty() {
+                continue;
+            }
+            let key = a.email.to_ascii_lowercase();
+            let display = a
+                .display_name
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| a.email.clone());
+            let entry = counts.entry(key).or_insert((display, 0));
+            entry.1 += 1;
+        }
+    }
+    let cutoff = ((total as f32) * SERIES_STEADY_MEMBER_RATIO).ceil() as usize;
+    let mut steady: Vec<(String, String, usize)> = counts
+        .into_iter()
+        .filter(|(_, (_, c))| *c >= cutoff.max(1))
+        .map(|(email, (name, c))| (email, name, c))
+        .collect();
+    // Sort most-frequent first, then alpha by name for deterministic output.
+    steady.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+
+    let mut s = String::new();
+    s.push_str("\n## Series summary\n");
+    s.push_str(&format!("Total occurrences known: {total}\n"));
+    s.push_str(&format!("First seen: {}\n", format_date(first)));
+    s.push_str(&format!("Last seen: {}\n", format_date(last)));
+    s.push_str(&format!(
+        "Steady members (present in >= {}% of occurrences):\n",
+        (SERIES_STEADY_MEMBER_RATIO * 100.0) as u32
+    ));
+    if steady.is_empty() {
+        s.push_str("- _(no recurring attendees besides self)_\n");
+    } else {
+        for (email, name, count) in steady {
+            s.push_str(&format!(
+                "- {name} <{email}> ({count}/{total})\n",
+                name = name,
+                email = email,
+                count = count,
+                total = total,
+            ));
+        }
+    }
+    s
+}
+
+/// Read every known occurrence of the series that `[E<n>]` belongs to
+/// (#128). The dispatcher resolves the schedule index → series_master_id
+/// → all rows in `calendar_events` with that master id. Errors when
+/// the event is one-off (no `series_master_id`). Per-occurrence
+/// attendee lists let the model answer questions like "which of the
+/// last 4 standups did Alice miss?" with concrete dates.
+fn dispatch_read_event_series(
+    app: &AppHandle,
+    n: usize,
+    schedule: &[crate::connectors::calendar::CalendarEvent],
+) -> ToolResult {
+    if n > schedule.len() {
+        return ToolResult {
+            content: format!(
+                "[E{n}] is out of range. Schedule has {len} entries — valid range is [E1]..[E{len}].",
+                n = n,
+                len = schedule.len()
+            ),
+            is_error: true,
+        };
+    }
+    let event = &schedule[n - 1];
+    let master_id = match event.series_master_id.as_deref() {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return ToolResult {
+                content: format!(
+                    "[E{n}] '{title}' is a one-off event, not part of a recurring series — \
+                     read_event_series doesn't apply. Use read_event_details instead.",
+                    n = n,
+                    title = event.title.trim()
+                ),
+                is_error: true,
+            };
+        }
+    };
+    let series = {
+        let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+        let c = match conn_state.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                return ToolResult {
+                    content: "Internal error: connection lock poisoned.".to_string(),
+                    is_error: true,
+                };
+            }
+        };
+        crate::connectors::calendar::list_events_by_series_id(&c, master_id).unwrap_or_default()
+    };
+    render_event_series_output(n, event, &series)
+}
+
+/// Pure renderer for `read_event_series` output. Split for unit
+/// testability — feed it any synthetic series and assert the shape.
+fn render_event_series_output(
+    n: usize,
+    anchor_event: &crate::connectors::calendar::CalendarEvent,
+    series: &[crate::connectors::calendar::CalendarEvent],
+) -> ToolResult {
+    if series.is_empty() {
+        return ToolResult {
+            content: format!(
+                "[E{n}] '{title}' is part of a recurring series, but no occurrences are stored \
+                 (the connector may not have synced any). Try read_event_details for the single \
+                 occurrence.",
+                n = n,
+                title = anchor_event.title.trim()
+            ),
+            is_error: false,
+        };
+    }
+    let total = series.len();
+    let returned = total.min(SERIES_OCCURRENCE_CAP);
+    // Take the most recent `cap` so the model sees the current state of
+    // a long-running series rather than the original kickoff meeting.
+    let truncated = total > SERIES_OCCURRENCE_CAP;
+    let slice: Vec<&crate::connectors::calendar::CalendarEvent> = if truncated {
+        series.iter().rev().take(returned).rev().collect()
+    } else {
+        series.iter().collect()
+    };
+
+    let mut s = String::new();
+    s.push_str(&format!(
+        "# Series for [E{n}] {title}\n",
+        n = n,
+        title = anchor_event.title.trim()
+    ));
+    s.push_str(&format!("Total known occurrences: {total}\n"));
+    if truncated {
+        s.push_str(&format!(
+            "Showing the {returned} most recent (older occurrences elided).\n",
+            returned = returned
+        ));
+    }
+    s.push_str(&format_series_summary(series));
+    s.push_str("\n## Occurrences\n");
+    for ev in slice {
+        s.push_str(&format!(
+            "\n### {when}\n",
+            when = format_dt_range(ev.start_ms, ev.end_ms, ev.all_day)
+        ));
+        s.push_str(&format!(
+            "Linked note: {}\n",
+            ev.linked_note_id.as_deref().unwrap_or("(none yet)")
+        ));
+        if let Some(status) = ev.status.as_deref().filter(|x| !x.is_empty()) {
+            s.push_str(&format!("Status: {status}\n"));
+        }
+        s.push_str("Attendees:\n");
+        if ev.attendees.is_empty() {
+            s.push_str("- _(none)_\n");
+        } else {
+            for a in &ev.attendees {
+                let name = a
+                    .display_name
+                    .as_deref()
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or(&a.email);
+                let mut tags: Vec<String> = Vec::new();
+                if a.is_organizer {
+                    tags.push("organizer".to_string());
+                }
+                if a.is_self {
+                    tags.push("self".to_string());
+                }
+                if let Some(rs) = a.response_status.as_deref().filter(|x| !x.is_empty()) {
+                    tags.push(rs.to_string());
+                }
+                let tag_str = if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", tags.join(", "))
+                };
+                s.push_str(&format!("- {name} <{email}>{tag_str}\n", email = a.email));
+            }
+        }
+    }
     ToolResult {
         content: s,
         is_error: false,
@@ -4928,5 +5194,144 @@ mod tests {
         assert_eq!(email_chip_title(&m), "@x@y.io: Hello");
         let m2 = make_email_for_test("e2", "t2", "a@b.io", Some("Alice"), "", 1, "");
         assert_eq!(email_chip_title(&m2), "@Alice");
+    }
+
+    // ----- Event series tool + summary (#128) ---------------------------
+
+    fn make_event_for_series_test(
+        id: &str,
+        title: &str,
+        start_ms: i64,
+        series_master_id: Option<&str>,
+        attendees: Vec<(&str, &str, bool)>, // (email, name, is_self)
+    ) -> crate::connectors::calendar::CalendarEvent {
+        crate::connectors::calendar::CalendarEvent {
+            id: id.to_string(),
+            connector_id: "mg:test".to_string(),
+            external_id: id.to_string(),
+            title: title.to_string(),
+            start_ms,
+            end_ms: start_ms + 30 * 60 * 1000,
+            all_day: false,
+            location: None,
+            description: None,
+            source_calendar: None,
+            status: None,
+            raw_etag: None,
+            modified_ms: start_ms,
+            linked_note_id: None,
+            series_master_id: series_master_id.map(|s| s.to_string()),
+            attendees: attendees
+                .into_iter()
+                .map(|(email, name, is_self)| crate::connectors::calendar::CalendarAttendee {
+                    email: email.to_string(),
+                    display_name: Some(name.to_string()),
+                    response_status: None,
+                    is_self,
+                    is_organizer: false,
+                    team_member_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn format_series_summary_counts_steady_members_and_window() {
+        // 4 occurrences. Alice attends all 4, Bob attends 3, Eve attends 1.
+        // Steady cutoff at 50% (= 2/4); Alice + Bob qualify, Eve does not.
+        let occs = vec![
+            make_event_for_series_test(
+                "o1",
+                "Standup",
+                1_000,
+                Some("m1"),
+                vec![("alice@x.io", "Alice", false), ("bob@x.io", "Bob", false)],
+            ),
+            make_event_for_series_test(
+                "o2",
+                "Standup",
+                2_000,
+                Some("m1"),
+                vec![("alice@x.io", "Alice", false), ("bob@x.io", "Bob", false)],
+            ),
+            make_event_for_series_test(
+                "o3",
+                "Standup",
+                3_000,
+                Some("m1"),
+                vec![("alice@x.io", "Alice", false), ("eve@x.io", "Eve", false)],
+            ),
+            make_event_for_series_test(
+                "o4",
+                "Standup",
+                4_000,
+                Some("m1"),
+                vec![("alice@x.io", "Alice", false), ("bob@x.io", "Bob", false)],
+            ),
+        ];
+        let s = format_series_summary(&occs);
+        assert!(s.contains("Total occurrences known: 4"), "total: {s}");
+        assert!(s.contains("Steady members"), "section header: {s}");
+        assert!(s.contains("Alice"), "Alice steady: {s}");
+        assert!(s.contains("(4/4)"), "Alice count: {s}");
+        assert!(s.contains("Bob"), "Bob steady: {s}");
+        assert!(s.contains("(3/4)"), "Bob count: {s}");
+        assert!(!s.contains("Eve"), "Eve below cutoff: {s}");
+    }
+
+    #[test]
+    fn format_series_summary_excludes_self_attendee() {
+        let occs = vec![make_event_for_series_test(
+            "o1",
+            "1:1",
+            1_000,
+            Some("m1"),
+            vec![("me@x.io", "Self", true), ("h@x.io", "Heike", false)],
+        )];
+        let s = format_series_summary(&occs);
+        assert!(s.contains("Heike"), "Heike present: {s}");
+        assert!(!s.contains("Self"), "self excluded: {s}");
+    }
+
+    #[test]
+    fn render_event_series_output_emits_per_occurrence_attendees() {
+        let anchor = make_event_for_series_test(
+            "o2",
+            "Standup",
+            2_000,
+            Some("m1"),
+            vec![("alice@x.io", "Alice", false)],
+        );
+        let series = vec![
+            make_event_for_series_test(
+                "o1",
+                "Standup",
+                1_000,
+                Some("m1"),
+                vec![("alice@x.io", "Alice", false)],
+            ),
+            anchor.clone(),
+        ];
+        let r = render_event_series_output(3, &anchor, &series);
+        assert!(!r.is_error, "ok result");
+        assert!(r.content.contains("# Series for [E3] Standup"), "anchor header: {}", r.content);
+        assert!(r.content.contains("Total known occurrences: 2"), "total: {}", r.content);
+        assert!(r.content.contains("## Occurrences"), "occurrences block: {}", r.content);
+        // Each occurrence renders its attendee list.
+        assert!(r.content.contains("Alice <alice@x.io>"), "attendee: {}", r.content);
+    }
+
+    #[test]
+    fn render_event_series_output_handles_empty_series_softly() {
+        let anchor = make_event_for_series_test("o1", "Solo", 1_000, Some("m1"), vec![]);
+        let r = render_event_series_output(1, &anchor, &[]);
+        // Not an error — the caller asked but the series is empty. We
+        // tell the model so it can fall back to read_event_details.
+        assert!(!r.is_error, "soft fallthrough: {}", r.content);
+        assert!(
+            r.content.contains("no occurrences are stored"),
+            "guidance present: {}",
+            r.content
+        );
     }
 }
