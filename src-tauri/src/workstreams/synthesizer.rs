@@ -1260,6 +1260,7 @@ mod tests {
         SnapshotItem {
             id: m.id.clone(),
             payload: SnapshotPayload::Email(m),
+            instance_count: 1,
         }
     }
 
@@ -1285,6 +1286,7 @@ mod tests {
         SnapshotItem {
             id: e.id.clone(),
             payload: SnapshotPayload::Event(e),
+            instance_count: 1,
         }
     }
 
@@ -1297,6 +1299,7 @@ mod tests {
         SnapshotItem {
             id: n.note_path.clone(),
             payload: SnapshotPayload::Note(n),
+            instance_count: 1,
         }
     }
 

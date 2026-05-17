@@ -61,6 +61,13 @@ pub enum HydratedSignal {
 pub struct SnapshotItem {
     pub id: String,
     pub payload: SnapshotPayload,
+    /// Number of underlying rows this snapshot row represents. `1` for
+    /// any non-collapsed source (emails, notes, Teams messages). For
+    /// calendar events it carries `CollapsedEvent.instance_count` —
+    /// the count of recurring occurrences within the snapshot window
+    /// (#126). Lets `format` annotate the prompt line so the LLM can
+    /// weight cadence-heavy workstreams correctly.
+    pub instance_count: usize,
 }
 
 #[derive(Debug)]
@@ -192,6 +199,7 @@ impl Signal for EmailSignal {
             .map(|m| SnapshotItem {
                 id: m.id.clone(),
                 payload: SnapshotPayload::Email(m),
+                instance_count: 1,
             })
             .collect())
     }
@@ -279,6 +287,7 @@ impl Signal for EventSignal {
             .into_iter()
             .map(|c| SnapshotItem {
                 id: c.canonical.id.clone(),
+                instance_count: c.instance_count,
                 payload: SnapshotPayload::Event(c.canonical),
             })
             .collect())
@@ -296,8 +305,20 @@ impl Signal for EventSignal {
         } else {
             format!(" — Attendees: {}", attendees.join(", "))
         };
+        // #126: when this row collapses multiple occurrences of a
+        // recurring series (#109), tell the LLM the cadence so it can
+        // weight workstreams organised around daily standups vs. one-
+        // off meetings correctly. Singletons render unchanged.
+        let recurrence_str = if item.instance_count > 1 {
+            format!(
+                " (recurring, {n} occurrences in window)",
+                n = item.instance_count
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "[{label}] {when} — {title}{attendees_str}\n",
+            "[{label}] {when} — {title}{attendees_str}{recurrence_str}\n",
             title = e.title
         )
     }
@@ -364,6 +385,7 @@ impl Signal for NoteSignal {
                     title: d.title,
                     modified_ms: d.modified_ms,
                 }),
+                instance_count: 1,
             })
             .collect();
         // `index::list_directory` already returns recency-desc; the
@@ -472,6 +494,7 @@ impl Signal for TeamsMessageSignal {
             .map(|m| SnapshotItem {
                 id: m.id.clone(),
                 payload: SnapshotPayload::TeamsMessage(m),
+                instance_count: 1,
             })
             .collect())
     }
@@ -1016,6 +1039,7 @@ mod tests {
         let item = SnapshotItem {
             id: m.id.clone(),
             payload: SnapshotPayload::Email(m),
+            instance_count: 1,
         };
         let out = EmailSignal.format("M3", &item);
         // 2023-11-14 — From: Alice <alice@x.io> — Subject: Renewal
@@ -1054,11 +1078,48 @@ mod tests {
         let item = SnapshotItem {
             id: e.id.clone(),
             payload: SnapshotPayload::Event(e),
+            instance_count: 1,
         };
         let out = EventSignal.format("E2", &item);
         assert_eq!(
             out,
             "[E2] 2023-11-14 22:13 — Hyundai sync — Attendees: bob@x.io\n"
+        );
+    }
+
+    /// #126: when `instance_count > 1` the event line gains a
+    /// `(recurring, N occurrences in window)` suffix so the LLM knows
+    /// this row stands for many underlying meetings. `instance_count = 1`
+    /// renders unchanged (covered by the test above).
+    #[test]
+    fn event_format_renders_recurring_count_suffix() {
+        let e = CalendarEvent {
+            id: "mg:test::e".into(),
+            connector_id: "mg:test".into(),
+            external_id: "e".into(),
+            title: "Daily standup".into(),
+            start_ms: 1_700_000_000_000,
+            end_ms: 1_700_000_000_000 + 30 * 60 * 1000,
+            all_day: false,
+            location: None,
+            description: None,
+            source_calendar: None,
+            status: None,
+            raw_etag: None,
+            modified_ms: 1_700_000_000_000,
+            linked_note_id: None,
+            series_master_id: Some("master-x".into()),
+            attendees: Vec::new(),
+        };
+        let item = SnapshotItem {
+            id: e.id.clone(),
+            payload: SnapshotPayload::Event(e),
+            instance_count: 14,
+        };
+        let out = EventSignal.format("E1", &item);
+        assert_eq!(
+            out,
+            "[E1] 2023-11-14 22:13 — Daily standup (recurring, 14 occurrences in window)\n"
         );
     }
 
@@ -1072,6 +1133,7 @@ mod tests {
         let item = SnapshotItem {
             id: n.note_path.clone(),
             payload: SnapshotPayload::Note(n),
+            instance_count: 1,
         };
         let out = NoteSignal.format("N1", &item);
         assert_eq!(out, "[N1] 2023-11-14 — Sourcing plan\n");
