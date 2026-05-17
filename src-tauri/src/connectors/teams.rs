@@ -148,11 +148,97 @@ pub fn upsert_messages(
                     )?;
                 }
             }
+            // #138: auto-attach this fresh message to whatever
+            // workstreams the chat's most recent prior attached message
+            // belongs to. Closes the "synth-pass-lag" gap (synth runs
+            // ~6h; without this, fresh Teams messages don't show up in
+            // their workstream's detail view or in `read_workstream`
+            // until the next pass). Purely additive — the synth's
+            // wholesale-replace later still gets to override / extend.
+            // Tombstoned signals on the prior message are ignored, so a
+            // user-rejected attachment doesn't propagate forward.
+            let _ = auto_attach_to_chat_workstreams(
+                &tx,
+                &m.id,
+                &m.chat_id,
+                m.sent_at_ms,
+                m.modified_ms,
+            )?;
             report.added += 1;
         }
     }
     tx.commit()?;
     Ok(report)
+}
+
+/// Inherit workstream attachments from the most recent prior message
+/// in the same chat (#138). Two-step lookup keeps the SQL legible:
+/// (1) find the most recent prior `teams_message` in this chat whose
+/// signals are not all tombstoned; (2) read that message's
+/// non-tombstoned workstream ids; (3) call `attach_signal` for each.
+/// Returns the number of attachments written so the caller can log /
+/// telemetry-track if needed.
+///
+/// Idempotency: only called on the `added` path of `upsert_messages`,
+/// so a re-sync of the same message doesn't re-trigger inheritance.
+/// Tombstone handling: `attach_signal` itself UPSERTs and clears the
+/// tombstone, but since we only run on newly-added messages there is
+/// no pre-existing tombstone to revive — safe by construction.
+fn auto_attach_to_chat_workstreams(
+    tx: &rusqlite::Transaction<'_>,
+    new_message_id: &str,
+    chat_id: &str,
+    sent_at_ms: i64,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    // Step 1: most recent prior attached message in this chat.
+    let prior_id: Option<String> = tx
+        .query_row(
+            "SELECT tm.id \
+             FROM teams_messages tm \
+             WHERE tm.chat_id = ?1 \
+               AND tm.sent_at_ms < ?2 \
+               AND EXISTS ( \
+                   SELECT 1 FROM workstream_signals ws \
+                   WHERE ws.kind = 'teams_message' \
+                     AND ws.item_id = tm.id \
+                     AND ws.manual_detached_ms IS NULL \
+               ) \
+             ORDER BY tm.sent_at_ms DESC \
+             LIMIT 1",
+            params![chat_id, sent_at_ms],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let prior_id = match prior_id {
+        Some(id) => id,
+        None => return Ok(0),
+    };
+
+    // Step 2: that message's non-tombstoned workstream ids.
+    let workstream_ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT workstream_id FROM workstream_signals \
+              WHERE kind = 'teams_message' \
+                AND item_id = ?1 \
+                AND manual_detached_ms IS NULL",
+        )?;
+        let rows = stmt.query_map(params![&prior_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Step 3: write the inherited attachments. attach_signal takes
+    // &Connection; a Transaction derefs to one.
+    for ws_id in &workstream_ids {
+        crate::workstreams::persist::attach_signal(
+            tx,
+            ws_id,
+            "teams_message",
+            new_message_id,
+            now_ms,
+        )?;
+    }
+    Ok(workstream_ids.len())
 }
 
 fn upsert_message(
@@ -713,5 +799,205 @@ mod tests {
         let got = list_messages_in_range(&conn, 2_000, 8_000, 100).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].body_preview.as_deref(), Some("b"));
+    }
+
+    // ----- #138: auto-attach to chat's prior workstreams -----------------
+
+    fn seed_workstream(conn: &Connection, id: &str, title: &str) {
+        conn.execute(
+            "INSERT INTO workstreams(id, title, summary, status, last_activity_ms, created_ms, updated_ms) \
+             VALUES (?1, ?2, '', 'active', 0, 0, 0)",
+            params![id, title],
+        )
+        .unwrap();
+    }
+
+    /// All workstream ids (non-tombstoned) currently attached to a
+    /// teams message. Ordered for deterministic asserts.
+    fn signals_for(conn: &Connection, message_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = conn
+            .prepare(
+                "SELECT workstream_id FROM workstream_signals \
+                  WHERE kind = 'teams_message' AND item_id = ?1 \
+                    AND manual_detached_ms IS NULL",
+            )
+            .unwrap()
+            .query_map(params![message_id], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// Prior message attached to W1 + W2 → new message inherits both.
+    #[test]
+    fn auto_attach_inherits_workstreams_from_prior_message_in_chat() {
+        let mut conn = open_db();
+        seed_workstream(&conn, "ws1", "W1");
+        seed_workstream(&conn, "ws2", "W2");
+
+        let prior_id = "microsoft_graph:test@x.io::teams::prior";
+        upsert_messages(
+            &mut conn,
+            &[sample_message(prior_id, "chat-A", 1_000, "first")],
+        )
+        .unwrap();
+        // Seed attachments on the prior message (the synth's job in prod).
+        crate::workstreams::persist::attach_signal(&conn, "ws1", "teams_message", prior_id, 1_000)
+            .unwrap();
+        crate::workstreams::persist::attach_signal(&conn, "ws2", "teams_message", prior_id, 1_000)
+            .unwrap();
+
+        let new_id = "microsoft_graph:test@x.io::teams::new";
+        upsert_messages(
+            &mut conn,
+            &[sample_message(new_id, "chat-A", 2_000, "follow-up")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            signals_for(&conn, new_id),
+            vec!["ws1".to_string(), "ws2".to_string()]
+        );
+    }
+
+    /// Chat has no attached prior messages → no signal written.
+    #[test]
+    fn auto_attach_writes_nothing_when_chat_has_no_attached_prior() {
+        let mut conn = open_db();
+        seed_workstream(&conn, "ws1", "W1");
+        // A prior message in the chat, but with NO workstream attachments.
+        upsert_messages(
+            &mut conn,
+            &[sample_message(
+                "microsoft_graph:test@x.io::teams::lonely",
+                "chat-A",
+                1_000,
+                "unattached",
+            )],
+        )
+        .unwrap();
+
+        let new_id = "microsoft_graph:test@x.io::teams::new";
+        upsert_messages(
+            &mut conn,
+            &[sample_message(new_id, "chat-A", 2_000, "follow-up")],
+        )
+        .unwrap();
+
+        assert!(signals_for(&conn, new_id).is_empty(), "no attachments expected");
+    }
+
+    /// Prior message manually detached (tombstoned) from W1 → new
+    /// message must NOT inherit W1. The tombstone is precisely the
+    /// user signal that says "don't re-cluster this here," and a
+    /// drive-by inheritance would silently revive that rejection.
+    #[test]
+    fn auto_attach_respects_tombstones_on_prior_message() {
+        let mut conn = open_db();
+        seed_workstream(&conn, "ws1", "W1");
+
+        let prior_id = "microsoft_graph:test@x.io::teams::prior";
+        upsert_messages(
+            &mut conn,
+            &[sample_message(prior_id, "chat-A", 1_000, "first")],
+        )
+        .unwrap();
+        crate::workstreams::persist::attach_signal(&conn, "ws1", "teams_message", prior_id, 1_000)
+            .unwrap();
+        crate::workstreams::persist::detach_signal(&conn, "ws1", "teams_message", prior_id, 1_500)
+            .unwrap();
+
+        let new_id = "microsoft_graph:test@x.io::teams::new";
+        upsert_messages(
+            &mut conn,
+            &[sample_message(new_id, "chat-A", 2_000, "follow-up")],
+        )
+        .unwrap();
+
+        assert!(
+            signals_for(&conn, new_id).is_empty(),
+            "tombstoned prior must not propagate"
+        );
+    }
+
+    /// Only the *most recent* attached prior message contributes its
+    /// workstreams. An older message attached to a different workstream
+    /// in the same chat is ignored — the chat's current topic is what
+    /// the heuristic models, not its lifetime history.
+    #[test]
+    fn auto_attach_uses_only_most_recent_attached_prior() {
+        let mut conn = open_db();
+        seed_workstream(&conn, "ws_old", "Old topic");
+        seed_workstream(&conn, "ws_current", "Current topic");
+
+        let old_id = "microsoft_graph:test@x.io::teams::old";
+        let recent_id = "microsoft_graph:test@x.io::teams::recent";
+        upsert_messages(
+            &mut conn,
+            &[
+                sample_message(old_id, "chat-A", 1_000, "way back"),
+                sample_message(recent_id, "chat-A", 5_000, "yesterday"),
+            ],
+        )
+        .unwrap();
+        crate::workstreams::persist::attach_signal(&conn, "ws_old", "teams_message", old_id, 1_000)
+            .unwrap();
+        crate::workstreams::persist::attach_signal(
+            &conn,
+            "ws_current",
+            "teams_message",
+            recent_id,
+            5_000,
+        )
+        .unwrap();
+
+        let new_id = "microsoft_graph:test@x.io::teams::new";
+        upsert_messages(
+            &mut conn,
+            &[sample_message(new_id, "chat-A", 9_000, "now")],
+        )
+        .unwrap();
+
+        assert_eq!(signals_for(&conn, new_id), vec!["ws_current".to_string()]);
+    }
+
+    /// Re-sync of an existing message must NOT re-trigger inheritance
+    /// — that would clobber a user's manual detach (#129) made between
+    /// the first sync and the re-sync.
+    #[test]
+    fn auto_attach_does_not_run_on_resync_of_existing_message() {
+        let mut conn = open_db();
+        seed_workstream(&conn, "ws1", "W1");
+
+        let prior_id = "microsoft_graph:test@x.io::teams::prior";
+        upsert_messages(
+            &mut conn,
+            &[sample_message(prior_id, "chat-A", 1_000, "first")],
+        )
+        .unwrap();
+        crate::workstreams::persist::attach_signal(&conn, "ws1", "teams_message", prior_id, 1_000)
+            .unwrap();
+
+        // First sync — inherits W1.
+        let new_id = "microsoft_graph:test@x.io::teams::new";
+        let msg = sample_message(new_id, "chat-A", 2_000, "follow-up");
+        upsert_messages(&mut conn, &[msg.clone()]).unwrap();
+        assert_eq!(signals_for(&conn, new_id), vec!["ws1".to_string()]);
+
+        // User manually detaches the new message from W1.
+        crate::workstreams::persist::detach_signal(&conn, "ws1", "teams_message", new_id, 2_500)
+            .unwrap();
+        assert!(signals_for(&conn, new_id).is_empty(), "user detach took effect");
+
+        // Re-sync (e.g. delta sync re-sends the same row). The auto-
+        // attach path must NOT run — re-attaching to W1 here would
+        // silently revive the user's rejection.
+        upsert_messages(&mut conn, &[msg]).unwrap();
+        assert!(
+            signals_for(&conn, new_id).is_empty(),
+            "re-sync must not revive a user-detached attachment"
+        );
     }
 }
