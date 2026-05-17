@@ -1616,7 +1616,7 @@ pub(crate) fn rewrite_action_owner(line: &str, new_owner: Option<&str>) -> Optio
     Some(format!("{indent}{bullet_char} {done_marker}{new_body}"))
 }
 
-fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
+pub(crate) fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
     let after_bullet = line
         .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))
