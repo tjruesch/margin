@@ -893,6 +893,13 @@ function WorkstreamDetailView({
   const [moreOpen, setMoreOpen] = useState(false);
   const [pickerMode, setPickerMode] = useState<"owner" | "parent" | null>(null);
   const [externalDialog, setExternalDialog] = useState<ExternalParticipant | null>(null);
+  /// #131: which row's "Move…" picker is open, or null. Carries kind +
+  /// item_id so the picker callback can chain detach(current) →
+  /// attach(target) on the right signal.
+  const [movePickerFor, setMovePickerFor] = useState<{
+    kind: string;
+    itemId: string;
+  } | null>(null);
 
   // Tell Home.tsx to drop its page-level H1 + list actions for as long
   // as this detail view is mounted; this view owns its own header zone.
@@ -934,6 +941,56 @@ function WorkstreamDetailView({
         console.error("detachSignalFromWorkstream failed:", e);
         alert("Could not detach. See console.");
       }
+    },
+    [id, reload],
+  );
+
+  /// Move an entity from this workstream to another (#131). Detach
+  /// then attach, fired serially client-side — acceptable for v1
+  /// (issue explicitly defers the transactional backend IPC). Recovery
+  /// on partial failure: if the attach fails after the detach
+  /// succeeded, re-attach to the source workstream so the item isn't
+  /// silently orphaned in Unassigned. The reload at the end picks up
+  /// both happy and recovery paths in one place.
+  const handleMove = useCallback(
+    async (kind: string, itemId: string, targetWorkstreamId: string) => {
+      if (targetWorkstreamId === id) {
+        setMovePickerFor(null);
+        return;
+      }
+      try {
+        await detachSignalFromWorkstream(id, kind, itemId);
+      } catch (e) {
+        console.error("move: detach failed", e);
+        alert("Could not move (detach failed). See console.");
+        setMovePickerFor(null);
+        return;
+      }
+      try {
+        await attachSignalToWorkstream(targetWorkstreamId, kind, itemId);
+      } catch (e) {
+        console.error("move: attach to target failed, recovering", e);
+        // Recovery: re-attach to the original workstream. If even
+        // recovery fails we surface both errors — the item will sit in
+        // Unassigned and the user can re-file from there manually.
+        try {
+          await attachSignalToWorkstream(id, kind, itemId);
+          alert(
+            "Could not attach to the target workstream — restored to this one. See console.",
+          );
+        } catch (recoveryErr) {
+          console.error("move: recovery re-attach failed", recoveryErr);
+          alert(
+            "Could not attach to target AND failed to restore — the item is now in Unassigned. See console.",
+          );
+        }
+        setMovePickerFor(null);
+        await reload();
+        return;
+      }
+      window.dispatchEvent(new CustomEvent("margin:unassigned-changed"));
+      setMovePickerFor(null);
+      await reload();
     },
     [id, reload],
   );
@@ -1326,23 +1383,29 @@ function WorkstreamDetailView({
       <EmailsSection
         emails={detail.emails}
         onDetach={(itemId) => void handleDetach("email", itemId)}
+        onMove={(itemId) => setMovePickerFor({ kind: "email", itemId })}
       />
 
       <MeetingsSection
         events={detail.events}
         onOpenEvent={onOpenEvent}
         onDetach={(itemId) => void handleDetach("event", itemId)}
+        onMove={(itemId) => setMovePickerFor({ kind: "event", itemId })}
       />
 
       <MessagesSection
         messages={detail.teams_messages}
         onDetach={(itemId) => void handleDetach("teams_message", itemId)}
+        onMove={(itemId) =>
+          setMovePickerFor({ kind: "teams_message", itemId })
+        }
       />
 
       <NotesSection
         notes={detail.notes}
         onOpenNote={onOpenNote}
         onDetach={(itemId) => void handleDetach("note", itemId)}
+        onMove={(itemId) => setMovePickerFor({ kind: "note", itemId })}
       />
 
       {detail.children.length > 0 ? (
@@ -1352,6 +1415,18 @@ function WorkstreamDetailView({
           onSelect={onNavigateTo}
         />
       ) : null}
+
+      {movePickerFor && (
+        <WorkstreamPickerPopover
+          workstreams={allWorkstreams}
+          excludeId={id}
+          headerLabel="Move to workstream…"
+          onPick={(targetId) =>
+            void handleMove(movePickerFor.kind, movePickerFor.itemId, targetId)
+          }
+          onCancel={() => setMovePickerFor(null)}
+        />
+      )}
     </div>
   );
 }
@@ -2583,9 +2658,11 @@ function OpenQuestionsSection({
 function EmailsSection({
   emails,
   onDetach,
+  onMove,
 }: {
   emails: EmailMessage[];
   onDetach?: (itemId: string) => void;
+  onMove?: (itemId: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [bodies, setBodies] = useState<Record<string, BodyState>>({});
@@ -2644,6 +2721,19 @@ function EmailsSection({
                 <span className="workstream-email-subject">{m.subject}</span>
                 <span className="workstream-email-chev">{open ? "▾" : "▸"}</span>
               </button>
+              {onMove && (
+                <button
+                  type="button"
+                  className="ws-move-btn"
+                  title="Move to another workstream"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMove(m.id);
+                  }}
+                >
+                  Move…
+                </button>
+              )}
               {onDetach && (
                 <button
                   type="button"
@@ -2728,9 +2818,11 @@ function EmailBodyPanel({
 function MessagesSection({
   messages,
   onDetach,
+  onMove,
 }: {
   messages: import("./file").TeamsMessage[];
   onDetach?: (itemId: string) => void;
+  onMove?: (itemId: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   if (messages.length === 0) return null;
@@ -2767,6 +2859,19 @@ function MessagesSection({
                 </span>
                 <span className="workstream-email-chev">{open ? "▾" : "▸"}</span>
               </button>
+              {onMove && (
+                <button
+                  type="button"
+                  className="ws-move-btn"
+                  title="Move to another workstream"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onMove(m.id);
+                  }}
+                >
+                  Move…
+                </button>
+              )}
               {onDetach && (
                 <button
                   type="button"
@@ -2860,10 +2965,12 @@ function MeetingRow({
   event,
   onOpenEvent,
   onDetach,
+  onMove,
 }: {
   event: CalendarEvent;
   onOpenEvent: (eventId: string) => void | Promise<void>;
   onDetach?: (itemId: string) => void;
+  onMove?: (itemId: string) => void;
 }) {
   return (
     <li>
@@ -2888,6 +2995,19 @@ function MeetingRow({
           </span>
         ) : null}
       </button>
+      {onMove && (
+        <button
+          type="button"
+          className="ws-move-btn"
+          title="Move to another workstream"
+          onClick={(ev) => {
+            ev.stopPropagation();
+            onMove(event.id);
+          }}
+        >
+          Move…
+        </button>
+      )}
       {onDetach && (
         <button
           type="button"
@@ -2909,10 +3029,12 @@ function MeetingsSection({
   events,
   onOpenEvent,
   onDetach,
+  onMove,
 }: {
   events: WorkstreamDetail["events"];
   onOpenEvent: (eventId: string) => void | Promise<void>;
   onDetach?: (itemId: string) => void;
+  onMove?: (itemId: string) => void;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const rows = useMemo(() => buildMeetingRows(events, Date.now()), [events]);
@@ -2930,6 +3052,7 @@ function MeetingsSection({
                 event={row.event}
                 onOpenEvent={onOpenEvent}
                 onDetach={onDetach}
+                onMove={onMove}
               />
             );
           }
@@ -2965,6 +3088,7 @@ function MeetingsSection({
                       event={occ}
                       onOpenEvent={onOpenEvent}
                       onDetach={onDetach}
+                      onMove={onMove}
                     />
                   ))}
                 </ul>
@@ -2981,10 +3105,12 @@ function NotesSection({
   notes,
   onOpenNote,
   onDetach,
+  onMove,
 }: {
   notes: WorkstreamDetail["notes"];
   onOpenNote: (path: string) => void;
   onDetach?: (itemId: string) => void;
+  onMove?: (itemId: string) => void;
 }) {
   if (notes.length === 0) return null;
   return (
@@ -3005,6 +3131,19 @@ function NotesSection({
                 {n.title || n.note_path}
               </span>
             </button>
+            {onMove && (
+              <button
+                type="button"
+                className="ws-move-btn"
+                title="Move to another workstream"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onMove(n.note_path);
+                }}
+              >
+                Move…
+              </button>
+            )}
             {onDetach && (
               <button
                 type="button"
@@ -3265,20 +3404,32 @@ function UnassignedFeed({
 /// Floating popover that lists every active workstream so the user
 /// can pick one to attach to. No search in v1 — the active list is
 /// small enough that scrolling suffices.
+///
+/// `excludeId` lets the caller hide one workstream from the list —
+/// used by the Move flow (#131) to drop the source workstream so the
+/// user can't "move to here". `headerLabel` overrides the default
+/// "Attach to workstream…" so the same popover can serve both flows.
 function WorkstreamPickerPopover({
   workstreams,
   onPick,
   onOpenWorkstream,
   onCancel,
+  excludeId,
+  headerLabel,
 }: {
   workstreams: Workstream[];
   onPick: (workstreamId: string) => void;
   onOpenWorkstream?: (workstreamId: string) => void;
   onCancel: () => void;
+  excludeId?: string;
+  headerLabel?: string;
 }) {
   const active = useMemo(
-    () => workstreams.filter((w) => w.status === "active"),
-    [workstreams],
+    () =>
+      workstreams.filter(
+        (w) => w.status === "active" && w.id !== excludeId,
+      ),
+    [workstreams, excludeId],
   );
 
   return (
@@ -3289,9 +3440,13 @@ function WorkstreamPickerPopover({
         role="dialog"
         aria-label="Pick a workstream"
       >
-        <h3>Attach to workstream…</h3>
+        <h3>{headerLabel ?? "Attach to workstream…"}</h3>
         {active.length === 0 ? (
-          <p className="ws-picker-empty">No active workstreams.</p>
+          <p className="ws-picker-empty">
+            {excludeId
+              ? "No other active workstream available."
+              : "No active workstreams."}
+          </p>
         ) : (
           <ul className="ws-picker-list">
             {active.map((w) => (

@@ -7986,8 +7986,11 @@ button.workstream-external-chip:hover {
 
 /* Per-row Detach button on workstream detail sections (#108). Muted
    by default; reveals on row hover so it doesn't compete with the
-   primary row affordance. */
-.ws-detach-btn {
+   primary row affordance. The Move button (#131) follows the same
+   hover-reveal rhythm; both share the same shape so the pair reads as
+   a row action group. */
+.ws-detach-btn,
+.ws-move-btn {
   background: transparent;
   border: 0;
   color: var(--fg-muted);
@@ -8002,11 +8005,15 @@ button.workstream-external-chip:hover {
   flex-shrink: 0;
 }
 .workstream-email:hover .ws-detach-btn,
+.workstream-email:hover .ws-move-btn,
 .workstream-meetings li:hover .ws-detach-btn,
-.workstream-notes li:hover .ws-detach-btn {
+.workstream-meetings li:hover .ws-move-btn,
+.workstream-notes li:hover .ws-detach-btn,
+.workstream-notes li:hover .ws-move-btn {
   opacity: 0.8;
 }
-.ws-detach-btn:hover {
+.ws-detach-btn:hover,
+.ws-move-btn:hover {
   background: color-mix(in srgb, var(--fg) 10%, transparent);
   color: var(--fg);
   opacity: 1 !important;
