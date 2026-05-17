@@ -499,6 +499,12 @@ fn upsert_waiting_action(
 /// id resets the counter; each tick that omits it bumps the counter
 /// and, at the threshold, also stamps `auto_resolved_ms` so the
 /// frontend can render the "Margin auto-resolved" pill + Undo.
+///
+/// Scope (#132): synth-origin rows ONLY. Note-origin rows (`- [ ]`
+/// markdown checkboxes in user-authored notes) are intentionally not
+/// auto-resolved — the user's notes are their source of truth, and
+/// auto-resolving would require silently rewriting the `.md` file.
+/// The pair (`undo_auto_resolved_action`) mirrors this guard.
 fn auto_resolve_missing(
     tx: &rusqlite::Transaction<'_>,
     person_id: &str,
