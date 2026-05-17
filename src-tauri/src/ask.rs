@@ -94,6 +94,35 @@ const TOOL_NAMES: &[&str] = &[
     "search_similar",
     "read_edges",
 ];
+
+/// Coverage assertion: every `workstreams::signals::registry` kind must
+/// have a path into the AI prompt — either a labeled section here in
+/// `format_user_message`, or a read-tool in `dispatch_tool` whose output
+/// surfaces items of that kind. The Teams-messages miss (a kind in the
+/// DB with no path into the model's view) was caught by inspection; the
+/// `registry_coverage` test below catches the next one structurally.
+///
+/// Add a new entry when you ship a new section or a new read-tool that
+/// covers a registry kind. Removing an entry without replacing coverage
+/// elsewhere will fail the test.
+///
+/// Kinds with their own labeled `# Section` header in `format_user_message`.
+const PROMPT_SECTION_KINDS: &[&str] = &[
+    "note",          // `# Notes directory` + `# Top candidates`
+    "event",         // `# Schedule (last 14 days, next 14 days)`
+    "teams_message", // `# Recent Teams messages (last 14 days)`
+];
+/// Kinds resolvable through a `dispatch_tool` tool-call result. Note that
+/// `read_workstream` surfaces a workstream's bundled `Recent emails`,
+/// `Recent meetings`, `Recent notes`, and `Recent Teams messages`
+/// (see `format_workstream_detail`), so the email kind is reachable via
+/// that path even though there is no dedicated `read_email` tool.
+const TOOL_RESOLVABLE_KINDS: &[&str] = &[
+    "note",          // `read_note(n)`
+    "event",         // `read_event_details(n)`
+    "teams_message", // `read_teams_message(n)` + bundled in `read_workstream`
+    "email",         // bundled in `read_workstream` ("Recent emails (top N of M)")
+];
 /// Per-category top-N when expanding a workstream via `read_workstream`
 /// (emails / events / notes returned per call).
 const WORKSTREAM_DETAIL_TOP_N: usize = 5;
@@ -3176,6 +3205,65 @@ mod tests {
             parent_workstream_id: None,
             external_participants: Vec::new(),
         }
+    }
+
+    /// #140: every kind registered in `workstreams::signals::registry`
+    /// must have a path into the AI prompt — either a labeled section
+    /// in `format_user_message` (declared in `PROMPT_SECTION_KINDS`) or
+    /// a read-tool result that surfaces items of that kind (declared in
+    /// `TOOL_RESOLVABLE_KINDS`). The Teams-messages coverage miss was a
+    /// signal kind in the DB with no path into the model's view; this
+    /// test catches the next one structurally before it ships.
+    #[test]
+    fn registry_coverage_every_kind_has_a_path_into_the_prompt() {
+        let reg = crate::workstreams::signals::registry();
+        let in_section: std::collections::HashSet<&str> =
+            PROMPT_SECTION_KINDS.iter().copied().collect();
+        let in_tool: std::collections::HashSet<&str> =
+            TOOL_RESOLVABLE_KINDS.iter().copied().collect();
+
+        let mut uncovered: Vec<&'static str> = Vec::new();
+        for src in reg.iter_in_prompt_order() {
+            let kind = src.kind();
+            if !in_section.contains(kind) && !in_tool.contains(kind) {
+                uncovered.push(kind);
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "Signal kind(s) {uncovered:?} have no path into the AI prompt. \
+             Add a labeled section in format_user_message (and list the kind \
+             in PROMPT_SECTION_KINDS), OR register a read-tool in dispatch_tool \
+             that surfaces items of that kind (and list it in TOOL_RESOLVABLE_KINDS). \
+             Without either, the kind exists in workstream_signals but the model \
+             cannot read it — same class of bug as the pre-#136 Teams miss."
+        );
+    }
+
+    /// Companion to the registry-coverage test: a kind listed in the
+    /// coverage slices that isn't registered in `signals::registry`
+    /// means the slice is stale and the assertion in the sibling test
+    /// is silently weakened. Fail fast on drift in either direction.
+    #[test]
+    fn registry_coverage_slices_have_no_stale_entries() {
+        let reg = crate::workstreams::signals::registry();
+        let registered: std::collections::HashSet<&str> = reg
+            .iter_in_prompt_order()
+            .map(|s| s.kind())
+            .collect();
+        let mut stale: Vec<&'static str> = Vec::new();
+        for k in PROMPT_SECTION_KINDS.iter().chain(TOOL_RESOLVABLE_KINDS.iter()) {
+            if !registered.contains(k) {
+                stale.push(k);
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "Coverage slice entries {stale:?} are not registered in \
+             workstreams::signals::registry. Either the kind was removed from \
+             the registry (drop it from PROMPT_SECTION_KINDS / TOOL_RESOLVABLE_KINDS) \
+             or the slice has a typo."
+        );
     }
 
     #[test]
