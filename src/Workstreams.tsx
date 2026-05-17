@@ -3271,6 +3271,20 @@ function UnassignedFeed({
   const [items, setItems] = useState<UnassignedItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [pickerFor, setPickerFor] = useState<UnassignedItem | null>(null);
+  /// #130: keys (from `unassignedKey`) of currently-selected rows.
+  /// Independent of `pickerFor`, which still drives the per-row attach
+  /// flow. A user can pre-select rows AND then click a single row's
+  /// per-row Attach without losing the bulk selection.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  /// True when the bulk-attach picker (vs. the per-row picker) is open.
+  const [bulkPickerOpen, setBulkPickerOpen] = useState(false);
+  /// In-flight count during a bulk attach. Non-zero means: disable
+  /// close + Esc, render a "Attaching N…" indicator on the bulk bar.
+  const [bulkBusy, setBulkBusy] = useState(false);
+  /// Keys of rows that failed during the last bulk attach. Keeps them
+  /// visible with an error marker so the user can re-try or detach
+  /// some other way. Cleared when the row is re-selected or re-attached.
+  const [bulkErrors, setBulkErrors] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -3293,13 +3307,18 @@ function UnassignedFeed({
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (bulkBusy) return; // protect a bulk attach mid-flight
+        if (bulkPickerOpen) {
+          setBulkPickerOpen(false);
+          return;
+        }
         if (pickerFor) setPickerFor(null);
         else onClose();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, pickerFor]);
+  }, [onClose, pickerFor, bulkPickerOpen, bulkBusy]);
 
   const handleAttach = useCallback(
     async (target: UnassignedItem, workstreamId: string) => {
@@ -3309,9 +3328,20 @@ function UnassignedFeed({
           target.kind,
           unassignedItemId(target),
         );
-        setItems((curr) =>
-          curr.filter((x) => unassignedKey(x) !== unassignedKey(target)),
-        );
+        const key = unassignedKey(target);
+        setItems((curr) => curr.filter((x) => unassignedKey(x) !== key));
+        setSelected((s) => {
+          if (!s.has(key)) return s;
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
+        setBulkErrors((s) => {
+          if (!s.has(key)) return s;
+          const next = new Set(s);
+          next.delete(key);
+          return next;
+        });
         window.dispatchEvent(new CustomEvent("margin:unassigned-changed"));
         setPickerFor(null);
       } catch (e) {
@@ -3322,8 +3352,112 @@ function UnassignedFeed({
     [],
   );
 
+  const toggleSelected = useCallback((key: string) => {
+    setSelected((s) => {
+      const next = new Set(s);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+    // Clicking a row clears its prior error indicator — the user has
+    // signalled intent to act on this row again.
+    setBulkErrors((s) => {
+      if (!s.has(key)) return s;
+      const next = new Set(s);
+      next.delete(key);
+      return next;
+    });
+  }, []);
+
+  /// Bulk attach the currently-selected rows to one workstream (#130).
+  /// `Promise.allSettled` so a single failure doesn't abort the rest.
+  /// Successes vanish from the list; failures stay with an inline
+  /// error marker so the user can retry or detach via the per-row
+  /// flow. One `margin:unassigned-changed` event after the dust
+  /// settles — the page header pill refetches once, not N times.
+  const handleBulkAttach = useCallback(
+    async (workstreamId: string) => {
+      const targets = items.filter((u) => selected.has(unassignedKey(u)));
+      if (targets.length === 0) {
+        setBulkPickerOpen(false);
+        return;
+      }
+      setBulkBusy(true);
+      setBulkPickerOpen(false);
+      try {
+        const results = await Promise.allSettled(
+          targets.map((t) =>
+            attachSignalToWorkstream(
+              workstreamId,
+              t.kind,
+              unassignedItemId(t),
+            ).then(() => t),
+          ),
+        );
+        const succeededKeys = new Set<string>();
+        const failedKeys = new Set<string>();
+        results.forEach((r, i) => {
+          const key = unassignedKey(targets[i]);
+          if (r.status === "fulfilled") {
+            succeededKeys.add(key);
+          } else {
+            console.error(
+              "bulk attach failed for",
+              key,
+              r.reason,
+            );
+            failedKeys.add(key);
+          }
+        });
+        setItems((curr) =>
+          curr.filter((x) => !succeededKeys.has(unassignedKey(x))),
+        );
+        setSelected((s) => {
+          const next = new Set<string>();
+          for (const k of s) {
+            if (failedKeys.has(k)) next.add(k); // keep failures selected
+          }
+          return next;
+        });
+        setBulkErrors(failedKeys);
+        if (succeededKeys.size > 0) {
+          window.dispatchEvent(new CustomEvent("margin:unassigned-changed"));
+        }
+        if (failedKeys.size > 0) {
+          alert(
+            `${succeededKeys.size} attached, ${failedKeys.size} failed. See console.`,
+          );
+        }
+      } finally {
+        setBulkBusy(false);
+      }
+    },
+    [items, selected],
+  );
+
+  const allVisibleKeys = useMemo(
+    () => items.map((u) => unassignedKey(u)),
+    [items],
+  );
+  const allSelected =
+    allVisibleKeys.length > 0 &&
+    allVisibleKeys.every((k) => selected.has(k));
+  const toggleAll = useCallback(() => {
+    if (allSelected) {
+      setSelected(new Set());
+    } else {
+      setSelected(new Set(allVisibleKeys));
+    }
+  }, [allSelected, allVisibleKeys]);
+
   return (
-    <div className="ws-modal-backdrop" onClick={onClose}>
+    <div
+      className="ws-modal-backdrop"
+      onClick={() => {
+        if (bulkBusy) return; // protect a bulk attach mid-flight
+        onClose();
+      }}
+    >
       <div
         className="ws-modal-card unassigned-modal"
         onClick={(e) => e.stopPropagation()}
@@ -3335,6 +3469,7 @@ function UnassignedFeed({
             className="ws-modal-close"
             onClick={onClose}
             aria-label="Close"
+            disabled={bulkBusy}
           >
             ×
           </button>
@@ -3349,41 +3484,126 @@ function UnassignedFeed({
         ) : items.length === 0 ? (
           <p className="unassigned-empty">Everything's filed away.</p>
         ) : (
-          <ul className="unassigned-list">
-            {items.map((u) => (
-              <li key={unassignedKey(u)} className="unassigned-row">
-                <span className={`unassigned-kind unassigned-kind--${u.kind}`}>
-                  {u.kind === "email"
-                    ? "✉"
-                    : u.kind === "event"
-                    ? "◷"
-                    : u.kind === "note"
-                    ? "▣"
-                    : "▾"}
+          <>
+            <div className="unassigned-select-all">
+              <label className="unassigned-checkbox">
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  // Indeterminate when some-but-not-all rows are
+                  // selected. Plain DOM property — React doesn't have
+                  // a JSX prop for it, so we set it via ref callback.
+                  ref={(el) => {
+                    if (el)
+                      el.indeterminate =
+                        selected.size > 0 && !allSelected;
+                  }}
+                  onChange={toggleAll}
+                  disabled={bulkBusy}
+                />
+                <span>
+                  {allSelected
+                    ? "Clear selection"
+                    : selected.size > 0
+                      ? `${selected.size} selected`
+                      : "Select all"}
                 </span>
-                <span className="unassigned-when">
-                  {formatShortDateTime(unassignedSortMs(u))}
-                </span>
-                <span className="unassigned-label">
-                  {unassignedLabel(u)}
-                  {unassignedSubLabel(u) && (
-                    <span className="unassigned-sub">
-                      {" — "}
-                      {unassignedSubLabel(u)}
+              </label>
+            </div>
+            <ul className="unassigned-list">
+              {items.map((u) => {
+                const key = unassignedKey(u);
+                const isSelected = selected.has(key);
+                const failed = bulkErrors.has(key);
+                return (
+                  <li
+                    key={key}
+                    className={
+                      "unassigned-row" +
+                      (isSelected ? " unassigned-row--selected" : "") +
+                      (failed ? " unassigned-row--failed" : "")
+                    }
+                  >
+                    <label
+                      className="unassigned-checkbox"
+                      title="Select for bulk attach"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => toggleSelected(key)}
+                        disabled={bulkBusy}
+                      />
+                    </label>
+                    <span className={`unassigned-kind unassigned-kind--${u.kind}`}>
+                      {u.kind === "email"
+                        ? "✉"
+                        : u.kind === "event"
+                        ? "◷"
+                        : u.kind === "note"
+                        ? "▣"
+                        : "▾"}
                     </span>
-                  )}
-                </span>
-                <button
-                  type="button"
-                  className="unassigned-attach"
-                  onClick={() => setPickerFor(u)}
-                  title="Attach to workstream…"
-                >
-                  + Attach
-                </button>
-              </li>
-            ))}
-          </ul>
+                    <span className="unassigned-when">
+                      {formatShortDateTime(unassignedSortMs(u))}
+                    </span>
+                    <span className="unassigned-label">
+                      {unassignedLabel(u)}
+                      {unassignedSubLabel(u) && (
+                        <span className="unassigned-sub">
+                          {" — "}
+                          {unassignedSubLabel(u)}
+                        </span>
+                      )}
+                    </span>
+                    {failed && (
+                      <span
+                        className="unassigned-row-error"
+                        title="Last bulk attach failed for this item. Select again and retry."
+                        aria-label="bulk attach failed"
+                      >
+                        ⚠
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="unassigned-attach"
+                      onClick={() => setPickerFor(u)}
+                      title="Attach to workstream…"
+                      disabled={bulkBusy}
+                    >
+                      + Attach
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
+        {selected.size > 0 && (
+          <div className="unassigned-bulkbar" role="region" aria-label="Bulk actions">
+            <span className="unassigned-bulkbar-count">
+              {bulkBusy
+                ? `Attaching ${selected.size}…`
+                : `${selected.size} selected`}
+            </span>
+            <button
+              type="button"
+              className="unassigned-bulkbar-clear"
+              onClick={() => setSelected(new Set())}
+              disabled={bulkBusy}
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              className="unassigned-bulkbar-attach"
+              onClick={() => setBulkPickerOpen(true)}
+              disabled={bulkBusy}
+            >
+              Attach {selected.size} to workstream…
+            </button>
+          </div>
         )}
         {pickerFor && (
           <WorkstreamPickerPopover
@@ -3394,6 +3614,14 @@ function UnassignedFeed({
               onOpenWorkstream(wsId);
             }}
             onCancel={() => setPickerFor(null)}
+          />
+        )}
+        {bulkPickerOpen && (
+          <WorkstreamPickerPopover
+            workstreams={workstreams}
+            headerLabel={`Attach ${selected.size} selected to…`}
+            onPick={(wsId) => void handleBulkAttach(wsId)}
+            onCancel={() => setBulkPickerOpen(false)}
           />
         )}
       </div>

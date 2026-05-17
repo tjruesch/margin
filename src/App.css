@@ -7913,6 +7913,107 @@ button.workstream-external-chip:hover {
   background: var(--bg-soft, color-mix(in srgb, var(--fg) 7%, transparent));
   color: var(--fg);
 }
+.unassigned-attach:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* #130: bulk-select column + bulk-action bar. The checkbox is small
+   so it doesn't dominate the row — selection is a secondary affordance,
+   per-row Attach stays primary. */
+.unassigned-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.unassigned-checkbox input {
+  cursor: pointer;
+  margin: 0;
+}
+.unassigned-checkbox input:disabled {
+  cursor: not-allowed;
+}
+.unassigned-select-all {
+  display: flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--home-line);
+  margin-bottom: 4px;
+}
+.unassigned-row--selected {
+  background: color-mix(in srgb, var(--accent, #4ade80) 10%, transparent);
+}
+.unassigned-row--selected:hover {
+  background: color-mix(in srgb, var(--accent, #4ade80) 14%, transparent);
+}
+.unassigned-row--failed {
+  background: color-mix(in srgb, #ef4444 10%, transparent);
+}
+.unassigned-row-error {
+  color: #b91c1c;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+/* Sticky bulk-action bar at the bottom of the modal. Sits inside the
+   flex column so it stays put when the list scrolls. */
+.unassigned-bulkbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-top: 8px;
+  border-top: 1px solid var(--home-line);
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  border-radius: 0 0 8px 8px;
+}
+.unassigned-bulkbar-count {
+  flex: 1;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--fg);
+}
+.unassigned-bulkbar-clear {
+  background: transparent;
+  border: 0;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.unassigned-bulkbar-clear:hover {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
+.unassigned-bulkbar-clear:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.unassigned-bulkbar-attach {
+  background: color-mix(in srgb, var(--fg) 12%, transparent);
+  border: 1px solid var(--home-line);
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.unassigned-bulkbar-attach:hover {
+  background: color-mix(in srgb, var(--fg) 18%, transparent);
+}
+.unassigned-bulkbar-attach:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 
 .ws-picker-backdrop {
   position: fixed;
