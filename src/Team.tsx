@@ -927,6 +927,130 @@ function ProfileSnapshotPane({
 
 type CompareTo = "none" | "7d" | "30d" | "first";
 
+/// Pure-LCS word-level diff (#133). Each segment carries the unbroken
+/// run of tokens that share an op so consecutive add/del words render
+/// inside one span (cleaner DOM than per-word spans).
+///
+/// Returns `null` when:
+///   - either side is too long (>500 chars) — pathological renders
+///   - the diff has more than 30 add/del segments — looks like a full
+///     rewrite; the stacked render is more legible
+/// Callers fall back to the existing stacked prev/current render in
+/// that case. See #133's acceptance criteria.
+type WordDiffOp = "keep" | "add" | "del";
+type WordDiffSegment = { op: WordDiffOp; text: string };
+
+const WORD_DIFF_MAX_LEN = 500;
+const WORD_DIFF_MAX_CHANGES = 30;
+
+function tokenizeForDiff(s: string): string[] {
+  // Whitespace and non-whitespace runs as separate tokens. Whitespace
+  // tokens act as anchors in the LCS (they almost always match) so
+  // typo-fixes inside a paragraph collapse to a single add+del pair.
+  return s.match(/\s+|\S+/g) ?? [];
+}
+
+function wordDiff(prev: string, curr: string): WordDiffSegment[] | null {
+  if (prev.length > WORD_DIFF_MAX_LEN || curr.length > WORD_DIFF_MAX_LEN) {
+    return null;
+  }
+  const a = tokenizeForDiff(prev);
+  const b = tokenizeForDiff(curr);
+  const n = a.length;
+  const m = b.length;
+  // Standard LCS DP table; O(n*m) time + space. Bounded by the length
+  // gate above (≤500 chars ≈ ≤200 tokens each side → 40k cells).
+  const dp: number[][] = Array.from({ length: n + 1 }, () =>
+    new Array<number>(m + 1).fill(0),
+  );
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const segs: WordDiffSegment[] = [];
+  const push = (op: WordDiffOp, text: string) => {
+    const last = segs[segs.length - 1];
+    if (last && last.op === op) last.text += text;
+    else segs.push({ op, text });
+  };
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      push("keep", a[i]);
+      i++;
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      push("del", a[i]);
+      i++;
+    } else {
+      push("add", b[j]);
+      j++;
+    }
+  }
+  while (i < n) push("del", a[i++]);
+  while (j < m) push("add", b[j++]);
+
+  // Count change segments (add+del). One typo-fix = 2 segments. >30
+  // change segments is closer to a rewrite than an edit — the stacked
+  // render is more legible there.
+  const changes = segs.reduce(
+    (n, s) => n + (s.op === "keep" ? 0 : 1),
+    0,
+  );
+  if (changes > WORD_DIFF_MAX_CHANGES) return null;
+  return segs;
+}
+
+/// Inline word-level diff renderer (#133). Falls back to the stacked
+/// prev/current pair when the diff is too large to render usefully
+/// (see `wordDiff` cap rules). The fallback path matches the legacy
+/// render so callers can swap this in without losing the long-text
+/// behaviour established in #118.
+function ProseDiff({
+  prev,
+  curr,
+  className,
+}: {
+  prev: string;
+  curr: string;
+  className: string;
+}) {
+  const segs = useMemo(() => wordDiff(prev, curr), [prev, curr]);
+  if (segs == null) {
+    // Stacked fallback — preserves the #118 legibility contract for
+    // long prev/curr pairs and near-full rewrites.
+    return (
+      <>
+        <p className={`${className} team-profile-diff-prev`}>{prev}</p>
+        <p className={className}>{curr}</p>
+      </>
+    );
+  }
+  return (
+    <p className={className}>
+      {segs.map((s, i) => {
+        if (s.op === "keep") return <span key={i}>{s.text}</span>;
+        if (s.op === "del") {
+          return (
+            <span key={i} className="team-profile-diff-del">
+              {s.text}
+            </span>
+          );
+        }
+        return (
+          <span key={i} className="team-profile-diff-add">
+            {s.text}
+          </span>
+        );
+      })}
+    </p>
+  );
+}
+
 /// Set-diff a pair of keyed arrays into added / removed / unchanged
 /// + rank-shifted items (#118). Rank shifts trigger only when an
 /// item exists in both arrays at materially different positions
@@ -1173,12 +1297,15 @@ function ProfileSnapshotView({
         )}
         {body.summary_prose ? (
           <div className="team-profile-summary-block">
-            {summaryChanged && compareBody?.summary_prose && (
-              <p className="team-profile-summary team-profile-diff-prev">
-                {compareBody.summary_prose}
-              </p>
+            {summaryChanged && compareBody?.summary_prose ? (
+              <ProseDiff
+                prev={compareBody.summary_prose}
+                curr={body.summary_prose}
+                className="team-profile-summary"
+              />
+            ) : (
+              <p className="team-profile-summary">{body.summary_prose}</p>
             )}
-            <p className="team-profile-summary">{body.summary_prose}</p>
           </div>
         ) : (
           <p className="team-profile-summary team-profile-summary--placeholder">
@@ -1351,14 +1478,17 @@ function ProfileSnapshotView({
         {body.communication_style_notes && (
           <section className="team-profile-glance-row">
             <h4 className="team-profile-glance-label">Communication style</h4>
-            {styleChanged && compareBody?.communication_style_notes && (
-              <p className="team-profile-style team-profile-diff-prev">
-                {compareBody.communication_style_notes}
+            {styleChanged && compareBody?.communication_style_notes ? (
+              <ProseDiff
+                prev={compareBody.communication_style_notes}
+                curr={body.communication_style_notes}
+                className="team-profile-style"
+              />
+            ) : (
+              <p className="team-profile-style">
+                {body.communication_style_notes}
               </p>
             )}
-            <p className="team-profile-style">
-              {body.communication_style_notes}
-            </p>
           </section>
         )}
 

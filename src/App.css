@@ -4395,6 +4395,20 @@ input.nh-title {
   display: block;
   margin: 0;
 }
+/* #133: inline word-level diff inside prose fields (summary_prose +
+   communication_style_notes). Subtle hue, no background, so the
+   prose stays readable as prose — the styling is informational, not
+   decorative. Falls back to stacked .team-profile-diff-prev above
+   when the diff is too large (>500 chars or >30 changes). */
+.team-profile-diff-del {
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, #ef4444 60%, transparent);
+  color: color-mix(in srgb, #b91c1c 85%, var(--fg-muted));
+}
+.team-profile-diff-add {
+  color: color-mix(in srgb, #15803d 90%, var(--fg));
+  font-weight: 500;
+}
 /* Chip that appeared in the latest snapshot but not the comparison. */
 .team-profile-chip--added {
   border: 1px dashed color-mix(in srgb, #4ade80 55%, transparent);
