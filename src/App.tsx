@@ -6,6 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
+import { NoteActionsSidebar } from "./NoteActionsSidebar";
 import { dispatchDiff } from "./editor/applyDiff";
 import { AssigneePopover } from "./editor/assigneePopover";
 import { DueDatePopover } from "./editor/dueDatePopover";
@@ -2040,16 +2041,32 @@ export default function App() {
 
       <main className="pane">
         {mode === "edit" && (
-          <Editor
-            ref={editorRef}
-            value={content}
-            onChange={setContent}
-            tabSize={tabSize}
-            useTabs={useTabs}
-            softWrap={softWrap}
-            fontSize={fontSize}
-            actions={noteActions}
-          />
+          <div className="editor-and-rail">
+            <Editor
+              ref={editorRef}
+              value={content}
+              onChange={setContent}
+              tabSize={tabSize}
+              useTabs={useTabs}
+              softWrap={softWrap}
+              fontSize={fontSize}
+              actions={noteActions}
+            />
+            <NoteActionsSidebar
+              notePath={path}
+              refreshKey={savedContent}
+              members={members}
+              workstreams={workstreams}
+              onOpenWorkstream={(id) => {
+                tryNavigate("home");
+                queueMicrotask(() => {
+                  window.dispatchEvent(
+                    new CustomEvent("margin:open-workstream", { detail: id }),
+                  );
+                });
+              }}
+            />
+          </div>
         )}
         {mode === "preview" && (
           <Preview source={content} theme={theme} onSourceChange={setContent} />

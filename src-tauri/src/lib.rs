@@ -549,6 +549,7 @@ pub fn run() {
             notes::set_archived,
             notes::set_favorite,
             notes::list_actions,
+            notes::list_actions_for_note,
             notes::set_action_done,
             notes::undo_auto_resolved_action,
             notes::set_action_assignee,

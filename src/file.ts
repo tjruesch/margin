@@ -317,11 +317,13 @@ export type ActionScope = "open" | "done" | "all";
 
 export type ActionListItem = {
   id: string;
-  /** Origin discriminator (#111). `"note"` for markdown-checkbox-backed
-   *  rows; `"synth"` for synthesizer-emitted rows. Drives click-
-   *  through routing; the unified write IPCs dispatch internally so
-   *  callers don't branch on this. */
-  origin_kind: "note" | "synth";
+  /** Origin discriminator (#111, #144). `"note"` for markdown-
+   *  checkbox-backed rows; `"synth"` for synthesizer-emitted rows;
+   *  `"reconcile"` for LLM-extracted rows from meeting reconciliation
+   *  (no body line). Drives click-through routing and badge rendering;
+   *  the unified write IPCs dispatch internally so callers don't
+   *  branch on this. */
+  origin_kind: "note" | "synth" | "reconcile";
   /** Source note path for note-origin rows; `null` for synth rows. */
   origin_note_path: string | null;
   /** 1-based source-line for note-origin rows; `null` for synth rows. */
@@ -398,6 +400,15 @@ export async function listActions(
     subjectMemberId: filters.subjectMemberId,
     originSynthKinds: filters.originSynthKinds,
   });
+}
+
+/** Per-note actions for the note-view sidebar (#145). Returns every
+ *  row whose `origin_note_path` matches `notePath`, regardless of
+ *  origin_kind or done state. Ordered created_ms DESC. */
+export async function listActionsForNote(
+  notePath: string,
+): Promise<ActionListItem[]> {
+  return invoke<ActionListItem[]>("list_actions_for_note", { noteId: notePath });
 }
 
 export async function setActionDone(id: string, done: boolean): Promise<void> {

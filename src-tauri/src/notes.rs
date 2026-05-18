@@ -333,6 +333,18 @@ pub fn list_actions(
     .map_err(|e| e.to_string())
 }
 
+/// Per-note actions for the note-view sidebar (#145). Returns both
+/// origins (reconcile + note + any synth row pinned via origin_note_id)
+/// and both done states. Ordering: created_ms DESC.
+#[tauri::command]
+pub fn list_actions_for_note(
+    note_id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<ActionListItem>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    crate::index::list_actions_for_note(&c, &note_id).map_err(|e| e.to_string())
+}
+
 #[derive(Serialize)]
 pub struct NoteMeta {
     pub modified_ms: i64,
