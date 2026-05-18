@@ -345,6 +345,18 @@ pub fn list_actions_for_note(
     crate::index::list_actions_for_note(&c, &note_id).map_err(|e| e.to_string())
 }
 
+/// Phase 1.4 (#146) — one-time backfill of pre-#144 reconciled notes
+/// into reconcile-origin rows. Idempotent. The boot sweep auto-runs
+/// this once; the Settings button re-runs it on demand.
+#[tauri::command]
+pub fn migrate_reconciled_notes_to_action_rows(
+    dry_run: bool,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<crate::actions_migration::MigrationReport, String> {
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    crate::actions_migration::run(&mut c, dry_run)
+}
+
 #[derive(Serialize)]
 pub struct NoteMeta {
     pub modified_ms: i64,

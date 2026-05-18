@@ -411,6 +411,28 @@ export async function listActionsForNote(
   return invoke<ActionListItem[]>("list_actions_for_note", { noteId: notePath });
 }
 
+/** Phase 1.4 (#146) — one-time backfill report. Auto-runs once at
+ *  boot when the meta flag is `'0'`; the Settings → Data button
+ *  re-runs it on demand (idempotent). */
+export type ActionsMigrationReport = {
+  dry_run: boolean;
+  candidates_scanned: number;
+  notes_migrated: number;
+  rows_created: number;
+  backups_written: number;
+  notes_already_clean: number;
+  errors: string[];
+};
+
+export async function migrateReconciledNotesToActionRows(
+  dryRun: boolean,
+): Promise<ActionsMigrationReport> {
+  return invoke<ActionsMigrationReport>(
+    "migrate_reconciled_notes_to_action_rows",
+    { dryRun },
+  );
+}
+
 export async function setActionDone(id: string, done: boolean): Promise<void> {
   await invoke<void>("set_action_done", { id, done });
 }

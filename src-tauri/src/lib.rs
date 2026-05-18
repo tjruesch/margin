@@ -1,4 +1,5 @@
 mod activity;
+mod actions_migration;
 mod anthropic;
 mod ask;
 mod audio;
@@ -434,6 +435,12 @@ pub fn run() {
                 eprintln!("profile.md purge failed at boot: {e}");
             }
 
+            // #146: one-shot backfill of pre-#144 reconciled notes —
+            // moves inline `## Action items` blocks into reconcile-origin
+            // rows + writes per-note backups. Gated by the
+            // actions_migration_v1_completed meta flag.
+            actions_migration::run_if_pending(&mut conn);
+
             // Connector registry: holds kind-factory mappings + live
             // connector instances. Real connector modules register
             // their factories at boot (Microsoft Graph in #63;
@@ -550,6 +557,7 @@ pub fn run() {
             notes::set_favorite,
             notes::list_actions,
             notes::list_actions_for_note,
+            notes::migrate_reconciled_notes_to_action_rows,
             notes::set_action_done,
             notes::undo_auto_resolved_action,
             notes::set_action_assignee,

@@ -499,7 +499,7 @@ fn strip_observations_block(raw: &str) -> (String, Vec<ParsedObservation>) {
 /// Only the first occurrence is processed. If the model ever emits two
 /// `## Action items` headings the second survives in the body; the
 /// caller's logging will surface that as a tail of un-persisted items.
-fn split_action_items_block(body: &str) -> (String, Vec<String>) {
+pub(crate) fn split_action_items_block(body: &str) -> (String, Vec<String>) {
     const HEADING: &str = "## Action items";
     let lines: Vec<&str> = body.split('\n').collect();
     let start = lines.iter().position(|l| l.trim_end() == HEADING);
