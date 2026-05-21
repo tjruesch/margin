@@ -22,6 +22,7 @@ pub mod commands;
 pub mod link_categorizer;
 pub mod link_summarizer;
 pub mod persist;
+pub mod rejected;
 pub mod signals;
 pub mod synthesizer;
 

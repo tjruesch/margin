@@ -92,6 +92,13 @@ differ (e.g. existing \"Follow up with Kern & Sohn on Bridge onboarding\" alread
 user can always add or edit actions manually. Several recent items about the same effort should \
 contribute AT MOST one new action, not one per source.
 
+Respect rejected actions: each existing workstream may also list \"Recently rejected (do not \
+re-emit)\". These are texts the user explicitly deleted in the last 30 days. Be **much more \
+selective** about emitting new actions that resemble them — same topic, same recipient, same \
+phrasing all count. Resemblance is your judgment; lean toward DROP. If you think a rejected \
+item still belongs in the output, phrase it from a clearly different angle or skip it. The \
+user's deletion is strong signal that the previous framing was wrong.
+
 Hierarchy: the \"Existing workstreams (active)\" section may show parents at the top level with \
 children indented underneath (rendered with a \"↳\" marker). When a NEW workstream cleanly extends \
 an umbrella effort already in the list (e.g. \"ELAN AI Bridge\" with sub-threads like \"Talgo demo\" \
@@ -202,7 +209,14 @@ async fn run_cluster_pass(
     // source declares its own window+cap (see `signals::Signal`); the
     // synthesizer just iterates the registry.
     let registry = signals::registry();
-    let (existing_active, existing_archived, mut snapshots, team, open_actions_by_ws) = {
+    let (
+        existing_active,
+        existing_archived,
+        mut snapshots,
+        team,
+        open_actions_by_ws,
+        rejected_by_ws,
+    ) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         // Pull both active and archived (snoozed excluded — they're
         // hidden from synthesis) and partition into separate sections
@@ -237,7 +251,21 @@ async fn run_cluster_pass(
         // duplicates every pass (#101).
         let open_actions = persist::list_open_action_texts_grouped(&c)
             .unwrap_or_default();
-        (active, archived, snapshots, team, open_actions)
+        // Per-workstream rejected-action texts from the deletion log
+        // (#150). Best-effort: a SQL failure here downgrades the prompt
+        // by one signal but must not abort the cluster pass.
+        let mut combined: Vec<crate::workstreams::Workstream> =
+            Vec::with_capacity(active.len() + archived.len());
+        combined.extend(active.iter().cloned());
+        combined.extend(archived.iter().cloned());
+        let rejected = crate::workstreams::rejected::rejected_texts_by_workstream(
+            &c, &combined, now_ms,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("[workstreams] rejected-by-workstream fetch failed: {e}");
+            std::collections::HashMap::new()
+        });
+        (active, archived, snapshots, team, open_actions, rejected)
     };
     let team_by_id: std::collections::HashMap<String, String> = team
         .iter()
@@ -269,6 +297,7 @@ async fn run_cluster_pass(
         registry,
         &team_by_id,
         &open_actions_by_ws,
+        &rejected_by_ws,
     );
     let items_clustered = total_items as u32;
 
@@ -505,6 +534,7 @@ fn build_user_message(
     registry: &SignalRegistry,
     team_by_id: &std::collections::HashMap<String, String>,
     open_actions_by_ws: &std::collections::HashMap<String, Vec<String>>,
+    rejected_by_ws: &std::collections::HashMap<String, Vec<String>>,
 ) -> (String, LabelMaps) {
     let mut s = String::new();
     s.push_str("# Existing workstreams (active)\n\n");
@@ -531,6 +561,7 @@ fn build_user_message(
                 w,
                 team_by_id,
                 open_actions_by_ws.get(&w.id),
+                rejected_by_ws.get(&w.id),
                 false,
             );
             if let Some(children) = children_by_parent.get(w.id.as_str()) {
@@ -540,6 +571,7 @@ fn build_user_message(
                         child,
                         team_by_id,
                         open_actions_by_ws.get(&child.id),
+                        rejected_by_ws.get(&child.id),
                         true,
                     );
                 }
@@ -666,6 +698,7 @@ fn format_existing_workstream_entry(
     w: &Workstream,
     team_by_id: &std::collections::HashMap<String, String>,
     open_actions: Option<&Vec<String>>,
+    rejected_actions: Option<&Vec<String>>,
     is_child: bool,
 ) {
     let head_prefix = if is_child { "   ↳ " } else { "" };
@@ -724,6 +757,20 @@ fn format_existing_workstream_entry(
                     "{cont_prefix}  (+{} more not shown)\n",
                     actions.len() - OPEN_ACTIONS_PER_WORKSTREAM_CAP
                 ));
+            }
+        }
+    }
+    // Recently rejected — the user deleted these from this workstream
+    // (or items tied to its members/series) in the last 30 days (#150).
+    // The system prompt instructs the LLM to be much more selective
+    // about candidates that resemble these.
+    if let Some(rejected) = rejected_actions {
+        if !rejected.is_empty() {
+            s.push_str(&format!("{cont_prefix}Recently rejected (do not re-emit):\n"));
+            for a in rejected {
+                let collapsed = collapse_ws(a);
+                let truncated = truncate_chars(&collapsed, OPEN_ACTION_LINE_CAP);
+                s.push_str(&format!("{cont_prefix}  - {truncated}\n"));
             }
         }
     }
@@ -1312,7 +1359,15 @@ mod tests {
             ("note", vec![make_note()]),
         ];
         let team: HashMap<String, String> = HashMap::new();
-        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team, &HashMap::new());
+        let (prompt, maps) = build_user_message(
+            &[],
+            &[],
+            &snapshots,
+            registry,
+            &team,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         let expected = concat!(
             "# Existing workstreams (active)\n\n",
@@ -1359,7 +1414,15 @@ mod tests {
             ("note", vec![]),
         ];
         let team: HashMap<String, String> = HashMap::new();
-        let (prompt, maps) = build_user_message(&[], &[], &snapshots, registry, &team, &HashMap::new());
+        let (prompt, maps) = build_user_message(
+            &[],
+            &[],
+            &snapshots,
+            registry,
+            &team,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(prompt.contains("\n# Recent emails (last 14 days)\n\n(none)\n"));
         assert!(prompt.contains("\n# Recent calendar events (window: -14d .. +14d)\n\n(none)\n"));
         assert!(prompt.contains("\n# Recent notes (last 30 days)\n\n(none)\n"));
