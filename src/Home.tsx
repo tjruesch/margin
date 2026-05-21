@@ -1554,6 +1554,7 @@ export function ActionRow({
     ? stripLeadingOwnerPrefix(it.text)
     : it.text;
   const isSynth = it.origin_kind === "synth";
+  const isReconcile = it.origin_kind === "reconcile";
   const isWaiting =
     it.origin_synth_kind === "email_waiting"
     || it.origin_synth_kind === "teams_waiting"
@@ -1607,11 +1608,13 @@ export function ActionRow({
           <div className="home-action-origin">
             {isSynth ? (
               <IconBriefcase size={10} sw={1.7} />
+            ) : isReconcile ? (
+              <IconCalendar size={10} sw={1.7} />
             ) : (
               <IconFileText size={10} sw={1.7} />
             )}
             <span className="home-action-origin-label">
-              {isSynth ? "Workstream" : "Note"}
+              {isSynth ? "Workstream" : isReconcile ? "Reconcile" : "Note"}
             </span>
             <span className="home-action-origin-sep">·</span>
             <span className="home-action-origin-title">{originTitle}</span>

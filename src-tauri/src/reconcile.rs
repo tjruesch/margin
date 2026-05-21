@@ -1,5 +1,7 @@
+use std::collections::HashSet;
 use std::path::Path;
 
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -483,6 +485,167 @@ fn strip_observations_block(raw: &str) -> (String, Vec<ParsedObservation>) {
     (body, out)
 }
 
+/// Find the `## Action items` block in `body` and split it off (#144).
+/// Returns `(stripped_body, action_lines)` where `action_lines` is the
+/// raw lines inside the block — the caller filters them through
+/// `parse_action_line` to drop anything that isn't a real `- [ ]` item.
+///
+/// Block boundary: from the `## Action items` heading line (exclusive)
+/// to the next `## `-prefixed line or EOF. The heading line itself is
+/// removed; runs of >=3 consecutive newlines created by the cut are
+/// collapsed back to a single blank line so the stripped body has no
+/// awkward double gaps.
+///
+/// Only the first occurrence is processed. If the model ever emits two
+/// `## Action items` headings the second survives in the body; the
+/// caller's logging will surface that as a tail of un-persisted items.
+pub(crate) fn split_action_items_block(body: &str) -> (String, Vec<String>) {
+    const HEADING: &str = "## Action items";
+    let lines: Vec<&str> = body.split('\n').collect();
+    let start = lines.iter().position(|l| l.trim_end() == HEADING);
+    let Some(start) = start else {
+        return (body.to_string(), Vec::new());
+    };
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(i, l)| l.trim_start().starts_with("## ").then_some(i))
+        .unwrap_or(lines.len());
+
+    let action_lines: Vec<String> = lines[start + 1..end]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+
+    let mut kept = Vec::with_capacity(lines.len() - (end - start));
+    kept.extend(lines[..start].iter().copied());
+    kept.extend(lines[end..].iter().copied());
+    let joined = kept.join("\n");
+
+    // Collapse 3+ consecutive newlines (a blank line on each side of
+    // the cut) down to 2.
+    let mut stripped = String::with_capacity(joined.len());
+    let mut newlines = 0usize;
+    for ch in joined.chars() {
+        if ch == '\n' {
+            newlines += 1;
+            if newlines <= 2 {
+                stripped.push(ch);
+            }
+        } else {
+            newlines = 0;
+            stripped.push(ch);
+        }
+    }
+
+    (stripped, action_lines)
+}
+
+/// Extract the reconciled `## Action items` block from `body`, persist
+/// each line as an `origin_kind='reconcile'` row, and return the body
+/// with the block stripped (#144).
+///
+/// Idempotency: stable row id (`action_id(note_id, text)`) +
+/// `ON CONFLICT(id) DO NOTHING` means re-running reconcile on the same
+/// meeting preserves `done`, `manual_override`, and any user-assigned
+/// `assignee_id` on rows whose text didn't change. New text → new row.
+/// Stale rows from prior runs are intentionally left alone — sweep is
+/// deferred to Phase 2 (the deletion log).
+fn extract_and_persist_action_items(
+    conn_state: &std::sync::Mutex<rusqlite::Connection>,
+    note_id: &str,
+    body: &str,
+) -> Result<(String, usize), String> {
+    let (stripped, raw_lines) = split_action_items_block(body);
+    if raw_lines.is_empty() {
+        return Ok((body.to_string(), 0));
+    }
+
+    let mut c = conn_state.lock().map_err(|e| e.to_string())?;
+    let tx = c.transaction().map_err(|e| e.to_string())?;
+    let now_ms = crate::events::current_unix_ms();
+
+    let members = crate::team::list_team_members_raw(&tx)?;
+    let resolver = crate::team::OwnerResolver::from_members(&members);
+    let self_id: Option<String> = tx
+        .query_row(
+            "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    // Snapshot existing reconcile-origin ids so `action_created`
+    // events fire only for genuinely new rows on re-reconciles.
+    let existing: HashSet<String> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id FROM actions \
+                  WHERE origin_kind = 'reconcile' AND origin_note_id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![note_id], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let mut count = 0usize;
+    {
+        let mut stmt = tx
+            .prepare_cached(
+                "INSERT INTO actions \
+                    (id, origin_kind, origin_note_id, origin_line, text, done, \
+                     created_ms, due_ms, assignee_id) \
+                 VALUES (?1, 'reconcile', ?2, NULL, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .map_err(|e| e.to_string())?;
+        for raw in &raw_lines {
+            let trimmed = raw.trim_start();
+            let Some((text, done, due_ms)) = crate::notes::parse_action_line(trimmed) else {
+                continue;
+            };
+            let id = crate::notes::action_id(note_id, &text);
+            let assignee_id = crate::notes::extract_owner_candidate(&text)
+                .and_then(|c| resolver.resolve(&c));
+            stmt.execute(params![
+                id,
+                note_id,
+                text,
+                done as i64,
+                now_ms,
+                due_ms,
+                assignee_id,
+            ])
+            .map_err(|e| e.to_string())?;
+            if !existing.contains(&id) {
+                let actor = assignee_id.as_deref().or(self_id.as_deref());
+                let payload = serde_json::json!({
+                    "text": text,
+                    "note_id": note_id,
+                });
+                crate::events::emit(
+                    &tx,
+                    now_ms,
+                    "action_created",
+                    actor,
+                    "action",
+                    &id,
+                    &payload,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            count += 1;
+        }
+    }
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok((stripped, count))
+}
+
 /// Format the user's glossary as a small system-block addendum that nudges
 /// Claude to preserve domain spellings. Returns None for an empty glossary
 /// so the caller can skip pushing the block.
@@ -834,6 +997,28 @@ pub async fn reconcile_notes(
         }
     }
 
+    // Move LLM-emitted `## Action items` from the body into action rows
+    // with origin_kind='reconcile' (#144). On any failure, fall through
+    // with the original body so the LLM round isn't lost — the existing
+    // note-origin parse path will absorb the items on save (pre-#144
+    // behaviour). Requires a note_path because origin_note_id is the FK.
+    let final_body: String = if let Some(np) = note_path.as_deref() {
+        match extract_and_persist_action_items(&conn_state, np, &markdown_body) {
+            Ok((stripped, n)) => {
+                if n > 0 {
+                    eprintln!("[reconcile] persisted {n} reconcile-origin actions");
+                }
+                stripped
+            }
+            Err(e) => {
+                eprintln!("[reconcile] action persist failed, leaving block in body: {e}");
+                markdown_body.clone()
+            }
+        }
+    } else {
+        markdown_body.clone()
+    };
+
     // Stamp the transcript so the post-record banner can suppress its
     // Generate-notes CTA next time the note is opened. Failure to write
     // is non-fatal — the user got their reconciled output, the flag is
@@ -850,7 +1035,7 @@ pub async fn reconcile_notes(
     }
 
     let _ = app.emit("reconcile-progress", "done");
-    Ok(markdown_body)
+    Ok(final_body)
 }
 
 #[cfg(test)]
@@ -1075,5 +1260,272 @@ mod tests {
         let (body, obs) = strip_observations_block(raw);
         assert_eq!(body, "# Note\n\nBody.");
         assert!(obs.is_empty());
+    }
+
+    // ---------- split_action_items_block (#144) ------------------------
+
+    #[test]
+    fn split_action_items_block_extracts_and_strips() {
+        let body = "# Title\n\n## Summary\n\nProse.\n\n## Action items\n\n- [ ] do thing 1\n- [x] do thing 2\n- [ ] Heike — Send Q3 budget\n\n## Open questions\n\n- [?] who owns deploy?\n";
+        let (stripped, lines) = split_action_items_block(body);
+        assert_eq!(lines.len(), 5, "5 raw lines in block (3 actions + 2 blanks): {lines:?}");
+        // Stripped body has summary + open questions, no action items heading.
+        assert!(!stripped.contains("## Action items"));
+        assert!(stripped.contains("## Summary\n\nProse."));
+        assert!(stripped.contains("## Open questions\n\n- [?] who owns deploy?"));
+        // No triple-newline gaps left behind.
+        assert!(!stripped.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn split_action_items_block_handles_eof_block() {
+        let body = "# Title\n\n## Summary\n\nProse.\n\n## Action items\n\n- [ ] last task\n";
+        let (stripped, lines) = split_action_items_block(body);
+        assert!(lines.iter().any(|l| l.contains("last task")));
+        assert!(!stripped.contains("## Action items"));
+        assert!(!stripped.contains("last task"));
+        assert!(stripped.contains("## Summary\n\nProse."));
+    }
+
+    #[test]
+    fn split_action_items_block_handles_missing_section() {
+        let body = "# Title\n\n## Summary\n\nProse only — no action items heading.\n";
+        let (stripped, lines) = split_action_items_block(body);
+        assert!(lines.is_empty());
+        assert_eq!(stripped, body, "no heading → body unchanged byte-for-byte");
+    }
+
+    #[test]
+    fn split_action_items_block_drops_non_checkbox_lines_in_block() {
+        let body = "# Title\n\n## Action items\n\nstray prose the model shouldn't emit\n- [ ] valid task\nmore prose\n\n## Next\n";
+        let (stripped, lines) = split_action_items_block(body);
+        // Captured: prose + checkbox + prose + blank (caller filters).
+        let parsed: Vec<_> = lines
+            .iter()
+            .filter_map(|l| crate::notes::parse_action_line(l.trim_start()))
+            .collect();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].0, "valid task");
+        assert!(!stripped.contains("## Action items"));
+        assert!(!stripped.contains("stray prose"));
+        assert!(stripped.contains("## Next"));
+    }
+
+    #[test]
+    fn split_action_items_block_only_strips_first_heading() {
+        let body = "# Title\n\n## Action items\n\n- [ ] one\n\n## Other\n\nstuff\n\n## Action items\n\n- [ ] two\n";
+        let (stripped, lines) = split_action_items_block(body);
+        // First block captured.
+        assert!(lines.iter().any(|l| l.contains("one")));
+        assert!(!lines.iter().any(|l| l.contains("two")));
+        // Second heading and its line survive in the stripped body.
+        assert!(stripped.contains("## Action items"));
+        assert!(stripped.contains("- [ ] two"));
+        assert!(!stripped.contains("- [ ] one"));
+    }
+
+    // ---------- extract_and_persist_action_items (#144) ----------------
+
+    fn db_with_note(note_id: &str) -> std::sync::Mutex<rusqlite::Connection> {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::apply_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO notes(id, bundle_id, title, modified_ms, body_size) \
+             VALUES (?1, ?1, 'T', 100, 0)",
+            rusqlite::params![note_id],
+        )
+        .unwrap();
+        std::sync::Mutex::new(conn)
+    }
+
+    fn seed_team_member(
+        mutex: &std::sync::Mutex<rusqlite::Connection>,
+        id: &str,
+        display_name: &str,
+        is_self: bool,
+    ) {
+        let c = mutex.lock().unwrap();
+        c.execute(
+            "INSERT INTO team_members(id, display_name, role, is_self, created_ms, updated_ms) \
+             VALUES (?1, ?2, '', ?3, 100, 100)",
+            rusqlite::params![id, display_name, is_self as i64],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn persist_creates_reconcile_origin_rows_with_correct_shape() {
+        let note_id = "/n/note.md";
+        let mutex = db_with_note(note_id);
+        let body = "# T\n\n## Action items\n\n- [ ] one\n- [x] two\n\n## End\n";
+
+        let (stripped, n) = extract_and_persist_action_items(&mutex, note_id, body).unwrap();
+        assert_eq!(n, 2);
+        assert!(!stripped.contains("## Action items"));
+
+        let c = mutex.lock().unwrap();
+        let (kind, oni, line, done): (String, String, Option<i64>, i64) = c
+            .query_row(
+                "SELECT origin_kind, origin_note_id, origin_line, done \
+                 FROM actions WHERE text = 'one'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "reconcile");
+        assert_eq!(oni, note_id);
+        assert!(line.is_none(), "origin_line must be NULL");
+        assert_eq!(done, 0);
+
+        let done_two: i64 = c
+            .query_row(
+                "SELECT done FROM actions WHERE text = 'two'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done_two, 1);
+    }
+
+    #[test]
+    fn persist_is_idempotent_on_rerun_preserving_done() {
+        let note_id = "/n/note.md";
+        let mutex = db_with_note(note_id);
+        let body = "## Action items\n\n- [ ] keep me\n";
+
+        let (_, n1) = extract_and_persist_action_items(&mutex, note_id, body).unwrap();
+        assert_eq!(n1, 1);
+
+        // User completes the action between runs.
+        {
+            let c = mutex.lock().unwrap();
+            c.execute(
+                "UPDATE actions SET done = 1, manual_override = 1 WHERE text = 'keep me'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Re-reconcile emits the same line.
+        let (_, n2) = extract_and_persist_action_items(&mutex, note_id, body).unwrap();
+        assert_eq!(n2, 1, "second run still attempts the upsert");
+
+        let c = mutex.lock().unwrap();
+        let (done, mo, row_count): (i64, i64, i64) = c
+            .query_row(
+                "SELECT done, manual_override, \
+                        (SELECT COUNT(*) FROM actions WHERE text = 'keep me') \
+                 FROM actions WHERE text = 'keep me'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(done, 1, "ON CONFLICT DO NOTHING preserves done=1");
+        assert_eq!(mo, 1, "manual_override preserved");
+        assert_eq!(row_count, 1, "no duplicate row");
+    }
+
+    #[test]
+    fn persist_resolves_owner_to_assignee() {
+        let note_id = "/n/note.md";
+        let mutex = db_with_note(note_id);
+        seed_team_member(&mutex, "tm_heike", "Heike", false);
+        let body = "## Action items\n\n- [ ] Heike — Send Q3 budget\n- [ ] anonymous task\n";
+
+        let (_, _) = extract_and_persist_action_items(&mutex, note_id, body).unwrap();
+
+        let c = mutex.lock().unwrap();
+        let assignee: Option<String> = c
+            .query_row(
+                "SELECT assignee_id FROM actions WHERE text LIKE 'Heike%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(assignee.as_deref(), Some("tm_heike"));
+
+        let anon: Option<String> = c
+            .query_row(
+                "SELECT assignee_id FROM actions WHERE text = 'anonymous task'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(anon.is_none());
+    }
+
+    #[test]
+    fn persist_emits_action_created_once_per_new_id() {
+        let note_id = "/n/note.md";
+        let mutex = db_with_note(note_id);
+        let body = "## Action items\n\n- [ ] one\n- [ ] two\n";
+
+        extract_and_persist_action_items(&mutex, note_id, body).unwrap();
+        let first_count: i64 = mutex
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'action_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_count, 2);
+
+        // Rerun with the same body — no new events.
+        extract_and_persist_action_items(&mutex, note_id, body).unwrap();
+        let second_count: i64 = mutex
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'action_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_count, 2, "no new events on idempotent re-run");
+
+        // Add a new item — one new event.
+        let body2 = "## Action items\n\n- [ ] one\n- [ ] two\n- [ ] three\n";
+        extract_and_persist_action_items(&mutex, note_id, body2).unwrap();
+        let third_count: i64 = mutex
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'action_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(third_count, 3);
+    }
+
+    #[test]
+    fn persist_returns_zero_when_no_block() {
+        let note_id = "/n/note.md";
+        let mutex = db_with_note(note_id);
+        let body = "# T\n\n## Summary\n\nNo action items section here.\n";
+
+        let (stripped, n) = extract_and_persist_action_items(&mutex, note_id, body).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(stripped, body);
+
+        let c = mutex.lock().unwrap();
+        let rows: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE origin_kind = 'reconcile'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        let events: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE kind = 'action_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 0);
     }
 }

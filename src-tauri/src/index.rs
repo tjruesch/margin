@@ -69,7 +69,10 @@ const SCHEMA_V35: &str = include_str!("migrations/035_chat_conversations.sql");
 const SCHEMA_V36: &str = include_str!("migrations/036_prompt_dumps.sql");
 const SCHEMA_V37: &str = include_str!("migrations/037_prompt_dumps_telemetry.sql");
 const SCHEMA_V38: &str = include_str!("migrations/038_prompt_cache_tokens.sql");
-const SCHEMA_VERSION: i64 = 38;
+const SCHEMA_V39: &str = include_str!("migrations/039_reconcile_origin.sql");
+const SCHEMA_V40: &str = include_str!("migrations/040_actions_migration_flag.sql");
+const SCHEMA_V41: &str = include_str!("migrations/041_action_deletions.sql");
+const SCHEMA_VERSION: i64 = 41;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -315,6 +318,18 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V38)?;
         version = 38;
     }
+    if version == 38 {
+        conn.execute_batch(SCHEMA_V39)?;
+        version = 39;
+    }
+    if version == 39 {
+        conn.execute_batch(SCHEMA_V40)?;
+        version = 40;
+    }
+    if version == 40 {
+        conn.execute_batch(SCHEMA_V41)?;
+        version = 41;
+    }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
@@ -461,6 +476,60 @@ pub fn list_actions(
             })
         },
     )?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Per-note actions for the note-view sidebar (#145). Returns every
+/// row whose `origin_note_id` matches, regardless of `done`,
+/// regardless of `origin_kind`, ignoring the archived-note /
+/// inactive-workstream guards (the user is *looking at* the note —
+/// they should see its actions). Ordered created_ms DESC with
+/// `origin_line` as a stable tiebreaker for note-origin rows.
+pub fn list_actions_for_note(
+    conn: &Connection,
+    note_id: &str,
+) -> Result<Vec<ActionListItem>> {
+    let sql = "SELECT a.id, a.origin_kind, a.origin_note_id, a.origin_line, \
+                      a.origin_synth_kind, a.origin_synth_id, \
+                      a.workstream_id, a.text, a.done, a.due_ms, \
+                      a.assignee_id, a.created_ms, \
+                      n.title AS note_title, \
+                      w.title AS workstream_title, \
+                      t.display_name AS assignee_display_name, \
+                      a.subject_member_id, a.manual_override, a.auto_resolved_ms \
+                 FROM actions a \
+                 LEFT JOIN notes        n ON n.id = a.origin_note_id \
+                 LEFT JOIN workstreams  w ON w.id = a.workstream_id \
+                 LEFT JOIN team_members t ON t.id = a.assignee_id \
+                WHERE a.origin_note_id = ?1 \
+                ORDER BY a.created_ms DESC, a.origin_line ASC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![note_id], |r| {
+        Ok(ActionListItem {
+            id: r.get(0)?,
+            origin_kind: r.get(1)?,
+            origin_note_path: r.get(2)?,
+            origin_line: r.get(3)?,
+            origin_synth_kind: r.get(4)?,
+            origin_synth_id: r.get(5)?,
+            workstream_id: r.get(6)?,
+            text: r.get(7)?,
+            done: r.get::<_, i64>(8)? != 0,
+            due_ms: r.get(9)?,
+            assignee_id: r.get(10)?,
+            created_ms: r.get(11)?,
+            note_title: r.get(12)?,
+            workstream_title: r.get(13)?,
+            assignee_display_name: r.get(14)?,
+            subject_member_id: r.get(15)?,
+            manual_override: r.get::<_, i64>(16)? != 0,
+            auto_resolved_ms: r.get(17)?,
+        })
+    })?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
@@ -2305,6 +2374,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(note_count, 1);
+    }
+
+    #[test]
+    fn list_actions_for_note_returns_all_origins_regardless_of_done() {
+        // The sidebar (#145) shows every action tied to the current
+        // note: both origins (reconcile + note), both done states.
+        // Synth rows on OTHER notes must not bleed in.
+        let conn = fresh_conn();
+        seed_note_row(&conn, "n_a", 100);
+        seed_note_row(&conn, "n_b", 100);
+
+        // Reconcile-origin row on n_a, done.
+        conn.execute(
+            "INSERT INTO actions(\
+                id, origin_kind, origin_note_id, origin_line, \
+                text, done, created_ms\
+             ) VALUES ('r:1', 'reconcile', 'n_a', NULL, 'recon done', 1, 200)",
+            [],
+        )
+        .unwrap();
+        // Note-origin row on n_a, open.
+        conn.execute(
+            "INSERT INTO actions(\
+                id, origin_kind, origin_note_id, origin_line, \
+                text, done, created_ms\
+             ) VALUES ('n_a:1', 'note', 'n_a', 1, 'hand task', 0, 100)",
+            [],
+        )
+        .unwrap();
+        // Note-origin row on a DIFFERENT note — must be excluded.
+        conn.execute(
+            "INSERT INTO actions(\
+                id, origin_kind, origin_note_id, origin_line, \
+                text, done, created_ms\
+             ) VALUES ('n_b:1', 'note', 'n_b', 1, 'unrelated', 0, 100)",
+            [],
+        )
+        .unwrap();
+
+        let got = list_actions_for_note(&conn, "n_a").unwrap();
+        let ids: Vec<&str> = got.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids.len(), 2, "expected 2 rows for n_a, got {ids:?}");
+        assert!(ids.contains(&"r:1"));
+        assert!(ids.contains(&"n_a:1"));
+        // created_ms DESC → reconcile row (200) before note row (100).
+        assert_eq!(ids[0], "r:1");
+        assert_eq!(ids[1], "n_a:1");
+
+        // Empty-note case returns []
+        let empty = list_actions_for_note(&conn, "/path/none").unwrap();
+        assert!(empty.is_empty());
     }
 
     // ----- #113 open questions integration ----------------------------------

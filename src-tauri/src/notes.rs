@@ -333,6 +333,30 @@ pub fn list_actions(
     .map_err(|e| e.to_string())
 }
 
+/// Per-note actions for the note-view sidebar (#145). Returns both
+/// origins (reconcile + note + any synth row pinned via origin_note_id)
+/// and both done states. Ordering: created_ms DESC.
+#[tauri::command]
+pub fn list_actions_for_note(
+    note_id: String,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<Vec<ActionListItem>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    crate::index::list_actions_for_note(&c, &note_id).map_err(|e| e.to_string())
+}
+
+/// Phase 1.4 (#146) — one-time backfill of pre-#144 reconciled notes
+/// into reconcile-origin rows. Idempotent. The boot sweep auto-runs
+/// this once; the Settings button re-runs it on demand.
+#[tauri::command]
+pub fn migrate_reconciled_notes_to_action_rows(
+    dry_run: bool,
+    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
+) -> Result<crate::actions_migration::MigrationReport, String> {
+    let mut c = conn.lock().map_err(|e| e.to_string())?;
+    crate::actions_migration::run(&mut c, dry_run)
+}
+
 #[derive(Serialize)]
 pub struct NoteMeta {
     pub modified_ms: i64,
@@ -727,12 +751,19 @@ fn locate_action_line(
 ///
 /// `mutate` returns `Ok(Some(new_line))` to replace the line,
 /// `Ok(None)` to delete it, or `Err` to abort.
+///
+/// `log_delete_action_id` — when `Some`, snapshots the named action
+/// row into `action_deletions` with `cause='user_delete'` inside the
+/// same tx that performs the body rewrite. Used by `delete_action`
+/// so #148/#149/#150 can suppress future re-emissions of the same
+/// text. Other callers pass `None` (a checkbox toggle isn't a delete).
 fn mutate_note_action_body<F>(
     note_id: &str,
     cached_line: usize,
     want_text: &str,
     conn: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
     mutate: F,
+    log_delete_action_id: Option<&str>,
 ) -> Result<(), String>
 where
     F: FnOnce(&str) -> Result<Option<String>, String>,
@@ -763,6 +794,15 @@ where
     let new_body = lines.join("\n");
     let now = current_unix_ms();
     let tx = c.transaction().map_err(|e| e.to_string())?;
+    if let Some(action_id) = log_delete_action_id {
+        crate::action_deletions::log_deletion(
+            &tx,
+            action_id,
+            crate::action_deletions::Cause::UserDelete,
+            now,
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let parsed = crate::index::parse_indexable_from_body(note_id, &new_body, now);
     crate::index::upsert_in_tx(&tx, note_id, &parsed).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -796,6 +836,7 @@ pub fn set_action_done(
         &dispatch.text,
         &conn,
         |line| Ok(Some(toggle_checkbox_marker(line, done))),
+        None,
     )
 }
 
@@ -864,11 +905,18 @@ pub fn set_action_assignee(
         None
     };
 
-    mutate_note_action_body(&note_id, cached_line, &dispatch.text, &conn, |line| {
-        rewrite_action_owner(line, new_owner_name.as_deref())
-            .map(Some)
-            .ok_or_else(|| "action line is not a recognizable checkbox".to_string())
-    })
+    mutate_note_action_body(
+        &note_id,
+        cached_line,
+        &dispatch.text,
+        &conn,
+        |line| {
+            rewrite_action_owner(line, new_owner_name.as_deref())
+                .map(Some)
+                .ok_or_else(|| "action line is not a recognizable checkbox".to_string())
+        },
+        None,
+    )
 }
 
 /// "Ignore" a worker-extracted waiting action: record the source in
@@ -901,6 +949,16 @@ pub fn dismiss_waiting_action(
         )
         .map_err(|e| e.to_string())?;
     }
+    // Universal deletion log (#147). Written alongside the legacy
+    // `dismissed_action_sources` insert above; #149 will read this
+    // log and deprecate the legacy table.
+    crate::action_deletions::log_deletion(
+        &tx,
+        &id,
+        crate::action_deletions::Cause::UserDismiss,
+        now,
+    )
+    .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM actions WHERE id = ?1", rusqlite::params![id])
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
@@ -922,8 +980,8 @@ pub fn delete_action(
     };
 
     if dispatch.origin_kind != "note" {
-        let c = conn.lock().map_err(|e| e.to_string())?;
-        return crate::workstreams::persist::delete_action(&c, &id)
+        let mut c = conn.lock().map_err(|e| e.to_string())?;
+        return crate::workstreams::persist::delete_action(&mut c, &id)
             .map_err(|e| e.to_string());
     }
 
@@ -932,7 +990,14 @@ pub fn delete_action(
     })?;
     let cached_line = dispatch.origin_line.unwrap_or(0);
 
-    mutate_note_action_body(&note_id, cached_line, &dispatch.text, &conn, |_| Ok(None))
+    mutate_note_action_body(
+        &note_id,
+        cached_line,
+        &dispatch.text,
+        &conn,
+        |_| Ok(None),
+        Some(&id),
+    )
 }
 
 /// Attach an action to a workstream (or clear the attachment when
@@ -1616,7 +1681,7 @@ pub(crate) fn rewrite_action_owner(line: &str, new_owner: Option<&str>) -> Optio
     Some(format!("{indent}{bullet_char} {done_marker}{new_body}"))
 }
 
-fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
+pub(crate) fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
     let after_bullet = line
         .strip_prefix("- ")
         .or_else(|| line.strip_prefix("* "))

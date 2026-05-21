@@ -543,6 +543,28 @@ fn auto_resolve_missing(
             // SQLite reads `auto_resolve_omissions` as the OLD value in
             // both the SET expression and the CASE; threshold compare
             // uses (old + 1) for both columns to stay consistent.
+            //
+            // Threshold-crossing tick is the moment the action becomes
+            // "auto-resolved." Log it to `action_deletions` (#147) so
+            // #150 has the signal, but #148/#149 ignore via `cause`
+            // filter — worker omissions are weak signal, not user
+            // intent. Done before the UPDATE so the helper can read
+            // the row's snapshot fields one last time.
+            let prior_omissions: i64 = tx
+                .query_row(
+                    "SELECT auto_resolve_omissions FROM actions WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if prior_omissions + 1 >= AUTO_RESOLVE_THRESHOLD {
+                crate::action_deletions::log_deletion(
+                    tx,
+                    &id,
+                    crate::action_deletions::Cause::AutoResolved,
+                    now_ms,
+                )?;
+            }
             tx.execute(
                 "UPDATE actions \
                     SET auto_resolve_omissions = auto_resolve_omissions + 1, \
@@ -952,6 +974,56 @@ mod tests {
         auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 3_000).unwrap();
         tx.commit().unwrap();
 
+        assert_eq!(action_done(&conn, &id), Some(1));
+        assert_eq!(action_auto_resolved_ms(&conn, &id), Some(3_000));
+    }
+
+    /// Auto-resolve writes to the deletion log (#147) ONLY on the
+    /// threshold-crossing tick — not on every omission. Cause is
+    /// `auto_resolved` so #148/#149 can filter it out (worker
+    /// omissions are weak signal, not user intent).
+    #[test]
+    fn auto_resolve_logs_deletion_only_when_threshold_crossed() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        let id = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "x"),
+            "tm_self",
+            "tm_alice",
+            1_000,
+        )
+        .unwrap()
+        .unwrap();
+        let live = std::collections::HashSet::new();
+
+        // First omission: counter bumps but threshold not yet crossed.
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 2_000).unwrap();
+        let after_first: i64 = tx
+            .query_row("SELECT COUNT(*) FROM action_deletions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_first, 0,
+            "first omission must not log; below threshold"
+        );
+
+        // Second omission: threshold crossed, log row written.
+        auto_resolve_missing(&tx, "tm_alice", "tm_self", &live, 3_000).unwrap();
+        tx.commit().unwrap();
+
+        let (count, cause, action_text): (i64, String, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(cause), MAX(text) FROM action_deletions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "exactly one log row at threshold-crossing");
+        assert_eq!(cause, "auto_resolved");
+        assert_eq!(action_text, "x");
+        // Sanity check the worker's existing contract still holds.
         assert_eq!(action_done(&conn, &id), Some(1));
         assert_eq!(action_auto_resolved_ms(&conn, &id), Some(3_000));
     }

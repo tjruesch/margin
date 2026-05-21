@@ -9,6 +9,7 @@ import {
   deleteFirecrawlApiKey,
   deleteVoyageApiKey,
   exportNotes,
+  migrateReconciledNotesToActionRows,
   forceReindexEmbeddings,
   hasAnthropicApiKey,
   hasFirecrawlApiKey,
@@ -325,6 +326,35 @@ function DataSection() {
     }
   };
 
+  const onMigrateActionItems = async () => {
+    const confirmed = await ask(
+      "Move LLM-extracted action items from your existing reconciled meeting notes into the database? This strips the `## Action items` block from each note body and writes a per-note backup (.action-items-backup.md) for rollback. Safe to run multiple times — already-migrated notes are skipped.",
+      { title: "Migrate reconciled action items", kind: "info" },
+    );
+    if (!confirmed) return;
+    setBusy(true);
+    setStatus(null);
+    try {
+      const r = await migrateReconciledNotesToActionRows(false);
+      if (r.errors.length > 0) {
+        setStatus(
+          `Migration completed with ${r.errors.length} error${r.errors.length === 1 ? "" : "s"}. Migrated ${r.notes_migrated} note${r.notes_migrated === 1 ? "" : "s"} (${r.rows_created} row${r.rows_created === 1 ? "" : "s"}).`,
+        );
+      } else if (r.notes_migrated === 0) {
+        setStatus("Nothing to migrate — all reconciled notes are already in the new format.");
+      } else {
+        setStatus(
+          `Migrated ${r.notes_migrated} note${r.notes_migrated === 1 ? "" : "s"}, ${r.rows_created} action${r.rows_created === 1 ? "" : "s"}, wrote ${r.backups_written} backup file${r.backups_written === 1 ? "" : "s"}.`,
+        );
+      }
+    } catch (e) {
+      console.error("[settings] migrateReconciledNotesToActionRows failed:", e);
+      setStatus(`Migration failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section className="settings-section">
       <h2>Data</h2>
@@ -341,6 +371,23 @@ function DataSection() {
           disabled={busy}
         >
           {busy ? "Exporting…" : "Export all notes…"}
+        </button>
+      </div>
+      <p className="settings-section-desc">
+        Pre-#144 reconciled meeting notes have an inline{" "}
+        <code>## Action items</code> block in their body. This migration moves
+        those items into the database (so the actions sidebar can show them)
+        and writes a per-note backup for rollback. It runs once automatically
+        at first launch; use this button to re-run it.
+      </p>
+      <div className="settings-row">
+        <button
+          type="button"
+          className="settings-btn"
+          onClick={onMigrateActionItems}
+          disabled={busy}
+        >
+          {busy ? "Migrating…" : "Migrate reconciled action items…"}
         </button>
       </div>
       {status && <p className="settings-helper">{status}</p>}
