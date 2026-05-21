@@ -19,6 +19,7 @@ mod observations;
 mod paths;
 mod profiles;
 mod reconcile;
+mod reconcile_rejected;
 mod reminders;
 mod sharing;
 mod sysaudio;
