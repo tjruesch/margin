@@ -831,6 +831,55 @@ pub async fn reconcile_notes(
     }
     let attendees_section = format_attendees_section(&entries);
 
+    // Recently-rejected action items block (#148). Reads the
+    // `action_deletions` log so the LLM stops re-emitting boilerplate
+    // the user already deleted from prior occurrences of this series
+    // or from items naming these attendees.
+    //
+    // Placed in the user message (alongside attendees + hand notes)
+    // rather than as a fifth system block. The reconcile prompt
+    // already uses four cache breakpoints (SYSTEM_PROMPT, glossary,
+    // ATTENDEE_POLICY, OBSERVATIONS_POLICY) — adding another would
+    // exceed Anthropic's per-request limit and bust an existing
+    // cache. As per-meeting context the block belongs near the user
+    // content anyway.
+    let series_master_id: Option<String> =
+        if let (Some(np), Ok(c)) = (note_path.as_deref(), conn_state.lock()) {
+            c.query_row(
+                "SELECT series_master_id FROM calendar_events \
+                   WHERE linked_note_id = ?1 \
+                     AND series_master_id IS NOT NULL \
+                   LIMIT 1",
+                rusqlite::params![np],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+        } else {
+            None
+        };
+    let non_self_attendee_ids: Vec<String> = entries
+        .iter()
+        .filter(|(m, _)| !m.is_self)
+        .map(|(m, _)| m.id.clone())
+        .collect();
+    let rejected_block = if series_master_id.is_some() || !non_self_attendee_ids.is_empty() {
+        let now = crate::events::current_unix_ms();
+        match conn_state.lock() {
+            Ok(c) => crate::reconcile_rejected::build_rejected_block(
+                &c,
+                series_master_id.as_deref(),
+                &non_self_attendee_ids,
+                now,
+            ),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // Hand-notes formatting: pass through as-is. The model is told to keep
     // them verbatim under ## Notes.
     let transcript_body = format_transcript(&transcript);
@@ -838,6 +887,10 @@ pub async fn reconcile_notes(
     if let Some(section) = attendees_section.as_deref() {
         user_message.push_str("\n\n");
         user_message.push_str(section);
+    }
+    if let Some(block) = rejected_block.as_deref() {
+        user_message.push_str("\n\n");
+        user_message.push_str(block);
     }
     user_message.push_str("\n\n## My notes\n\n");
     user_message.push_str(hand_notes.trim());
