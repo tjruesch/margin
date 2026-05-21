@@ -1,3 +1,4 @@
+mod action_deletions;
 mod activity;
 mod actions_migration;
 mod anthropic;

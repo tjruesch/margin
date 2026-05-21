@@ -71,7 +71,8 @@ const SCHEMA_V37: &str = include_str!("migrations/037_prompt_dumps_telemetry.sql
 const SCHEMA_V38: &str = include_str!("migrations/038_prompt_cache_tokens.sql");
 const SCHEMA_V39: &str = include_str!("migrations/039_reconcile_origin.sql");
 const SCHEMA_V40: &str = include_str!("migrations/040_actions_migration_flag.sql");
-const SCHEMA_VERSION: i64 = 40;
+const SCHEMA_V41: &str = include_str!("migrations/041_action_deletions.sql");
+const SCHEMA_VERSION: i64 = 41;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -324,6 +325,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 39 {
         conn.execute_batch(SCHEMA_V40)?;
         version = 40;
+    }
+    if version == 40 {
+        conn.execute_batch(SCHEMA_V41)?;
+        version = 41;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.

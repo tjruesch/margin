@@ -1261,17 +1261,29 @@ pub fn set_action_assignee(
     Ok(())
 }
 
-/// DB-only delete path for a synth-origin row in the unified
-/// `actions` table (#111). The synthesizer content-hashes ids over
-/// (workstream_id, text), so re-synthesis of the same text +
+/// DB-only delete path for a synth-origin or reconcile-origin row in
+/// the unified `actions` table (#111). The synthesizer content-hashes
+/// ids over (workstream_id, text), so re-synthesis of the same text +
 /// workstream pair will recreate it — same trade-off as `done`,
 /// which is preserved on conflict.
-pub fn delete_action(conn: &Connection, action_id: &str) -> rusqlite::Result<()> {
-    conn.execute(
+///
+/// Writes a snapshot to `action_deletions` (#147) in the same tx with
+/// `cause='user_delete'` so #148/#149/#150 can suppress future
+/// re-emissions of the same text.
+pub fn delete_action(conn: &mut Connection, action_id: &str) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    let now = crate::events::current_unix_ms();
+    crate::action_deletions::log_deletion(
+        &tx,
+        action_id,
+        crate::action_deletions::Cause::UserDelete,
+        now,
+    )?;
+    tx.execute(
         "DELETE FROM actions WHERE id = ?1",
         params![action_id],
     )?;
-    Ok(())
+    tx.commit()
 }
 
 /// Apply a user-driven status change (#78). Stamps the appropriate
@@ -1822,6 +1834,11 @@ mod tests {
             "../migrations/034_workstream_signal_tombstone.sql"
         ))
         .unwrap();
+        // 041 adds the universal action_deletions log (#147). Required
+        // by delete_action and dismiss_waiting_action, which both write
+        // a snapshot row before deleting from `actions`.
+        conn.execute_batch(include_str!("../migrations/041_action_deletions.sql"))
+            .unwrap();
         conn
     }
 
@@ -2210,7 +2227,7 @@ mod tests {
         tx.commit().unwrap();
 
         let aid = action_id("ws1", "Send recap");
-        delete_action(&conn, &aid).unwrap();
+        delete_action(&mut conn, &aid).unwrap();
 
         let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
         assert!(detail.actions.is_empty(), "delete_action must remove the row");
