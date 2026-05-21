@@ -211,6 +211,78 @@ fn sort_and_cap(items: &mut Vec<WaitingCandidate>, cap: usize) {
     items.truncate(cap);
 }
 
+/// Per-source-kind cap on rejected-waiting items fed to the worker
+/// prompt (#149). Recent first; older rows drop.
+pub const REJECTED_WAITING_PER_KIND_CAP: usize = 10;
+
+/// Build the per-person "recently rejected waiting actions" payload
+/// for the worker prompt (#149). Returns a JSON object keyed by short
+/// source_kind (`email` / `teams` / `meeting`); each value is an array
+/// of action-item text strings the user previously deleted or
+/// dismissed *about this person*, last 30 days.
+///
+/// Matches the person either via the action's counterparty
+/// (`subject_member_id = person_id`, which covers `waiting_from_me`
+/// rows where the user was assignee) OR via the assignee
+/// (`assignee_id = person_id`, which covers `waiting_for_them` rows
+/// where the user was waiting on them). Either direction is the same
+/// "we tried to surface a waiting action about this person and the
+/// user rejected it" signal.
+///
+/// Cause filter: `user_delete` / `user_dismiss` only. `auto_resolved`
+/// is excluded — worker omissions are weak signal; including them
+/// would create a feedback loop where the LLM hides items so the
+/// worker sweeps them, training the LLM to hide more.
+///
+/// Returns `None` (and the caller omits the key) when no kind has any
+/// matching rows — keeps the prompt clean for the steady state.
+pub fn recently_rejected_waiting(
+    conn: &Connection,
+    person_id: &str,
+    now_ms: i64,
+) -> rusqlite::Result<Option<serde_json::Value>> {
+    let cutoff = now_ms - RECENCY_WINDOW_MS;
+    const KINDS: &[(&str, &str)] = &[
+        ("email_waiting", "email"),
+        ("teams_waiting", "teams"),
+        ("meeting_waiting", "meeting"),
+    ];
+
+    let mut out = serde_json::Map::new();
+    for (synth_kind, short_kind) in KINDS {
+        let mut stmt = conn.prepare(
+            "SELECT text \
+               FROM action_deletions \
+              WHERE origin_synth_kind = ?1 \
+                AND (subject_member_id = ?2 OR assignee_id = ?2) \
+                AND cause IN ('user_delete', 'user_dismiss') \
+                AND deleted_ms > ?3 \
+              ORDER BY deleted_ms DESC \
+              LIMIT ?4",
+        )?;
+        let texts: Vec<String> = stmt
+            .query_map(
+                params![synth_kind, person_id, cutoff, REJECTED_WAITING_PER_KIND_CAP as i64],
+                |r| r.get::<_, String>(0),
+            )?
+            .filter_map(Result::ok)
+            .collect();
+        if !texts.is_empty() {
+            out.insert(
+                (*short_kind).to_string(),
+                serde_json::Value::Array(
+                    texts.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
+        }
+    }
+    if out.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(serde_json::Value::Object(out)))
+    }
+}
+
 // ---------- Email ---------------------------------------------------------
 
 /// Person → self emails within the recency window. The previous
@@ -1266,5 +1338,188 @@ mod tests {
         hydrate_chat_participants(&conn, &mut cands).unwrap();
         assert!(cands[0].chat_participants.is_empty());
         assert!(cands[1].chat_participants.is_empty());
+    }
+
+    // ---------- Recently rejected waiting (#149) --------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_deletion(
+        conn: &Connection,
+        deleted_ms: i64,
+        origin_synth_kind: &str,
+        text: &str,
+        subject_member_id: Option<&str>,
+        assignee_id: Option<&str>,
+        cause: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO action_deletions \
+                (deleted_ms, origin_kind, origin_synth_kind, \
+                 subject_member_id, assignee_id, text, cause) \
+             VALUES (?1, 'synth', ?2, ?3, ?4, ?5, ?6)",
+            params![
+                deleted_ms,
+                origin_synth_kind,
+                subject_member_id,
+                assignee_id,
+                text,
+                cause
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn worker_rejected_block_groups_by_synth_kind() {
+        let conn = open_db();
+        seed_self(&conn, "tm_self", "me@x.io");
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        let now = 1_700_000_000_000;
+        // One row of each kind for the same counterparty.
+        seed_deletion(
+            &conn,
+            now - 1_000,
+            "email_waiting",
+            "Reply to Alice about Q3",
+            Some("tm_alice"),
+            Some("tm_self"),
+            "user_delete",
+        );
+        seed_deletion(
+            &conn,
+            now - 2_000,
+            "teams_waiting",
+            "Follow up on planning ping",
+            Some("tm_alice"),
+            Some("tm_self"),
+            "user_dismiss",
+        );
+        seed_deletion(
+            &conn,
+            now - 3_000,
+            "meeting_waiting",
+            "Write notes from 1:1",
+            Some("tm_self"),
+            Some("tm_alice"),
+            "user_delete",
+        );
+
+        let payload = recently_rejected_waiting(&conn, "tm_alice", now)
+            .unwrap()
+            .expect("expected payload with all three kinds populated");
+        let obj = payload.as_object().unwrap();
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("email"));
+        assert!(obj.contains_key("teams"));
+        assert!(obj.contains_key("meeting"));
+        let emails = obj["email"].as_array().unwrap();
+        assert_eq!(emails.len(), 1);
+        assert_eq!(emails[0].as_str().unwrap(), "Reply to Alice about Q3");
+    }
+
+    #[test]
+    fn worker_rejected_block_filters_to_window() {
+        let conn = open_db();
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        // `now` chosen large enough that `now - 90d` is positive — keeps
+        // the seeded `deleted_ms` non-negative, which matches production
+        // (ms-since-epoch is always positive).
+        let now: i64 = 100 * 24 * 60 * 60 * 1000; // 100 days
+        seed_deletion(
+            &conn,
+            now - 40 * 24 * 60 * 60 * 1000, // 40 days ago — outside 30-day window
+            "email_waiting",
+            "Stale rejection",
+            Some("tm_alice"),
+            None,
+            "user_delete",
+        );
+        seed_deletion(
+            &conn,
+            now - 5 * 24 * 60 * 60 * 1000, // 5 days ago — inside window
+            "email_waiting",
+            "Recent rejection",
+            Some("tm_alice"),
+            None,
+            "user_delete",
+        );
+        let payload = recently_rejected_waiting(&conn, "tm_alice", now).unwrap().unwrap();
+        let emails = payload["email"].as_array().unwrap();
+        assert_eq!(emails.len(), 1, "only the in-window row survives");
+        assert_eq!(emails[0].as_str().unwrap(), "Recent rejection");
+    }
+
+    #[test]
+    fn worker_rejected_block_excludes_auto_resolved() {
+        let conn = open_db();
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        let now: i64 = 100 * 24 * 60 * 60 * 1000;
+        seed_deletion(
+            &conn,
+            now - 1_000,
+            "email_waiting",
+            "Worker swept this",
+            Some("tm_alice"),
+            None,
+            "auto_resolved",
+        );
+        let payload = recently_rejected_waiting(&conn, "tm_alice", now).unwrap();
+        assert!(payload.is_none(), "auto_resolved must not feed the prompt");
+    }
+
+    #[test]
+    fn worker_rejected_block_matches_by_assignee_for_for_them_rows() {
+        // `waiting_for_them` rows have assignee = person, subject = self.
+        // The query must catch those via the assignee_id arm.
+        let conn = open_db();
+        seed_self(&conn, "tm_self", "me@x.io");
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        let now: i64 = 100 * 24 * 60 * 60 * 1000;
+        seed_deletion(
+            &conn,
+            now - 1_000,
+            "teams_waiting",
+            "Ping Alice for status",
+            Some("tm_self"),     // subject = self (it's a "for_them" row)
+            Some("tm_alice"),    // assignee = person
+            "user_delete",
+        );
+        let payload = recently_rejected_waiting(&conn, "tm_alice", now)
+            .unwrap()
+            .expect("for_them row must be visible when person is the assignee");
+        let teams = payload["teams"].as_array().unwrap();
+        assert_eq!(teams.len(), 1);
+    }
+
+    #[test]
+    fn worker_rejected_block_caps_per_kind() {
+        let conn = open_db();
+        seed_teammate(&conn, "tm_alice", "alice@x.io");
+        let now: i64 = 100 * 24 * 60 * 60 * 1000;
+        // Seed twice the cap; only the most recent REJECTED_WAITING_PER_KIND_CAP
+        // survive.
+        for i in 0..(REJECTED_WAITING_PER_KIND_CAP * 2) {
+            seed_deletion(
+                &conn,
+                now - (i as i64) * 1_000,
+                "email_waiting",
+                &format!("Item #{i:02}"),
+                Some("tm_alice"),
+                None,
+                "user_delete",
+            );
+        }
+        let payload = recently_rejected_waiting(&conn, "tm_alice", now).unwrap().unwrap();
+        let emails = payload["email"].as_array().unwrap();
+        assert_eq!(emails.len(), REJECTED_WAITING_PER_KIND_CAP);
+        // Newest survives, oldest dropped.
+        assert!(emails.iter().any(|v| v.as_str().unwrap().contains("#00")));
+        assert!(
+            !emails.iter().any(|v| v.as_str().unwrap().contains(&format!(
+                "#{:02}",
+                REJECTED_WAITING_PER_KIND_CAP * 2 - 1
+            ))),
+            "oldest row must be dropped past the cap"
+        );
     }
 }

@@ -430,8 +430,26 @@ fn upsert_waiting_action(
         _ => return Ok(None),
     };
 
-    // Skip if the user explicitly dismissed this source.
-    let dismissed: bool = tx
+    // Skip if the user explicitly rejected this source. Consults both:
+    //   - the universal deletion log (#147), the new primary signal
+    //     populated by every delete/dismiss path.
+    //   - `dismissed_action_sources`, the pre-#147 legacy table. Kept
+    //     in service until we're confident the log covers every row
+    //     it used to gate; deprecation is a separate follow-up.
+    let dismissed_via_log: bool = tx
+        .query_row(
+            "SELECT 1 FROM action_deletions \
+              WHERE origin_synth_kind = ?1 \
+                AND origin_synth_id = ?2 \
+                AND (assignee_id = ?3 OR (assignee_id IS NULL AND ?3 IS NULL)) \
+                AND cause IN ('user_delete', 'user_dismiss') \
+              LIMIT 1",
+            rusqlite::params![synth_kind, w.source_ref_id, assignee_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    let dismissed_legacy: bool = tx
         .query_row(
             "SELECT 1 FROM dismissed_action_sources \
               WHERE origin_synth_kind = ?1 \
@@ -442,7 +460,7 @@ fn upsert_waiting_action(
         )
         .optional()?
         .unwrap_or(false);
-    if dismissed {
+    if dismissed_via_log || dismissed_legacy {
         return Ok(None);
     }
 
@@ -898,8 +916,12 @@ mod tests {
         assert_eq!(action_text(&conn, &id).as_deref(), Some("original"));
     }
 
+    /// Regression: the worker still honors the legacy
+    /// `dismissed_action_sources` table even after #149 added the
+    /// deletion-log path. Old rows from before #147 must keep blocking
+    /// re-emission until the legacy table is dropped in a follow-up.
     #[test]
-    fn upsert_skips_dismissed_source() {
+    fn upsert_still_honors_dismissed_action_sources_until_deprecated() {
         let mut conn = open_db();
         seed_member(&conn, "tm_self", true);
         seed_member(&conn, "tm_alice", false);
@@ -922,6 +944,74 @@ mod tests {
         tx.commit().unwrap();
         assert!(res.is_none(), "dismissed source returns None");
         assert_eq!(count_actions(&conn), 0);
+    }
+
+    /// New path (#149): a row in `action_deletions` with a
+    /// user-driven cause blocks the worker from re-emitting the same
+    /// (kind, ref_id, assignee) tuple. The deletion log is now the
+    /// primary signal; `dismissed_action_sources` is the legacy fallback.
+    #[test]
+    fn upsert_skips_when_action_deletions_log_records_user_delete() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO action_deletions \
+                (deleted_ms, origin_kind, origin_synth_kind, origin_synth_id, \
+                 assignee_id, text, cause) \
+             VALUES (1000, 'synth', 'teams_waiting', 'msg1', 'tm_self', 'x', 'user_delete')",
+            [],
+        )
+        .unwrap();
+        let res = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "x"),
+            "tm_self",
+            "tm_alice",
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            res.is_none(),
+            "deletion log entry with user_delete cause must block re-emission"
+        );
+        assert_eq!(count_actions(&conn), 0);
+    }
+
+    /// Auto-resolved rows in the deletion log are NOT user signal —
+    /// they record the worker's own sweep. Re-emission must NOT be
+    /// blocked by them, or the LLM could never resurface a previously
+    /// auto-resolved item that became relevant again.
+    #[test]
+    fn upsert_does_not_skip_on_auto_resolved_log_entry() {
+        let mut conn = open_db();
+        seed_member(&conn, "tm_self", true);
+        seed_member(&conn, "tm_alice", false);
+        let tx = conn.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO action_deletions \
+                (deleted_ms, origin_kind, origin_synth_kind, origin_synth_id, \
+                 assignee_id, text, cause) \
+             VALUES (1000, 'synth', 'teams_waiting', 'msg1', 'tm_self', 'x', 'auto_resolved')",
+            [],
+        )
+        .unwrap();
+        let res = upsert_waiting_action(
+            &tx,
+            &waiting("teams", "msg1", "x"),
+            "tm_self",
+            "tm_alice",
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            res.is_some(),
+            "auto_resolved entries are not user signal — re-emission must proceed"
+        );
+        assert_eq!(count_actions(&conn), 1);
     }
 
     /// First omission bumps the hysteresis counter but does NOT flip
