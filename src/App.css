@@ -8542,7 +8542,10 @@ button.workstream-external-chip:hover {
   min-width: 0;
 }
 .note-sidebar {
-  flex: 0 0 280px;
+  /* Wider than the original 280px so multi-sentence action items
+     don't wrap to ~15-char lines once the row's chip column claims
+     its share of the width. See `.note-sidebar .home-action-row`. */
+  flex: 0 0 320px;
   /* Explicit full-height + align-self belt-and-suspenders so the
      gray rail always reaches the bottom of the editor pane, even
      when the empty-state body has no content to push it down. */
@@ -8602,9 +8605,23 @@ button.workstream-external-chip:hover {
   color: var(--fg-muted);
 }
 .note-sidebar .home-action-row {
-  /* The default action row is tuned for the wider Home page. Tighten
-     padding so rows breathe at 280px. */
+  /* The Home-page action row packs checkbox + body + due chip +
+     workstream chip + assignee chip + delete onto one horizontal
+     line. At sidebar width that squeezes the body to ~150px and
+     wraps text to ~15 chars per line. Restore breathing room with:
+       1. wider rail (320px) so the body has more room.
+       2. flex-wrap + a 100%-basis on the body so the chips flow
+          onto a second line *below* the text instead of stealing
+          horizontal space. */
   padding: 10px 10px;
-  gap: 10px;
+  gap: 8px 10px;
+  flex-wrap: wrap;
+}
+.note-sidebar .home-action-body {
+  /* Full row width minus checkbox (20px) + gap (10px) so the body
+     consumes the rest of row 1 and forces subsequent chips onto
+     row 2 where they pack left, indented under the body column. */
+  flex: 1 1 calc(100% - 30px);
+  min-width: 0;
 }
 
