@@ -1,3 +1,29 @@
+//! Keychain access for IPC + internal callers.
+//!
+//! ## Why the IPC commands are `async fn`
+//!
+//! Sync `#[tauri::command] pub fn …` handlers are dispatched inline
+//! from the WKWebView URL-scheme handler — which runs on the AppKit
+//! main thread. If macOS decides to show a SecurityAgent permission
+//! dialog (every code-identity change triggers one), the dialog
+//! needs the main thread's run loop to render, but the main thread
+//! is blocked inside `SecKeychainFindGenericPassword`. Permanent
+//! deadlock; the window never appears.
+//!
+//! Making each IPC handler `async fn` moves dispatch onto Tauri's
+//! tokio runtime. We then `spawn_blocking` the actual keyring call
+//! so we don't starve the runtime workers — `keyring` is a sync API
+//! that can block for unbounded time waiting on Keychain prompts.
+//! The main thread stays free to render the prompt, the user clicks
+//! Allow, the future resolves, the WebView gets its answer.
+//!
+//! Internal `read_*` accessors stay sync. Every caller is already
+//! inside an `async` context where briefly blocking a tokio worker
+//! is acceptable (the main thread is free; the prompt renders; the
+//! worker unblocks when the user responds).
+//!
+//! See #155 for the full root-cause writeup.
+
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
@@ -19,55 +45,82 @@ fn connector_entry(connector_id: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, &account).map_err(|e| e.to_string())
 }
 
+fn voyage_entry() -> Result<Entry, String> {
+    Entry::new(SERVICE, VOYAGE_ACCOUNT).map_err(|e| e.to_string())
+}
+
+/// Wrap a sync keychain closure for use from an IPC command. Joins
+/// the blocking task and collapses the join error into a String so
+/// callers see one consistent `Result<T, String>` shape.
+async fn blocking<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("keychain task join error: {e}"))?
+}
+
+// ----- Anthropic API key ------------------------------------------------
+
 #[tauri::command]
-pub fn set_anthropic_api_key(key: String) -> Result<(), String> {
-    match entry()?.set_password(&key) {
-        Ok(()) => {
-            eprintln!("[keychain] set_password OK ({} chars)", key.len());
-            Ok(())
+pub async fn set_anthropic_api_key(key: String) -> Result<(), String> {
+    blocking(move || {
+        match entry()?.set_password(&key) {
+            Ok(()) => {
+                eprintln!("[keychain] set_password OK ({} chars)", key.len());
+                Ok(())
+            }
+            Err(err) => {
+                eprintln!("[keychain] set_password ERR: {err:?}");
+                Err(err.to_string())
+            }
         }
-        Err(err) => {
-            eprintln!("[keychain] set_password ERR: {err:?}");
-            Err(err.to_string())
-        }
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn delete_anthropic_api_key() -> Result<(), String> {
-    match entry()?.delete_credential() {
+pub async fn delete_anthropic_api_key() -> Result<(), String> {
+    blocking(|| match entry()?.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => {
             eprintln!("[keychain] delete ERR: {e:?}");
             Err(e.to_string())
         }
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn has_anthropic_api_key() -> bool {
-    let e = match entry() {
-        Ok(e) => e,
-        Err(err) => {
+pub async fn has_anthropic_api_key() -> bool {
+    // `bool` return type means we can't surface a join error, so
+    // fall through to `false` on any failure (same as the prior
+    // sync impl, which also returned false on every error path).
+    blocking(|| {
+        let e = entry().map_err(|err| {
             eprintln!("[keychain] entry() ERR: {err}");
-            return false;
+            err
+        })?;
+        match e.get_password() {
+            Ok(_) => {
+                eprintln!("[keychain] get_password OK");
+                Ok(true)
+            }
+            Err(keyring::Error::NoEntry) => {
+                eprintln!("[keychain] get_password NoEntry");
+                Ok(false)
+            }
+            Err(err) => {
+                eprintln!("[keychain] get_password ERR: {err:?}");
+                Ok(false)
+            }
         }
-    };
-    match e.get_password() {
-        Ok(_) => {
-            eprintln!("[keychain] get_password OK");
-            true
-        }
-        Err(keyring::Error::NoEntry) => {
-            eprintln!("[keychain] get_password NoEntry");
-            false
-        }
-        Err(err) => {
-            eprintln!("[keychain] get_password ERR: {err:?}");
-            false
-        }
-    }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Internal accessor for reconcile_notes. Never via IPC.
@@ -79,26 +132,33 @@ pub fn read_anthropic_api_key() -> Result<String, String> {
 // ----- Firecrawl API key ------------------------------------------------
 
 #[tauri::command]
-pub fn set_firecrawl_api_key(key: String) -> Result<(), String> {
-    firecrawl_entry()?.set_password(&key).map_err(|e| e.to_string())
+pub async fn set_firecrawl_api_key(key: String) -> Result<(), String> {
+    blocking(move || {
+        firecrawl_entry()?
+            .set_password(&key)
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn delete_firecrawl_api_key() -> Result<(), String> {
-    match firecrawl_entry()?.delete_credential() {
+pub async fn delete_firecrawl_api_key() -> Result<(), String> {
+    blocking(|| match firecrawl_entry()?.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn has_firecrawl_api_key() -> bool {
-    let e = match firecrawl_entry() {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    matches!(e.get_password(), Ok(_))
+pub async fn has_firecrawl_api_key() -> bool {
+    blocking(|| {
+        let e = firecrawl_entry()?;
+        Ok(matches!(e.get_password(), Ok(_)))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Internal accessor for the link summarizer. Never via IPC.
@@ -109,31 +169,30 @@ pub fn read_firecrawl_api_key() -> Result<String, String> {
 
 // ----- Voyage AI API key (#104) ----------------------------------------
 
-fn voyage_entry() -> Result<Entry, String> {
-    Entry::new(SERVICE, VOYAGE_ACCOUNT).map_err(|e| e.to_string())
+#[tauri::command]
+pub async fn set_voyage_api_key(key: String) -> Result<(), String> {
+    blocking(move || voyage_entry()?.set_password(&key).map_err(|e| e.to_string()))
+        .await
 }
 
 #[tauri::command]
-pub fn set_voyage_api_key(key: String) -> Result<(), String> {
-    voyage_entry()?.set_password(&key).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn delete_voyage_api_key() -> Result<(), String> {
-    match voyage_entry()?.delete_credential() {
+pub async fn delete_voyage_api_key() -> Result<(), String> {
+    blocking(|| match voyage_entry()?.delete_credential() {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
-    }
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn has_voyage_api_key() -> bool {
-    let e = match voyage_entry() {
-        Ok(e) => e,
-        Err(_) => return false,
-    };
-    matches!(e.get_password(), Ok(_))
+pub async fn has_voyage_api_key() -> bool {
+    blocking(|| {
+        let e = voyage_entry()?;
+        Ok(matches!(e.get_password(), Ok(_)))
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Internal accessor for the embeddings worker. Never via IPC.
