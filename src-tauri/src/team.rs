@@ -482,24 +482,34 @@ pub fn set_meeting_attendees(
 ) -> Result<(), String> {
     let mut c = conn.lock().map_err(|e| e.to_string())?;
     let tx = c.transaction().map_err(|e| e.to_string())?;
+    set_meeting_attendees_in_tx(&tx, &note_path, &member_ids)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Replace the attendee set for `note_id` with `member_ids` inside the
+/// given transaction. Extracted so tests can exercise the SQL against
+/// a real schema without dragging in `tauri::State`.
+pub(crate) fn set_meeting_attendees_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    note_id: &str,
+    member_ids: &[String],
+) -> Result<(), String> {
     tx.execute(
         "DELETE FROM meeting_attendees WHERE note_id = ?1",
-        params![note_path],
+        params![note_id],
     )
     .map_err(|e| e.to_string())?;
-    {
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO meeting_attendees(note_path, member_id) VALUES (?1, ?2) \
-                 ON CONFLICT(note_path, member_id) DO NOTHING",
-            )
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO meeting_attendees(note_id, member_id) VALUES (?1, ?2) \
+             ON CONFLICT(note_id, member_id) DO NOTHING",
+        )
+        .map_err(|e| e.to_string())?;
+    for member_id in member_ids {
+        stmt.execute(params![note_id, member_id])
             .map_err(|e| e.to_string())?;
-        for member_id in &member_ids {
-            stmt.execute(params![note_path, member_id])
-                .map_err(|e| e.to_string())?;
-        }
     }
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -714,6 +724,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, 17);
+    }
+
+    /// Regression: the INSERT in `set_meeting_attendees` was left
+    /// referencing the dropped `note_path` column after mig 026
+    /// renamed it to `note_id` (#112). The "Generate notes" flow's
+    /// participant modal would fire the IPC, SQLite would error at
+    /// prepare time, the frontend's catch block would log to console
+    /// and bail before reconcile ran — and the user would just see
+    /// nothing happen. This test prepares + executes against the
+    /// post-026 schema to lock in the column name.
+    #[test]
+    fn set_meeting_attendees_replaces_full_set() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::apply_migrations(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
+                                created_ms, body_size) \
+             VALUES ('n1', 'n1', 'M', '', 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        for id in ["m1", "m2", "m3"] {
+            conn.execute(
+                "INSERT INTO team_members(id, display_name, role, is_self, \
+                                          created_ms, updated_ms) \
+                 VALUES (?1, ?1, '', 0, 0, 0)",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let tx = conn.transaction().unwrap();
+        set_meeting_attendees_in_tx(&tx, "n1", &["m1".into(), "m2".into()]).unwrap();
+        tx.commit().unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meeting_attendees WHERE note_id = 'n1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Replace the set entirely — m1 should drop, m3 should land.
+        let tx = conn.transaction().unwrap();
+        set_meeting_attendees_in_tx(&tx, "n1", &["m2".into(), "m3".into()]).unwrap();
+        tx.commit().unwrap();
+        let mut got: Vec<String> = conn
+            .prepare(
+                "SELECT member_id FROM meeting_attendees WHERE note_id = 'n1'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["m2".to_string(), "m3".to_string()]);
     }
 
     #[test]
