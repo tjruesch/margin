@@ -2186,7 +2186,13 @@ select.settings-input {
   border-radius: 6px;
   flex-shrink: 0;
   background: transparent;
-  border: 1.5px solid var(--home-line-strong);
+  /* `--home-line-strong` (= --border, ~#d0d7de in light mode) is the
+     hairline used for card borders, which gives barely any contrast
+     against the white card background — the unchecked checkbox read
+     as a blank gap in the sidebar's narrow rows. Bump to the muted
+     foreground tone for a clearly perceptible "empty checkbox" glyph
+     while staying subtle next to the bolder filled (done) state. */
+  border: 1.5px solid color-mix(in srgb, var(--fg) 35%, transparent);
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -2194,6 +2200,9 @@ select.settings-input {
   margin-top: 2px;
   color: var(--bg);
   transition: all 120ms ease;
+}
+.home-checkbox:hover {
+  border-color: color-mix(in srgb, var(--fg) 55%, transparent);
 }
 .home-checkbox.done {
   background: var(--accent);
