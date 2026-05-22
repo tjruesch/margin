@@ -498,10 +498,14 @@ fn write_with_frontmatter(map: &Mapping, body: &str) -> String {
     format!("---\n{yaml}---\n{body}")
 }
 
-/// Load a note's body + flags + tags from the DB (#112). The
-/// `frontmatter_extras` field survives in the type for compatibility
-/// with the pre-#112 editor; values are always an empty mapping after
-/// the migration (free-form YAML keys aren't preserved post-#112).
+/// Load a note's body + flags + tags from the DB (#112). Any leading
+/// YAML frontmatter in `body_md` is split off — the editor sees only
+/// the prose. The non-managed keys (everything except `tags`,
+/// `archived`, `favorite`, which live in their own columns/tables)
+/// land in `frontmatter_extras` so `write_note` can prepend them back
+/// on save. This keeps calendar-event notes' `calendar_event_id` /
+/// `meeting_start_ms` / `meeting_end_ms` / `location` metadata alive
+/// across edits without showing it to the user as visible content.
 #[tauri::command]
 pub fn read_note(
     note_path: String,
@@ -509,7 +513,7 @@ pub fn read_note(
 ) -> Result<NoteContent, String> {
     let note_id = note_path;
     let c = conn.lock().map_err(|e| e.to_string())?;
-    let (body, archived, favorite): (String, bool, bool) = c
+    let (raw, archived, favorite): (String, bool, bool) = c
         .query_row(
             "SELECT body_md, archived, favorite FROM notes WHERE id = ?1",
             rusqlite::params![note_id],
@@ -522,6 +526,21 @@ pub fn read_note(
             },
         )
         .map_err(|e| format!("note not found: {e}"))?;
+    let (fm_yaml, body_after_fm) = split_frontmatter(&raw);
+    let frontmatter_extras = match fm_yaml {
+        Some(yaml) => {
+            let mut map = parse_frontmatter(yaml);
+            // `tags` / `archived` / `favorite` are owned by the DB
+            // columns + tags table — don't echo them back to the
+            // frontend as user-managed extras. Strip them so the
+            // round-trip on write doesn't double-write managed flags.
+            map.remove(serde_yml::Value::String("tags".into()));
+            map.remove(serde_yml::Value::String("archived".into()));
+            map.remove(serde_yml::Value::String("favorite".into()));
+            map
+        }
+        None => Mapping::new(),
+    };
     let mut stmt = c
         .prepare("SELECT tag FROM tags WHERE note_id = ?1 ORDER BY tag")
         .map_err(|e| e.to_string())?;
@@ -531,11 +550,11 @@ pub fn read_note(
         .filter_map(|r| r.ok())
         .collect();
     Ok(NoteContent {
-        body,
+        body: body_after_fm.to_string(),
         tags,
         archived,
         favorite,
-        frontmatter_extras: Mapping::new(),
+        frontmatter_extras,
     })
 }
 
@@ -569,17 +588,23 @@ pub fn write_note(
     frontmatter_extras: Mapping,
     conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
 ) -> Result<WriteNoteResult, String> {
-    let _ = frontmatter_extras; // dropped after #112; see read_note
     let note_id = note_path;
 
+    // Run due-token rewrites on the editor-visible body (no
+    // frontmatter), then restore the frontmatter `read_note` split
+    // off so non-managed metadata (calendar_event_id, etc.) survives
+    // the round-trip. The returned `rewritten_body` echoes only the
+    // editor-visible portion so the frontend can swap its buffer
+    // without re-introducing the hidden YAML.
     let today = chrono::Local::now().date_naive();
-    let (final_body, rewritten_body) = match rewrite_relative_due_tokens(&body, today) {
+    let (visible_body, rewritten_body) = match rewrite_relative_due_tokens(&body, today) {
         Some(new_body) => {
             let echo = new_body.clone();
             (new_body, Some(echo))
         }
         None => (body, None),
     };
+    let final_body = write_with_frontmatter(&frontmatter_extras, &visible_body);
 
     let now = current_unix_ms();
     let normalized = normalize_tags(tags);
@@ -2764,6 +2789,66 @@ mod tests {
     fn read_favorite_tolerates_string_yes() {
         let map: Mapping = serde_yml::from_str("favorite: \"yes\"").unwrap();
         assert!(read_favorite(&map));
+    }
+
+    /// Regression: pre-#155 `read_note` returned `body_md` raw with no
+    /// frontmatter handling, so calendar-event notes leaked their
+    /// `calendar_event_id` / `meeting_*` YAML into the editor view.
+    /// This test asserts the split + parse + re-emit path the fixed
+    /// `read_note`/`write_note` rely on round-trips cleanly for a
+    /// connector-produced body.
+    #[test]
+    fn event_frontmatter_round_trips_via_extras() {
+        let raw = "---\n\
+                   calendar_event_id: \"mg::evt-1\"\n\
+                   meeting_start_ms: 1779442200000\n\
+                   meeting_end_ms: 1779444000000\n\
+                   location: Microsoft Teams Meeting\n\
+                   ---\n\n\
+                   # memoq-bridge integration\n\n";
+
+        // read_note side: split frontmatter off, parse extras minus
+        // the managed keys.
+        let (fm_yaml, body) = split_frontmatter(raw);
+        let yaml = fm_yaml.expect("event note must have frontmatter");
+        let mut extras = parse_frontmatter(yaml);
+        for managed in ["tags", "archived", "favorite"] {
+            extras.remove(serde_yml::Value::String(managed.into()));
+        }
+        assert!(
+            !body.contains("calendar_event_id"),
+            "editor-visible body must NOT include the frontmatter"
+        );
+        assert!(
+            body.trim_start().starts_with("# memoq-bridge integration"),
+            "body starts with the H1: got {body:?}"
+        );
+        assert_eq!(extras.len(), 4, "all four event keys land in extras");
+
+        // write_note side: extras + edited body merge back into a
+        // body_md that preserves the YAML keys.
+        let edited = format!("{body}Some notes the user typed.\n");
+        let merged = write_with_frontmatter(&extras, &edited);
+        assert!(merged.starts_with("---\n"));
+        assert!(merged.contains("calendar_event_id"));
+        assert!(merged.contains("Some notes the user typed."));
+
+        // And the next read_note pass yields the same extras + edited
+        // body — idempotent round-trip.
+        let (fm2, body2) = split_frontmatter(&merged);
+        assert!(fm2.is_some());
+        assert_eq!(body2, edited);
+    }
+
+    /// Round-trip with an empty extras map must NOT prepend a
+    /// frontmatter block (regression against double-blank-lines or
+    /// stray `---` markers on plain notes).
+    #[test]
+    fn empty_extras_writes_body_unchanged() {
+        let extras = Mapping::new();
+        let body = "# Plain note\n\nNo frontmatter here.\n";
+        let merged = write_with_frontmatter(&extras, body);
+        assert_eq!(merged, body);
     }
 
     // The pre-#112 `delete_note_in` path-validation tests are gone:
