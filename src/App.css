@@ -400,6 +400,12 @@ body {
   min-height: 0;
   overflow: hidden;
   background: var(--bg);
+  /* Flex column so `.editor-and-rail` (its only child in edit mode)
+     actually fills the available height — otherwise its `flex: 1`
+     was a no-op against a block parent and the row collapsed to its
+     tallest child, leaving the sidebar visually short. */
+  display: flex;
+  flex-direction: column;
 }
 
 .preview-scroll {
@@ -8537,6 +8543,12 @@ button.workstream-external-chip:hover {
 }
 .note-sidebar {
   flex: 0 0 280px;
+  /* Explicit full-height + align-self belt-and-suspenders so the
+     gray rail always reaches the bottom of the editor pane, even
+     when the empty-state body has no content to push it down. */
+  align-self: stretch;
+  height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--border-muted);
