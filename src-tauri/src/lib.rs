@@ -553,6 +553,7 @@ pub fn run() {
             notes::discard_recording,
             notes::delete_note,
             notes::read_note,
+            notes::transcript_path_for,
             notes::write_note,
             notes::set_note_tags,
             notes::set_archived,

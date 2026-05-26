@@ -144,8 +144,18 @@ function greet(name: string) {
 [^1]: Like this one.
 `;
 
-function transcriptPathFor(notePath: string): string {
-  return notePath.replace(/note\.md$/, "transcript.json");
+/// Resolve the absolute path of a note's `transcript.json` sidecar.
+/// After #112 the frontend's `notePath` is the DB bundle id (no
+/// `note.md` suffix), so we can't construct the on-disk path with a
+/// regex anymore — we ask Rust to do it. Returns `null` when the
+/// bundle has no transcript on disk yet.
+async function transcriptPathFor(noteId: string): Promise<string | null> {
+  try {
+    return (await invoke<string | null>("transcript_path_for", { noteId })) ?? null;
+  } catch (e) {
+    console.error("transcript_path_for failed:", e);
+    return null;
+  }
 }
 
 function deriveTitle(content: string, fallback: string): string {
@@ -508,19 +518,17 @@ export default function App() {
   // transcript has already been reconciled (`reconciled_at` set by
   // reconcile_notes), and reset banner state accordingly.
   const refreshRecordingState = useCallback(async (notePath: string | null) => {
-    if (!notePath || !notePath.endsWith("/note.md")) {
+    if (!notePath) {
       setRecording({ kind: "none", hasTranscript: false });
       return;
     }
-    const tp = transcriptPathFor(notePath);
-    let exists = false;
-    try {
-      exists = await invoke<boolean>("file_exists", { path: tp });
-    } catch {
-      exists = false;
-    }
+    // After #112 `notePath` is the DB bundle id, so we ask Rust to
+    // resolve `<notes_dir>/<id>/transcript.json` and report whether
+    // it's on disk. `null` here means "no transcript yet" — there's
+    // no separate file_exists hop.
+    const tp = await transcriptPathFor(notePath);
     let reconciled = false;
-    if (exists) {
+    if (tp) {
       try {
         const f = await readFile(tp);
         const parsed: Partial<Transcript> = JSON.parse(f.content);
@@ -531,8 +539,8 @@ export default function App() {
     }
     setRecording({
       kind: "none",
-      hasTranscript: exists,
-      transcriptPath: exists ? tp : undefined,
+      hasTranscript: tp != null,
+      transcriptPath: tp ?? undefined,
       reconciled,
     });
   }, []);
@@ -620,7 +628,7 @@ export default function App() {
       });
       try {
         await transcribe(wavPath, aiRef.current.glossary, aiRef.current.whisperModel);
-        const tp = transcriptPathFor(snapshot.notePath);
+        const tp = await transcriptPathFor(snapshot.notePath);
 
         // Notify regardless of where the user is now.
         pushNotificationAndPersist({
@@ -632,7 +640,7 @@ export default function App() {
         // Refresh the per-note quiescent state only if the user is
         // still on the source note. Otherwise loadFile will pick up
         // the new transcript next time they navigate back.
-        if (pathRef.current === snapshot.notePath) {
+        if (pathRef.current === snapshot.notePath && tp) {
           setRecording({ kind: "ready", transcriptPath: tp });
         }
       } catch (err) {
