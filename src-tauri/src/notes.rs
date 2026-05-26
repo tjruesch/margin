@@ -290,6 +290,28 @@ pub fn list_notes(
     crate::index::list_all(&c, scope.unwrap_or_default()).map_err(|e| e.to_string())
 }
 
+/// Resolve a note's bundle id to the absolute filesystem path of its
+/// `transcript.json` sidecar. Returns `None` when the file isn't on
+/// disk (no recording yet, transcript pending, etc.).
+///
+/// After #112 notes live in the DB by `note_id` (= bundle id) and the
+/// frontend no longer holds filesystem paths. Audio + transcripts
+/// still live on disk under `<notes_dir>/<note_id>/`, so any code
+/// path that needs to read or reference the transcript by absolute
+/// path (reconcile prompt, transcript viewer, "Generate notes"
+/// affordance) routes through this helper.
+#[tauri::command]
+pub fn transcript_path_for(note_id: String) -> Option<String> {
+    let path = crate::paths::notes_dir()
+        .join(&note_id)
+        .join(TRANSCRIPT_FILENAME);
+    if path.exists() {
+        Some(path.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 /// Search across all non-archived owned notes (titles + bodies via the
 /// FTS5 index, plus per-bundle transcript.json segments). Returns a
 /// ranked list of `SearchHit`s. `limit` defaults to 20 and is clamped
