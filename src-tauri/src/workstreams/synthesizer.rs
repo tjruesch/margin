@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::persist::{self, SynthesizedAction, SynthesizedWorkstream};
+use super::persist::{self, SynthesizedWorkstream};
 use super::signals::{self, SignalRegistry, SnapshotItem, SnapshotPayload};
 use super::{ClusterReport, Workstream};
 use crate::anthropic::{ANTHROPIC_VERSION, DEFAULT_MODEL, ENDPOINT};
@@ -75,30 +75,6 @@ Titles: short, specific, proper-noun-leaning (\"Hyundai POC review\", \"Q3 sourc
 
 Summaries: 1-3 sentences. State what's happening and what's next, not what it is in the abstract.
 
-Action items: extract concrete TODOs the user owes (or owns) per workstream. Each must reference \
-a source by its label. Skip items that are already done. Do NOT emit an item whose only content is \
-attending, joining, or being present at a meeting/call/event (e.g. \"Attend the Talgo demo\", \
-\"Join the kickoff call\", \"Be at standup on Friday\"). Mere participation is not an action item — \
-emit one only when there is a concrete deliverable, decision, or follow-up the user must produce. \
-Set \"owner_label\" to a team label (e.g. \"T1\") from the \"Team\" section when the source \
-clearly assigns the work to that person; omit or leave null when the owner is ambiguous or is the \
-user themselves.
-
-Dedup against existing open actions: each existing workstream may list its open actions under \
-\"Open actions (already tracked)\". Treat that list as the source of truth — do NOT emit a new \
-action when an existing one already covers the same concrete TODO, even if your phrasing would \
-differ (e.g. existing \"Follow up with Kern & Sohn on Bridge onboarding\" already covers a new \
-\"Follow up with katharina@kern-sohn.com on Bridge intro next steps\"). When in doubt, omit; the \
-user can always add or edit actions manually. Several recent items about the same effort should \
-contribute AT MOST one new action, not one per source.
-
-Respect rejected actions: each existing workstream may also list \"Recently rejected (do not \
-re-emit)\". These are texts the user explicitly deleted in the last 30 days. Be **much more \
-selective** about emitting new actions that resemble them — same topic, same recipient, same \
-phrasing all count. Resemblance is your judgment; lean toward DROP. If you think a rejected \
-item still belongs in the output, phrase it from a clearly different angle or skip it. The \
-user's deletion is strong signal that the previous framing was wrong.
-
 Hierarchy: the \"Existing workstreams (active)\" section may show parents at the top level with \
 children indented underneath (rendered with a \"↳\" marker). When a NEW workstream cleanly extends \
 an umbrella effort already in the list (e.g. \"ELAN AI Bridge\" with sub-threads like \"Talgo demo\" \
@@ -117,10 +93,7 @@ Schema:
     \"parent_id\": \"<existing parent workstream id or null>\",
     \"title\": \"...\",
     \"summary\": \"...\",
-    \"members\": { \"emails\": [\"M1\", \"M2\"], \"events\": [\"E3\"], \"notes\": [\"N1\"] },
-    \"actions\": [
-      { \"text\": \"...\", \"due_ms\": null, \"source_kind\": \"email\", \"source_label\": \"M2\", \"owner_label\": \"T1\" }
-    ]
+    \"members\": { \"emails\": [\"M1\", \"M2\"], \"events\": [\"E3\"], \"notes\": [\"N1\"] }
   }
 ]";
 
@@ -214,8 +187,6 @@ async fn run_cluster_pass(
         existing_archived,
         mut snapshots,
         team,
-        open_actions_by_ws,
-        rejected_by_ws,
     ) = {
         let c = conn_state.lock().map_err(|e| e.to_string())?;
         // Pull both active and archived (snoozed excluded — they're
@@ -246,26 +217,7 @@ async fn run_cluster_pass(
             snapshots.push((src.kind(), items));
         }
         let team = team::list_team_members_raw(&c).unwrap_or_default();
-        // Existing open actions per workstream — fed into the prompt so
-        // the LLM can dedupe against them instead of re-emitting near
-        // duplicates every pass (#101).
-        let open_actions = persist::list_open_action_texts_grouped(&c)
-            .unwrap_or_default();
-        // Per-workstream rejected-action texts from the deletion log
-        // (#150). Best-effort: a SQL failure here downgrades the prompt
-        // by one signal but must not abort the cluster pass.
-        let mut combined: Vec<crate::workstreams::Workstream> =
-            Vec::with_capacity(active.len() + archived.len());
-        combined.extend(active.iter().cloned());
-        combined.extend(archived.iter().cloned());
-        let rejected = crate::workstreams::rejected::rejected_texts_by_workstream(
-            &c, &combined, now_ms,
-        )
-        .unwrap_or_else(|e| {
-            eprintln!("[workstreams] rejected-by-workstream fetch failed: {e}");
-            std::collections::HashMap::new()
-        });
-        (active, archived, snapshots, team, open_actions, rejected)
+        (active, archived, snapshots, team)
     };
     let team_by_id: std::collections::HashMap<String, String> = team
         .iter()
@@ -296,8 +248,6 @@ async fn run_cluster_pass(
         &snapshots,
         registry,
         &team_by_id,
-        &open_actions_by_ws,
-        &rejected_by_ws,
     );
     let items_clustered = total_items as u32;
 
@@ -358,8 +308,6 @@ async fn run_cluster_pass(
             } else {
                 report.workstreams_updated += 1;
             }
-            report.actions_added += counts.actions_added;
-            report.actions_updated += counts.actions_updated;
         }
         tx.commit().map_err(|e| e.to_string())?;
     }
@@ -510,8 +458,7 @@ async fn call_anthropic(api_key: &str, model: &str, user_message: &str) -> Resul
 /// IDs, keyed by source `kind` ("email", "event", "note", …). Built
 /// from the registry so adding a new source extends this map by one
 /// entry without any synthesizer-side surgery. The synthetic kind
-/// `"team"` carries team-member labels (T1, T2, …) used for action
-/// `owner_label` resolution.
+/// `"team"` carries team-member labels (T1, T2, …).
 struct LabelMaps {
     by_kind: HashMap<&'static str, HashMap<String, String>>,
 }
@@ -533,8 +480,6 @@ fn build_user_message(
     snapshots: &[(&'static str, Vec<SnapshotItem>)],
     registry: &SignalRegistry,
     team_by_id: &std::collections::HashMap<String, String>,
-    open_actions_by_ws: &std::collections::HashMap<String, Vec<String>>,
-    rejected_by_ws: &std::collections::HashMap<String, Vec<String>>,
 ) -> (String, LabelMaps) {
     let mut s = String::new();
     s.push_str("# Existing workstreams (active)\n\n");
@@ -560,8 +505,6 @@ fn build_user_message(
                 &mut s,
                 w,
                 team_by_id,
-                open_actions_by_ws.get(&w.id),
-                rejected_by_ws.get(&w.id),
                 false,
             );
             if let Some(children) = children_by_parent.get(w.id.as_str()) {
@@ -570,8 +513,6 @@ fn build_user_message(
                         &mut s,
                         child,
                         team_by_id,
-                        open_actions_by_ws.get(&child.id),
-                        rejected_by_ws.get(&child.id),
                         true,
                     );
                 }
@@ -605,7 +546,7 @@ fn build_user_message(
     let mut maps = LabelMaps::empty();
 
     // Team section. Labels T1, T2, … resolve to team_members.id so the
-    // LLM can assign an `owner_label` per action. Sorted by display
+    // LLM can reference team members by label. Sorted by display
     // name for stable labels across runs.
     if !team_by_id.is_empty() {
         let mut team_pairs: Vec<(&String, &String)> = team_by_id.iter().collect();
@@ -656,7 +597,7 @@ fn build_user_message(
     s.push_str(&format!(
         "\n# Instructions\n\nReturn a JSON array matching the schema in the system prompt. \
          Reuse an existing workstream id when the new items extend it; spawn a new one (id: null) \
-         only when no existing fit. Each action's source_label MUST be one of the labels above \
+         only when no existing fit. Each member source_label MUST be one of the labels above \
          ({label_glob}). Output JSON only — no prose, no fences.\n"
     ));
 
@@ -685,20 +626,10 @@ fn collapse_ws(s: &str) -> String {
 /// with a "↳" marker so Claude sees the parent → child structure (#89).
 /// The same per-row continuation lines (Owner / Members / Notes) are
 /// emitted for both, just under a deeper indent for children.
-/// Max open actions rendered per workstream in the prompt (#101).
-/// Keeps token usage bounded while giving the LLM enough context to
-/// dedupe against most real-world workstreams.
-const OPEN_ACTIONS_PER_WORKSTREAM_CAP: usize = 12;
-/// Per-line cap for an open action's text in the prompt. Long action
-/// bodies get a trailing ellipsis.
-const OPEN_ACTION_LINE_CAP: usize = 200;
-
 fn format_existing_workstream_entry(
     s: &mut String,
     w: &Workstream,
     team_by_id: &std::collections::HashMap<String, String>,
-    open_actions: Option<&Vec<String>>,
-    rejected_actions: Option<&Vec<String>>,
     is_child: bool,
 ) {
     let head_prefix = if is_child { "   ↳ " } else { "" };
@@ -740,39 +671,6 @@ fn format_existing_workstream_entry(
         s.push_str(&format!(
             "{cont_prefix}Notes (user-authored, ground truth): {truncated}\n"
         ));
-    }
-    // Existing open actions — rendered so the LLM can skip near
-    // duplicates instead of re-emitting them every pass (#101).
-    if let Some(actions) = open_actions {
-        if !actions.is_empty() {
-            s.push_str(&format!("{cont_prefix}Open actions (already tracked):\n"));
-            let shown = actions.iter().take(OPEN_ACTIONS_PER_WORKSTREAM_CAP);
-            for a in shown {
-                let collapsed = collapse_ws(a);
-                let truncated = truncate_chars(&collapsed, OPEN_ACTION_LINE_CAP);
-                s.push_str(&format!("{cont_prefix}  - {truncated}\n"));
-            }
-            if actions.len() > OPEN_ACTIONS_PER_WORKSTREAM_CAP {
-                s.push_str(&format!(
-                    "{cont_prefix}  (+{} more not shown)\n",
-                    actions.len() - OPEN_ACTIONS_PER_WORKSTREAM_CAP
-                ));
-            }
-        }
-    }
-    // Recently rejected — the user deleted these from this workstream
-    // (or items tied to its members/series) in the last 30 days (#150).
-    // The system prompt instructs the LLM to be much more selective
-    // about candidates that resemble these.
-    if let Some(rejected) = rejected_actions {
-        if !rejected.is_empty() {
-            s.push_str(&format!("{cont_prefix}Recently rejected (do not re-emit):\n"));
-            for a in rejected {
-                let collapsed = collapse_ws(a);
-                let truncated = truncate_chars(&collapsed, OPEN_ACTION_LINE_CAP);
-                s.push_str(&format!("{cont_prefix}  - {truncated}\n"));
-            }
-        }
     }
 }
 
@@ -818,8 +716,6 @@ struct RawWorkstream {
     summary: Option<String>,
     #[serde(default)]
     members: Option<RawMembers>,
-    #[serde(default)]
-    actions: Option<Vec<RawAction>>,
     /// Optional parent workstream id (#89). Synthesizer's write path
     /// validates against the 2-level cap before persisting; invalid
     /// values are dropped to NULL. Only honored on insert — existing
@@ -836,24 +732,6 @@ struct RawMembers {
     events: Vec<String>,
     #[serde(default)]
     notes: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawAction {
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    due_ms: Option<i64>,
-    #[serde(default)]
-    source_kind: Option<String>,
-    #[serde(default)]
-    source_label: Option<String>,
-    /// Optional team label (T1, T2, …) the LLM picked for the action's
-    /// owner. Resolved at parse time via label_maps.by_kind["team"];
-    /// unknown labels are dropped silently with a log line. None means
-    /// "no owner / the user themselves" — surfaces as NULL assignee.
-    #[serde(default)]
-    owner_label: Option<String>,
 }
 
 fn parse_synthesizer_response(
@@ -921,57 +799,6 @@ fn parse_synthesizer_response(
         let member_events = map_labels(&members.events, label_maps, "event");
         let member_notes = map_labels(&members.notes, label_maps, "note");
 
-        let actions = raw
-            .actions
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|a| {
-                let text = match a.text.as_deref().map(str::trim) {
-                    Some(t) if !t.is_empty() => t.to_string(),
-                    _ => return None,
-                };
-                if is_mere_participation(&text) {
-                    eprintln!(
-                        "[workstreams] dropping participation-only action: {text}"
-                    );
-                    return None;
-                }
-                let kind = a.source_kind.unwrap_or_default();
-                let label = a.source_label.unwrap_or_default();
-                let source_id = label_maps.lookup(&kind, &label).cloned();
-                let source_id = match source_id {
-                    Some(s) => s,
-                    None => {
-                        eprintln!(
-                            "[workstreams] dropping action with unknown label {label} kind {kind}: {text}"
-                        );
-                        return None;
-                    }
-                };
-                let assignee_id = a
-                    .owner_label
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && *s != "null")
-                    .and_then(|label| {
-                        let resolved = label_maps.lookup("team", label).cloned();
-                        if resolved.is_none() {
-                            eprintln!(
-                                "[workstreams] dropping unknown owner_label {label} for action: {text}"
-                            );
-                        }
-                        resolved
-                    });
-                Some(SynthesizedAction {
-                    text,
-                    due_ms: a.due_ms,
-                    source_kind: kind,
-                    source_id,
-                    assignee_id,
-                })
-            })
-            .collect();
-
         out.push(SynthesizedWorkstream {
             id,
             title,
@@ -979,42 +806,11 @@ fn parse_synthesizer_response(
             member_emails,
             member_events,
             member_notes,
-            actions,
             status,
             parent_id,
         });
     }
     out
-}
-
-/// Safety net for the LLM ignoring the "no mere participation" rule
-/// in the prompt: drops items whose entire content is just attending
-/// or joining a meeting/call/event. Matches phrasings like
-/// "Attend the demo", "Join standup Friday", "Be present at kickoff",
-/// "Show up to the review". Anything with a comma, semicolon, or
-/// follow-up verb after the participation phrase escapes the filter —
-/// those are no longer "merely" participation.
-fn is_mere_participation(text: &str) -> bool {
-    let s = text.trim().trim_end_matches(['.', '!', '?']).to_lowercase();
-    if s.contains(',') || s.contains(';') || s.contains(" and ") {
-        return false;
-    }
-    const LEAD: &[&str] = &[
-        "attend",
-        "join",
-        "be at",
-        "be present at",
-        "be present for",
-        "be on",
-        "go to",
-        "show up to",
-        "show up for",
-        "participate in",
-        "sit in on",
-        "dial in to",
-        "dial into",
-    ];
-    LEAD.iter().any(|p| s.starts_with(p))
 }
 
 fn map_labels(
@@ -1065,11 +861,9 @@ fn emit_status(app: &AppHandle, state: &str, message: Option<String>) {
 
 fn format_report_summary(r: &ClusterReport) -> String {
     format!(
-        "+{}/~{} workstreams, +{}/~{} actions, {} items clustered",
+        "+{}/~{} workstreams, {} items clustered",
         r.workstreams_added,
         r.workstreams_updated,
-        r.actions_added,
-        r.actions_updated,
         r.items_clustered
     )
 }
@@ -1108,82 +902,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_synthesizer_response_resolves_owner_label() {
-        let raw = r#"[
-            {
-                "title": "WS",
-                "summary": "",
-                "members": { "emails": ["M1"], "events": [], "notes": [] },
-                "actions": [
-                    { "text": "Send recap", "source_kind": "email", "source_label": "M1", "owner_label": "T1" },
-                    { "text": "Other", "source_kind": "email", "source_label": "M1", "owner_label": "T99" },
-                    { "text": "Unowned", "source_kind": "email", "source_label": "M1" }
-                ]
-            }
-        ]"#;
-        let parsed = parse_synthesizer_response(raw, &label_maps());
-        assert_eq!(parsed.len(), 1);
-        let actions = &parsed[0].actions;
-        assert_eq!(actions.len(), 3);
-        assert_eq!(actions[0].assignee_id.as_deref(), Some("tm_alice"));
-        assert!(
-            actions[1].assignee_id.is_none(),
-            "unknown owner_label resolves to None instead of dropping the action",
-        );
-        assert!(actions[2].assignee_id.is_none());
-    }
-
-    #[test]
-    fn parse_synthesizer_response_drops_mere_participation() {
-        let raw = r#"[
-            {
-                "title": "WS",
-                "summary": "",
-                "members": { "emails": ["M1"], "events": ["E1"], "notes": [] },
-                "actions": [
-                    { "text": "Attend the Talgo demo", "source_kind": "event", "source_label": "E1" },
-                    { "text": "Join the kickoff call", "source_kind": "event", "source_label": "E1" },
-                    { "text": "Send recap after the demo", "source_kind": "event", "source_label": "E1" },
-                    { "text": "Attend the demo and present slides", "source_kind": "event", "source_label": "E1" }
-                ]
-            }
-        ]"#;
-        let parsed = parse_synthesizer_response(raw, &label_maps());
-        assert_eq!(parsed.len(), 1);
-        let texts: Vec<&str> = parsed[0]
-            .actions
-            .iter()
-            .map(|a| a.text.as_str())
-            .collect();
-        assert!(
-            !texts.iter().any(|t| *t == "Attend the Talgo demo"),
-            "pure participation must be filtered",
-        );
-        assert!(
-            !texts.iter().any(|t| *t == "Join the kickoff call"),
-            "pure participation must be filtered",
-        );
-        assert!(
-            texts.iter().any(|t| *t == "Send recap after the demo"),
-            "non-participation actions must survive",
-        );
-        assert!(
-            texts.iter().any(|t| *t == "Attend the demo and present slides"),
-            "items with a follow-up clause escape the filter",
-        );
-    }
-
-    #[test]
     fn parse_synthesizer_response_handles_raw_json() {
         let raw = r#"[
             {
                 "id": null,
                 "title": "Hyundai POC",
                 "summary": "Final invoice + dismissals.",
-                "members": { "emails": ["M1","M2"], "events": ["E1"], "notes": ["N1"] },
-                "actions": [
-                    { "text": "Reply to invoice", "due_ms": null, "source_kind": "email", "source_label": "M1" }
-                ]
+                "members": { "emails": ["M1","M2"], "events": ["E1"], "notes": ["N1"] }
             }
         ]"#;
         let parsed = parse_synthesizer_response(raw, &label_maps());
@@ -1193,8 +918,6 @@ mod tests {
         assert_eq!(ws.member_emails, vec!["mg:test::msg-1", "mg:test::msg-2"]);
         assert_eq!(ws.member_events, vec!["mg:test::ev-1"]);
         assert_eq!(ws.member_notes, vec!["/notes/a.md"]);
-        assert_eq!(ws.actions.len(), 1);
-        assert_eq!(ws.actions[0].source_id, "mg:test::msg-1");
     }
 
     #[test]
@@ -1218,11 +941,7 @@ mod tests {
             {
                 "title": "Mixed",
                 "summary": "",
-                "members": { "emails": ["M1","M99"], "events": [], "notes": ["NX"] },
-                "actions": [
-                    { "text": "ok", "source_kind": "email", "source_label": "M1" },
-                    { "text": "drop", "source_kind": "email", "source_label": "M99" }
-                ]
+                "members": { "emails": ["M1","M99"], "events": [], "notes": ["NX"] }
             }
         ]"#;
         let parsed = parse_synthesizer_response(raw, &label_maps());
@@ -1230,9 +949,6 @@ mod tests {
         // M1 keeps, M99 dropped.
         assert_eq!(parsed[0].member_emails, vec!["mg:test::msg-1"]);
         assert!(parsed[0].member_notes.is_empty(), "NX not in label map");
-        // Action whose source_label was unknown is dropped.
-        assert_eq!(parsed[0].actions.len(), 1);
-        assert_eq!(parsed[0].actions[0].text, "ok");
     }
 
     #[test]
@@ -1365,8 +1081,6 @@ mod tests {
             &snapshots,
             registry,
             &team,
-            &HashMap::new(),
-            &HashMap::new(),
         );
 
         let expected = concat!(
@@ -1382,7 +1096,7 @@ mod tests {
             "\n# Instructions\n\n",
             "Return a JSON array matching the schema in the system prompt. ",
             "Reuse an existing workstream id when the new items extend it; spawn a new one (id: null) ",
-            "only when no existing fit. Each action's source_label MUST be one of the labels above ",
+            "only when no existing fit. Each member source_label MUST be one of the labels above ",
             "(M*/E*/N*). Output JSON only — no prose, no fences.\n",
         );
 
@@ -1420,8 +1134,6 @@ mod tests {
             &snapshots,
             registry,
             &team,
-            &HashMap::new(),
-            &HashMap::new(),
         );
         assert!(prompt.contains("\n# Recent emails (last 14 days)\n\n(none)\n"));
         assert!(prompt.contains("\n# Recent calendar events (window: -14d .. +14d)\n\n(none)\n"));

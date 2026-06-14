@@ -1,6 +1,4 @@
-mod action_deletions;
 mod activity;
-mod actions_migration;
 mod anthropic;
 mod ask;
 mod audio;
@@ -19,8 +17,6 @@ mod observations;
 mod paths;
 mod profiles;
 mod reconcile;
-mod reconcile_rejected;
-mod reminders;
 mod sharing;
 mod sysaudio;
 mod team;
@@ -437,12 +433,6 @@ pub fn run() {
                 eprintln!("profile.md purge failed at boot: {e}");
             }
 
-            // #146: one-shot backfill of pre-#144 reconciled notes —
-            // moves inline `## Action items` blocks into reconcile-origin
-            // rows + writes per-note backups. Gated by the
-            // actions_migration_v1_completed meta flag.
-            actions_migration::run_if_pending(&mut conn);
-
             // Connector registry: holds kind-factory mappings + live
             // connector instances. Real connector modules register
             // their factories at boot (Microsoft Graph in #63;
@@ -471,11 +461,6 @@ pub fn run() {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = apply_vibrancy(&win, NSVisualEffectMaterial::Sidebar, None, None);
             }
-
-            // Reminders ticker: polls the index every 60s and fires a
-            // system notification per newly-due action item (#43). The
-            // task lives until the app exits.
-            reminders::start(app.handle().clone());
 
             // Connector sync runner (#59): ticks every 15s, syncs any
             // due connectors, emits `connector-status` events per pass.
@@ -530,7 +515,6 @@ pub fn run() {
             profiles::commands::get_first_profile_snapshot,
             profiles::commands::count_profile_snapshots,
             profiles::commands::force_recompute_profile,
-            profiles::commands::team_waiting_counts,
             observations::commands::list_profile_observations,
             observations::commands::pending_observation_counts,
             observations::commands::accept_profile_observation,
@@ -544,7 +528,6 @@ pub fn run() {
             transcribe::transcribe,
             reconcile::reconcile_notes,
             notes::create_note,
-            notes::ensure_inbox_note,
             notes::duplicate_note,
             notes::list_notes,
             notes::export_notes,
@@ -558,15 +541,6 @@ pub fn run() {
             notes::set_note_tags,
             notes::set_archived,
             notes::set_favorite,
-            notes::list_actions,
-            notes::list_actions_for_note,
-            notes::migrate_reconciled_notes_to_action_rows,
-            notes::set_action_done,
-            notes::undo_auto_resolved_action,
-            notes::set_action_assignee,
-            notes::set_action_workstream,
-            notes::delete_action,
-            notes::dismiss_waiting_action,
             notes::list_open_questions,
             notes::resolve_open_question,
             notes::reopen_open_question,

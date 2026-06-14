@@ -11,10 +11,10 @@ type Props = {
   onPick: (memberId: string | null) => void;
 };
 
-/// Strip a leading "Owner — " segment from action text — TS counterpart
-/// of the Rust `strip_leading_owner_segment` (#51). Used by ActionRow to
-/// hide the prefix in the displayed text once the assignee is shown via
-/// the chip. Pure render-time transform; doesn't touch the body.
+/// Strip a leading "Owner — " segment from row text — TS counterpart
+/// of the Rust `strip_leading_owner_segment` (#51). Used to hide the
+/// prefix in the displayed text once the assignee is shown via the
+/// chip. Pure render-time transform; doesn't touch the body.
 export function stripLeadingOwnerPrefix(text: string): string {
   const seps = [" — ", " – ", " -- "];
   let best: { idx: number; len: number } | null = null;
@@ -36,7 +36,7 @@ export function AssigneeChip({
   const [open, setOpen] = useState(false);
   const anchorRef = useRef<HTMLDivElement | null>(null);
 
-  // Outside-click + Escape dismissal, mirrors MoreMenu / dueDatePopover.
+  // Outside-click + Escape dismissal, mirrors MoreMenu.
   useEffect(() => {
     if (!open) return;
     const onMouseDown = (e: MouseEvent) => {

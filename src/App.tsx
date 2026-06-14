@@ -6,10 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { undo, redo } from "@codemirror/commands";
 import type { ReactCodeMirrorRef } from "@uiw/react-codemirror";
 import { Editor } from "./Editor";
-import { NoteActionsSidebar } from "./NoteActionsSidebar";
 import { dispatchDiff } from "./editor/applyDiff";
-import { AssigneePopover } from "./editor/assigneePopover";
-import { DueDatePopover } from "./editor/dueDatePopover";
 import {
   loadNotifications,
   makeNotificationId,
@@ -31,7 +28,6 @@ import {
   deleteNote,
   discardRecording,
   duplicateNote,
-  ensureInboxNote,
   getInitialFile,
   hasAnthropicApiKey,
   isOwnedNote,
@@ -47,21 +43,14 @@ import {
   reconcileNotes,
   setArchived as setArchivedFile,
   setFavorite as setFavoriteFile,
-  setActionAssignee,
-  setActionDone,
-  setActionWorkstream,
-  deleteAction,
-  undoAutoResolvedAction,
   setMeetingAttendees,
   getMeetingAttendees,
   setNoteTags,
   shareNote,
-  listActions,
   listOpenQuestions,
   listTeamMembers,
   listWorkstreams,
   synthesizeWorkstreams,
-  type ActionListItem,
   type TeamMember,
   type Workstream,
   startMeetingRecording,
@@ -316,11 +305,10 @@ export default function App() {
   // sidebar / autocomplete stay in sync without an extra disk walk.
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [notesLoading, setNotesLoading] = useState<boolean>(true);
-  const [actions, setActions] = useState<ActionListItem[]>([]);
   /** Currently-unresolved open questions (#113). Surfaces as the
    *  badge count on the "Open questions" sidebar entry. Refreshed on
-   *  every save (alongside `actions`) since `write_note` re-parses
-   *  body_md and the count can shift. */
+   *  every save since `write_note` re-parses body_md and the count can
+   *  shift. */
   const [openQuestionCount, setOpenQuestionCount] = useState<number>(0);
   // Synthesized workstreams (#71). Populated by listWorkstreams on
   // mount; refreshed when the synthesizer emits `workstream-status`.
@@ -331,10 +319,9 @@ export default function App() {
   const [synthInFlight, setSynthInFlight] = useState<boolean>(false);
   // Toast slot below the Workstreams header. Auto-clears after 4s.
   const [synthMessage, setSynthMessage] = useState<string | null>(null);
-  // Team members for the assignee-chip dropdown on action rows (#51).
-  // Loaded once at mount and refreshed on `margin:nav` events so adds /
-  // edits / deletes done on the Team page are reflected next time the
-  // user is back on Home or the Action items page.
+  // Team members. Loaded once at mount and refreshed on `margin:nav`
+  // events so adds / edits / deletes done on the Team page are reflected
+  // next time the user is back on Home.
   const [members, setMembers] = useState<TeamMember[]>([]);
   // In-app notifications surfaced by the title-bar bell (#37). Persisted
   // via tauri-plugin-store; survives app restarts. Capped at 50.
@@ -406,12 +393,6 @@ export default function App() {
   useEffect(() => {
     pathRef.current = path;
   }, [path]);
-  // Mirror actions in a ref so dispatch callbacks can look up a row's
-  // source without re-creating on every actions change (#100).
-  const actionsRef = useRef<ActionListItem[]>([]);
-  useEffect(() => {
-    actionsRef.current = actions;
-  }, [actions]);
   useEffect(() => {
     savedRef.current = savedContent;
   }, [savedContent]);
@@ -461,20 +442,9 @@ export default function App() {
     }
   }, []);
 
-  /** Re-scan open action items. Used by the Home teaser, the sidebar
-   *  count badge, and the dedicated actions feed. Always fetches the
-   *  open scope; done/all are query-time choices the actions feed can
-   *  surface later if we add a "Show completed" toggle. */
-  const refreshActions = useCallback(async () => {
-    try {
-      const items = await listActions("open");
-      setActions(items);
-    } catch (err) {
-      console.error("listActions failed:", err);
-    }
-    // Open-question count refreshes on the same beat — both surfaces
-    // derive from `body_md` (#113), so a `write_note` that bumps one
-    // can shift the other.
+  /** Re-scan the open-question count that drives the sidebar badge
+   *  (#113). Derives from `body_md`, so a `write_note` can shift it. */
+  const refreshOpenQuestionCount = useCallback(async () => {
     try {
       const qs = await listOpenQuestions("open");
       setOpenQuestionCount(qs.length);
@@ -928,8 +898,7 @@ export default function App() {
   }, []);
 
   // Listeners for the in-app notifications panel (#37). Reconcile
-  // emits "reconcile-progress" with payload "done"; reminders emit
-  // a structured object on "notification:reminder". Transcription
+  // emits "reconcile-progress" with payload "done". Transcription
   // completion is pushed directly from `runTranscribe` (it has the
   // resolved note path in scope).
   useEffect(() => {
@@ -943,25 +912,8 @@ export default function App() {
         note_title: noteTitleRef.current,
       });
     });
-    const unRem = listen<{
-      action_id?: string;
-      note_path?: string;
-      note_title?: string;
-      action_text?: string;
-    }>("notification:reminder", (e) => {
-      const p = e.payload;
-      if (!p || !p.note_path || !p.note_title) return;
-      pushNotificationAndPersist({
-        kind: "action-item-reminder",
-        note_path: p.note_path,
-        note_title: p.note_title,
-        action_id: p.action_id,
-        body: p.action_text,
-      });
-    });
     return () => {
       unRec.then((u) => u());
-      unRem.then((u) => u());
     };
   }, [pushNotificationAndPersist]);
 
@@ -1407,16 +1359,16 @@ export default function App() {
       .then(setHasKey)
       .catch(() => setHasKey(false));
     void refreshNotes();
-    void refreshActions();
+    void refreshOpenQuestionCount();
   }, []);
 
   // Re-scan notes whenever the user enters home or flips between active
   // and archive scopes so the feed reflects any edits since last visit.
-  // Also refresh actions so the teaser + sidebar count stay current.
+  // Also refresh the open-question count so the sidebar badge stays current.
   useEffect(() => {
     if (mode === "home") {
       void refreshNotes();
-      void refreshActions();
+      void refreshOpenQuestionCount();
     }
     // refreshNotes is stable (defined below with empty deps)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1595,137 +1547,13 @@ export default function App() {
     [isOwnedPath, refreshNotes, loadFile],
   );
 
-  /** Toggle the done state of an action item. Optimistic — flips the
-   *  local state instantly, then writes through. On error, revert and
-   *  surface the message.
-   *
-   *  We deliberately keep the row in the list after marking it done,
-   *  so the user can see what they just completed (filled checkbox +
-   *  strikethrough) instead of having it vanish mid-click. The next
-   *  navigation back into Home triggers `refreshActions()` which
-   *  re-fetches the open scope and drops the now-done row naturally. */
-  /** Append a quick todo to the catch-all Inbox bundle and refresh the
-   *  actions feed. The Inbox bundle is find-or-created on the Rust side
-   *  by `ensure_inbox_note`. The action goes through the normal write
-   *  path, so any relative date token gets resolved to absolute on save. */
-  const onAddInboxTodo = useCallback(
-    async (text: string, dueToken: string | null) => {
-      try {
-        const ref = await ensureInboxNote();
-        const note = await readNote(ref.note_path);
-        const trimmedBody = note.body.replace(/\s+$/, "");
-        const sep = trimmedBody.length === 0 ? "" : "\n\n";
-        const dueSuffix = dueToken && dueToken.trim() ? ` @${dueToken.trim()}` : "";
-        const nextBody = `${trimmedBody}${sep}- [ ] ${text}${dueSuffix}\n`;
-        await writeNote(
-          ref.note_path,
-          nextBody,
-          note.tags,
-          note.archived,
-          note.favorite,
-          note.frontmatter_extras,
-        );
-        await refreshActions();
-      } catch (err) {
-        console.error("onAddInboxTodo failed:", err);
-        alert("Could not add the todo. See console for details.");
-      }
-    },
-    [refreshActions],
-  );
-
-  const onToggleAction = useCallback(async (id: string, nextDone: boolean) => {
-    setActions((curr) =>
-      curr.map((a) => (a.id === id ? { ...a, done: nextDone } : a)),
-    );
-    try {
-      // Unified IPC dispatches on origin_kind backend-side (#111).
-      await setActionDone(id, nextDone);
-    } catch (err) {
-      console.error("toggle action failed:", err);
-      alert("Could not update the task. See console for details.");
-      setActions((curr) =>
-        curr.map((a) => (a.id === id ? { ...a, done: !nextDone } : a)),
-      );
-    }
-  }, []);
-
-  // Reopen + lock a worker auto-resolved row (#124). Optimistic:
-  // strip `auto_resolved_ms` + flip `done` immediately so the pill
-  // vanishes and the row reappears in the open bucket without
-  // waiting for the refetch. On failure, refetch to reconcile.
-  const onUndoAutoResolved = useCallback(async (id: string) => {
-    setActions((curr) =>
-      curr.map((a) =>
-        a.id === id ? { ...a, done: false, auto_resolved_ms: null } : a,
-      ),
-    );
-    try {
-      await undoAutoResolvedAction(id);
-      await refreshActions();
-    } catch (err) {
-      console.error("undoAutoResolvedAction failed:", err);
-      alert("Could not reopen the action. See console for details.");
-      try {
-        const fresh = await listActions("open");
-        setActions(fresh);
-      } catch {}
-    }
-  }, [refreshActions]);
-
-  // Delete an action item. Confirms first, optimistically drops the
-  // row from local state, then writes through to the unified
-  // `deleteAction` IPC which dispatches on origin_kind (#111). On
-  // error, refetches to restore the authoritative list.
-  const onDeleteAction = useCallback(async (id: string) => {
-    const target = actionsRef.current.find((a) => a.id === id);
-    const isSynth = target?.origin_kind === "synth";
-    const ok = await ask(
-      isSynth
-        ? "This action item will be removed from its workstream."
-        : "This action item will be removed from its source note.",
-      {
-        title: "Delete action item?",
-        kind: "warning",
-        okLabel: "Delete",
-        cancelLabel: "Cancel",
-      },
-    );
-    if (!ok) return;
-    setActions((curr) => curr.filter((a) => a.id !== id));
-    try {
-      await deleteAction(id);
-    } catch (err) {
-      console.error("deleteAction failed:", err);
-      alert("Could not delete the action item. See console for details.");
-      try {
-        const fresh = await listActions("open");
-        setActions(fresh);
-      } catch {}
-    }
-  }, []);
-
-  // Slice of actions belonging to the currently-open note (#53). The
-  // Editor uses this to decorate inline checkbox lines with the
-  // assignee chip. Empty when no note is open.
-  const noteActions = useMemo(
-    () =>
-      path
-        ? actions.filter(
-            (a) => a.origin_kind === "note" && a.origin_note_path === path,
-          )
-        : [],
-    [actions, path],
-  );
-
-  // Refresh actions whenever the on-disk saved content changes for the
-  // current note. Catches autosave, manual save, and the reconcile
-  // write path so the inline chips (#53) pick up freshly-resolved
-  // assignee_ids without a separate notification.
+  // Refresh the open-question count whenever the on-disk saved content
+  // changes for the current note. Catches autosave, manual save, and the
+  // reconcile write path so the sidebar badge stays in sync.
   useEffect(() => {
     if (!path) return;
-    void refreshActions();
-  }, [path, savedContent, refreshActions]);
+    void refreshOpenQuestionCount();
+  }, [path, savedContent, refreshOpenQuestionCount]);
 
   // Refresh team-member list. Cheap; runs on mount and on every
   // `margin:nav` event (fires when the user changes sidebar nav).
@@ -1750,73 +1578,6 @@ export default function App() {
       window.removeEventListener("margin:team-changed", onTeamChanged);
     };
   }, []);
-
-  // Reassign an action item to a new team member (or unassign with
-  // null). Optimistic local update first; on success refetch the list
-  // because the action's id changes when the body line is rewritten.
-  // On error, refetch to restore authoritative state.
-  const onReassignAction = useCallback(
-    async (actionId: string, memberId: string | null) => {
-      const newName =
-        memberId === null
-          ? null
-          : members.find((m) => m.id === memberId)?.display_name ?? null;
-      setActions((curr) =>
-        curr.map((a) =>
-          a.id === actionId
-            ? { ...a, assignee_id: memberId, assignee_display_name: newName }
-            : a,
-        ),
-      );
-      try {
-        // Unified IPC dispatches on origin_kind backend-side (#111).
-        await setActionAssignee(actionId, memberId);
-        const fresh = await listActions("open");
-        setActions(fresh);
-      } catch (err) {
-        console.error("setActionAssignee failed:", err);
-        alert("Could not change the owner. See console for details.");
-        try {
-          const fresh = await listActions("open");
-          setActions(fresh);
-        } catch {}
-      }
-    },
-    [members],
-  );
-
-  // Pin (or detach with null) an action to a workstream (#111). Pure
-  // DB write — markdown lines aren't touched. Optimistic local
-  // update, refetch on success to pick up the joined workstream_title;
-  // refetch on error to restore authoritative state.
-  const onReattachActionWorkstream = useCallback(
-    async (actionId: string, workstreamId: string | null) => {
-      const newTitle =
-        workstreamId === null
-          ? null
-          : workstreams.find((w) => w.id === workstreamId)?.title ?? null;
-      setActions((curr) =>
-        curr.map((a) =>
-          a.id === actionId
-            ? { ...a, workstream_id: workstreamId, workstream_title: newTitle }
-            : a,
-        ),
-      );
-      try {
-        await setActionWorkstream(actionId, workstreamId);
-        const fresh = await listActions("open");
-        setActions(fresh);
-      } catch (err) {
-        console.error("setActionWorkstream failed:", err);
-        alert("Could not update the workstream attachment.");
-        try {
-          const fresh = await listActions("open");
-          setActions(fresh);
-        } catch {}
-      }
-    },
-    [workstreams],
-  );
 
   /** Open the macOS share sheet for the active note. The Rust side
    *  writes a renamed temp `<title>.md` (frontmatter stripped) and
@@ -2049,32 +1810,15 @@ export default function App() {
 
       <main className="pane">
         {mode === "edit" && (
-          <div className="editor-and-rail">
-            <Editor
-              ref={editorRef}
-              value={content}
-              onChange={setContent}
-              tabSize={tabSize}
-              useTabs={useTabs}
-              softWrap={softWrap}
-              fontSize={fontSize}
-              actions={noteActions}
-            />
-            <NoteActionsSidebar
-              notePath={path}
-              refreshKey={savedContent}
-              members={members}
-              workstreams={workstreams}
-              onOpenWorkstream={(id) => {
-                tryNavigate("home");
-                queueMicrotask(() => {
-                  window.dispatchEvent(
-                    new CustomEvent("margin:open-workstream", { detail: id }),
-                  );
-                });
-              }}
-            />
-          </div>
+          <Editor
+            ref={editorRef}
+            value={content}
+            onChange={setContent}
+            tabSize={tabSize}
+            useTabs={useTabs}
+            softWrap={softWrap}
+            fontSize={fontSize}
+          />
         )}
         {mode === "preview" && (
           <Preview source={content} theme={theme} onSourceChange={setContent} />
@@ -2109,15 +1853,8 @@ export default function App() {
             onArchiveRow={(p, next) => void onArchiveNote(p, next)}
             onFavoriteRow={(p, next) => void onFavoriteNote(p, next)}
             onDuplicateRow={(p) => void onDuplicateNote(p)}
-            actions={actions}
             openQuestionCount={openQuestionCount}
-            onToggleAction={(id, next) => void onToggleAction(id, next)}
-            onDeleteAction={(id) => void onDeleteAction(id)}
-            onAddInboxTodo={onAddInboxTodo}
             members={members}
-            onReassignAction={onReassignAction}
-            onReattachActionWorkstream={onReattachActionWorkstream}
-            onUndoAutoResolved={onUndoAutoResolved}
             notifications={notifications}
             onMarkAllNotificationsRead={markNotificationsRead}
             workstreams={workstreams}
@@ -2139,11 +1876,6 @@ export default function App() {
         </footer>
       )}
 
-      <DueDatePopover />
-      <AssigneePopover
-        members={members}
-        onPick={(actionId, memberId) => onReassignAction(actionId, memberId)}
-      />
       {pickerState && (
         <AttendeePicker
           notePath={pickerState.notePath}

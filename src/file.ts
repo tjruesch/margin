@@ -185,18 +185,6 @@ export async function countProfileSnapshots(memberId: string): Promise<number> {
   return invoke<number>("count_profile_snapshots", { memberId });
 }
 
-export type TeamWaitingCounts = {
-  from_me: number;
-  for_them: number;
-  last_seen_active_ms: number | null;
-};
-
-export async function teamWaitingCounts(): Promise<
-  Record<string, TeamWaitingCounts>
-> {
-  return invoke<Record<string, TeamWaitingCounts>>("team_waiting_counts");
-}
-
 // --- Profile observations (#52) -----------------------------------------
 
 export type ObservationStatus = "pending" | "accepted" | "rejected";
@@ -311,160 +299,6 @@ export async function shareNote(notePath: string): Promise<void> {
   await invoke<void>("share_note", { notePath });
 }
 
-// --- Action items --------------------------------------------------------
-
-export type ActionScope = "open" | "done" | "all";
-
-export type ActionListItem = {
-  id: string;
-  /** Origin discriminator (#111, #144). `"note"` for markdown-
-   *  checkbox-backed rows; `"synth"` for synthesizer-emitted rows;
-   *  `"reconcile"` for LLM-extracted rows from meeting reconciliation
-   *  (no body line). Drives click-through routing and badge rendering;
-   *  the unified write IPCs dispatch internally so callers don't
-   *  branch on this. */
-  origin_kind: "note" | "synth" | "reconcile";
-  /** Source note path for note-origin rows; `null` for synth rows. */
-  origin_note_path: string | null;
-  /** 1-based source-line for note-origin rows; `null` for synth rows. */
-  origin_line: number | null;
-  /** Synth source kind ("email" | "event" | "note" | …) when the
-   *  synthesizer paraphrased this row; `null` for note-origin rows.
-   *  Drives the "open source" affordance on the workstream detail
-   *  page. */
-  origin_synth_kind: string | null;
-  /** Connector-qualified id of the synth source row; `null` for
-   *  note-origin rows. */
-  origin_synth_id: string | null;
-  /** Note title when `origin_note_path` resolves, `null` otherwise. */
-  note_title: string | null;
-  /** Direct workstream attachment id. Set by the synthesizer on a
-   *  synth row, or by the user via `setActionWorkstream` on any row. */
-  workstream_id: string | null;
-  /** Workstream title joined from `workstream_id` for render. */
-  workstream_title: string | null;
-  text: string;
-  done: boolean;
-  created_ms: number;
-  /** Absolute due-date timestamp (Unix ms). For note-origin rows,
-   *  parsed from a trailing `@YYYY-MM-DD[ HH:MM]` token. */
-  due_ms: number | null;
-  /** team_members.id when the action has a resolved owner. */
-  assignee_id: string | null;
-  /** Canonical display name from team_members, joined for render so the
-   *  frontend can show an avatar chip without a second IPC round-trip. */
-  assignee_display_name: string | null;
-  /** For worker-extracted waiting actions, the *other* party in the
-   *  conversation (counterparty of `assignee_id`). NULL for note-origin
-   *  rows and any synth row without a single counterparty. */
-  subject_member_id: string | null;
-  /** Set to `true` once the user has touched a worker-extracted row
-   *  (toggled done, reassigned). The profile worker stops auto-
-   *  modifying the row after that. */
-  manual_override: boolean;
-  /** Stamped by the worker (NOT the user) when auto-resolve flipped
-   *  `done` after the hysteresis threshold (#124). Non-null means the
-   *  row was machine-resolved and should render a "Margin
-   *  auto-resolved" pill with an Undo affordance. */
-  auto_resolved_ms: number | null;
-};
-
-export type ListActionsFilters = {
-  scope?: ActionScope;
-  assigneeId?: string;
-  workstreamId?: string;
-  /** Filter to worker-extracted rows whose subject is this team member
-   *  (the counterparty in the conversation). */
-  subjectMemberId?: string;
-  /** Filter to rows whose `origin_synth_kind` is one of these values.
-   *  Common usage: `["email_waiting","teams_waiting","meeting_waiting"]`
-   *  to fetch only worker-extracted waiting actions. */
-  originSynthKinds?: string[];
-};
-
-export async function listActions(
-  scopeOrFilters: ActionScope | ListActionsFilters = "open",
-  assigneeId?: string,
-  workstreamId?: string,
-): Promise<ActionListItem[]> {
-  // Two call shapes for back-compat. Old: listActions("open", "id1", "id2").
-  // New: listActions({ scope, assigneeId, subjectMemberId, originSynthKinds }).
-  const filters: ListActionsFilters =
-    typeof scopeOrFilters === "string"
-      ? { scope: scopeOrFilters, assigneeId, workstreamId }
-      : scopeOrFilters;
-  return invoke<ActionListItem[]>("list_actions", {
-    scope: filters.scope ?? "open",
-    assigneeId: filters.assigneeId,
-    workstreamId: filters.workstreamId,
-    subjectMemberId: filters.subjectMemberId,
-    originSynthKinds: filters.originSynthKinds,
-  });
-}
-
-/** Per-note actions for the note-view sidebar (#145). Returns every
- *  row whose `origin_note_path` matches `notePath`, regardless of
- *  origin_kind or done state. Ordered created_ms DESC. */
-export async function listActionsForNote(
-  notePath: string,
-): Promise<ActionListItem[]> {
-  return invoke<ActionListItem[]>("list_actions_for_note", { noteId: notePath });
-}
-
-/** Phase 1.4 (#146) — one-time backfill report. Auto-runs once at
- *  boot when the meta flag is `'0'`; the Settings → Data button
- *  re-runs it on demand (idempotent). */
-export type ActionsMigrationReport = {
-  dry_run: boolean;
-  candidates_scanned: number;
-  notes_migrated: number;
-  rows_created: number;
-  backups_written: number;
-  notes_already_clean: number;
-  errors: string[];
-};
-
-export async function migrateReconciledNotesToActionRows(
-  dryRun: boolean,
-): Promise<ActionsMigrationReport> {
-  return invoke<ActionsMigrationReport>(
-    "migrate_reconciled_notes_to_action_rows",
-    { dryRun },
-  );
-}
-
-export async function setActionDone(id: string, done: boolean): Promise<void> {
-  await invoke<void>("set_action_done", { id, done });
-}
-
-/** Undo a worker auto-resolution (#124). Reopens the action and
- *  locks it with `manual_override = 1` so the profile worker can't
- *  re-resolve it. No-op when called on a user-checked row. */
-export async function undoAutoResolvedAction(id: string): Promise<void> {
-  await invoke<void>("undo_auto_resolved_action", { id });
-}
-
-export async function deleteAction(id: string): Promise<void> {
-  await invoke<void>("delete_action", { id });
-}
-
-/** Permanently dismiss a worker-extracted waiting action so the
- *  profile worker won't recreate it on the next recompute. Records
- *  the source in `dismissed_action_sources` and deletes the row. */
-export async function dismissWaitingAction(id: string): Promise<void> {
-  await invoke<void>("dismiss_waiting_action", { id });
-}
-
-/** Attach an action to a workstream, or clear the attachment with
- *  `null` (#111). Works for any `origin_kind` — note-origin rows keep
- *  their markdown line untouched; only the DB column changes. */
-export async function setActionWorkstream(
-  actionId: string,
-  workstreamId: string | null,
-): Promise<void> {
-  await invoke<void>("set_action_workstream", { actionId, workstreamId });
-}
-
 // --- Open questions (#113) ----------------------------------------
 
 export type QuestionScope = "open" | "resolved" | "all";
@@ -554,13 +388,6 @@ export async function isOwnedNote(_path: string): Promise<boolean> {
 
 export async function createNote(): Promise<NoteRef> {
   return invoke<NoteRef>("create_note");
-}
-
-/** Find-or-create the catch-all "Inbox" note that holds quick todos
- *  added from the Action items page. Stable id so subsequent calls
- *  return the same NoteRef. */
-export async function ensureInboxNote(): Promise<NoteRef> {
-  return invoke<NoteRef>("ensure_inbox_note");
 }
 
 export async function duplicateNote(notePath: string): Promise<NoteRef> {
@@ -1103,9 +930,6 @@ export type ExternalParticipant = {
   count: number;
 };
 
-// WorkstreamAction was removed in #111; the workstream detail view
-// now consumes `ActionListItem` rows from the unified actions feed.
-
 export type WorkstreamNoteRef = {
   note_path: string;
   title: string;
@@ -1153,9 +977,6 @@ export type WorkstreamDetail = Workstream & {
   emails: EmailMessage[];
   events: CalendarEvent[];
   notes: WorkstreamNoteRef[];
-  /** Unified action items pinned to or originating from this
-   *  workstream (#111). Replaces the previous `WorkstreamAction[]`. */
-  actions: ActionListItem[];
   /** Open questions inheriting from this workstream's attached notes
    *  via the `workstream_signals(kind='note')` pivot (#113). */
   open_questions: OpenQuestionItem[];
@@ -1278,12 +1099,6 @@ export async function detachSignalFromWorkstream(
     itemId,
   });
 }
-
-// setWorkstreamActionDone / setWorkstreamActionAssignee /
-// deleteWorkstreamAction were removed in #111. Callers should use the
-// unified `setActionDone` / `setActionAssignee` / `deleteAction`
-// wrappers — the backend dispatches on `origin_kind` to write to the
-// markdown file (note origins) or the DB (synth origins).
 
 export async function setWorkstreamStatus(
   id: string,
@@ -1459,13 +1274,6 @@ export async function setMeetingAttendees(
 
 export async function getMeetingAttendees(notePath: string): Promise<TeamMember[]> {
   return invoke<TeamMember[]>("get_meeting_attendees", { notePath });
-}
-
-export async function setActionAssignee(
-  actionId: string,
-  memberId: string | null,
-): Promise<void> {
-  await invoke<void>("set_action_assignee", { actionId, memberId });
 }
 
 // --- Recording + transcription -------------------------------------------

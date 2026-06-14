@@ -1,7 +1,7 @@
 //! Workstreams view (#71).
 //!
 //! Sidebar nav target. List of synthesized workstreams as cards;
-//! click → detail view with sections for actions, emails, meetings,
+//! click → detail view with sections for emails, meetings,
 //! notes. Refresh button forces a synthesis pass via the boot
 //! pipeline added in #70 and listens for `workstream-status` to
 //! refetch.
@@ -10,12 +10,10 @@ import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { listen } from "@tauri-apps/api/event";
-import { ask } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
   AliasKind,
-  type ActionListItem,
   type CalendarEvent,
   type OpenQuestionItem,
   resolveOpenQuestion,
@@ -35,7 +33,6 @@ import {
   attachSignalToWorkstream,
   createTeamMember,
   createWorkstream,
-  deleteAction,
   detachSignalFromWorkstream,
   getEmailBody,
   getWorkstreamDetails,
@@ -45,8 +42,6 @@ import {
   markWorkstreamSeen,
   openOrCreateEventNote,
   removeWorkstreamLink,
-  setActionAssignee,
-  setActionDone,
   setWorkstreamOwner,
   setWorkstreamParent,
   setWorkstreamStatus,
@@ -54,7 +49,6 @@ import {
 } from "./file";
 import { AssigneeChip } from "./AssigneeChip";
 import { ResolveQuestionPopover } from "./ResolveQuestionPopover";
-import { DueChip } from "./Home";
 import { usePageDetailLifecycle } from "./pageDetail";
 import {
   IconArchive,
@@ -842,8 +836,6 @@ function countLine(w: Workstream, childCount = 0): string {
   const parts: string[] = [];
   if (childCount > 0)
     parts.push(plural(childCount, "sub-workstream", "sub-workstreams"));
-  if (w.open_action_count > 0)
-    parts.push(plural(w.open_action_count, "open action", "open actions"));
   if (w.email_count > 0) parts.push(plural(w.email_count, "email", "emails"));
   if (w.event_count > 0)
     parts.push(plural(w.event_count, "meeting", "meetings"));
@@ -1024,81 +1016,6 @@ function WorkstreamDetailView({
       }
     };
   }, []);
-
-  // Optimistic update for action toggle. On error, revert and refetch
-  // to reconcile.
-  const onToggleAction = useCallback(
-    async (actionId: string, nextDone: boolean) => {
-      setDetail((d) => {
-        if (!d) return d;
-        return {
-          ...d,
-          actions: d.actions.map((a) =>
-            a.id === actionId ? { ...a, done: nextDone } : a,
-          ),
-        };
-      });
-      try {
-        // Unified IPC dispatches on origin_kind backend-side (#111).
-        await setActionDone(actionId, nextDone);
-      } catch (e) {
-        console.error("[workstreams] toggle action failed", e);
-        await reload();
-      }
-    },
-    [reload],
-  );
-
-  // Reassign an action's owner. Optimistic local update first; refetch
-  // on error to reconcile.
-  const onReassignAction = useCallback(
-    async (actionId: string, memberId: string | null) => {
-      setDetail((d) => {
-        if (!d) return d;
-        return {
-          ...d,
-          actions: d.actions.map((a) =>
-            a.id === actionId ? { ...a, assignee_id: memberId } : a,
-          ),
-        };
-      });
-      try {
-        await setActionAssignee(actionId, memberId);
-      } catch (e) {
-        console.error("[workstreams] reassign action failed", e);
-        await reload();
-      }
-    },
-    [reload],
-  );
-
-  // Delete an action from the workstream. Confirms first to match the
-  // Action items page UX, then optimistically removes the row.
-  const onDeleteAction = useCallback(
-    async (actionId: string) => {
-      const ok = await ask(
-        "This action item will be removed from this workstream.",
-        {
-          title: "Delete action item?",
-          kind: "warning",
-          okLabel: "Delete",
-          cancelLabel: "Cancel",
-        },
-      );
-      if (!ok) return;
-      setDetail((d) => {
-        if (!d) return d;
-        return { ...d, actions: d.actions.filter((a) => a.id !== actionId) };
-      });
-      try {
-        await deleteAction(actionId);
-      } catch (e) {
-        console.error("[workstreams] delete action failed", e);
-        await reload();
-      }
-    },
-    [reload],
-  );
 
   const onChangeStatus = useCallback(
     async (status: WorkstreamStatus) => {
@@ -1349,28 +1266,6 @@ function WorkstreamDetailView({
             d ? { ...d, links: next, link_count: next.length } : d,
           )
         }
-      />
-
-      <ActionsSection
-        actions={detail.actions}
-        onToggle={onToggleAction}
-        onReassign={onReassignAction}
-        onDelete={onDeleteAction}
-        members={teamMembers}
-        onOpenSource={async (a) => {
-          // Note-origin rows always open their source markdown,
-          // regardless of any workstream pin. Synth rows route via the
-          // synth source kind/id.
-          if (a.origin_kind === "note" && a.origin_note_path) {
-            onOpenNote(a.origin_note_path);
-            return;
-          }
-          if (a.origin_synth_kind === "note" && a.origin_synth_id) {
-            onOpenNote(a.origin_synth_id);
-          } else if (a.origin_synth_kind === "event" && a.origin_synth_id) {
-            await onOpenEvent(a.origin_synth_id);
-          }
-        }}
       />
 
       <OpenQuestionsSection
@@ -2437,114 +2332,11 @@ function LinkComposer({
 
 // ----- Sections ------------------------------------------------------------
 
-function ActionsSection({
-  actions,
-  onToggle,
-  onReassign,
-  onDelete,
-  onOpenSource,
-  members,
-}: {
-  actions: ActionListItem[];
-  onToggle: (actionId: string, nextDone: boolean) => void | Promise<void>;
-  onReassign: (actionId: string, memberId: string | null) => void | Promise<void>;
-  onDelete: (actionId: string) => void | Promise<void>;
-  /** Route the row click to its source (#111). For note-origin rows
-   *  this opens the source note; for synth rows it dispatches by
-   *  origin_synth_kind to the email/event/note source. */
-  onOpenSource: (
-    a: ActionListItem,
-  ) => void | Promise<void>;
-  members: TeamMember[];
-}) {
-  if (actions.length === 0) return null;
-  return (
-    <section className="workstream-section">
-      <h2 className="workstream-section-title">Actions ({actions.length})</h2>
-      <div className="home-actions">
-        {actions.map((a) => {
-          const sourceKind = a.origin_kind === "note"
-            ? "note"
-            : a.origin_synth_kind ?? "";
-          const openable =
-            a.origin_kind === "note" ||
-            sourceKind === "note" ||
-            sourceKind === "event";
-          return (
-            <div
-              key={a.id}
-              className="home-action-row"
-              role={openable ? "button" : undefined}
-              tabIndex={openable ? 0 : undefined}
-              onClick={openable ? () => void onOpenSource(a) : undefined}
-              onKeyDown={
-                openable
-                  ? (e) => {
-                      if (e.key === "Enter" || e.key === " ") {
-                        e.preventDefault();
-                        void onOpenSource(a);
-                      }
-                    }
-                  : undefined
-              }
-              title={openable ? `Open ${sourceKind || "source"}` : undefined}
-            >
-              <button
-                type="button"
-                className={"home-checkbox" + (a.done ? " done" : "")}
-                aria-label={a.done ? "Mark as open" : "Mark as done"}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void onToggle(a.id, !a.done);
-                }}
-              >
-                {a.done && <IconCheck size={20} sw={3.6} />}
-              </button>
-              <div className="home-action-body">
-                <div className={"home-action-text" + (a.done ? " done" : "")}>
-                  {a.text}
-                </div>
-              </div>
-              <DueChip dueMs={a.due_ms} />
-              <AssigneeChip
-                assigneeId={a.assignee_id}
-                assigneeDisplayName={a.assignee_display_name}
-                members={members}
-                onPick={(memberId) => void onReassign(a.id, memberId)}
-              />
-              {sourceKind && (
-                <span
-                  className="workstream-action-source-chip"
-                  title={`from ${sourceKind}`}
-                >
-                  from {sourceKind}
-                </span>
-              )}
-              <button
-                type="button"
-                className="home-action-delete"
-                aria-label="Delete action item"
-                title="Delete"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  void onDelete(a.id);
-                }}
-              >
-                <IconTrash size={14} sw={1.7} />
-              </button>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 /// Open Questions section on the Workstream detail view (#113).
-/// Mirrors `ActionsSection` shape: per-row click opens the source
-/// note, per-row resolve/reopen/reassign/delete fires the matching
-/// IPC. Calls `onResolved` after any mutation so the parent can
-/// `reload()` and pick up updated counts.
+/// Per-row click opens the source note; per-row
+/// resolve/reopen/reassign/delete fires the matching IPC. Calls
+/// `onResolved` after any mutation so the parent can `reload()` and
+/// pick up updated counts.
 function OpenQuestionsSection({
   questions,
   members,

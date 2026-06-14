@@ -398,8 +398,8 @@ questions: \"which of the last 4 standups did Alice miss?\", \"tell me about our
 sync\", \"how often does this meeting actually happen?\". Errors if the event isn't recurring. \
 Pass the integer after the `E` as `n` — the dispatcher resolves it to the series master id \
 internally.
-- **`read_workstream(n)`** — returns the workstream's full summary, all open + recently completed \
-actions, and the most recent emails / events / notes that belong to it. Use for status questions \
+- **`read_workstream(n)`** — returns the workstream's full summary and the most recent emails / \
+events / notes that belong to it. Use for status questions \
 (\"what's happening with X?\"). Pass the integer after the `W` as `n` (e.g. for `[W2]` call \
 `read_workstream(2)`).
 - **`read_teams_message(n)`** — returns the full body of Teams message `[T<n>]` plus a few \
@@ -1151,7 +1151,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "read_workstream",
-            "description": "Read the full details of a workstream by its label [W<N>]. Returns the summary, all open and recently completed actions, and the most recent emails / events / notes that belong to this workstream. Use when the user is asking about ongoing work, status updates, or 'what's happening with X'. NOTE: the `n` argument is the integer after the `W` (e.g. for `[W3]` pass `n: 3`).",
+            "description": "Read the full details of a workstream by its label [W<N>]. Returns the summary and the most recent emails / events / notes that belong to this workstream. Use when the user is asking about ongoing work, status updates, or 'what's happening with X'. NOTE: the `n` argument is the integer after the `W` (e.g. for `[W3]` pass `n: 3`).",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1196,7 +1196,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "search_similar",
-            "description": "Search the user's content semantically (via the Voyage embedding index, #104). Use this for questions like 'what was I working on around X', 'who said anything about Y last month', 'remind me what we decided about Z' — where keyword search would miss the answer because the user's wording differs from the original. Returns up to `limit` hits across notes, emails, calendar events, action items, and workstreams, ranked by cosine similarity to the query.",
+            "description": "Search the user's content semantically (via the Voyage embedding index, #104). Use this for questions like 'what was I working on around X', 'who said anything about Y last month', 'remind me what we decided about Z' — where keyword search would miss the answer because the user's wording differs from the original. Returns up to `limit` hits across notes, emails, calendar events, and workstreams, ranked by cosine similarity to the query.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1208,7 +1208,7 @@ fn tool_definitions() -> serde_json::Value {
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["note","email","event","action","workstream","teams_message"]
+                            "enum": ["note","email","event","workstream","teams_message"]
                         },
                         "description": "Optional. Restrict results to a subset of entity kinds."
                     },
@@ -1224,18 +1224,18 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "read_edges",
-            "description": "Retrieve the 1-hop graph neighborhood of a node. Returns every edge whose source OR target is the given node, with the relationship kind, confidence, and the other side's display label. Use to discover relationships ('who attended this meeting', 'what does this person own', 'who is mentioned in this note', 'which workstreams include this email'). The graph is populated by the deterministic edge synthesizer (#103); current edge kinds are AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED, ATTENDED, INCLUDES, OWNS.",
+            "description": "Retrieve the 1-hop graph neighborhood of a node. Returns every edge whose source OR target is the given node, with the relationship kind, confidence, and the other side's display label. Use to discover relationships ('who attended this meeting', 'who is mentioned in this note', 'which workstreams include this email'). The graph is populated by the deterministic edge synthesizer (#103); current edge kinds are AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED, ATTENDED, INCLUDES.",
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "node_kind": {
                         "type": "string",
-                        "enum": ["person", "event", "note", "email", "action", "workstream"],
+                        "enum": ["person", "event", "note", "email", "workstream"],
                         "description": "Entity kind of the node to look up."
                     },
                     "node_id": {
                         "type": "string",
-                        "description": "Canonical id of the node. For person: team_members.id. For event: calendar_events.id. For note: note_path. For email: email_messages.id. For action: actions.id. For workstream: workstreams.id."
+                        "description": "Canonical id of the node. For person: team_members.id. For event: calendar_events.id. For note: note_path. For email: email_messages.id. For workstream: workstreams.id."
                     }
                 },
                 "required": ["node_kind", "node_id"]
@@ -1735,8 +1735,8 @@ fn dispatch_tool(
 }
 
 /// Format a single workstream into a structured text block the model
-/// can quote from. Includes the summary, all actions (open + recently
-/// completed), and the top-N most recent items per category.
+/// can quote from. Includes the summary and the top-N most recent items
+/// per category.
 fn dispatch_read_workstream(
     app: &AppHandle,
     n: usize,
@@ -2027,7 +2027,6 @@ struct EdgeRow {
 /// - note → notes.title
 /// - email → email_messages.subject
 /// - workstream → workstreams.title
-/// - action → actions.text (unified table; #111)
 /// Missing rows fall back to the raw id at render time.
 fn resolve_edge_labels(
     conn: &rusqlite::Connection,
@@ -2059,25 +2058,6 @@ fn resolve_edge_labels(
                 "SELECT id, title FROM workstreams WHERE id = ?1",
                 "workstream",
             ),
-            "action" => {
-                // Unified actions table (#111).
-                if let Ok(mut stmt) =
-                    conn.prepare("SELECT id, text FROM actions WHERE id = ?1")
-                {
-                    for id in &ids {
-                        if let Ok(Some((rid, txt))) = stmt
-                            .query_row(rusqlite::params![id], |r| {
-                                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                            })
-                            .map(Some)
-                            .or(Ok::<_, rusqlite::Error>(None))
-                        {
-                            out.insert(("action".into(), rid), trim_label(&txt));
-                        }
-                    }
-                }
-                continue;
-            }
             _ => continue,
         };
         if let Ok(mut stmt) = conn.prepare(sql) {
@@ -2100,7 +2080,6 @@ fn map_kind(k: &str) -> &'static str {
         "note" => "note",
         "email" => "email",
         "workstream" => "workstream",
-        "action" => "action",
         _ => "",
     }
 }
@@ -2219,41 +2198,6 @@ fn format_workstream_detail(
         }
     }
 
-    // Actions: open first, then recently done. After #111 the
-    // workstream detail's action list is a `Vec<ActionListItem>`;
-    // "from {kind}" reads the synth source kind when present and
-    // falls back to the origin discriminator otherwise.
-    if !detail.actions.is_empty() {
-        let open: Vec<&crate::notes::ActionListItem> =
-            detail.actions.iter().filter(|a| !a.done).collect();
-        let done: Vec<&crate::notes::ActionListItem> =
-            detail.actions.iter().filter(|a| a.done).collect();
-        s.push_str(&format!(
-            "\nActions ({open_n} open, {done_n} done):\n",
-            open_n = open.len(),
-            done_n = done.len()
-        ));
-        let kind_label = |a: &crate::notes::ActionListItem| -> String {
-            a.origin_synth_kind
-                .clone()
-                .unwrap_or_else(|| a.origin_kind.clone())
-        };
-        for a in &open {
-            s.push_str(&format!(
-                "- [ ] {text} (from {kind})\n",
-                text = a.text.trim(),
-                kind = kind_label(a)
-            ));
-        }
-        for a in done.iter().take(WORKSTREAM_DETAIL_TOP_N) {
-            s.push_str(&format!(
-                "- [x] {text} (from {kind})\n",
-                text = a.text.trim(),
-                kind = kind_label(a)
-            ));
-        }
-    }
-
     if !detail.emails.is_empty() {
         s.push_str(&format!(
             "\nRecent emails (top {n} of {total}):\n",
@@ -2332,23 +2276,16 @@ fn format_workstream_detail(
         }
     }
 
-    // Children rollup (#89). Title + summary + open-action count per
-    // child, no per-child hydration. Lets the model answer
-    // "how's [Bridge] going?" with a parent-level summary plus
-    // status across each sub-thread without growing the prompt by
-    // a full WorkstreamDetail per child.
+    // Children rollup (#89). Title + summary per child, no per-child
+    // hydration. Lets the model answer "how's [Bridge] going?" with a
+    // parent-level summary plus status across each sub-thread without
+    // growing the prompt by a full WorkstreamDetail per child.
     if !detail.children.is_empty() {
         s.push_str("\n## Children\n\n");
         for child in &detail.children {
             let summary = truncate_chars(child.summary.trim(), 200);
-            let open = child.open_action_count;
-            let action_phrase = if open == 1 {
-                "1 open action".to_string()
-            } else {
-                format!("{open} open actions")
-            };
             s.push_str(&format!(
-                "- [{id}] {title} — {summary} ({action_phrase})\n",
+                "- [{id}] {title} — {summary}\n",
                 id = child.id,
                 title = child.title.trim(),
             ));
@@ -3128,9 +3065,6 @@ fn format_workstreams_section(
         let label = format!("W{}", i + 1);
         let summary = workstream_one_line_summary(&w.summary);
         let mut counts: Vec<String> = Vec::new();
-        if w.open_action_count > 0 {
-            counts.push(format!("{} open", w.open_action_count));
-        }
         if w.email_count > 0 {
             counts.push(format!("{} emails", w.email_count));
         }
@@ -3831,7 +3765,6 @@ fn format_date(modified_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notes::ActionListItem;
     use crate::workstreams::{NoteRef, Workstream, WorkstreamDetail};
     use crate::connectors::email::EmailMessage;
 
@@ -3852,7 +3785,6 @@ mod tests {
             email_count: 0,
             event_count: 0,
             note_count: 0,
-            open_action_count: 0,
             link_count: 0,
             parent_workstream_id: None,
             external_participants: Vec::new(),
@@ -3921,7 +3853,6 @@ mod tests {
     #[test]
     fn format_workstreams_section_renders_labels_and_counts() {
         let mut a = make_ws("ws_a", "Hyundai POC", "Final invoice details.", 100);
-        a.open_action_count = 2;
         a.email_count = 5;
         a.event_count = 1;
 
@@ -3934,7 +3865,7 @@ mod tests {
         assert!(out.contains("[W2] Q3 hiring"));
         assert!(out.contains("Final invoice details."));
         assert!(
-            out.contains("(2 open · 5 emails · 1 meetings)"),
+            out.contains("(5 emails · 1 meetings)"),
             "expected counts pill in section, got: {out}"
         );
         // No counts when all zero — just the title-summary line.
@@ -3973,29 +3904,6 @@ mod tests {
         }
     }
 
-    fn make_action(text: &str, done: bool) -> ActionListItem {
-        ActionListItem {
-            id: format!("wsa_{text}"),
-            origin_kind: "synth".into(),
-            origin_note_path: None,
-            origin_line: None,
-            origin_synth_kind: Some("email".into()),
-            origin_synth_id: Some("msg".into()),
-            workstream_id: Some("ws_x".into()),
-            workstream_title: None,
-            note_title: None,
-            text: text.into(),
-            done,
-            created_ms: 0,
-            due_ms: None,
-            assignee_id: None,
-            assignee_display_name: None,
-            subject_member_id: None,
-            manual_override: false,
-            auto_resolved_ms: None,
-        }
-    }
-
     #[test]
     fn format_workstream_detail_renders_all_sections() {
         let detail = WorkstreamDetail {
@@ -4015,7 +3923,6 @@ mod tests {
                 email_count: 2,
                 event_count: 0,
                 note_count: 1,
-                open_action_count: 1,
                 link_count: 0,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4031,7 +3938,6 @@ mod tests {
                 modified_ms: 800,
             }],
             open_questions: vec![],
-            actions: vec![make_action("Reply to invoice", false), make_action("Send quote", true)],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),
@@ -4040,9 +3946,6 @@ mod tests {
         let out = format_workstream_detail("W1", &detail, &team_map);
         assert!(out.starts_with("# [W1] Hyundai POC\n"));
         assert!(out.contains("Invoicing in flight."));
-        assert!(out.contains("Actions (1 open, 1 done)"));
-        assert!(out.contains("- [ ] Reply to invoice (from email)"));
-        assert!(out.contains("- [x] Send quote (from email)"));
         assert!(out.contains("Recent emails (top 2 of 2)"));
         assert!(out.contains("Re: invoice"));
         assert!(out.contains("Quote attached"));
@@ -4076,7 +3979,6 @@ mod tests {
                 email_count: emails.len() as u32,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 0,
                 link_count: 0,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4085,7 +3987,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),
@@ -4138,7 +4039,6 @@ mod tests {
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 0,
                 link_count: 0,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4147,7 +4047,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),
@@ -4163,7 +4062,7 @@ mod tests {
     }
 
     #[test]
-    fn format_workstream_detail_handles_empty_summary_and_actions() {
+    fn format_workstream_detail_handles_empty_summary() {
         let detail = WorkstreamDetail {
             workstream: Workstream {
                 id: "ws_z".into(),
@@ -4181,7 +4080,6 @@ mod tests {
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 0,
                 link_count: 0,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4190,7 +4088,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),
@@ -4201,7 +4098,7 @@ mod tests {
     }
 
     #[test]
-    fn format_workstream_detail_renders_links_between_user_notes_and_actions() {
+    fn format_workstream_detail_renders_links_after_user_notes() {
         let detail = WorkstreamDetail {
             workstream: Workstream {
                 id: "ws_links".into(),
@@ -4219,7 +4116,6 @@ mod tests {
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 1,
                 link_count: 2,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4228,7 +4124,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![make_action("Reply to invoice", false)],
             links: vec![
                 crate::workstreams::WorkstreamLink {
                     id: "wsl_1".into(),
@@ -4264,12 +4159,10 @@ mod tests {
             "no kind suffix when kind is None"
         );
 
-        // Section ordering: User notes → Links → Actions.
+        // Section ordering: User notes → Links.
         let notes_idx = out.find("User notes (ground truth)").expect("user notes");
         let links_idx = out.find("## Links").expect("links section");
-        let actions_idx = out.find("Actions (").expect("actions");
         assert!(notes_idx < links_idx);
-        assert!(links_idx < actions_idx);
     }
 
     #[test]
@@ -4291,7 +4184,6 @@ mod tests {
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 0,
                 link_count: 0,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4300,7 +4192,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),
@@ -4329,7 +4220,6 @@ mod tests {
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 0,
                 link_count: 1,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4338,7 +4228,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: vec![
                 crate::workstreams::WorkstreamLink {
                     id: "wsl_1".into(),
@@ -4394,7 +4283,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),
@@ -4413,7 +4301,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),
@@ -4423,10 +4310,8 @@ mod tests {
         assert!(!out.contains("External:"));
     }
 
-    fn make_child(id: &str, title: &str, summary: &str, open: u32) -> Workstream {
-        let mut w = make_ws(id, title, summary, 0);
-        w.open_action_count = open;
-        w
+    fn make_child(id: &str, title: &str, summary: &str) -> Workstream {
+        make_ws(id, title, summary, 0)
     }
 
     #[test]
@@ -4448,7 +4333,6 @@ mod tests {
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 0,
                 link_count: 0,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4457,20 +4341,19 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: vec![
-                make_child("ws_talgo", "Talgo demo", "Vendor evaluation.", 1),
-                make_child("ws_comptia", "CompTIA setup", "Onboarding.", 0),
+                make_child("ws_talgo", "Talgo demo", "Vendor evaluation."),
+                make_child("ws_comptia", "CompTIA setup", "Onboarding."),
             ],
         };
         let team_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let out = format_workstream_detail("W8", &detail, &team_map);
 
         assert!(out.contains("## Children"));
-        assert!(out.contains("- [ws_talgo] Talgo demo — Vendor evaluation. (1 open action)"));
-        assert!(out.contains("- [ws_comptia] CompTIA setup — Onboarding. (0 open actions)"));
+        assert!(out.contains("- [ws_talgo] Talgo demo — Vendor evaluation."));
+        assert!(out.contains("- [ws_comptia] CompTIA setup — Onboarding."));
     }
 
     #[test]
@@ -4492,7 +4375,6 @@ mod tests {
                 email_count: 0,
                 event_count: 0,
                 note_count: 0,
-                open_action_count: 0,
                 link_count: 0,
                 parent_workstream_id: None,
                 external_participants: Vec::new(),
@@ -4501,7 +4383,6 @@ mod tests {
             events: vec![],
             notes: vec![],
             open_questions: vec![],
-            actions: vec![],
             links: Vec::new(),
             teams_messages: Vec::new(),
             children: Vec::new(),

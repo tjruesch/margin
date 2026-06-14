@@ -3,7 +3,7 @@
 //! Takes raw signals from #69 (emails), #63 (calendar events), and the
 //! existing notes index, hands them to Claude, and writes back named
 //! "workstreams" — ongoing efforts the user is participating in (e.g.
-//! "Hyundai POC review", "Q3 hiring") with attached action items.
+//! "Hyundai POC review", "Q3 hiring").
 //!
 //! No UI in this module — the data layer is callable end-to-end after
 //! this PR; the Workstreams view (#71) and AI ask integration (#72)
@@ -22,7 +22,6 @@ pub mod commands;
 pub mod link_categorizer;
 pub mod link_summarizer;
 pub mod persist;
-pub mod rejected;
 pub mod signals;
 pub mod synthesizer;
 
@@ -78,7 +77,6 @@ pub struct Workstream {
     pub email_count: u32,
     pub event_count: u32,
     pub note_count: u32,
-    pub open_action_count: u32,
     /// Count of user-curated external links (#88). Drives the small
     /// link-icon badge on the list card; the actual links land in
     /// `WorkstreamDetail.links` on detail-view fetch.
@@ -156,7 +154,6 @@ pub struct WorkstreamDetail {
     pub emails: Vec<crate::connectors::email::EmailMessage>,
     pub events: Vec<crate::connectors::calendar::CalendarEvent>,
     pub notes: Vec<NoteRef>,
-    pub actions: Vec<crate::notes::ActionListItem>,
     /// Open questions inheriting from this workstream's attached
     /// notes via `workstream_signals(kind='note')` (#113).
     pub open_questions: Vec<crate::notes::OpenQuestionItem>,
@@ -167,7 +164,7 @@ pub struct WorkstreamDetail {
     pub teams_messages: Vec<crate::connectors::teams::TeamsMessage>,
     /// Direct children when this workstream is a parent (#89). Lean
     /// `Workstream` shape — counts + members already populated, no
-    /// emails/events/notes/actions hydration. Empty for leaves and
+    /// emails/events/notes hydration. Empty for leaves and
     /// standalones. Ordered by `last_activity_ms` desc.
     pub children: Vec<Workstream>,
 }
@@ -179,8 +176,6 @@ pub struct ClusterReport {
     /// Workstreams the synthesizer resurrected from archived → active
     /// because new evidence rolled in (#78).
     pub workstreams_reopened: u32,
-    pub actions_added: u32,
-    pub actions_updated: u32,
     pub items_clustered: u32,
     pub model: String,
     pub last_clustered_ms: i64,
@@ -196,6 +191,4 @@ pub struct ClusterReport {
 #[derive(Debug, Default, Clone)]
 pub struct WriteCounts {
     pub workstream_added: bool,
-    pub actions_added: u32,
-    pub actions_updated: u32,
 }

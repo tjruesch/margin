@@ -1,6 +1,6 @@
 //! Embeddings + sqlite-vec semantic retrieval (#104).
 //!
-//! Every note / email / event / action / workstream gets a 1024-dim
+//! Every note / email / event / workstream gets a 1024-dim
 //! Voyage embedding stored in a `vec0` virtual table. The AI ask
 //! palette's `search_similar` tool queries it for meaning-based
 //! retrieval (complements the structural `read_edges` tool from #103).

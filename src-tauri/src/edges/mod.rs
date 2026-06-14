@@ -7,8 +7,8 @@
 //!   new INCLUDES, new attendees → new CO_ATTENDED, etc.)
 //! - on-demand via `synthesize_edges(force)` IPC
 //!
-//! Seven edge kinds in v1: AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED,
-//! ATTENDED, INCLUDES, OWNS. See the module-level constants for the
+//! Six edge kinds in v1: AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED,
+//! ATTENDED, INCLUDES. See the module-level constants for the
 //! tunables (CO_ATTENDED window, mention confidence, TTL).
 
 pub mod commands;

@@ -117,7 +117,7 @@ export function AttendeePicker({
             Who attended this meeting?
           </h2>
           <p className="attendee-modal-sub">
-            Action items will be attributed to listed attendees by name.
+            Listed attendees are recognized by name in this meeting's notes.
           </p>
         </header>
         <div className="attendee-modal-list">
