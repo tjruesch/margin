@@ -9,7 +9,7 @@
 //! Idempotency is the caller's responsibility — `events.id` is
 //! autoincrement and there's no natural unique key. Each emit is a
 //! pure INSERT; callers gate emission on "the entity row was newly
-//! inserted" (or, for action_completed, on a done-flag transition).
+//! inserted" (or, e.g., on a state transition).
 
 use rusqlite::{params, Transaction};
 use serde_json::Value;

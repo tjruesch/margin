@@ -1,5 +1,4 @@
-//! Team-member CRUD, the `meeting_attendees` join, and `actions.assignee_id`
-//! writes.
+//! Team-member CRUD and the `meeting_attendees` join.
 //!
 //! Profile bodies live in the DB (`profile_snapshots`, #107) after the
 //! legacy on-disk `profile.md` files were retired by #117. The Self
@@ -259,7 +258,7 @@ pub fn list_team_members(
 }
 
 /// NFD-decompose, drop combining marks (the diacritics), then lowercase.
-/// Used by `OwnerResolver` to match action-item owner candidates against
+/// Used by `OwnerResolver` to match owner/asked-of candidates against
 /// `display_name ∪ aliases` regardless of case or accent (#49). The
 /// edges synthesizer's MENTIONED text scanner (#103) also reads through
 /// this so its word-bounded matching is consistent with owner resolution.

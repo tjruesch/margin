@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "react";
 
-import { IconBell, IconSparkle } from "./icons";
+import { IconSparkle } from "./icons";
 import {
   type NotificationKind,
   type NotificationRecord,
@@ -124,17 +124,13 @@ function NotificationGroup({
   );
 }
 
-function iconFor(kind: NotificationKind) {
-  if (kind === "action-item-reminder") {
-    return <IconBell size={11} sw={1.7} />;
-  }
+function iconFor(_kind: NotificationKind) {
   return <IconSparkle size={11} sw={1.7} />;
 }
 
 function titleFor(kind: NotificationKind, noteTitle: string): string {
   if (kind === "transcription-complete") return `Transcript ready: ${noteTitle}`;
-  if (kind === "reconcile-complete") return `Notes generated: ${noteTitle}`;
-  return `Action item due: ${noteTitle}`;
+  return `Notes generated: ${noteTitle}`;
 }
 
 function groupByDay(list: NotificationRecord[]): {

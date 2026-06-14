@@ -25,9 +25,8 @@ use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 use serde::Serialize;
 
 use crate::notes::{
-    action_id, extract_preview, open_question_id, parse_actions, parse_open_questions,
-    ActionListItem, ActionScope, NoteListItem, NoteScope, ParsedAction, ParsedQuestion,
-    NOTE_FILENAME, TRANSCRIPT_FILENAME,
+    extract_preview, open_question_id, parse_open_questions, NoteListItem, NoteScope,
+    ParsedQuestion, NOTE_FILENAME, TRANSCRIPT_FILENAME,
 };
 use crate::paths;
 
@@ -72,7 +71,8 @@ const SCHEMA_V38: &str = include_str!("migrations/038_prompt_cache_tokens.sql");
 const SCHEMA_V39: &str = include_str!("migrations/039_reconcile_origin.sql");
 const SCHEMA_V40: &str = include_str!("migrations/040_actions_migration_flag.sql");
 const SCHEMA_V41: &str = include_str!("migrations/041_action_deletions.sql");
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_V42: &str = include_str!("migrations/042_drop_actions.sql");
+const SCHEMA_VERSION: i64 = 42;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -330,6 +330,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V41)?;
         version = 41;
     }
+    if version == 41 {
+        conn.execute_batch(SCHEMA_V42)?;
+        version = 42;
+    }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
         return Err(rusqlite::Error::InvalidQuery);
@@ -392,149 +396,6 @@ pub fn list_all(conn: &Connection, scope: NoteScope) -> Result<Vec<NoteListItem>
             favorite: r.favorite,
         })
         .collect())
-}
-
-/// Action items across both origins, served from the unified `actions`
-/// table (#111). Each row carries an `origin_kind` so the frontend can
-/// route click-through (note-origin → editor, synth → workstream
-/// detail) and so the unified write IPCs can dispatch correctly.
-///
-/// Note-origin rows on archived notes and synth rows on non-active
-/// workstreams are filtered out — their actions are out of sight.
-pub fn list_actions(
-    conn: &Connection,
-    scope: ActionScope,
-    assignee_id: Option<&str>,
-    workstream_id: Option<&str>,
-    subject_member_id: Option<&str>,
-    origin_synth_kinds_json: Option<&str>,
-) -> Result<Vec<ActionListItem>> {
-    let where_done = match scope {
-        ActionScope::Open => "AND a.done = 0",
-        ActionScope::Done => "AND a.done = 1",
-        ActionScope::All => "",
-    };
-    // `(?N IS NULL OR <col> = ?N)` lets us bind every optional filter
-    // unconditionally; SQLite short-circuits when the bound value is
-    // NULL. Avoids dynamic-params gymnastics.
-    //
-    // The `origin_synth_kinds_json` filter is a JSON array of strings
-    // (or NULL); rows match when their `origin_synth_kind` appears in
-    // the array. `json_each` makes the IN-list portable to any length
-    // without dynamic placeholders.
-    //
-    // The visibility guard: a row is visible iff
-    //   - it has no origin note OR its origin note is non-archived, AND
-    //   - it has no workstream attachment OR its workstream is active.
-    let sql = format!(
-        "SELECT a.id, a.origin_kind, a.origin_note_id, a.origin_line, \
-                a.origin_synth_kind, a.origin_synth_id, \
-                a.workstream_id, a.text, a.done, a.due_ms, \
-                a.assignee_id, a.created_ms, \
-                n.title AS note_title, \
-                w.title AS workstream_title, \
-                t.display_name AS assignee_display_name, \
-                a.subject_member_id, a.manual_override, a.auto_resolved_ms, \
-                COALESCE(n.modified_ms, w.last_activity_ms, a.created_ms) AS order_ms \
-           FROM actions a \
-           LEFT JOIN notes        n ON n.id        = a.origin_note_id \
-           LEFT JOIN workstreams  w ON w.id        = a.workstream_id \
-           LEFT JOIN team_members t ON t.id        = a.assignee_id \
-          WHERE (a.origin_note_id IS NULL OR n.archived = 0) \
-            AND (a.workstream_id  IS NULL OR w.status   = 'active') \
-            {where_done} \
-            AND (?1 IS NULL OR a.assignee_id        = ?1) \
-            AND (?2 IS NULL OR a.workstream_id      = ?2) \
-            AND (?3 IS NULL OR a.subject_member_id  = ?3) \
-            AND (?4 IS NULL OR a.origin_synth_kind IN (SELECT value FROM json_each(?4))) \
-          ORDER BY (a.due_ms IS NULL), a.due_ms ASC, order_ms DESC, \
-                   a.origin_line ASC"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        params![assignee_id, workstream_id, subject_member_id, origin_synth_kinds_json],
-        |r| {
-            Ok(ActionListItem {
-                id: r.get(0)?,
-                origin_kind: r.get(1)?,
-                origin_note_path: r.get(2)?,
-                origin_line: r.get(3)?,
-                origin_synth_kind: r.get(4)?,
-                origin_synth_id: r.get(5)?,
-                workstream_id: r.get(6)?,
-                text: r.get(7)?,
-                done: r.get::<_, i64>(8)? != 0,
-                due_ms: r.get(9)?,
-                assignee_id: r.get(10)?,
-                created_ms: r.get(11)?,
-                note_title: r.get(12)?,
-                workstream_title: r.get(13)?,
-                assignee_display_name: r.get(14)?,
-                subject_member_id: r.get(15)?,
-                manual_override: r.get::<_, i64>(16)? != 0,
-                auto_resolved_ms: r.get(17)?,
-            })
-        },
-    )?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-/// Per-note actions for the note-view sidebar (#145). Returns every
-/// row whose `origin_note_id` matches, regardless of `done`,
-/// regardless of `origin_kind`, ignoring the archived-note /
-/// inactive-workstream guards (the user is *looking at* the note —
-/// they should see its actions). Ordered created_ms DESC with
-/// `origin_line` as a stable tiebreaker for note-origin rows.
-pub fn list_actions_for_note(
-    conn: &Connection,
-    note_id: &str,
-) -> Result<Vec<ActionListItem>> {
-    let sql = "SELECT a.id, a.origin_kind, a.origin_note_id, a.origin_line, \
-                      a.origin_synth_kind, a.origin_synth_id, \
-                      a.workstream_id, a.text, a.done, a.due_ms, \
-                      a.assignee_id, a.created_ms, \
-                      n.title AS note_title, \
-                      w.title AS workstream_title, \
-                      t.display_name AS assignee_display_name, \
-                      a.subject_member_id, a.manual_override, a.auto_resolved_ms \
-                 FROM actions a \
-                 LEFT JOIN notes        n ON n.id = a.origin_note_id \
-                 LEFT JOIN workstreams  w ON w.id = a.workstream_id \
-                 LEFT JOIN team_members t ON t.id = a.assignee_id \
-                WHERE a.origin_note_id = ?1 \
-                ORDER BY a.created_ms DESC, a.origin_line ASC";
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![note_id], |r| {
-        Ok(ActionListItem {
-            id: r.get(0)?,
-            origin_kind: r.get(1)?,
-            origin_note_path: r.get(2)?,
-            origin_line: r.get(3)?,
-            origin_synth_kind: r.get(4)?,
-            origin_synth_id: r.get(5)?,
-            workstream_id: r.get(6)?,
-            text: r.get(7)?,
-            done: r.get::<_, i64>(8)? != 0,
-            due_ms: r.get(9)?,
-            assignee_id: r.get(10)?,
-            created_ms: r.get(11)?,
-            note_title: r.get(12)?,
-            workstream_title: r.get(13)?,
-            assignee_display_name: r.get(14)?,
-            subject_member_id: r.get(15)?,
-            manual_override: r.get::<_, i64>(16)? != 0,
-            auto_resolved_ms: r.get(17)?,
-        })
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
 }
 
 /// One ranked hit from `search_notes`. `source` carries which surface
@@ -1264,14 +1125,13 @@ pub(crate) struct Indexable {
     pub(crate) duration_ms: Option<u64>,
     pub(crate) preview: String,
     pub(crate) body_size: i64,
-    pub(crate) actions: Vec<ParsedAction>,
     pub(crate) open_questions: Vec<ParsedQuestion>,
     pub(crate) body: String,
 }
 
 /// Build an `Indexable` from an in-memory `body_md` string. Title is
-/// derived from the first `# Heading` line; actions parsed from
-/// `- [ ]` lines. Duration is best-effort hydrated from
+/// derived from the first `# Heading` line; open questions parsed from
+/// `- [?]` lines. Duration is best-effort hydrated from
 /// `<notes_dir>/<note_id>/transcript.json` when present — audio/
 /// transcripts still live on disk after #112.
 pub(crate) fn parse_indexable_from_body(
@@ -1279,7 +1139,6 @@ pub(crate) fn parse_indexable_from_body(
     body_md: &str,
     modified_ms: i64,
 ) -> Indexable {
-    let actions = parse_actions(body_md);
     let open_questions = parse_open_questions(body_md);
     let title = body_md
         .lines()
@@ -1312,7 +1171,6 @@ pub(crate) fn parse_indexable_from_body(
         duration_ms,
         preview,
         body_size,
-        actions,
         open_questions,
         body: body_md.to_string(),
     }
@@ -1320,9 +1178,9 @@ pub(crate) fn parse_indexable_from_body(
 
 /// Refresh the row for `note_id` (#112). UPDATEs the row in place,
 /// re-derives title from the body, refreshes FTS, reparses
-/// `- [ ]` lines into the unified `actions` table, and emits
-/// `note_modified`/`action_created`/`action_completed` events — all
-/// inside the supplied transaction.
+/// `- [?]` lines into the open-questions table, and emits the
+/// `note_modified`/`note_created` event — all inside the supplied
+/// transaction.
 ///
 /// `archived`/`favorite`/`tags` are *not* touched here. Those have
 /// their own DB-only IPCs (`set_archived` / `set_favorite` /
@@ -1332,8 +1190,7 @@ pub(crate) fn upsert_in_tx(
     note_id: &str,
     p: &Indexable,
 ) -> Result<()> {
-    // Snapshot pre-state for live event emission (#106) and the
-    // action-diff that follows.
+    // Snapshot pre-state for live event emission (#106).
     let note_pre_existed: bool = tx
         .query_row(
             "SELECT 1 FROM notes WHERE id = ?1",
@@ -1342,16 +1199,6 @@ pub(crate) fn upsert_in_tx(
         )
         .optional()?
         .is_some();
-    let prior_actions: HashMap<String, bool> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, done FROM actions \
-              WHERE origin_kind = 'note' AND origin_note_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![note_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
-        })?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
     let self_id: Option<String> = tx
         .query_row(
             "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
@@ -1386,7 +1233,7 @@ pub(crate) fn upsert_in_tx(
         ],
     )?;
 
-    // Emit the note event before tags/FTS/actions — keeps the events
+    // Emit the note event before FTS/open-questions — keeps the events
     // table chronologically consistent with the notes table.
     let note_kind = if note_pre_existed {
         "note_modified"
@@ -1417,83 +1264,15 @@ pub(crate) fn upsert_in_tx(
         params![note_id, p.title, p.body],
     )?;
 
-    // Actions: replace wholesale (note-origin rows for this note
-    // only). Synth-origin rows attached via workstream_id survive
-    // because the DELETE is scoped by origin_kind + origin_note_id.
+    // Resolve owner candidates on open-question lines to team-member
+    // ids for the `asked_of_id` column.
     let team_members = crate::team::list_team_members_raw(tx).unwrap_or_else(|e| {
         eprintln!("[index] list_team_members_raw failed: {e}");
         Vec::new()
     });
     let resolver = crate::team::OwnerResolver::from_members(&team_members);
 
-    tx.execute(
-        "DELETE FROM actions \
-          WHERE origin_kind = 'note' AND origin_note_id = ?1",
-        params![note_id],
-    )?;
     let now_ms = current_unix_ms();
-    let mut post_actions: Vec<(String, bool, String, Option<String>)> = Vec::new();
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO actions \
-                (id, origin_kind, origin_note_id, origin_line, text, done, \
-                 created_ms, due_ms, assignee_id) \
-             VALUES (?1, 'note', ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-             ON CONFLICT(id) DO NOTHING",
-        )?;
-        for a in &p.actions {
-            let id = action_id(&p.bundle_id, &a.text);
-            let assignee_id = a
-                .owner_candidate
-                .as_deref()
-                .and_then(|c| resolver.resolve(c));
-            stmt.execute(params![
-                id,
-                note_id,
-                a.line as i64,
-                a.text,
-                a.done as i64,
-                now_ms,
-                a.due_ms,
-                assignee_id.clone(),
-            ])?;
-            post_actions.push((id, a.done, a.text.clone(), assignee_id));
-        }
-    }
-
-    // Live action events (#106). Diff the post-state against the
-    // pre-state captured at the top of this function.
-    for (id, done, text, assignee_id) in &post_actions {
-        let was_present = prior_actions.contains_key(id);
-        let was_done = prior_actions.get(id).copied().unwrap_or(false);
-        let actor = assignee_id.as_deref().or(self_id.as_deref());
-        let payload = serde_json::json!({
-            "text": text,
-            "note_id": note_id,
-        });
-        if !was_present {
-            crate::events::emit(
-                tx,
-                now_ms,
-                "action_created",
-                actor,
-                "action",
-                id,
-                &payload,
-            )?;
-        }
-        if *done && !was_done {
-            crate::events::emit(
-                tx,
-                now_ms,
-                "action_completed",
-                actor,
-                "action",
-                id,
-                &payload,
-            )?;
-        }
-    }
 
     // Open questions (#113): wholesale-replace scoped to unresolved
     // rows. Resolved rows live forever (until the note is deleted via
@@ -1546,7 +1325,7 @@ pub(crate) fn current_unix_ms() -> i64 {
 }
 
 pub(crate) fn remove_in_tx(tx: &Transaction<'_>, note_id: &str) -> Result<()> {
-    // FK ON DELETE CASCADE handles `tags`/`actions`/`meeting_attendees`;
+    // FK ON DELETE CASCADE handles `tags`/`meeting_attendees`;
     // FTS is a virtual table so we delete its row explicitly.
     tx.execute(
         "DELETE FROM notes_fts WHERE note_id = ?1",
@@ -1682,7 +1461,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v4_to_v5_adds_due_columns() {
+    fn migration_v4_to_v5_sets_body_size_sentinel() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA_V1).unwrap();
         conn.execute_batch(SCHEMA_V2).unwrap();
@@ -1696,12 +1475,6 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO actions(id, note_path, line, text, done, created_ms) \
-             VALUES ('dd:00000000', '/x/dd/note.md', 1, 'old', 0, 1)",
-            [],
-        )
-        .unwrap();
 
         apply_migrations(&conn).unwrap();
         let v: i64 = conn
@@ -1712,16 +1485,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
-
-        // due_ms column exists, defaults to NULL on the pre-existing row.
-        let due_ms: Option<i64> = conn
-            .query_row(
-                "SELECT due_ms FROM actions WHERE id='dd:00000000'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(due_ms.is_none());
 
         // body_size = -1 sentinel applied to all notes so reconcile re-reads.
         // After #112 the PK is `id` (set to the legacy bundle_id) but the
@@ -1767,7 +1530,6 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: 0,
-            actions: vec![],
             open_questions: vec![],
             body: String::new(),
         };
@@ -1780,54 +1542,6 @@ mod tests {
         let items = list_all(&conn, NoteScope::Active).unwrap();
         let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
         assert_eq!(titles, vec!["new", "mid", "old"]);
-    }
-
-    #[test]
-    fn list_actions_excludes_archived_note() {
-        let mut conn = fresh_conn();
-        let tx = conn.transaction().unwrap();
-        let p = Indexable {
-            bundle_id: "active".into(),
-            title: "A".into(),
-            modified_ms: 100,
-            duration_ms: None,
-            preview: String::new(),
-            body_size: 0,
-            actions: vec![ParsedAction {
-                line: 3,
-                text: "visible".into(),
-                done: false,
-                due_ms: None,
-                owner_candidate: None,
-            }],
-            open_questions: vec![],
-            body: "# A\n\n- [ ] visible\n".into(),
-        };
-        upsert_in_tx(&tx, "active", &p).unwrap();
-        let p2 = Indexable {
-            bundle_id: "arc".into(),
-            title: "Z".into(),
-            modified_ms: 100,
-            duration_ms: None,
-            preview: String::new(),
-            body_size: 0,
-            actions: vec![ParsedAction {
-                line: 3,
-                text: "hidden".into(),
-                done: false,
-                due_ms: None,
-                owner_candidate: None,
-            }],
-            open_questions: vec![],
-            body: "# Z\n\n- [ ] hidden\n".into(),
-        };
-        upsert_in_tx(&tx, "arc", &p2).unwrap();
-        tx.execute("UPDATE notes SET archived = 1 WHERE id = 'arc'", []).unwrap();
-        tx.commit().unwrap();
-
-        let opens = list_actions(&conn, ActionScope::Open, None, None, None, None).unwrap();
-        assert_eq!(opens.len(), 1);
-        assert_eq!(opens[0].text, "visible");
     }
 
     // ----- events + edges backfill (#102) -----------------------------------
@@ -1907,17 +1621,6 @@ mod tests {
         .unwrap();
     }
 
-    fn seed_action(conn: &Connection, id: &str, note_id: &str, assignee: Option<&str>) {
-        conn.execute(
-            "INSERT INTO actions(\
-                id, origin_kind, origin_note_id, origin_line, \
-                text, done, created_ms, assignee_id\
-             ) VALUES (?1, 'note', ?2, 1, 'task', 0, 100, ?3)",
-            rusqlite::params![id, note_id, assignee],
-        )
-        .unwrap();
-    }
-
     fn seed_workstream(conn: &Connection, id: &str) {
         conn.execute(
             "INSERT INTO workstreams(id, title, summary, status, last_activity_ms, created_ms, updated_ms) \
@@ -1936,20 +1639,6 @@ mod tests {
         .unwrap();
     }
 
-    fn seed_workstream_action(conn: &Connection, id: &str, ws_id: &str, assignee: Option<&str>) {
-        // Post-#111: synth-origin rows live in the unified `actions`
-        // table; the legacy `workstream_actions` table is dropped by
-        // migration 025. Seed via origin_kind='synth' instead.
-        conn.execute(
-            "INSERT INTO actions(\
-                id, origin_kind, origin_synth_kind, origin_synth_id, \
-                workstream_id, text, done, created_ms, assignee_id\
-             ) VALUES (?1, 'synth', 'email', 'src', ?2, 'task', 0, 100, ?3)",
-            rusqlite::params![id, ws_id, assignee],
-        )
-        .unwrap();
-    }
-
     #[test]
     fn events_and_edges_backfill_from_existing_rows() {
         let conn = Connection::open_in_memory().unwrap();
@@ -1964,18 +1653,15 @@ mod tests {
         seed_event_with_attendee(&conn, "mg:test::evt-1", "tm_bob", 4_000);
         // One note.
         seed_note_row(&conn, "x", 5_000);
-        // One note-backed action with an assignee.
-        seed_action(&conn, "a-1", "x", Some("tm_bob"));
-        // One workstream + one signal + one workstream-action with assignee.
+        // One workstream + one signal.
         seed_workstream(&conn, "ws_1");
         seed_workstream_signal(&conn, "ws_1", "email", "mg:test::msg-1");
-        seed_workstream_action(&conn, "wsa_1", "ws_1", Some("tm_bob"));
 
         // Re-run apply_migrations to confirm the version gate is idempotent.
         // No rows added on the second pass.
         apply_migrations(&conn).unwrap();
 
-        // events: 3 emails + 1 meeting + 1 note + 2 actions = 7 rows.
+        // events: 3 emails + 1 meeting + 1 note = 5 rows.
         let total_events: i64 = conn
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap();
@@ -1990,7 +1676,7 @@ mod tests {
         let total_events: i64 = conn
             .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total_events, 7, "3 emails + 1 meeting + 1 note + 2 actions");
+        assert_eq!(total_events, 5, "3 emails + 1 meeting + 1 note");
 
         let sent: i64 = conn
             .query_row(
@@ -2046,15 +1732,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attended, 1, "1 resolved attendee");
-
-        let owns: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM edges WHERE edge_kind = 'OWNS'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(owns, 2, "1 note action + 1 workstream action, both with assignees");
     }
 
     /// Mirrors the INSERT statements at the bottom of 022_events_edges.sql.
@@ -2098,22 +1775,6 @@ mod tests {
               n.modified_ms
             FROM notes n;
 
-            -- Unified action_created backfill (#111/#112): one INSERT
-            -- for both note- and synth-origin rows. Payload carries
-            -- whichever origin field is populated.
-            INSERT INTO events (ts_ms, kind, actor_id, ref_kind, ref_id, payload, created_ms)
-            SELECT
-              a.created_ms, 'action_created',
-              COALESCE(a.assignee_id, (SELECT id FROM team_members WHERE is_self = 1 LIMIT 1)),
-              'action', a.id,
-              json_object(
-                'text', a.text,
-                'note_id', a.origin_note_id,
-                'workstream_id', a.workstream_id
-              ),
-              a.created_ms
-            FROM actions a;
-
             INSERT OR IGNORE INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, first_seen_ms, last_seen_ms)
             SELECT 'workstream', s.workstream_id, s.kind, s.item_id, 'INCLUDES',
                    s.added_ms, s.added_ms
@@ -2127,13 +1788,6 @@ mod tests {
             FROM calendar_attendees ca
             JOIN calendar_events ce ON ce.id = ca.event_id
             WHERE ca.team_member_id IS NOT NULL
-            ;
-
-            INSERT OR IGNORE INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, first_seen_ms, last_seen_ms)
-            SELECT 'person', a.assignee_id, 'action', a.id, 'OWNS',
-                   a.created_ms, a.created_ms
-            FROM actions a
-            WHERE a.assignee_id IS NOT NULL
             ;
             "#,
         )
@@ -2158,7 +1812,7 @@ mod tests {
 
     // ----- #106 live event emission ----------------------------------------
 
-    fn mk_indexable(title: &str, body: &str, actions: Vec<ParsedAction>, modified_ms: i64) -> Indexable {
+    fn mk_indexable(title: &str, body: &str, modified_ms: i64) -> Indexable {
         Indexable {
             bundle_id: "b1".into(),
             title: title.into(),
@@ -2166,7 +1820,6 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: body.len() as i64,
-            actions,
             open_questions: vec![],
             body: body.into(),
         }
@@ -2178,7 +1831,7 @@ mod tests {
         apply_migrations(&conn).unwrap();
         // Self for actor_id is not required (column is nullable).
 
-        let p1 = mk_indexable("First", "hello", vec![], 100);
+        let p1 = mk_indexable("First", "hello", 100);
         let tx = conn.transaction().unwrap();
         upsert_in_tx(&tx, "a", &p1).unwrap();
         tx.commit().unwrap();
@@ -2192,7 +1845,7 @@ mod tests {
         assert_eq!(created, 1);
 
         // Re-upsert (simulates a save) → note_modified.
-        let p2 = mk_indexable("First v2", "hello again", vec![], 200);
+        let p2 = mk_indexable("First v2", "hello again", 200);
         let tx = conn.transaction().unwrap();
         upsert_in_tx(&tx, "a", &p2).unwrap();
         tx.commit().unwrap();
@@ -2204,227 +1857,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(modified, 1);
-    }
-
-    #[test]
-    fn action_completed_fires_on_done_flip() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        apply_migrations(&conn).unwrap();
-
-        // Insert with an open action.
-        let p1 = mk_indexable(
-            "T",
-            "- [ ] task",
-            vec![ParsedAction {
-                line: 1,
-                text: "task".into(),
-                done: false,
-                due_ms: None,
-                owner_candidate: None,
-            }],
-            100,
-        );
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "a", &p1).unwrap();
-        tx.commit().unwrap();
-        let created: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE kind = 'action_created'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(created, 1);
-        let completed: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE kind = 'action_completed'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(completed, 0);
-
-        // Re-upsert with done=true → action_completed event.
-        let p2 = mk_indexable(
-            "T",
-            "- [x] task",
-            vec![ParsedAction {
-                line: 1,
-                text: "task".into(),
-                done: true,
-                due_ms: None,
-                owner_candidate: None,
-            }],
-            200,
-        );
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "a", &p2).unwrap();
-        tx.commit().unwrap();
-        let completed: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM events WHERE kind = 'action_completed'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(completed, 1);
-    }
-
-    // ----- #111 unified actions table -----------------------------------
-
-    #[test]
-    fn unify_actions_migration_workstream_actions_dropped() {
-        // After 025 the legacy workstream_actions table is gone — but
-        // any rows it held survive in the unified `actions` table with
-        // origin_kind='synth'.
-        let conn = fresh_conn();
-        seed_workstream(&conn, "ws_x");
-        seed_workstream_action(&conn, "wsa_1", "ws_x", None);
-        let synth_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM actions WHERE origin_kind = 'synth'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(synth_rows, 1);
-
-        let table_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master \
-                  WHERE type = 'table' AND name = 'workstream_actions'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(table_exists, 0, "workstream_actions table must be dropped");
-    }
-
-    #[test]
-    fn list_actions_filters_by_workstream() {
-        let conn = fresh_conn();
-        seed_workstream(&conn, "ws_a");
-        seed_workstream(&conn, "ws_b");
-        seed_workstream_action(&conn, "wsa_a", "ws_a", None);
-        seed_workstream_action(&conn, "wsa_b", "ws_b", None);
-        // A floating note-origin row pinned to ws_a.
-        seed_note_row(&conn, "n", 100);
-        conn.execute(
-            "INSERT INTO actions \
-                (id, origin_kind, origin_note_id, origin_line, text, done, \
-                 created_ms, workstream_id) \
-             VALUES ('n:1', 'note', 'n', 1, 'task', 0, 100, 'ws_a')",
-            [],
-        )
-        .unwrap();
-
-        let only_a = list_actions(&conn, ActionScope::All, None, Some("ws_a"), None, None)
-            .unwrap();
-        let ids_a: Vec<&str> = only_a.iter().map(|r| r.id.as_str()).collect();
-        assert!(ids_a.contains(&"wsa_a"));
-        assert!(ids_a.contains(&"n:1"));
-        assert!(!ids_a.contains(&"wsa_b"));
-
-        let only_b = list_actions(&conn, ActionScope::All, None, Some("ws_b"), None, None)
-            .unwrap();
-        let ids_b: Vec<&str> = only_b.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids_b, vec!["wsa_b"]);
-    }
-
-    #[test]
-    fn upsert_in_tx_preserves_synth_rows_on_other_origins() {
-        // Re-running upsert_in_tx on a note must only blow away that
-        // note's own note-origin rows. Synth rows attached to other
-        // workstreams survive untouched (#111).
-        let mut conn = fresh_conn();
-        seed_workstream(&conn, "ws_x");
-        seed_workstream_action(&conn, "wsa_keep", "ws_x", None);
-
-        let p = mk_indexable(
-            "T",
-            "- [ ] task",
-            vec![ParsedAction {
-                line: 1,
-                text: "task".into(),
-                done: false,
-                due_ms: None,
-                owner_candidate: None,
-            }],
-            100,
-        );
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "a", &p).unwrap();
-        tx.commit().unwrap();
-
-        let synth_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM actions \
-                  WHERE origin_kind = 'synth' AND id = 'wsa_keep'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(synth_count, 1, "synth row must survive note reindex");
-        let note_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM actions \
-                  WHERE origin_kind = 'note' AND origin_note_id = 'a'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(note_count, 1);
-    }
-
-    #[test]
-    fn list_actions_for_note_returns_all_origins_regardless_of_done() {
-        // The sidebar (#145) shows every action tied to the current
-        // note: both origins (reconcile + note), both done states.
-        // Synth rows on OTHER notes must not bleed in.
-        let conn = fresh_conn();
-        seed_note_row(&conn, "n_a", 100);
-        seed_note_row(&conn, "n_b", 100);
-
-        // Reconcile-origin row on n_a, done.
-        conn.execute(
-            "INSERT INTO actions(\
-                id, origin_kind, origin_note_id, origin_line, \
-                text, done, created_ms\
-             ) VALUES ('r:1', 'reconcile', 'n_a', NULL, 'recon done', 1, 200)",
-            [],
-        )
-        .unwrap();
-        // Note-origin row on n_a, open.
-        conn.execute(
-            "INSERT INTO actions(\
-                id, origin_kind, origin_note_id, origin_line, \
-                text, done, created_ms\
-             ) VALUES ('n_a:1', 'note', 'n_a', 1, 'hand task', 0, 100)",
-            [],
-        )
-        .unwrap();
-        // Note-origin row on a DIFFERENT note — must be excluded.
-        conn.execute(
-            "INSERT INTO actions(\
-                id, origin_kind, origin_note_id, origin_line, \
-                text, done, created_ms\
-             ) VALUES ('n_b:1', 'note', 'n_b', 1, 'unrelated', 0, 100)",
-            [],
-        )
-        .unwrap();
-
-        let got = list_actions_for_note(&conn, "n_a").unwrap();
-        let ids: Vec<&str> = got.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids.len(), 2, "expected 2 rows for n_a, got {ids:?}");
-        assert!(ids.contains(&"r:1"));
-        assert!(ids.contains(&"n_a:1"));
-        // created_ms DESC → reconcile row (200) before note row (100).
-        assert_eq!(ids[0], "r:1");
-        assert_eq!(ids[1], "n_a:1");
-
-        // Empty-note case returns []
-        let empty = list_actions_for_note(&conn, "/path/none").unwrap();
-        assert!(empty.is_empty());
     }
 
     // ----- #113 open questions integration ----------------------------------
@@ -2442,7 +1874,6 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: body.len() as i64,
-            actions: vec![],
             open_questions: questions,
             body: body.into(),
         }

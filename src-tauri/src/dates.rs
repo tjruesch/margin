@@ -39,8 +39,7 @@ pub fn parse_due_token(token: &str, today: NaiveDate) -> Option<DueDate> {
 }
 
 /// Parse only the absolute ISO forms (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM`).
-/// Used by the action-line parser, which can resolve absolute tokens
-/// without a `today` reference.
+/// Resolves absolute tokens without a `today` reference.
 pub fn try_parse_absolute(token: &str) -> Option<DueDate> {
     parse_iso(token.trim())
 }

@@ -1,7 +1,6 @@
-// In-app notification records (#37). Three sources today:
+// In-app notification records (#37). Two sources today:
 //   - transcription-complete: a meeting's whisper pass finished.
 //   - reconcile-complete:    the LLM produced reconciled notes.
-//   - action-item-reminder:  a checkbox's `due_ms` arrived.
 //
 // Persisted via tauri-plugin-store (`notifications.json`) so the queue
 // survives app restarts. Capped to MAX_RECORDS — when capacity is hit,
@@ -11,8 +10,7 @@ import { LazyStore } from "@tauri-apps/plugin-store";
 
 export type NotificationKind =
   | "transcription-complete"
-  | "reconcile-complete"
-  | "action-item-reminder";
+  | "reconcile-complete";
 
 export type NotificationRecord = {
   id: string;
@@ -24,9 +22,6 @@ export type NotificationRecord = {
   /** Pre-formatted body line for display. Optional — kinds with
    *  self-explanatory titles can omit it. */
   body?: string;
-  /** Action id, set only on `action-item-reminder` records. Reserved
-   *  for future deep-linking to the specific row. */
-  action_id?: string;
   created_ms: number;
   /** Unix-ms when the user opened the panel after this record was
    *  added. Undefined = unread. */
@@ -115,8 +110,7 @@ function isNotificationRecord(v: unknown): v is NotificationRecord {
   if (typeof o.id !== "string") return false;
   if (
     o.kind !== "transcription-complete" &&
-    o.kind !== "reconcile-complete" &&
-    o.kind !== "action-item-reminder"
+    o.kind !== "reconcile-complete"
   ) {
     return false;
   }

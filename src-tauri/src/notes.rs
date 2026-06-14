@@ -11,7 +11,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_yml::Mapping;
 
@@ -54,75 +53,6 @@ pub enum NoteScope {
     All,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ActionListItem {
-    pub id: String,
-    /// Origin discriminator (#111): `"note"` for markdown-checkbox-backed
-    /// rows, `"synth"` for synthesizer-emitted rows. Drives row click-
-    /// through and the per-origin write dispatch inside the unified
-    /// IPCs.
-    pub origin_kind: String,
-    /// Source note path for note-origin rows; `None` for synth rows
-    /// (no underlying file).
-    pub origin_note_path: Option<String>,
-    /// 1-based source-line for note-origin rows; `None` for synth rows.
-    pub origin_line: Option<i64>,
-    /// Note title when `origin_note_path` resolves, `None` otherwise.
-    pub note_title: Option<String>,
-    /// Synth source kind (`"email" | "event" | "note"`) when the
-    /// synthesizer paraphrased this row (#111). `None` for note-origin
-    /// rows. Powers the workstream detail's per-row "open source"
-    /// affordance and the AI ask prompt's "from {kind}" label.
-    pub origin_synth_kind: Option<String>,
-    /// Connector-qualified id of the synth source row. `None` for
-    /// note-origin rows.
-    pub origin_synth_id: Option<String>,
-    /// Direct workstream attachment id. Set by the synthesizer on a
-    /// `'synth'` row or by the user via `set_action_workstream` on any
-    /// origin (#111).
-    pub workstream_id: Option<String>,
-    /// Workstream title joined from `workstream_id` for render.
-    pub workstream_title: Option<String>,
-    pub text: String,
-    pub done: bool,
-    pub created_ms: i64,
-    /// Absolute due-date timestamp (Unix ms). For note-origin rows,
-    /// parsed from a trailing `@YYYY-MM-DD[ HH:MM]` token; for synth
-    /// rows, set by the synthesizer.
-    pub due_ms: Option<i64>,
-    /// `team_members.id` when the action has a resolved owner. Note-
-    /// origin: matched the leading `Owner — ` segment (#49). Synth:
-    /// stamped by the synthesizer or manually set via
-    /// `set_action_assignee` (#111).
-    pub assignee_id: Option<String>,
-    /// Canonical display name from `team_members`, joined for render so
-    /// the frontend can surface an avatar chip without a second
-    /// round-trip (#50/#51).
-    pub assignee_display_name: Option<String>,
-    /// For waiting-extracted synth rows, points at the *other* person
-    /// in the conversation (counterparty of the assignee). NULL for
-    /// note-origin rows and any synth row with no single counterparty.
-    pub subject_member_id: Option<String>,
-    /// 1 once the user has touched this synth row; the profile worker
-    /// stops auto-modifying it after that. Avoids the user-unchecks /
-    /// worker-rechecks loop.
-    pub manual_override: bool,
-    /// Stamped by the worker (NOT the user) when auto-resolve flipped
-    /// `done` after the hysteresis threshold (#124). Drives the
-    /// "Margin auto-resolved" pill on the action row; clicking the
-    /// pill calls `undo_auto_resolved_action` to reopen + lock.
-    pub auto_resolved_ms: Option<i64>,
-}
-
-#[derive(Deserialize, Default, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum ActionScope {
-    #[default]
-    Open,
-    Done,
-    All,
-}
-
 fn new_note_ref(id: String) -> NoteRef {
     NoteRef {
         // After #112 the `note_path`-named field carries the note id,
@@ -140,11 +70,6 @@ fn current_unix_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
-
-/// Reserved id for the catch-all "Inbox" note that holds quick
-/// todos created without a source note. Stable across sessions so the
-/// frontend can find-or-create with a single call.
-pub const INBOX_BUNDLE_ID: &str = "inbox";
 
 /// Create a new note row and return its id (#112). No disk write
 /// happens at create time — the per-note bundle directory under
@@ -180,42 +105,6 @@ pub fn create_note(
     )
     .map_err(|e| e.to_string())?;
     Ok(new_note_ref(id))
-}
-
-/// Find-or-create the Inbox note and return its NoteRef. Quick todos
-/// from the Action items page get appended to this note's body via the
-/// normal `write_note` round-trip (#112).
-#[tauri::command]
-pub fn ensure_inbox_note(
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<NoteRef, String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    let exists: bool = c
-        .query_row(
-            "SELECT 1 FROM notes WHERE id = ?1",
-            rusqlite::params![INBOX_BUNDLE_ID],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .is_some();
-    if !exists {
-        let now = current_unix_ms();
-        c.execute(
-            "INSERT INTO notes(id, bundle_id, title, body_md, modified_ms, \
-                               preview, body_size, created_ms) \
-             VALUES (?1, ?1, 'Inbox', '# Inbox\n', ?2, '', 8, ?2)",
-            rusqlite::params![INBOX_BUNDLE_ID, now],
-        )
-        .map_err(|e| e.to_string())?;
-        c.execute(
-            "INSERT INTO notes_fts(note_id, title, body) \
-             VALUES (?1, 'Inbox', '# Inbox\n')",
-            rusqlite::params![INBOX_BUNDLE_ID],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    Ok(new_note_ref(INBOX_BUNDLE_ID.to_string()))
 }
 
 /// Clone a note into a new row (#112). Title and tags carry over;
@@ -325,58 +214,6 @@ pub fn search_notes(
     let c = conn.lock().map_err(|e| e.to_string())?;
     crate::index::search_notes(&c, &query, limit.unwrap_or(20))
         .map_err(|e| e.to_string())
-}
-
-/// Return action items from the unified `actions` table (#111), scoped
-/// by done-state, optional assignee, and optional workstream
-/// attachment. Default scope is `Open`. Joins surface the source note's
-/// or workstream's title for display without a second round-trip.
-#[tauri::command]
-pub fn list_actions(
-    scope: Option<ActionScope>,
-    assignee_id: Option<String>,
-    workstream_id: Option<String>,
-    subject_member_id: Option<String>,
-    origin_synth_kinds: Option<Vec<String>>,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<Vec<ActionListItem>, String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    let kinds_json = origin_synth_kinds
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".into()));
-    crate::index::list_actions(
-        &c,
-        scope.unwrap_or_default(),
-        assignee_id.as_deref(),
-        workstream_id.as_deref(),
-        subject_member_id.as_deref(),
-        kinds_json.as_deref(),
-    )
-    .map_err(|e| e.to_string())
-}
-
-/// Per-note actions for the note-view sidebar (#145). Returns both
-/// origins (reconcile + note + any synth row pinned via origin_note_id)
-/// and both done states. Ordering: created_ms DESC.
-#[tauri::command]
-pub fn list_actions_for_note(
-    note_id: String,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<Vec<ActionListItem>, String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    crate::index::list_actions_for_note(&c, &note_id).map_err(|e| e.to_string())
-}
-
-/// Phase 1.4 (#146) — one-time backfill of pre-#144 reconciled notes
-/// into reconcile-origin rows. Idempotent. The boot sweep auto-runs
-/// this once; the Settings button re-runs it on demand.
-#[tauri::command]
-pub fn migrate_reconciled_notes_to_action_rows(
-    dry_run: bool,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<crate::actions_migration::MigrationReport, String> {
-    let mut c = conn.lock().map_err(|e| e.to_string())?;
-    crate::actions_migration::run(&mut c, dry_run)
 }
 
 #[derive(Serialize)]
@@ -592,8 +429,8 @@ pub struct WriteNoteResult {
 
 /// Persist a note body and refresh derived state in one transaction
 /// (#112). Re-derives title from `body`, refreshes FTS, reparses
-/// `- [ ]` lines into the unified `actions` table, emits
-/// `note_modified` and `action_*` events — all atomically.
+/// `- [?]` lines into the open-questions table, emits the
+/// `note_modified` event — all atomically.
 ///
 /// `tags` / `archived` / `favorite` are NOT touched here; those
 /// surfaces have their own DB-only IPCs (`set_note_tags` /
@@ -633,7 +470,7 @@ pub fn write_note(
     let mut c = conn.lock().map_err(|e| e.to_string())?;
     {
         let tx = c.transaction().map_err(|e| e.to_string())?;
-        // Body + derived columns + FTS + actions in one go.
+        // Body + derived columns + FTS + open questions in one go.
         let parsed = crate::index::parse_indexable_from_body(&note_id, &final_body, now);
         crate::index::upsert_in_tx(&tx, &note_id, &parsed).map_err(|e| e.to_string())?;
         // Flag + tag side-effects share the same transaction so a
@@ -716,359 +553,6 @@ pub fn set_archived(
         rusqlite::params![note_id, archived as i64],
     )
     .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Read just the dispatch fields for an action: origin_kind +
-/// origin_note_id + origin_line + text + assignee_id. For synth-
-/// origin rows the note locator fields are NULL.
-struct ActionDispatch {
-    origin_kind: String,
-    origin_note_id: Option<String>,
-    origin_line: Option<usize>,
-    text: String,
-    assignee_id: Option<String>,
-}
-
-fn load_action_dispatch(
-    conn: &rusqlite::Connection,
-    id: &str,
-) -> Result<ActionDispatch, String> {
-    conn.query_row(
-        "SELECT origin_kind, origin_note_id, origin_line, text, assignee_id \
-           FROM actions WHERE id = ?1",
-        rusqlite::params![id],
-        |r| {
-            Ok(ActionDispatch {
-                origin_kind: r.get::<_, String>(0)?,
-                origin_note_id: r.get::<_, Option<String>>(1)?,
-                origin_line: r
-                    .get::<_, Option<i64>>(2)?
-                    .map(|n| n as usize),
-                text: r.get::<_, String>(3)?,
-                assignee_id: r.get::<_, Option<String>>(4)?,
-            })
-        },
-    )
-    .map_err(|e| e.to_string())
-}
-
-/// Toggle the done state of an action item by its derived id (#111).
-///
-/// Dispatches on `origin_kind`:
-///   - `'note'`: round-trip through the source markdown — find the line
-///     (cached index first, then text-hash scan), flip the
-///     `[ ]`/`[x]` marker, write the file back. `touch_index` queues
-///     a reindex which republishes the row via `upsert_in_tx`.
-///   - everything else (`'synth'`, future `'inbox'`): pure DB write
-///     against the `actions` table; emits `action_completed` on a 0→1
-///     transition.
-/// Locate the action's line in `body_md`. Tries the cached line
-/// index first, then falls back to a full hash scan. Returns the
-/// 0-based line index when found.
-fn locate_action_line(
-    body_md: &str,
-    cached_line: usize,
-    want_text: &str,
-) -> Option<usize> {
-    let lines: Vec<&str> = body_md.split('\n').collect();
-    let want_hash = action_text_hash(want_text);
-    if cached_line >= 1 && cached_line <= lines.len() {
-        if let Some((line_text, _, _)) =
-            parse_action_line(lines[cached_line - 1].trim_start())
-        {
-            if action_text_hash(&line_text) == want_hash {
-                return Some(cached_line - 1);
-            }
-        }
-    }
-    for (i, line) in lines.iter().enumerate() {
-        if let Some((line_text, _, _)) = parse_action_line(line.trim_start()) {
-            if action_text_hash(&line_text) == want_hash {
-                return Some(i);
-            }
-        }
-    }
-    None
-}
-
-/// Mutate the body of a note-origin action by `mutate` and write the
-/// new body back atomically through `upsert_in_tx`. Common scaffold
-/// for `set_action_done` / `set_action_assignee` / `delete_action`.
-///
-/// `mutate` returns `Ok(Some(new_line))` to replace the line,
-/// `Ok(None)` to delete it, or `Err` to abort.
-///
-/// `log_delete_action_id` — when `Some`, snapshots the named action
-/// row into `action_deletions` with `cause='user_delete'` inside the
-/// same tx that performs the body rewrite. Used by `delete_action`
-/// so #148/#149/#150 can suppress future re-emissions of the same
-/// text. Other callers pass `None` (a checkbox toggle isn't a delete).
-fn mutate_note_action_body<F>(
-    note_id: &str,
-    cached_line: usize,
-    want_text: &str,
-    conn: &tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-    mutate: F,
-    log_delete_action_id: Option<&str>,
-) -> Result<(), String>
-where
-    F: FnOnce(&str) -> Result<Option<String>, String>,
-{
-    let mut c = conn.lock().map_err(|e| e.to_string())?;
-    let body: String = c
-        .query_row(
-            "SELECT body_md FROM notes WHERE id = ?1",
-            rusqlite::params![note_id],
-            |r| r.get::<_, String>(0),
-        )
-        .map_err(|e| format!("note not found: {e}"))?;
-    let idx = locate_action_line(&body, cached_line, want_text).ok_or_else(|| {
-        "Action not found in note (index may be stale; reload to refresh)".to_string()
-    })?;
-    let mut lines: Vec<String> = body.split('\n').map(|s| s.to_string()).collect();
-    match mutate(&lines[idx])? {
-        Some(new_line) => {
-            if new_line == lines[idx] {
-                return Ok(());
-            }
-            lines[idx] = new_line;
-        }
-        None => {
-            lines.remove(idx);
-        }
-    }
-    let new_body = lines.join("\n");
-    let now = current_unix_ms();
-    let tx = c.transaction().map_err(|e| e.to_string())?;
-    if let Some(action_id) = log_delete_action_id {
-        crate::action_deletions::log_deletion(
-            &tx,
-            action_id,
-            crate::action_deletions::Cause::UserDelete,
-            now,
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    let parsed = crate::index::parse_indexable_from_body(note_id, &new_body, now);
-    crate::index::upsert_in_tx(&tx, note_id, &parsed).map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_action_done(
-    id: String,
-    done: bool,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let dispatch = {
-        let c = conn.lock().map_err(|e| e.to_string())?;
-        load_action_dispatch(&c, &id)?
-    };
-
-    if dispatch.origin_kind != "note" {
-        let c = conn.lock().map_err(|e| e.to_string())?;
-        return crate::workstreams::persist::set_action_done(&c, &id, done)
-            .map_err(|e| e.to_string());
-    }
-
-    let note_id = dispatch.origin_note_id.ok_or_else(|| {
-        "note-origin action has no origin_note_id (corrupt row)".to_string()
-    })?;
-    let cached_line = dispatch.origin_line.unwrap_or(0);
-    mutate_note_action_body(
-        &note_id,
-        cached_line,
-        &dispatch.text,
-        &conn,
-        |line| Ok(Some(toggle_checkbox_marker(line, done))),
-        None,
-    )
-}
-
-/// Undo a worker auto-resolution (#124). Reopens the row, locks it
-/// with `manual_override = 1` so the worker can't re-resolve, and
-/// clears the hysteresis bookkeeping. Guarded by
-/// `auto_resolved_ms IS NOT NULL` so misfires from the frontend
-/// can't accidentally reopen a user-completed action.
-#[tauri::command]
-pub fn undo_auto_resolved_action(
-    id: String,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    crate::workstreams::persist::undo_auto_resolved_action(&c, &id)
-        .map_err(|e| e.to_string())
-}
-
-/// Reassign an action item to a different team member, or unassign
-/// (#51, #111). Note-origin rows write through the markdown — the
-/// leading `Owner — ` prefix is replaced/prepended/stripped via
-/// `rewrite_action_owner`; `assignee_id` is re-resolved on the next
-/// reindex pass. Synth-origin rows write the column directly. No-op
-/// when the new assignee already matches the current one.
-#[tauri::command]
-pub fn set_action_assignee(
-    action_id: String,
-    member_id: Option<String>,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let dispatch = {
-        let c = conn.lock().map_err(|e| e.to_string())?;
-        load_action_dispatch(&c, &action_id)?
-    };
-
-    if member_id == dispatch.assignee_id {
-        return Ok(());
-    }
-
-    if dispatch.origin_kind != "note" {
-        let c = conn.lock().map_err(|e| e.to_string())?;
-        return crate::workstreams::persist::set_action_assignee(
-            &c,
-            &action_id,
-            member_id.as_deref(),
-        )
-        .map_err(|e| e.to_string());
-    }
-
-    let note_id = dispatch.origin_note_id.ok_or_else(|| {
-        "note-origin action has no origin_note_id (corrupt row)".to_string()
-    })?;
-    let cached_line = dispatch.origin_line.unwrap_or(0);
-
-    // Resolve the new member's canonical display name (if assigning).
-    // None member_id = unassign.
-    let new_owner_name: Option<String> = if let Some(id) = member_id.as_deref() {
-        let c = conn.lock().map_err(|e| e.to_string())?;
-        let members =
-            crate::team::list_team_members_raw(&c).map_err(|e| e)?;
-        match members.into_iter().find(|m| m.id == id) {
-            Some(m) => Some(m.display_name),
-            None => return Err(format!("team member not found: {id}")),
-        }
-    } else {
-        None
-    };
-
-    mutate_note_action_body(
-        &note_id,
-        cached_line,
-        &dispatch.text,
-        &conn,
-        |line| {
-            rewrite_action_owner(line, new_owner_name.as_deref())
-                .map(Some)
-                .ok_or_else(|| "action line is not a recognizable checkbox".to_string())
-        },
-        None,
-    )
-}
-
-/// "Ignore" a worker-extracted waiting action: record the source in
-/// `dismissed_action_sources` so the profile worker doesn't recreate
-/// it, then delete the action row. Idempotent — re-dismissing the
-/// same source is a no-op.
-#[tauri::command]
-pub fn dismiss_waiting_action(
-    id: String,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let mut c = conn.lock().map_err(|e| e.to_string())?;
-    let tx = c.transaction().map_err(|e| e.to_string())?;
-    let row: Option<(Option<String>, Option<String>, Option<String>)> = tx
-        .query_row(
-            "SELECT origin_synth_kind, origin_synth_id, assignee_id \
-               FROM actions WHERE id = ?1",
-            rusqlite::params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let now = crate::events::current_unix_ms();
-    if let Some((Some(kind), Some(ref_id), assignee_id)) = row {
-        tx.execute(
-            "INSERT OR IGNORE INTO dismissed_action_sources \
-                (origin_synth_kind, origin_synth_id, assignee_id, dismissed_ms) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![kind, ref_id, assignee_id, now],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    // Universal deletion log (#147). Written alongside the legacy
-    // `dismissed_action_sources` insert above; #149 will read this
-    // log and deprecate the legacy table.
-    crate::action_deletions::log_deletion(
-        &tx,
-        &id,
-        crate::action_deletions::Cause::UserDismiss,
-        now,
-    )
-    .map_err(|e| e.to_string())?;
-    tx.execute("DELETE FROM actions WHERE id = ?1", rusqlite::params![id])
-        .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Delete an action item (#111). Note-origin rows drop the literal
-/// `- [ ]` line from `body_md` and let `upsert_in_tx` cull the row on
-/// the next reparse. Synth-origin rows are deleted directly from the
-/// `actions` table.
-#[tauri::command]
-pub fn delete_action(
-    id: String,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let dispatch = {
-        let c = conn.lock().map_err(|e| e.to_string())?;
-        load_action_dispatch(&c, &id)?
-    };
-
-    if dispatch.origin_kind != "note" {
-        let mut c = conn.lock().map_err(|e| e.to_string())?;
-        return crate::workstreams::persist::delete_action(&mut c, &id)
-            .map_err(|e| e.to_string());
-    }
-
-    let note_id = dispatch.origin_note_id.ok_or_else(|| {
-        "note-origin action has no origin_note_id (corrupt row)".to_string()
-    })?;
-    let cached_line = dispatch.origin_line.unwrap_or(0);
-
-    mutate_note_action_body(
-        &note_id,
-        cached_line,
-        &dispatch.text,
-        &conn,
-        |_| Ok(None),
-        Some(&id),
-    )
-}
-
-/// Attach an action to a workstream (or clear the attachment when
-/// `workstream_id` is `None`) (#111). Works for any `origin_kind` — a
-/// note-origin row keeps its markdown line untouched; only the
-/// `actions.workstream_id` column changes. The next synthesizer pass
-/// treats a non-null attachment as a fixed pin and does not re-cluster
-/// it.
-#[tauri::command]
-pub fn set_action_workstream(
-    action_id: String,
-    workstream_id: Option<String>,
-    conn: tauri::State<'_, std::sync::Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let c = conn.lock().map_err(|e| e.to_string())?;
-    let changed = c
-        .execute(
-            "UPDATE actions SET workstream_id = ?2 WHERE id = ?1",
-            rusqlite::params![action_id, workstream_id],
-        )
-        .map_err(|e| e.to_string())?;
-    if changed == 0 {
-        return Err(format!("action not found: {action_id}"));
-    }
     Ok(())
 }
 
@@ -1238,9 +722,9 @@ fn locate_question_line(
     None
 }
 
-/// Generic body-mutate scaffold for question IPCs (#113). Mirrors
-/// `mutate_note_action_body`. `mutate` returns `Some(new_line)` to
-/// replace the line, `None` to delete it, `Err` to abort.
+/// Generic body-mutate scaffold for question IPCs (#113). `mutate`
+/// returns `Some(new_line)` to replace the line, `None` to delete it,
+/// `Err` to abort.
 fn mutate_note_question_body<F>(
     note_id: &str,
     cached_line: usize,
@@ -1375,7 +859,7 @@ pub fn reopen_open_question(
 
 /// Reassign a question to a different team member, or unassign with
 /// `None` (#113). Rewrites the leading `Asked-of — ` prefix on the
-/// markdown line — same machinery as `set_action_assignee`.
+/// markdown line.
 #[tauri::command]
 pub fn set_open_question_asked_of(
     id: String,
@@ -1419,7 +903,7 @@ pub fn set_open_question_asked_of(
         None
     };
     mutate_note_question_body(&note_id, origin_line, &text, &conn, |line| {
-        rewrite_action_owner(line, new_owner_name.as_deref())
+        rewrite_checkbox_owner(line, new_owner_name.as_deref())
             .map(Some)
             .ok_or_else(|| "question line is not a recognizable checkbox".to_string())
     })
@@ -1504,23 +988,6 @@ fn drop_trailing_answer(line: &str) -> String {
 
 // ===== end open questions =========================================
 
-/// Replace the character between `[` and `]` on the first checkbox the
-/// line contains. Preserves indentation, bullet character, and
-/// trailing text/whitespace. Always normalizes done to lowercase `x`.
-fn toggle_checkbox_marker(line: &str, done: bool) -> String {
-    if let Some(open) = line.find('[') {
-        let close = open + 2;
-        if line.as_bytes().get(close) == Some(&b']') {
-            let mut out = String::with_capacity(line.len());
-            out.push_str(&line[..open + 1]);
-            out.push(if done { 'x' } else { ' ' });
-            out.push_str(&line[open + 2..]);
-            return out;
-        }
-    }
-    line.to_string()
-}
-
 /// Flip the favorite flag on a note (#112). DB-only.
 #[tauri::command]
 pub fn set_favorite(
@@ -1538,56 +1005,17 @@ pub fn set_favorite(
     Ok(())
 }
 
-// ---------- Action items (markdown checkboxes) ---------------------------
+// ---------- Markdown checkbox parsing (open questions + due tokens) -------
 
-#[derive(Clone)]
-pub(crate) struct ParsedAction {
-    pub line: usize,
-    pub text: String,
-    pub done: bool,
-    /// Absolute due-date timestamp (Unix ms) if a recognized
-    /// `@YYYY-MM-DD[ HH:MM]` token trails the action text. Relative
-    /// tokens (`@today`, `@tomorrow`, `@<weekday>`) are stripped from
-    /// `text` but leave `due_ms` as `None`; they get normalized to
-    /// absolute on the next `write_note` call.
-    pub due_ms: Option<i64>,
-    /// Leading `Owner — ` segment extracted from `text`, or `None` when
-    /// the line has no recognizable space-flanked separator (#49). The
-    /// candidate name is preserved verbatim — case + accents — so the
-    /// resolver in `team::OwnerResolver` can normalize once and the raw
-    /// form is still available for diagnostics.
-    pub owner_candidate: Option<String>,
-}
-
-/// One open-question line extracted from a note body (#113). Same shape
-/// as `ParsedAction` minus the done/due fields — questions don't carry
-/// per-line state in the source markdown beyond `[?]` / `[x]`.
+/// One open-question line extracted from a note body (#113). Carries the
+/// `[?]` text plus an optional leading owner segment — questions don't
+/// carry per-line state in the source markdown beyond `[?]` / `[x]`.
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedQuestion {
     pub line: usize,
     pub text: String,
     /// Leading `Asked-of — ` segment, same convention as action owners.
     pub owner_candidate: Option<String>,
-}
-
-/// Walk a note body and return every markdown task line as a
-/// ParsedAction. Lines inside fenced code blocks are skipped (mirrors
-/// the heuristic used by `extract_preview` for prose extraction).
-pub(crate) fn parse_actions(body: &str) -> Vec<ParsedAction> {
-    let mut out = Vec::new();
-    walk_body_lines(body, |line_no, trimmed| {
-        if let Some((text, done, due_ms)) = parse_action_line(trimmed) {
-            let owner_candidate = extract_owner_candidate(&text);
-            out.push(ParsedAction {
-                line: line_no,
-                text,
-                done,
-                due_ms,
-                owner_candidate,
-            });
-        }
-    });
-    out
 }
 
 /// Walk a note body and return every `- [?]` line as a
@@ -1624,12 +1052,12 @@ fn walk_body_lines<F: FnMut(usize, &str)>(body: &str, mut yield_line: F) {
     }
 }
 
-/// Extract a leading `{Owner} {sep} ` segment from action text where
-/// `{sep}` is one of `—` (em-dash), `–` (en-dash), or `--` (double
-/// hyphen). The separator must be flanked by spaces — bare hyphens in
-/// natural language (`self-driving`, `Tom—task`) are never treated as
-/// owner separators (#49). Returns the trimmed owner candidate, or
-/// `None`.
+/// Extract a leading `{Owner} {sep} ` segment from a checkbox line's
+/// text where `{sep}` is one of `—` (em-dash), `–` (en-dash), or `--`
+/// (double hyphen). The separator must be flanked by spaces — bare
+/// hyphens in natural language (`self-driving`, `Tom—task`) are never
+/// treated as owner separators (#49). Returns the trimmed owner
+/// candidate, or `None`.
 pub(crate) fn extract_owner_candidate(text: &str) -> Option<String> {
     const SEPARATORS: &[&str] = &[" — ", " – ", " -- "];
     let mut earliest: Option<usize> = None;
@@ -1673,19 +1101,18 @@ pub(crate) fn strip_leading_owner_segment(text: &str) -> &str {
     }
 }
 
-/// Replace, prepend, or strip the leading `{Owner} — ` segment of an
-/// action line (#51). Preserves the indentation, bullet character,
-/// checkbox marker, and the rest of the line text (including any
-/// trailing `@<token>`). Returns `None` when `line` is not a recognized
-/// markdown checkbox.
+/// Replace, prepend, or strip the leading `{Owner} — ` segment of a
+/// markdown checkbox line. Preserves the indentation, bullet character,
+/// checkbox marker (`[ ]` / `[x]` / `[?]` …), and the rest of the line
+/// text. Returns `None` when `line` is not a recognized markdown
+/// checkbox. Used to set/clear the `Asked-of — ` prefix on open-question
+/// (`[?]`) lines (#51/#113).
 ///
 /// - `Some(name)` → produce `{name} — {body without prior owner prefix}`.
 /// - `None`       → strip any prior owner prefix.
 ///
-/// Always emits the canonical em-dash separator on output regardless of
-/// what was on input. Returns `Some(line.to_string())` unchanged when
-/// the rewrite would be a no-op.
-pub(crate) fn rewrite_action_owner(line: &str, new_owner: Option<&str>) -> Option<String> {
+/// Always emits the canonical em-dash separator regardless of input.
+pub(crate) fn rewrite_checkbox_owner(line: &str, new_owner: Option<&str>) -> Option<String> {
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
     let trimmed = &line[indent_len..];
@@ -1707,11 +1134,11 @@ pub(crate) fn rewrite_action_owner(line: &str, new_owner: Option<&str>) -> Optio
     if bytes.len() < 4 || bytes[0] != b'[' || bytes[2] != b']' || bytes[3] != b' ' {
         return None;
     }
-    let done_marker = &after_bullet[..4]; // "[ ] " or "[x] " or "[X] "
+    let done_marker = &after_bullet[..4]; // "[ ] " / "[x] " / "[?] " …
     let body_with_at = &after_bullet[4..];
 
-    // Pure body manipulation: strip any prior owner prefix, then
-    // optionally prepend the new one with the canonical em-dash.
+    // Strip any prior owner prefix, then optionally prepend the new one
+    // with the canonical em-dash.
     let stripped = strip_leading_owner_segment(body_with_at);
     let new_body = match new_owner {
         Some(name) => {
@@ -1726,35 +1153,6 @@ pub(crate) fn rewrite_action_owner(line: &str, new_owner: Option<&str>) -> Optio
     };
 
     Some(format!("{indent}{bullet_char} {done_marker}{new_body}"))
-}
-
-pub(crate) fn parse_action_line(line: &str) -> Option<(String, bool, Option<i64>)> {
-    let after_bullet = line
-        .strip_prefix("- ")
-        .or_else(|| line.strip_prefix("* "))
-        .or_else(|| line.strip_prefix("+ "))?;
-    let bytes = after_bullet.as_bytes();
-    // Need `[X] x` (4 ASCII bytes plus the body) — the body itself must
-    // be non-empty after trimming.
-    if bytes.len() < 4 || bytes[0] != b'[' || bytes[2] != b']' || bytes[3] != b' ' {
-        return None;
-    }
-    let done = match bytes[1] {
-        b' ' => false,
-        b'x' | b'X' => true,
-        _ => return None,
-    };
-    let raw_text = after_bullet[4..].trim();
-    if raw_text.is_empty() {
-        return None;
-    }
-    let (text, due_ms) = strip_trailing_due_token(raw_text);
-    if text.is_empty() {
-        // Token consumed the entire body. Treat as a no-text action and
-        // skip — same rule as the bare `- [ ]` case.
-        return None;
-    }
-    Some((text, done, due_ms))
 }
 
 /// Match `- [?] question text` / `* [?] …` / `+ [?] …` lines (#113).
@@ -1793,30 +1191,11 @@ fn strip_trailing_answer_segment(text: &str) -> &str {
     text
 }
 
-/// If `s` ends with a recognized ` @<token>`, return `(text_without_token,
-/// due_ms)` where `due_ms` is `Some` for absolute ISO tokens and `None`
-/// for relative ones (still stripped from text). If no recognizable token
-/// trails, returns the input unchanged with `due_ms = None`.
-fn strip_trailing_due_token(s: &str) -> (String, Option<i64>) {
-    let Some((prefix, token)) = take_trailing_at_token(s) else {
-        return (s.to_string(), None);
-    };
-    if let Some(due) = crate::dates::try_parse_absolute(&token) {
-        return (prefix, Some(due.timestamp_ms));
-    }
-    if crate::dates::is_relative(&token) {
-        return (prefix, None);
-    }
-    // Unrecognized → leave the @token in the text so the user can see
-    // and fix the typo. Don't punish them with a vanishing date.
-    (s.to_string(), None)
-}
-
 /// Resolve any trailing relative `@<token>` (today/tomorrow/weekday) on
 /// checkbox lines to its absolute `@YYYY-MM-DD` form, against `today`.
 /// Returns `Some(new_body)` if at least one substitution happened,
 /// `None` if the body was already canonical. Code-fenced lines are
-/// skipped — same heuristic as `parse_actions`.
+/// skipped — same heuristic as `parse_open_questions`.
 pub(crate) fn rewrite_relative_due_tokens(
     body: &str,
     today: chrono::NaiveDate,
@@ -1924,13 +1303,12 @@ fn take_trailing_at_token(s: &str) -> Option<(String, String)> {
     Some((prefix, token))
 }
 
-/// Stable per-text hash for action IDs. FNV-1a 64-bit, keep low 32 bits
-/// as 8 hex chars. No new dep; deterministic across builds.
+/// Stable per-text hash for open-question IDs. FNV-1a 64-bit, keep low
+/// 32 bits as 8 hex chars. No new dep; deterministic across builds.
 ///
-/// The hash is computed over the *stripped* `text` (trailing `@<token>`
-/// already removed by `parse_action_line`), so insert-side and
-/// `set_action_done` lookup-side hashes always match. Any future change
-/// to what gets stripped from the action body must be applied
+/// The hash is computed over the *stripped* question `text`, so
+/// insert-side and lookup-side hashes always match. Any future change to
+/// what gets stripped from the question body must be applied
 /// symmetrically on both sides or row identity will drift.
 pub(crate) fn action_text_hash(text: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -1939,10 +1317,6 @@ pub(crate) fn action_text_hash(text: &str) -> String {
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{:08x}", h as u32)
-}
-
-pub(crate) fn action_id(bundle_id: &str, text: &str) -> String {
-    format!("{bundle_id}:{}", action_text_hash(text))
 }
 
 /// Stable id for an open-question row (#113). The `q:` infix
@@ -2170,7 +1544,7 @@ pub fn discard_recording(
 }
 
 /// Delete a note row + its on-disk audio/transcript sidecars (#112).
-/// FK ON DELETE CASCADE handles tags / actions / meeting_attendees;
+/// FK ON DELETE CASCADE handles tags / meeting_attendees;
 /// the FTS row is dropped explicitly inside the transaction.
 #[tauri::command]
 pub fn delete_note(
@@ -2508,15 +1882,6 @@ mod tests {
             .collect();
         assert_eq!(tags, vec!["work".to_string()]);
 
-        let actions: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM actions WHERE origin_note_id = 'abc'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(actions, 1);
-
         let flag: String = conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'notes_body_backfill_done'",
@@ -2619,44 +1984,6 @@ mod tests {
         assert!(read_favorite(&map));
     }
 
-    #[test]
-    fn parse_actions_open_and_done() {
-        let body = "intro\n- [ ] alpha\n- [x] beta\n- [X] gamma\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].line, 2);
-        assert_eq!(got[0].text, "alpha");
-        assert!(!got[0].done);
-        assert_eq!(got[1].text, "beta");
-        assert!(got[1].done);
-        assert_eq!(got[2].text, "gamma");
-        assert!(got[2].done);
-    }
-
-    #[test]
-    fn parse_actions_alt_bullets() {
-        let body = "* [ ] starred\n+ [x] plussed\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].text, "starred");
-        assert!(got[1].done);
-    }
-
-    #[test]
-    fn parse_actions_skips_code_fences() {
-        let body = "intro\n```\n- [ ] inside fence\n```\n- [ ] after fence\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "after fence");
-    }
-
-    #[test]
-    fn parse_actions_skips_non_checkbox_lines() {
-        let body = "- regular bullet\n- [text]\n- [ ]nospace\n- [ ]\n";
-        let got = parse_actions(body);
-        assert!(got.is_empty(), "got: {:?}", got.iter().map(|a| &a.text).collect::<Vec<_>>());
-    }
-
     // ----- #113 open questions -----
 
     #[test]
@@ -2712,68 +2039,6 @@ mod tests {
     #[test]
     fn action_text_hash_stable_for_same_text() {
         assert_eq!(action_text_hash("hello"), action_text_hash("hello"));
-    }
-
-    #[test]
-    fn parse_actions_user_repro_real_lines() {
-        // Lines copied verbatim from a real note that wasn't getting
-        // chips on the Action items page.
-        let body = "- [ ] Follow up with Staatsanwaltschaft Heilbronn; propose Rahmenvertrag. @2026-05-11\n\
-                    - [ ] Send SUND login by Friday (refine over weekend if needed). @2026-05-08\n\
-                    - [x] Add upgrade button/page to Bridge app today (within 1\u{2013}2 hours), then notify so Siegfried email can go out. @2026-05-07 00:00\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 3, "expected three actions, got: {:?}", got.iter().map(|a| &a.text).collect::<Vec<_>>());
-        for a in &got {
-            assert!(a.due_ms.is_some(), "due_ms missing for: {:?}", a.text);
-            assert!(!a.text.contains('@'), "text not stripped: {:?}", a.text);
-        }
-    }
-
-    #[test]
-    fn parse_actions_strips_absolute_due_token() {
-        let body = "- [ ] Submit invoice @2026-05-15\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "Submit invoice");
-        assert!(got[0].due_ms.is_some());
-    }
-
-    #[test]
-    fn parse_actions_strips_absolute_due_with_time() {
-        let body = "- [ ] Stand-up @2026-05-15 09:00\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "Stand-up");
-        assert!(got[0].due_ms.is_some());
-    }
-
-    #[test]
-    fn parse_actions_strips_relative_token_but_no_due_ms() {
-        // Relative tokens are recognized and stripped from text, but due_ms
-        // stays None until rewrite_relative_due_tokens runs at write_note time.
-        let body = "- [ ] Schedule retro @tomorrow\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "Schedule retro");
-        assert!(got[0].due_ms.is_none());
-    }
-
-    #[test]
-    fn parse_actions_leaves_unrecognized_token_in_text() {
-        let body = "- [ ] Email someone@example.com\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "Email someone@example.com");
-        assert!(got[0].due_ms.is_none());
-    }
-
-    #[test]
-    fn parse_actions_leaves_garbage_at_token_in_text() {
-        let body = "- [ ] Task @notadate\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "Task @notadate");
-        assert!(got[0].due_ms.is_none());
     }
 
     #[test]
@@ -2932,94 +2197,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_actions_populates_owner_candidate() {
-        let body = "- [ ] Tom — write spec\n- [ ] no owner here\n";
-        let got = parse_actions(body);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].owner_candidate.as_deref(), Some("Tom"));
-        assert_eq!(got[0].text, "Tom — write spec");
-        assert_eq!(got[1].owner_candidate, None);
-        assert_eq!(got[1].text, "no owner here");
-    }
-
-    // ---------- #51 owner rewrite -------------------------------------
-
-    #[test]
-    fn rewrite_action_owner_replaces_existing_prefix() {
-        let got = rewrite_action_owner("- [ ] Heike — task", Some("Tom Ruesch"));
-        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
-    }
-
-    #[test]
-    fn rewrite_action_owner_prepends_when_absent() {
-        let got = rewrite_action_owner("- [ ] task", Some("Tom Ruesch"));
-        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
-    }
-
-    #[test]
-    fn rewrite_action_owner_strips_when_unassigning() {
-        let got = rewrite_action_owner("- [ ] Heike — task", None);
-        assert_eq!(got.as_deref(), Some("- [ ] task"));
-    }
-
-    #[test]
-    fn rewrite_action_owner_unassign_no_prefix_is_noop() {
-        let got = rewrite_action_owner("- [ ] task", None);
-        assert_eq!(got.as_deref(), Some("- [ ] task"));
-    }
-
-    #[test]
-    fn rewrite_action_owner_canonicalizes_separator() {
-        // En-dash + double-hyphen separators get rewritten as em-dash.
-        let got = rewrite_action_owner("- [ ] Heike – task", Some("Tom Ruesch"));
-        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
-        let got = rewrite_action_owner("- [ ] Heike -- task", Some("Tom Ruesch"));
-        assert_eq!(got.as_deref(), Some("- [ ] Tom Ruesch — task"));
-    }
-
-    #[test]
-    fn rewrite_action_owner_preserves_due_token() {
-        let got = rewrite_action_owner("- [ ] Heike — task @2026-05-15", Some("Tom"));
-        assert_eq!(got.as_deref(), Some("- [ ] Tom — task @2026-05-15"));
-    }
-
-    #[test]
-    fn rewrite_action_owner_preserves_done_marker_and_indent() {
-        let got = rewrite_action_owner("\t- [x] Heike — task", Some("Tom"));
-        assert_eq!(got.as_deref(), Some("\t- [x] Tom — task"));
-        let got = rewrite_action_owner("  * [X] Heike — task", Some("Tom"));
-        assert_eq!(got.as_deref(), Some("  * [X] Tom — task"));
-        let got = rewrite_action_owner("+ [ ] Heike — task", None);
-        assert_eq!(got.as_deref(), Some("+ [ ] task"));
-    }
-
-    #[test]
-    fn rewrite_action_owner_returns_none_for_non_checkbox() {
-        assert_eq!(rewrite_action_owner("plain text line", Some("Tom")), None);
-        assert_eq!(rewrite_action_owner("- not a checkbox", Some("Tom")), None);
-        assert_eq!(rewrite_action_owner("[x] bare bullet missing", Some("Tom")), None);
-    }
-
-    #[test]
-    fn strip_leading_owner_segment_handles_all_separators() {
-        assert_eq!(strip_leading_owner_segment("Tom — task"), "task");
-        assert_eq!(strip_leading_owner_segment("Tom – task"), "task");
-        assert_eq!(strip_leading_owner_segment("Tom -- task"), "task");
-    }
-
-    #[test]
-    fn strip_leading_owner_segment_leaves_compact_dashes_alone() {
-        assert_eq!(strip_leading_owner_segment("Tom—task"), "Tom—task");
-        assert_eq!(
-            strip_leading_owner_segment("Refactor self-driving cars"),
-            "Refactor self-driving cars"
-        );
-    }
-
-    #[test]
-    fn strip_leading_owner_segment_no_separator_unchanged() {
-        assert_eq!(strip_leading_owner_segment("write spec"), "write spec");
-        assert_eq!(strip_leading_owner_segment(""), "");
-    }
 }

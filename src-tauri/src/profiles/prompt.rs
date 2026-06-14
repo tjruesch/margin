@@ -139,7 +139,6 @@ pub async fn build_prompt_inputs(
         accepted_observations,
         waiting_from_me,
         waiting_for_them,
-        recently_rejected_waiting,
     ) = {
         let conn_state = app.state::<std::sync::Mutex<Connection>>();
         let c = conn_state.lock().map_err(|e| e.to_string())?;
@@ -154,12 +153,6 @@ pub async fn build_prompt_inputs(
             .map_err(|e| format!("from_me candidates: {e}"))?;
         let for_them = crate::profiles::signals::candidates_for_them(&c, person_id, now_ms)
             .map_err(|e| format!("for_them candidates: {e}"))?;
-        let rejected =
-            crate::profiles::signals::recently_rejected_waiting(&c, person_id, now_ms)
-                .unwrap_or_else(|e| {
-                    eprintln!("[profiles] rejected-waiting fetch failed: {e}");
-                    None
-                });
         (
             load_member(&c, person_id)?,
             load_edges(&c, person_id)?,
@@ -167,7 +160,6 @@ pub async fn build_prompt_inputs(
             projected,
             from_me,
             for_them,
-            rejected,
         )
     };
     let display_name = member_block.display_name.clone();
@@ -206,7 +198,7 @@ pub async fn build_prompt_inputs(
         Vec::new()
     };
 
-    let mut payload = serde_json::json!({
+    let payload = serde_json::json!({
         "member": member_block,
         "edges": edge_rows,
         "events": event_rows,
@@ -217,14 +209,6 @@ pub async fn build_prompt_inputs(
             "for_them": waiting_for_them,
         },
     });
-    // Only insert the key when there's signal — keeps the prompt
-    // clean in the steady state and makes the JSON diff-friendly when
-    // a new rejection lands.
-    if let Some(rejected) = recently_rejected_waiting {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("recently_rejected_waiting".to_string(), rejected);
-        }
-    }
     Ok(payload)
 }
 
@@ -471,13 +455,7 @@ KEEP examples:\n\
     * Pending decision waiting on the user (\"Sollen wir mit X oder Y weitergehen?\").\n\
 \n\
 - Cap each direction at 5 items; if you have more substantive candidates than that, pick the highest-stakes (deadlines, decisions, blockers) over the smallest-ask ones.\n\
-- Never emit a source_ref_id that wasn't in the candidate set — the post-parse validator will drop it anyway.\n\
-\n\
-Recently rejected (user signal):\n\
-- The user message may include `recently_rejected_waiting`: keyed by `source_kind` (`email`/`teams`/`meeting`), each value is an array of short action-item texts the user previously deleted or dismissed for this person (last 30 days).\n\
-- These are strong signal that you proposed something the user didn't want. Be **much more selective** when emitting candidates that resemble them. Resemblance is your judgment — same topic, same recipient, same phrasing all count.\n\
-- When in doubt, DROP rather than re-emit. The user can always check the source candidate directly if needed; getting a rejected item back as a waiting action is worse than missing one.\n\
-- The field is omitted entirely when no matching rejections exist.";
+- Never emit a source_ref_id that wasn't in the candidate set — the post-parse validator will drop it anyway.";
 
 pub async fn call_anthropic(
     api_key: &str,

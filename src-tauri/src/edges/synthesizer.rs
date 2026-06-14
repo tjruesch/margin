@@ -1,8 +1,8 @@
 //! Deterministic edge synthesizer (#103). Walks events + entity tables
 //! and re-derives the `edges` graph layer. No LLM calls.
 //!
-//! Seven edge kinds in v1: AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED,
-//! ATTENDED, INCLUDES, OWNS. Each kind runs as its own UPSERT pass
+//! Six edge kinds in v1: AUTHORED, REPLIED_TO, MENTIONED, CO_ATTENDED,
+//! ATTENDED, INCLUDES. Each kind runs as its own UPSERT pass
 //! against `edges` keyed on the natural PK (src, src_id, tgt, tgt_id,
 //! edge_kind). Re-running the synth is idempotent: `first_seen_ms` is
 //! preserved, `last_seen_ms` and `confidence` get monotonically updated.
@@ -134,7 +134,6 @@ fn run_passes(
     // new workstream_signals / calendar_attendees / assignees show up.
     run_includes_pass(conn, report)?;
     run_attended_pass(conn, report)?;
-    run_owns_pass(conn, report)?;
     run_authored_pass(conn, report)?;
 
     // Inference passes.
@@ -185,29 +184,6 @@ fn run_attended_pass(conn: &mut Connection, report: &mut EdgeSynthReport) -> Res
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     bump(report, "ATTENDED", n);
-    Ok(())
-}
-
-fn run_owns_pass(conn: &mut Connection, report: &mut EdgeSynthReport) -> Result<(), String> {
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let n1 = tx
-        .execute(
-            "INSERT INTO edges (src_kind, src_id, tgt_kind, tgt_id, edge_kind, \
-                                confidence, evidence, first_seen_ms, last_seen_ms) \
-             SELECT 'person', a.assignee_id, 'action', a.id, 'OWNS', \
-                    1.0, '[]', a.created_ms, a.created_ms \
-             FROM actions a WHERE a.assignee_id IS NOT NULL \
-             ON CONFLICT(src_kind, src_id, tgt_kind, tgt_id, edge_kind) DO UPDATE SET \
-                last_seen_ms = max(edges.last_seen_ms, excluded.last_seen_ms)",
-            [],
-        )
-        .map_err(|e| e.to_string())?;
-    // Synth-backed actions used to live in `workstream_actions`; after
-    // #111 they share the unified `actions` table with note-backed
-    // rows, so the first INSERT above already covers both. No second
-    // pass needed.
-    tx.commit().map_err(|e| e.to_string())?;
-    bump(report, "OWNS", n1);
     Ok(())
 }
 

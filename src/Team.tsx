@@ -1,67 +1,51 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ask } from "@tauri-apps/plugin-dialog";
 
-import { dueBucket } from "./dueLabel";
-import { ActionRow, BUCKET_ORDER } from "./Home";
 import { IconChevLeft, IconPlus, IconSearch, IconTrash } from "./icons";
 import { usePageDetailLifecycle } from "./pageDetail";
 import {
   AliasKind,
-  type ActionListItem,
   type ProfileObservation,
   type ProfileSnapshot,
   type ProfileSnapshotBody,
   type TeamMember,
-  type TeamWaitingCounts,
   type TypedAlias,
   acceptProfileObservation,
   countProfileSnapshots,
   createTeamMember,
   deleteTeamMember,
-  dismissWaitingAction,
   forceRecomputeProfile,
   getFirstProfileSnapshot,
   getProfileSnapshot,
   getProfileSnapshotAt,
-  listActions,
   listProfileObservations,
   listTeamMembers,
   pendingObservationCounts,
   rejectProfileObservation,
-  setActionDone,
-  teamWaitingCounts,
   updateTeamMember,
 } from "./file";
 
-const WAITING_SYNTH_KINDS = ["email_waiting", "teams_waiting", "meeting_waiting"];
 import { avatarColor, initialsFromName } from "./initials";
 
 export function TeamView({
   onOpenNote,
   onOpenWorkstream,
-  onToggleAction,
-  onReassignAction,
 }: {
   onOpenNote: (path: string) => void;
   /** Routes workstream-sourced rows to the Workstreams view (#100). */
   onOpenWorkstream: (id: string) => void;
-  onToggleAction: (id: string, nextDone: boolean) => void;
-  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
 }) {
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [pendingCounts, setPendingCounts] = useState<Record<string, number>>({});
-  const [waitingMap, setWaitingMap] = useState<
-    Record<string, TeamWaitingCounts>
-  >({});
   // Cross-link state (#115, lifted up for #116). Owned here so the
   // activity-popover → team-detail jump can seed both the highlight
   // and the active tab without per-mount races.
   const [highlightObsId, setHighlightObsId] = useState<string | null>(null);
   const [flashKey, setFlashKey] = useState(0);
   const [pendingTab, setPendingTab] = useState<
-    "profile" | "suggestions" | "tasks" | null
+    "profile" | "suggestions" | null
   >(null);
 
   const onCiteClick = useCallback((obsId: string) => {
@@ -101,12 +85,8 @@ export function TeamView({
 
   const reloadCounts = useCallback(async () => {
     try {
-      const [pending, waiting] = await Promise.all([
-        pendingObservationCounts(),
-        teamWaitingCounts(),
-      ]);
+      const pending = await pendingObservationCounts();
       setPendingCounts(pending);
-      setWaitingMap(waiting);
     } catch (err) {
       console.error("team counts fetch failed:", err);
     }
@@ -118,8 +98,8 @@ export function TeamView({
 
   // Tell App.tsx (and anyone else holding a member-list copy) that the
   // roster changed. Dispatched after any create / update / delete so
-  // the assignee-chip dropdown on action rows (#51) sees the new list
-  // without forcing a full app reload.
+  // member-name lookups across the app see the new list without forcing
+  // a full app reload.
   const announceTeamChanged = useCallback(() => {
     window.dispatchEvent(new CustomEvent("margin:team-changed"));
   }, []);
@@ -166,8 +146,6 @@ export function TeamView({
         onCiteClick={onCiteClick}
         onOpenNote={onOpenNote}
         onOpenWorkstream={onOpenWorkstream}
-        onToggleAction={onToggleAction}
-        onReassignAction={onReassignAction}
         onObservationsChanged={() => void reloadCounts()}
         onUpdated={(next) => {
           setMembers((prev) => prev.map((m) => (m.id === next.id ? next : m)));
@@ -186,7 +164,6 @@ export function TeamView({
     <ListPane
       members={members}
       pendingCounts={pendingCounts}
-      waitingMap={waitingMap}
       onSelect={setSelectedId}
       onCreated={async (m) => {
         await reload();
@@ -202,13 +179,11 @@ export function TeamView({
 function ListPane({
   members,
   pendingCounts,
-  waitingMap,
   onSelect,
   onCreated,
 }: {
   members: TeamMember[];
   pendingCounts: Record<string, number>;
-  waitingMap: Record<string, TeamWaitingCounts>;
   onSelect: (id: string) => void;
   onCreated: (member: TeamMember) => void;
 }) {
@@ -254,7 +229,7 @@ function ListPane({
       {members.length === 0 ? (
         <p className="home-empty">
           No team members yet — start with someone you work with regularly so
-          Claude can attribute action items to them by name.
+          their name can be recognized across your notes and meetings.
         </p>
       ) : (
         <>
@@ -315,7 +290,6 @@ function ListPane({
                         key={self.id}
                         member={self}
                         pendingCount={pendingCounts[self.id] ?? 0}
-                        waiting={waitingMap[self.id]}
                         onClick={() => onSelect(self.id)}
                       />
                     </div>
@@ -337,7 +311,6 @@ function ListPane({
                           key={m.id}
                           member={m}
                           pendingCount={pendingCounts[m.id] ?? 0}
-                          waiting={waitingMap[m.id]}
                           onClick={() => onSelect(m.id)}
                         />
                       ))}
@@ -356,16 +329,12 @@ function ListPane({
 function TeamRow({
   member,
   pendingCount,
-  waiting,
   onClick,
 }: {
   member: TeamMember;
   pendingCount: number;
-  waiting: TeamWaitingCounts | undefined;
   onClick: () => void;
 }) {
-  const onYou = waiting?.from_me ?? 0;
-  const onThem = waiting?.for_them ?? 0;
   return (
     <div
       className="team-row"
@@ -391,16 +360,6 @@ function TeamRow({
           </div>
         </div>
       </div>
-      <RowIndicator
-        count={onYou}
-        tone="on-you"
-        label={`${onYou} item${onYou === 1 ? "" : "s"} waiting on you`}
-      />
-      <RowIndicator
-        count={onThem}
-        tone="on-them"
-        label={`${onThem} item${onThem === 1 ? "" : "s"} waiting on ${member.display_name}`}
-      />
       <RowIndicator
         count={pendingCount}
         tone="suggestion"
@@ -540,8 +499,6 @@ function TeamDetail({
   onDeleted,
   onOpenNote,
   onOpenWorkstream,
-  onToggleAction,
-  onReassignAction,
   onObservationsChanged,
 }: {
   member: TeamMember;
@@ -549,7 +506,7 @@ function TeamDetail({
   pendingCount: number;
   highlightObsId: string | null;
   flashKey: number;
-  pendingTab: "profile" | "suggestions" | "tasks" | null;
+  pendingTab: "profile" | "suggestions" | null;
   onPendingTabConsumed: () => void;
   onBack: () => void;
   onSelectMember: (id: string) => void;
@@ -558,17 +515,15 @@ function TeamDetail({
   onDeleted: () => void;
   onOpenNote: (path: string) => void;
   onOpenWorkstream: (id: string) => void;
-  onToggleAction: (id: string, nextDone: boolean) => void;
-  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
   onObservationsChanged: () => void;
 }) {
-  const [tab, setTab] = useState<"profile" | "suggestions" | "tasks">("profile");
+  const [tab, setTab] = useState<"profile" | "suggestions">("profile");
   // Tell Home.tsx to drop its page-level H1 + list actions for as long
   // as this detail view is mounted (#117-ish navigation polish).
   usePageDetailLifecycle();
 
   // Reset to Profile when switching to a different member so the user
-  // never lands on a stale Tasks tab from the previous selection.
+  // never lands on a stale tab from the previous selection.
   useEffect(() => {
     setTab("profile");
   }, [member.id]);
@@ -617,7 +572,7 @@ function TeamDetail({
 
   const onDelete = async () => {
     const ok = await ask(
-      `Delete ${member.display_name}? Their profile and any meeting attendance records are removed. Action items already assigned to them stay, but become unassigned.`,
+      `Delete ${member.display_name}? Their profile and any meeting attendance records are removed.`,
       {
         title: "Delete team member?",
         kind: "warning",
@@ -718,15 +673,6 @@ function TeamDetail({
             <span className="actions-filter-count">{pendingCount}</span>
           )}
         </button>
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "tasks"}
-          className={"home-filter-chip" + (tab === "tasks" ? " active" : "")}
-          onClick={() => setTab("tasks")}
-        >
-          Tasks
-        </button>
       </div>
       {tab === "profile" && (
         <ProfileSnapshotPane
@@ -744,16 +690,6 @@ function TeamDetail({
           onChanged={onObservationsChanged}
           highlightId={highlightObsId}
           flashKey={flashKey}
-        />
-      )}
-      {tab === "tasks" && (
-        <TasksTab
-          member={member}
-          members={members}
-          onOpenNote={onOpenNote}
-          onOpenWorkstream={onOpenWorkstream}
-          onToggleAction={onToggleAction}
-          onReassignAction={onReassignAction}
         />
       )}
     </section>
@@ -775,59 +711,29 @@ function ProfileSnapshotPane({
   onOpenWorkstream: (id: string) => void;
   onCiteClick: (obsId: string) => void;
 }) {
-  const selfId = useMemo(
-    () => members.find((m) => m.is_self)?.id ?? null,
-    [members],
-  );
   const [snap, setSnap] = useState<ProfileSnapshot | null | "loading">(
     "loading",
   );
   const [acceptedById, setAcceptedById] = useState<
     Map<string, ProfileObservation>
   >(() => new Map());
-  const [onYou, setOnYou] = useState<ActionListItem[]>([]);
-  const [onThem, setOnThem] = useState<ActionListItem[]>([]);
   const [recomputing, setRecomputing] = useState(false);
-
-  const fetchWaiting = useCallback(async (memberId: string) => {
-    if (!selfId) return { fm: [], ft: [] };
-    const [fm, ft] = await Promise.all([
-      listActions({
-        scope: "open",
-        assigneeId: selfId,
-        subjectMemberId: memberId,
-        originSynthKinds: WAITING_SYNTH_KINDS,
-      }),
-      listActions({
-        scope: "open",
-        assigneeId: memberId,
-        subjectMemberId: selfId,
-        originSynthKinds: WAITING_SYNTH_KINDS,
-      }),
-    ]);
-    return { fm, ft };
-  }, [selfId]);
 
   useEffect(() => {
     let cancelled = false;
     setSnap("loading");
     setAcceptedById(new Map());
-    setOnYou([]);
-    setOnThem([]);
     void (async () => {
       try {
-        const [s, accepted, waiting] = await Promise.all([
+        const [s, accepted] = await Promise.all([
           getProfileSnapshot(member.id),
           listProfileObservations(member.id, "accepted"),
-          fetchWaiting(member.id),
         ]);
         if (cancelled) return;
         setSnap(s);
         const map = new Map<string, ProfileObservation>();
         for (const obs of accepted) map.set(obs.id, obs);
         setAcceptedById(map);
-        setOnYou(waiting.fm);
-        setOnThem(waiting.ft);
       } catch (err) {
         console.error("ProfileSnapshotPane fetch failed:", err);
         if (!cancelled) setSnap(null);
@@ -836,53 +742,23 @@ function ProfileSnapshotPane({
     return () => {
       cancelled = true;
     };
-  }, [member.id, fetchWaiting]);
+  }, [member.id]);
 
   const onRefresh = async () => {
     setRecomputing(true);
     try {
-      const [fresh, accepted, waiting] = await Promise.all([
+      const [fresh, accepted] = await Promise.all([
         forceRecomputeProfile(member.id),
         listProfileObservations(member.id, "accepted"),
-        fetchWaiting(member.id),
       ]);
       setSnap(fresh);
       const map = new Map<string, ProfileObservation>();
       for (const obs of accepted) map.set(obs.id, obs);
       setAcceptedById(map);
-      setOnYou(waiting.fm);
-      setOnThem(waiting.ft);
     } catch (err) {
       console.error("forceRecomputeProfile failed:", err);
     } finally {
       setRecomputing(false);
-    }
-  };
-
-  // Optimistic action mutations: update local state right away so the
-  // UI feels snappy, then re-fetch to converge with the DB.
-  const onResolve = async (actionId: string) => {
-    setOnYou((prev) => prev.filter((a) => a.id !== actionId));
-    setOnThem((prev) => prev.filter((a) => a.id !== actionId));
-    try {
-      await setActionDone(actionId, true);
-    } catch (err) {
-      console.error("setActionDone failed:", err);
-      const waiting = await fetchWaiting(member.id);
-      setOnYou(waiting.fm);
-      setOnThem(waiting.ft);
-    }
-  };
-  const onIgnore = async (actionId: string) => {
-    setOnYou((prev) => prev.filter((a) => a.id !== actionId));
-    setOnThem((prev) => prev.filter((a) => a.id !== actionId));
-    try {
-      await dismissWaitingAction(actionId);
-    } catch (err) {
-      console.error("dismissWaitingAction failed:", err);
-      const waiting = await fetchWaiting(member.id);
-      setOnYou(waiting.fm);
-      setOnThem(waiting.ft);
     }
   };
 
@@ -910,13 +786,9 @@ function ProfileSnapshotPane({
       snap={snap}
       members={members}
       acceptedById={acceptedById}
-      waitingOnYou={onYou}
-      waitingOnThem={onThem}
       onSelectMember={onSelectMember}
       onOpenWorkstream={onOpenWorkstream}
       onCiteClick={onCiteClick}
-      onResolveWaiting={(id) => void onResolve(id)}
-      onIgnoreWaiting={(id) => void onIgnore(id)}
       onRefresh={() => void onRefresh()}
       refreshing={recomputing}
     />
@@ -1094,26 +966,18 @@ function ProfileSnapshotView({
   snap,
   members,
   acceptedById,
-  waitingOnYou,
-  waitingOnThem,
   onSelectMember,
   onOpenWorkstream,
   onCiteClick,
-  onResolveWaiting,
-  onIgnoreWaiting,
   onRefresh,
   refreshing,
 }: {
   snap: ProfileSnapshot;
   members: TeamMember[];
   acceptedById: Map<string, ProfileObservation>;
-  waitingOnYou: ActionListItem[];
-  waitingOnThem: ActionListItem[];
   onSelectMember: (id: string) => void;
   onOpenWorkstream: (id: string) => void;
   onCiteClick: (obsId: string) => void;
-  onResolveWaiting: (actionId: string) => void;
-  onIgnoreWaiting: (actionId: string) => void;
   onRefresh: () => void;
   refreshing: boolean;
 }) {
@@ -1316,64 +1180,6 @@ function ProfileSnapshotView({
         )}
       </header>
 
-      {/* Zone 2 — Between you & them. Directional pair; highest
-          actionable content; deserves visual weight as a panel. */}
-      <section className="team-profile-waiting" aria-label="Between you and this person">
-        <div className="team-profile-waiting-col">
-          <div className="team-profile-waiting-head">
-            <span className="team-profile-waiting-label">
-              Waiting on you
-            </span>
-            {waitingOnYou.length > 0 && (
-              <span className="team-profile-waiting-count">
-                {waitingOnYou.length}
-              </span>
-            )}
-          </div>
-          {waitingOnYou.length > 0 ? (
-            <ul className="team-profile-waiting-list">
-              {waitingOnYou.map((a) => (
-                <WaitingActionRow
-                  key={a.id}
-                  action={a}
-                  onResolve={onResolveWaiting}
-                  onIgnore={onIgnoreWaiting}
-                />
-              ))}
-            </ul>
-          ) : (
-            <p className="team-profile-waiting-empty">All caught up.</p>
-          )}
-        </div>
-        <div className="team-profile-waiting-divider" aria-hidden="true" />
-        <div className="team-profile-waiting-col">
-          <div className="team-profile-waiting-head">
-            <span className="team-profile-waiting-label">
-              Waiting on {firstName}
-            </span>
-            {waitingOnThem.length > 0 && (
-              <span className="team-profile-waiting-count">
-                {waitingOnThem.length}
-              </span>
-            )}
-          </div>
-          {waitingOnThem.length > 0 ? (
-            <ul className="team-profile-waiting-list">
-              {waitingOnThem.map((a) => (
-                <WaitingActionRow
-                  key={a.id}
-                  action={a}
-                  onResolve={onResolveWaiting}
-                  onIgnore={onIgnoreWaiting}
-                />
-              ))}
-            </ul>
-          ) : (
-            <p className="team-profile-waiting-empty">Nothing outstanding.</p>
-          )}
-        </div>
-      </section>
-
       {/* Zone 3 — At-a-glance. Quieter visual weight; supports the
           hero without competing with it. Sections only render when
           their data is non-empty. */}
@@ -1548,52 +1354,6 @@ function ProfileSnapshotView({
         </button>
       </div>
     </div>
-  );
-}
-
-function WaitingActionRow({
-  action,
-  onResolve,
-  onIgnore,
-}: {
-  action: ActionListItem;
-  onResolve: (id: string) => void;
-  onIgnore: (id: string) => void;
-}) {
-  const kindIcon =
-    action.origin_synth_kind === "email_waiting"
-      ? "✉"
-      : action.origin_synth_kind === "teams_waiting"
-      ? "▣"
-      : "◷";
-  return (
-    <li className="team-profile-waiting-item team-profile-waiting-action">
-      <button
-        type="button"
-        className="team-profile-waiting-check"
-        aria-label="Resolve"
-        title="Resolve"
-        onClick={() => onResolve(action.id)}
-      >
-        ○
-      </button>
-      <span className="team-profile-waiting-kind" aria-hidden>
-        {kindIcon}
-      </span>
-      <span className="team-profile-waiting-body">{action.text}</span>
-      <span className="team-profile-waiting-meta">
-        {formatRelative(action.created_ms)}
-      </span>
-      <button
-        type="button"
-        className="team-profile-waiting-ignore"
-        aria-label="Ignore"
-        title="Ignore — won't surface again"
-        onClick={() => onIgnore(action.id)}
-      >
-        ×
-      </button>
-    </li>
   );
 }
 
@@ -1927,247 +1687,6 @@ function EditableField({
     >
       {display || placeholder || ""}
     </button>
-  );
-}
-
-// ---------- Tasks tab ----------------------------------------------------
-
-function TasksTab({
-  member,
-  members,
-  onOpenNote,
-  onOpenWorkstream,
-  onToggleAction,
-  onReassignAction,
-}: {
-  member: TeamMember;
-  members: TeamMember[];
-  onOpenNote: (path: string) => void;
-  onOpenWorkstream: (id: string) => void;
-  onToggleAction: (id: string, nextDone: boolean) => void;
-  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
-}) {
-  const [actions, setActions] = useState<ActionListItem[] | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    setActions(null);
-    void (async () => {
-      try {
-        const list = await listActions("all", member.id);
-        if (!cancelled) setActions(list);
-      } catch (err) {
-        console.error("listActions failed:", err);
-        if (!cancelled) setActions([]);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [member.id]);
-
-  // Optimistic toggle: flip the local copy immediately so the row
-  // updates without a refetch round-trip. The upstream onToggleAction
-  // writes to disk; on next reindex / re-render the source of truth
-  // matches.
-  const toggleLocal = useCallback(
-    (id: string, nextDone: boolean) => {
-      onToggleAction(id, nextDone);
-      setActions((prev) =>
-        prev === null
-          ? prev
-          : prev.map((a) => (a.id === id ? { ...a, done: nextDone } : a)),
-      );
-    },
-    [onToggleAction],
-  );
-
-  // Reassign with optimistic chip update + post-write refetch.
-  // Reassigning may move the action OUT of this member's tab (if the
-  // user picks someone else), so we always refetch after the IPC.
-  const reassignLocal = useCallback(
-    async (actionId: string, memberId: string | null) => {
-      const newName =
-        memberId === null
-          ? null
-          : members.find((m) => m.id === memberId)?.display_name ?? null;
-      setActions((prev) =>
-        prev === null
-          ? prev
-          : prev.map((a) =>
-              a.id === actionId
-                ? {
-                    ...a,
-                    assignee_id: memberId,
-                    assignee_display_name: newName,
-                  }
-                : a,
-            ),
-      );
-      try {
-        await onReassignAction(actionId, memberId);
-        // Action ID changes when text changes; refetch to pick it up.
-        const fresh = await listActions("all", member.id);
-        setActions(fresh);
-      } catch (err) {
-        console.error("reassign failed:", err);
-        try {
-          const fresh = await listActions("all", member.id);
-          setActions(fresh);
-        } catch {}
-      }
-    },
-    [members, member.id, onReassignAction],
-  );
-
-  const stats = useMemo(() => {
-    if (!actions) return { open: 0, dueThisWeek: 0, overdue: 0 };
-    const now = Date.now();
-    let open = 0;
-    let dueThisWeek = 0;
-    let overdue = 0;
-    for (const a of actions) {
-      if (a.done) continue;
-      open += 1;
-      if (a.due_ms == null) continue;
-      const bucket = dueBucket(a.due_ms, now);
-      if (bucket === "overdue") {
-        overdue += 1;
-        dueThisWeek += 1;
-      } else if (bucket === "today" || bucket === "soon") {
-        dueThisWeek += 1;
-      }
-    }
-    return { open, dueThisWeek, overdue };
-  }, [actions]);
-
-  const grouped = useMemo(() => {
-    const empty: Record<string, ActionListItem[]> = {
-      overdue: [],
-      today: [],
-      soon: [],
-      later: [],
-    };
-    const undated: ActionListItem[] = [];
-    if (!actions) return { byBucket: empty, undated };
-    const now = Date.now();
-    for (const a of actions) {
-      if (a.done) continue;
-      if (a.due_ms == null) {
-        undated.push(a);
-        continue;
-      }
-      const bucket = dueBucket(a.due_ms, now);
-      empty[bucket].push(a);
-    }
-    return { byBucket: empty, undated };
-  }, [actions]);
-
-  if (actions === null) {
-    return <div className="team-tasks-loading" />;
-  }
-
-  const totalOpen = stats.open;
-  const completed = actions.filter((a) => a.done);
-
-  return (
-    <div className="team-tasks-tab">
-      <div className="team-tasks-counters">
-        <span className="team-tasks-counter">
-          <strong>{stats.open}</strong> open
-        </span>
-        <span className="team-tasks-counter">
-          <strong>{stats.dueThisWeek}</strong> due this week
-        </span>
-        <span
-          className={
-            "team-tasks-counter overdue" + (stats.overdue > 0 ? " active" : "")
-          }
-        >
-          <strong>{stats.overdue}</strong> overdue
-        </span>
-      </div>
-
-      {totalOpen === 0 && completed.length === 0 ? (
-        <p className="home-empty">
-          No tasks attributed to {member.display_name} yet. Action items resolve
-          here when they're written as <code>{member.display_name} — task</code>{" "}
-          in any meeting note.
-        </p>
-      ) : (
-        <>
-          {BUCKET_ORDER.map(({ key, label }) => {
-            const items = grouped.byBucket[key];
-            if (!items || items.length === 0) return null;
-            return (
-              <div key={key} className={`home-action-bucket bucket-${key}`}>
-                <div className="home-action-bucket-head">
-                  <span className="home-action-bucket-label">{label}</span>
-                  <span className="home-action-bucket-count">{items.length}</span>
-                </div>
-                <div className="home-actions">
-                  {items.map((it) => (
-                    <ActionRow
-                      key={it.id}
-                      it={it}
-                      onToggle={toggleLocal}
-                      onOpenNote={onOpenNote}
-                      onOpenWorkstream={onOpenWorkstream}
-                      members={members}
-                      onReassign={(id, memberId) => void reassignLocal(id, memberId)}
-                    />
-                  ))}
-                </div>
-              </div>
-            );
-          })}
-          {grouped.undated.length > 0 && (
-            <div className="home-action-bucket bucket-undated">
-              <div className="home-action-bucket-head">
-                <span className="home-action-bucket-label">No due date</span>
-                <span className="home-action-bucket-count">
-                  {grouped.undated.length}
-                </span>
-              </div>
-              <div className="home-actions">
-                {grouped.undated.map((it) => (
-                  <ActionRow
-                    key={it.id}
-                    it={it}
-                    onToggle={toggleLocal}
-                    onOpenNote={onOpenNote}
-                    onOpenWorkstream={onOpenWorkstream}
-                    members={members}
-                    onReassign={(id, memberId) => void reassignLocal(id, memberId)}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-          {completed.length > 0 && (
-            <div className="home-action-bucket bucket-done">
-              <div className="home-action-bucket-head">
-                <span className="home-action-bucket-label">Completed</span>
-                <span className="home-action-bucket-count">{completed.length}</span>
-              </div>
-              <div className="home-actions">
-                {completed.map((it) => (
-                  <ActionRow
-                    key={it.id}
-                    it={it}
-                    onToggle={toggleLocal}
-                    onOpenNote={onOpenNote}
-                    onOpenWorkstream={onOpenWorkstream}
-                    members={members}
-                    onReassign={(id, memberId) => void reassignLocal(id, memberId)}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-        </>
-      )}
-    </div>
   );
 }
 

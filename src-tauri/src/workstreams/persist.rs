@@ -1,4 +1,4 @@
-//! Storage layer for workstreams + their pivots and actions.
+//! Storage layer for workstreams + their pivots.
 //!
 //! Mirrors the per-domain pattern from `connectors/calendar.rs` /
 //! `connectors/email.rs`: small, transparent functions that take a
@@ -6,11 +6,8 @@
 //! state, no caching. The synthesizer composes these into the
 //! end-to-end cluster pass.
 
-use std::collections::HashMap;
-
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use super::{
     ExternalParticipant, NoteRef, Workstream, WorkstreamDetail, WorkstreamLink,
@@ -34,7 +31,6 @@ pub struct SynthesizedWorkstream {
     pub member_emails: Vec<String>,
     pub member_events: Vec<String>,
     pub member_notes: Vec<String>,
-    pub actions: Vec<SynthesizedAction>,
     /// Optional status hint from Claude (#78). When set to `"active"`
     /// for a workstream that's currently archived, the synthesizer
     /// runs `resurrect_if_archived`. Other values are ignored — archive
@@ -45,17 +41,6 @@ pub struct SynthesizedWorkstream {
     /// self-parent / unknown-id rules; invalid values are silently
     /// dropped to NULL with a log line.
     pub parent_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SynthesizedAction {
-    pub text: String,
-    pub due_ms: Option<i64>,
-    pub source_kind: String,
-    pub source_id: String,
-    /// Resolved team_members.id when the synthesizer picked an
-    /// `owner_label` (#100). None means unowned/user-owned.
-    pub assignee_id: Option<String>,
 }
 
 // ----- meta key/value ------------------------------------------------------
@@ -89,7 +74,6 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0) AS ec, \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0) AS evc, \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0) AS nc, \
-                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0) AS ac, \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0) AS lc, \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -113,9 +97,8 @@ pub fn list_workstreams_active(conn: &Connection) -> rusqlite::Result<Vec<Workst
             email_count: r.get::<_, i64>(11)? as u32,
             event_count: r.get::<_, i64>(12)? as u32,
             note_count: r.get::<_, i64>(13)? as u32,
-            open_action_count: r.get::<_, i64>(14)? as u32,
-            link_count: r.get::<_, i64>(15)? as u32,
-            parent_workstream_id: r.get(16)?,
+            link_count: r.get::<_, i64>(14)? as u32,
+            parent_workstream_id: r.get(15)?,
             external_participants: Vec::new(),
         })
     })?;
@@ -139,7 +122,6 @@ pub fn list_workstreams_archived(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
-                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -163,9 +145,8 @@ pub fn list_workstreams_archived(
             email_count: r.get::<_, i64>(11)? as u32,
             event_count: r.get::<_, i64>(12)? as u32,
             note_count: r.get::<_, i64>(13)? as u32,
-            open_action_count: r.get::<_, i64>(14)? as u32,
-            link_count: r.get::<_, i64>(15)? as u32,
-            parent_workstream_id: r.get(16)?,
+            link_count: r.get::<_, i64>(14)? as u32,
+            parent_workstream_id: r.get(15)?,
             external_participants: Vec::new(),
         })
     })?;
@@ -194,7 +175,6 @@ pub fn list_workstreams_for_synthesis(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
-                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -223,9 +203,8 @@ pub fn list_workstreams_for_synthesis(
                 email_count: r.get::<_, i64>(11)? as u32,
                 event_count: r.get::<_, i64>(12)? as u32,
                 note_count: r.get::<_, i64>(13)? as u32,
-                open_action_count: r.get::<_, i64>(14)? as u32,
-                link_count: r.get::<_, i64>(15)? as u32,
-                parent_workstream_id: r.get(16)?,
+                link_count: r.get::<_, i64>(14)? as u32,
+                parent_workstream_id: r.get(15)?,
                 external_participants: Vec::new(),
             },
             is_archived,
@@ -290,7 +269,6 @@ pub fn get_workstream_detail(
         }
     }
 
-    let actions = list_actions_for(conn, id)?;
     // Open questions on this workstream (#113) inherit from the
     // attached notes via `workstream_signals(kind='note')`. The
     // `list_open_questions` IPC already does that join; we just
@@ -310,7 +288,6 @@ pub fn get_workstream_detail(
         emails,
         events,
         notes,
-        actions,
         open_questions,
         links,
         teams_messages,
@@ -331,7 +308,6 @@ pub fn list_children_of(
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
-                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w \
@@ -355,9 +331,8 @@ pub fn list_children_of(
             email_count: r.get::<_, i64>(11)? as u32,
             event_count: r.get::<_, i64>(12)? as u32,
             note_count: r.get::<_, i64>(13)? as u32,
-            open_action_count: r.get::<_, i64>(14)? as u32,
-            link_count: r.get::<_, i64>(15)? as u32,
-            parent_workstream_id: r.get(16)?,
+            link_count: r.get::<_, i64>(14)? as u32,
+            parent_workstream_id: r.get(15)?,
             external_participants: Vec::new(),
         })
     })?;
@@ -505,7 +480,6 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'email' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'event' AND manual_detached_ms IS NULL), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_signals WHERE workstream_id = w.id AND kind = 'note' AND manual_detached_ms IS NULL), 0), \
-                COALESCE((SELECT COUNT(*) FROM actions WHERE workstream_id = w.id AND done = 0), 0), \
                 COALESCE((SELECT COUNT(*) FROM workstream_links WHERE workstream_id = w.id), 0), \
                 w.parent_workstream_id \
          FROM workstreams w WHERE w.id = ?1",
@@ -528,9 +502,8 @@ fn get_workstream_one(conn: &Connection, id: &str) -> rusqlite::Result<Option<Wo
                 email_count: r.get::<_, i64>(11)? as u32,
                 event_count: r.get::<_, i64>(12)? as u32,
                 note_count: r.get::<_, i64>(13)? as u32,
-                open_action_count: r.get::<_, i64>(14)? as u32,
-                link_count: r.get::<_, i64>(15)? as u32,
-                parent_workstream_id: r.get(16)?,
+                link_count: r.get::<_, i64>(14)? as u32,
+                parent_workstream_id: r.get(15)?,
                 external_participants: Vec::new(),
             })
         })
@@ -764,68 +737,15 @@ fn attach_external_participants(
     Ok(())
 }
 
-/// Bulk fetch open action texts grouped by workstream id (#101). Used
-/// by the synthesizer prompt to render each workstream's current open
-/// actions so the model can dedupe against them on the next pass
-/// instead of re-emitting near-identical TODOs. Returns texts only
-/// (not full WorkstreamAction rows) — the prompt only displays them.
-/// Ordered by created_ms ASC so the prompt shows actions in stable
-/// chronological order; the caller caps per-workstream count.
-pub fn list_open_action_texts_grouped(
-    conn: &Connection,
-) -> rusqlite::Result<HashMap<String, Vec<String>>> {
-    // Unified actions table (#111): any row with a workstream_id
-    // contributes — note-origin rows that have been pinned to a
-    // workstream show up here too.
-    let mut stmt = conn.prepare(
-        "SELECT a.workstream_id, a.text \
-         FROM actions a \
-         JOIN workstreams w ON w.id = a.workstream_id \
-         WHERE a.done = 0 AND w.status IN ('active', 'archived') \
-         ORDER BY a.workstream_id, a.created_ms ASC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        let id: String = r.get(0)?;
-        let text: String = r.get(1)?;
-        Ok((id, text))
-    })?;
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    for row in rows {
-        let (id, text) = row?;
-        out.entry(id).or_default().push(text);
-    }
-    Ok(out)
-}
-
-fn list_actions_for(
-    conn: &Connection,
-    workstream_id: &str,
-) -> rusqlite::Result<Vec<crate::notes::ActionListItem>> {
-    // After the #111 unification the workstream detail's action list
-    // is just `list_actions` filtered by workstream_id with no
-    // done-scope (we want both open and done on the detail page).
-    // Surfacing through the unified type lets the WS detail page
-    // reuse the ActionRow / AssigneeChip stack on the frontend.
-    crate::index::list_actions(
-        conn,
-        crate::notes::ActionScope::All,
-        None,
-        Some(workstream_id),
-        None,
-        None,
-    )
-}
-
 // ----- Write helpers -------------------------------------------------------
 
-/// Upsert a workstream + replace its pivot sets + upsert actions in a
-/// single transaction. Returns the per-workstream contribution to the
-/// outer ClusterReport.
+/// Upsert a workstream + replace its pivot sets in a single
+/// transaction. Returns the per-workstream contribution to the outer
+/// ClusterReport.
 ///
 /// `record.id` is the existing workstream id when the synthesizer
 /// recognized this thread as a continuation; otherwise we generate a
-/// fresh `ws_<uuid>`. Action ids are content-hash so re-runs preserve
-/// the user's `done` flag.
+/// fresh `ws_<uuid>`.
 pub fn write_workstream(
     tx: &rusqlite::Transaction<'_>,
     record: &SynthesizedWorkstream,
@@ -917,121 +837,6 @@ pub fn write_workstream(
         }
         for np in &record.member_notes {
             stmt.execute(params![id, "note", np, now_ms])?;
-        }
-    }
-
-    // Self team_member id for events.actor_id fallback when an action
-    // has no explicit assignee (#106).
-    let self_id_for_events: Option<String> = tx
-        .query_row(
-            "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-
-    // Actions: write into the unified `actions` table with
-    // origin_kind='synth' (#111). Two changes from the legacy
-    // workstream_actions path:
-    //
-    //   1. Dedup against the literal `- [ ]` line: when source_kind
-    //      is 'note' and the source note already carries a row with
-    //      identical normalized text, attach workstream_id to that
-    //      note-origin row instead of inserting a parallel 'synth'
-    //      row. Exact match only (lowercased + trimmed) — see the
-    //      design discussion in #111. Synth interpretations that
-    //      diverge from the literal line keep their own row.
-    //
-    //   2. ON CONFLICT for an existing 'synth' row preserves done,
-    //      created_ms, AND assignee_id (user-mutable state) and
-    //      refreshes the synthesizer metadata. assignee_id is stamped
-    //      on insert from the synthesizer's owner resolution; on
-    //      update we keep whatever's there so a user reassignment
-    //      survives the next cluster pass.
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO actions (\
-                id, origin_kind, origin_synth_kind, origin_synth_id, \
-                workstream_id, text, due_ms, done, created_ms, assignee_id\
-             ) VALUES (?1, 'synth', ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
-             ON CONFLICT(id) DO UPDATE SET \
-                text = excluded.text, \
-                due_ms = excluded.due_ms, \
-                origin_synth_kind = excluded.origin_synth_kind, \
-                origin_synth_id = excluded.origin_synth_id, \
-                workstream_id = excluded.workstream_id",
-        )?;
-        for a in &record.actions {
-            // Dedup branch: for note-sourced synth output, look for an
-            // existing note-origin row on the same note with matching
-            // text. If found, pin the workstream_id on that row and
-            // skip the synth insert entirely.
-            if a.source_kind == "note" {
-                let dedup_target: Option<String> = tx
-                    .query_row(
-                        "SELECT id FROM actions \
-                          WHERE origin_kind = 'note' \
-                            AND origin_note_id = ?1 \
-                            AND lower(trim(text)) = lower(trim(?2)) \
-                          LIMIT 1",
-                        params![a.source_id, a.text],
-                        |r| r.get::<_, String>(0),
-                    )
-                    .optional()?;
-                if let Some(existing_id) = dedup_target {
-                    tx.execute(
-                        "UPDATE actions SET workstream_id = ?2 \
-                           WHERE id = ?1 \
-                             AND (workstream_id IS NULL OR workstream_id != ?2)",
-                        params![existing_id, id],
-                    )?;
-                    counts.actions_updated += 1;
-                    continue;
-                }
-            }
-
-            let aid = action_id(&id, &a.text);
-            let pre_existed_action: i64 = tx
-                .query_row(
-                    "SELECT 1 FROM actions WHERE id = ?1",
-                    params![aid],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or(0);
-            stmt.execute(params![
-                aid,
-                a.source_kind,
-                a.source_id,
-                id,
-                a.text,
-                a.due_ms,
-                now_ms,
-                a.assignee_id,
-            ])?;
-            if pre_existed_action == 0 {
-                // Live action_created event (#106).
-                let actor = a
-                    .assignee_id
-                    .as_deref()
-                    .or(self_id_for_events.as_deref());
-                let payload = serde_json::json!({
-                    "text": a.text,
-                    "workstream_id": id,
-                });
-                crate::events::emit(
-                    tx,
-                    now_ms,
-                    "action_created",
-                    actor,
-                    "action",
-                    &aid,
-                    &payload,
-                )?;
-                counts.actions_added += 1;
-            } else {
-                counts.actions_updated += 1;
-            }
         }
     }
 
@@ -1151,139 +956,6 @@ pub fn create_workstream(
         params![id, title, summary, now, parent_id],
     )?;
     Ok(Ok(id))
-}
-
-/// DB-only write path for toggling done on a synth-origin (or other
-/// non-note) row in the unified `actions` table (#111). Used by the
-/// unified `set_action_done` IPC for non-note origins; note-origin
-/// rows round-trip through the markdown file instead.
-pub fn set_action_done(
-    conn: &Connection,
-    action_id: &str,
-    done: bool,
-) -> rusqlite::Result<()> {
-    let was_done: i64 = conn
-        .query_row(
-            "SELECT done FROM actions WHERE id = ?1",
-            params![action_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    // Bump `manual_override` so the profile worker stops auto-touching
-    // this row (#120 follow-up). Also clear the hysteresis state
-    // (#124): a user-touched row shouldn't carry a stale
-    // auto-resolved stamp or omission counter — the pill must vanish
-    // on manual check, and a manual uncheck should reset cleanly so
-    // the next worker tick starts the counter from zero.
-    conn.execute(
-        "UPDATE actions \
-            SET done = ?2, \
-                manual_override = 1, \
-                auto_resolved_ms = NULL, \
-                auto_resolve_omissions = 0 \
-          WHERE id = ?1",
-        params![action_id, done as i64],
-    )?;
-    // Live action_completed event on a 0→1 transition (#106). Skipped
-    // when undoing (1→0) or when state didn't change.
-    if done && was_done == 0 {
-        let (text, assignee_id): (String, Option<String>) = conn
-            .query_row(
-                "SELECT text, assignee_id FROM actions WHERE id = ?1",
-                params![action_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-            )
-            .unwrap_or_default();
-        let self_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM team_members WHERE is_self = 1 LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
-        let actor = assignee_id.as_deref().or(self_id.as_deref());
-        // The events insert isn't atomic with the UPDATE above —
-        // worst-case desync: action is done in the table but no event
-        // row. Acceptable for v1; downstream consumers won't see a
-        // dropped completion as anything worse than missing telemetry.
-        let payload = serde_json::json!({ "text": text });
-        let tx = conn.unchecked_transaction()?;
-        crate::events::emit(
-            &tx,
-            crate::events::current_unix_ms(),
-            "action_completed",
-            actor,
-            "action",
-            action_id,
-            &payload,
-        )?;
-        tx.commit()?;
-    }
-    Ok(())
-}
-
-/// Undo a worker auto-resolution (#124). Reopens the row, locks it
-/// against further auto-resolve, and clears the hysteresis state.
-/// Guarded by `auto_resolved_ms IS NOT NULL` so the path is a no-op
-/// on rows the user (rather than the worker) marked done — those
-/// reopen via `set_action_done(_, false)` instead.
-pub fn undo_auto_resolved_action(
-    conn: &Connection,
-    action_id: &str,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE actions \
-            SET done = 0, \
-                manual_override = 1, \
-                auto_resolved_ms = NULL, \
-                auto_resolve_omissions = 0 \
-          WHERE id = ?1 \
-            AND origin_kind = 'synth' \
-            AND auto_resolved_ms IS NOT NULL",
-        params![action_id],
-    )?;
-    Ok(())
-}
-
-/// DB-only write path for reassigning a synth-origin row in the
-/// unified `actions` table (#111). User-authored override; preserved
-/// across re-synthesis because the upsert ON CONFLICT clause does not
-/// touch `assignee_id`.
-pub fn set_action_assignee(
-    conn: &Connection,
-    action_id: &str,
-    assignee_id: Option<&str>,
-) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE actions SET assignee_id = ?2, manual_override = 1 WHERE id = ?1",
-        params![action_id, assignee_id],
-    )?;
-    Ok(())
-}
-
-/// DB-only delete path for a synth-origin or reconcile-origin row in
-/// the unified `actions` table (#111). The synthesizer content-hashes
-/// ids over (workstream_id, text), so re-synthesis of the same text +
-/// workstream pair will recreate it — same trade-off as `done`,
-/// which is preserved on conflict.
-///
-/// Writes a snapshot to `action_deletions` (#147) in the same tx with
-/// `cause='user_delete'` so #148/#149/#150 can suppress future
-/// re-emissions of the same text.
-pub fn delete_action(conn: &mut Connection, action_id: &str) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    let now = crate::events::current_unix_ms();
-    crate::action_deletions::log_deletion(
-        &tx,
-        action_id,
-        crate::action_deletions::Cause::UserDelete,
-        now,
-    )?;
-    tx.execute(
-        "DELETE FROM actions WHERE id = ?1",
-        params![action_id],
-    )?;
-    tx.commit()
 }
 
 /// Apply a user-driven status change (#78). Stamps the appropriate
@@ -1659,17 +1331,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Stable id for a workstream action: sha256 of `workstream_id\ntrim(text)`.
-/// Re-runs that produce the same workstream + same action text generate
-/// the same id, so the upsert preserves any user-set `done`.
-pub fn action_id(workstream_id: &str, text: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(workstream_id.as_bytes());
-    h.update(b"\n");
-    h.update(text.trim().as_bytes());
-    format!("wsa_{:x}", h.finalize())
-}
-
 // ----- Tests ---------------------------------------------------------------
 
 #[cfg(test)]
@@ -1771,9 +1432,9 @@ mod tests {
              );",
         )
         .unwrap();
-        // #106 events table — needed by live emission in write_workstream
-        // and set_action_done. Backfill block produces zero rows against
-        // this fresh fixture (no source data); safe.
+        // #106 events table — needed by live emission in write_workstream.
+        // Backfill block produces zero rows against this fresh fixture
+        // (no source data); safe.
         conn.execute_batch(include_str!("../migrations/022_events_edges.sql"))
             .unwrap();
         // 023 (embeddings) references the sqlite-vec extension which
@@ -1872,7 +1533,7 @@ mod tests {
         .unwrap();
     }
 
-    fn make_ws(id: Option<&str>, title: &str, emails: &[&str], events: &[&str], notes: &[&str], actions: Vec<SynthesizedAction>) -> SynthesizedWorkstream {
+    fn make_ws(id: Option<&str>, title: &str, emails: &[&str], events: &[&str], notes: &[&str]) -> SynthesizedWorkstream {
         SynthesizedWorkstream {
             id: id.map(|s| s.to_string()),
             title: title.to_string(),
@@ -1880,19 +1541,8 @@ mod tests {
             member_emails: emails.iter().map(|s| s.to_string()).collect(),
             member_events: events.iter().map(|s| s.to_string()).collect(),
             member_notes: notes.iter().map(|s| s.to_string()).collect(),
-            actions,
             status: None,
             parent_id: None,
-        }
-    }
-
-    fn make_action(text: &str, source_kind: &str, source_id: &str) -> SynthesizedAction {
-        SynthesizedAction {
-            text: text.to_string(),
-            due_ms: None,
-            source_kind: source_kind.to_string(),
-            source_id: source_id.to_string(),
-            assignee_id: None,
         }
     }
 
@@ -1918,13 +1568,11 @@ mod tests {
             &["mg:test::m1"],
             &["mg:test::e1"],
             &["/n/a.md"],
-            vec![make_action("Send invoice", "email", "mg:test::m1")],
         );
         let counts = write_workstream(&tx, &ws, 5_000).unwrap();
         tx.commit().unwrap();
 
         assert!(counts.workstream_added);
-        assert_eq!(counts.actions_added, 1);
 
         let active = list_workstreams_active(&conn).unwrap();
         assert_eq!(active.len(), 1);
@@ -1932,7 +1580,6 @@ mod tests {
         assert_eq!(active[0].email_count, 1);
         assert_eq!(active[0].event_count, 1);
         assert_eq!(active[0].note_count, 1);
-        assert_eq!(active[0].open_action_count, 1);
         // last_activity = max(1000, 2000, 3000) = 3000
         assert_eq!(active[0].last_activity_ms, 3_000);
     }
@@ -1951,7 +1598,6 @@ mod tests {
             &["mg:test::m1"],
             &["mg:test::e1"],
             &[],
-            vec![],
         );
         write_workstream(&tx, &ws, 1_000).unwrap();
         tx.commit().unwrap();
@@ -1964,7 +1610,6 @@ mod tests {
             &["mg:test::m2"],
             &[],
             &[],
-            vec![],
         );
         let counts = write_workstream(&tx, &ws2, 2_000).unwrap();
         tx.commit().unwrap();
@@ -1975,155 +1620,6 @@ mod tests {
         assert_eq!(detail.emails.len(), 1);
         assert_eq!(detail.emails[0].id, "mg:test::m2");
         assert_eq!(detail.events.len(), 0);
-    }
-
-    #[test]
-    fn write_workstream_preserves_action_done_on_resync() {
-        let mut conn = open_test_db();
-        seed_email(&conn, "mg:test::m1", 1_000);
-
-        let tx = conn.transaction().unwrap();
-        write_workstream(
-            &tx,
-            &make_ws(
-                Some("ws1"),
-                "WS",
-                &["mg:test::m1"],
-                &[],
-                &[],
-                vec![make_action("Reply to invoice", "email", "mg:test::m1")],
-            ),
-            1_000,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        // User checks the action.
-        let aid = action_id("ws1", "Reply to invoice");
-        set_action_done(&conn, &aid, true).unwrap();
-        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
-        assert_eq!(detail.actions.len(), 1);
-        assert!(detail.actions[0].done);
-
-        // Re-sync emits the same action text.
-        let tx = conn.transaction().unwrap();
-        let counts = write_workstream(
-            &tx,
-            &make_ws(
-                Some("ws1"),
-                "WS",
-                &["mg:test::m1"],
-                &[],
-                &[],
-                vec![make_action("Reply to invoice", "email", "mg:test::m1")],
-            ),
-            2_000,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        assert_eq!(counts.actions_added, 0);
-        assert_eq!(counts.actions_updated, 1);
-
-        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
-        assert!(
-            detail.actions[0].done,
-            "done flag must survive a re-sync of the same action text"
-        );
-    }
-
-    #[test]
-    fn write_workstream_round_trips_action_assignee() {
-        let mut conn = open_test_db();
-        seed_email(&conn, "mg:test::m1", 1_000);
-        seed_team_member(&conn, "tm_alice");
-
-        let tx = conn.transaction().unwrap();
-        write_workstream(
-            &tx,
-            &make_ws(
-                Some("ws1"),
-                "WS",
-                &["mg:test::m1"],
-                &[],
-                &[],
-                vec![SynthesizedAction {
-                    text: "Send recap".into(),
-                    due_ms: None,
-                    source_kind: "email".into(),
-                    source_id: "mg:test::m1".into(),
-                    assignee_id: Some("tm_alice".into()),
-                }],
-            ),
-            1_000,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
-        assert_eq!(detail.actions.len(), 1);
-        assert_eq!(detail.actions[0].assignee_id.as_deref(), Some("tm_alice"));
-    }
-
-    #[test]
-    fn write_workstream_preserves_user_assignee_on_resync() {
-        let mut conn = open_test_db();
-        seed_email(&conn, "mg:test::m1", 1_000);
-        seed_team_member(&conn, "tm_alice");
-        seed_team_member(&conn, "tm_bob");
-
-        let tx = conn.transaction().unwrap();
-        write_workstream(
-            &tx,
-            &make_ws(
-                Some("ws1"),
-                "WS",
-                &["mg:test::m1"],
-                &[],
-                &[],
-                vec![SynthesizedAction {
-                    text: "Send recap".into(),
-                    due_ms: None,
-                    source_kind: "email".into(),
-                    source_id: "mg:test::m1".into(),
-                    assignee_id: Some("tm_alice".into()),
-                }],
-            ),
-            1_000,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        // User reassigns to Bob.
-        let aid = action_id("ws1", "Send recap");
-        set_action_assignee(&conn, &aid, Some("tm_bob")).unwrap();
-
-        // Synthesizer re-emits Alice for the same action text.
-        let tx = conn.transaction().unwrap();
-        write_workstream(
-            &tx,
-            &make_ws(
-                Some("ws1"),
-                "WS",
-                &["mg:test::m1"],
-                &[],
-                &[],
-                vec![SynthesizedAction {
-                    text: "Send recap".into(),
-                    due_ms: None,
-                    source_kind: "email".into(),
-                    source_id: "mg:test::m1".into(),
-                    assignee_id: Some("tm_alice".into()),
-                }],
-            ),
-            2_000,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        // The user's override must survive — ON CONFLICT does not
-        // touch assignee_id.
-        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
-        assert_eq!(detail.actions[0].assignee_id.as_deref(), Some("tm_bob"));
     }
 
     #[test]
@@ -2156,7 +1652,7 @@ mod tests {
         let tx = conn.transaction().unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_umbrella"), "Umbrella", &[], &[], &[], vec![]),
+            &make_ws(Some("ws_umbrella"), "Umbrella", &[], &[], &[]),
             1_000,
         )
         .unwrap();
@@ -2185,13 +1681,13 @@ mod tests {
         let tx = conn.transaction().unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_g"), "Grand", &[], &[], &[], vec![]),
+            &make_ws(Some("ws_g"), "Grand", &[], &[], &[]),
             1_000,
         )
         .unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_p"), "Parent", &[], &[], &[], vec![]),
+            &make_ws(Some("ws_p"), "Parent", &[], &[], &[]),
             1_000,
         )
         .unwrap();
@@ -2206,46 +1702,18 @@ mod tests {
     }
 
     #[test]
-    fn delete_action_removes_row() {
-        let mut conn = open_test_db();
-        seed_email(&conn, "mg:test::m1", 1_000);
-
-        let tx = conn.transaction().unwrap();
-        write_workstream(
-            &tx,
-            &make_ws(
-                Some("ws1"),
-                "WS",
-                &["mg:test::m1"],
-                &[],
-                &[],
-                vec![make_action("Send recap", "email", "mg:test::m1")],
-            ),
-            1_000,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let aid = action_id("ws1", "Send recap");
-        delete_action(&mut conn, &aid).unwrap();
-
-        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
-        assert!(detail.actions.is_empty(), "delete_action must remove the row");
-    }
-
-    #[test]
     fn list_workstreams_active_excludes_archived() {
         let mut conn = open_test_db();
         let tx = conn.transaction().unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_a"), "Active", &[], &[], &[], vec![]),
+            &make_ws(Some("ws_a"), "Active", &[], &[], &[]),
             1_000,
         )
         .unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_b"), "Archived", &[], &[], &[], vec![]),
+            &make_ws(Some("ws_b"), "Archived", &[], &[], &[]),
             1_000,
         )
         .unwrap();
@@ -2258,125 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn set_action_done_round_trips() {
-        let mut conn = open_test_db();
-        seed_email(&conn, "mg:test::m1", 1_000);
-
-        let tx = conn.transaction().unwrap();
-        write_workstream(
-            &tx,
-            &make_ws(
-                Some("ws1"),
-                "WS",
-                &["mg:test::m1"],
-                &[],
-                &[],
-                vec![make_action("Do thing", "email", "mg:test::m1")],
-            ),
-            1_000,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let aid = action_id("ws1", "Do thing");
-        set_action_done(&conn, &aid, true).unwrap();
-        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
-        assert!(detail.actions[0].done);
-        set_action_done(&conn, &aid, false).unwrap();
-        let detail = get_workstream_detail(&conn, "ws1").unwrap().unwrap();
-        assert!(!detail.actions[0].done);
-    }
-
-    /// Helper: seed a synth waiting action with the worker's
-    /// auto-resolved state. Mirrors what `auto_resolve_missing` would
-    /// leave behind once the threshold is crossed.
-    fn seed_auto_resolved_action(conn: &Connection, id: &str, ts_ms: i64) {
-        conn.execute(
-            "INSERT INTO actions \
-                (id, text, done, created_ms, \
-                 origin_kind, origin_synth_kind, origin_synth_id, \
-                 manual_override, auto_resolve_omissions, auto_resolved_ms) \
-             VALUES (?1, 'desc', 1, 0, \
-                     'synth', 'teams_waiting', 'src1', \
-                     0, 2, ?2)",
-            params![id, ts_ms],
-        )
-        .unwrap();
-    }
-
-    /// User unchecks a worker-auto-resolved row via the normal toggle:
-    /// `set_action_done(_, false)` must clear the pill state.
-    #[test]
-    fn set_action_done_clears_auto_resolved_ms_on_uncheck() {
-        let conn = open_test_db();
-        seed_auto_resolved_action(&conn, "a:x", 1_000);
-        set_action_done(&conn, "a:x", false).unwrap();
-        let (done, mo, ms, om): (i64, i64, Option<i64>, i64) = conn
-            .query_row(
-                "SELECT done, manual_override, auto_resolved_ms, auto_resolve_omissions \
-                   FROM actions WHERE id = 'a:x'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(done, 0);
-        assert_eq!(mo, 1);
-        assert!(ms.is_none(), "auto_resolved_ms must clear on user-uncheck");
-        assert_eq!(om, 0);
-    }
-
-    /// Undo path reopens the row, locks it against the worker, and
-    /// clears the hysteresis state in one transaction.
-    #[test]
-    fn undo_auto_resolved_action_reopens_and_locks() {
-        let conn = open_test_db();
-        seed_auto_resolved_action(&conn, "a:x", 1_000);
-        undo_auto_resolved_action(&conn, "a:x").unwrap();
-        let (done, mo, ms, om): (i64, i64, Option<i64>, i64) = conn
-            .query_row(
-                "SELECT done, manual_override, auto_resolved_ms, auto_resolve_omissions \
-                   FROM actions WHERE id = 'a:x'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(done, 0);
-        assert_eq!(mo, 1);
-        assert!(ms.is_none());
-        assert_eq!(om, 0);
-    }
-
-    /// Undo on a user-checked row (no `auto_resolved_ms`) is a no-op —
-    /// the WHERE guard prevents the frontend from accidentally
-    /// resurrecting a manually-completed action.
-    #[test]
-    fn undo_auto_resolved_action_is_noop_on_user_checked_row() {
-        let conn = open_test_db();
-        // User-checked row: done=1 but auto_resolved_ms IS NULL.
-        conn.execute(
-            "INSERT INTO actions \
-                (id, text, done, created_ms, \
-                 origin_kind, origin_synth_kind, origin_synth_id, \
-                 manual_override, auto_resolve_omissions, auto_resolved_ms) \
-             VALUES ('a:user', 'desc', 1, 0, \
-                     'synth', 'teams_waiting', 'src1', \
-                     1, 0, NULL)",
-            [],
-        )
-        .unwrap();
-        undo_auto_resolved_action(&conn, "a:user").unwrap();
-        let done: i64 = conn
-            .query_row(
-                "SELECT done FROM actions WHERE id = 'a:user'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(done, 1, "user-completed row must not reopen via Undo path");
-    }
-
-    #[test]
-    fn get_workstream_detail_returns_joined_emails_events_notes_and_actions() {
+    fn get_workstream_detail_returns_joined_emails_events_notes() {
         let mut conn = open_test_db();
         seed_email(&conn, "mg:test::m1", 1_000);
         seed_email(&conn, "mg:test::m2", 5_000);
@@ -2392,10 +1742,6 @@ mod tests {
                 &["mg:test::m1", "mg:test::m2"],
                 &["mg:test::e1"],
                 &["/n/a.md"],
-                vec![
-                    make_action("a1", "email", "mg:test::m1"),
-                    make_action("a2", "note", "/n/a.md"),
-                ],
             ),
             10_000,
         )
@@ -2410,31 +1756,6 @@ mod tests {
         assert_eq!(d.events.len(), 1);
         assert_eq!(d.notes.len(), 1);
         assert_eq!(d.notes[0].note_path, "/n/a.md");
-        assert_eq!(d.actions.len(), 2);
-    }
-
-    #[test]
-    fn action_id_is_stable_for_same_inputs() {
-        let id1 = action_id("ws1", "Do thing");
-        let id2 = action_id("ws1", "Do thing");
-        assert_eq!(id1, id2);
-
-        let id3 = action_id("ws2", "Do thing");
-        assert_ne!(id1, id3);
-        let id4 = action_id("ws1", "Do other thing");
-        assert_ne!(id1, id4);
-    }
-
-    #[test]
-    fn action_id_is_trim_normalized() {
-        // Trimming the text means whitespace drift in Claude output
-        // doesn't fragment action history.
-        let id1 = action_id("ws1", "Do thing");
-        let id2 = action_id("ws1", "  Do thing  ");
-        assert_eq!(id1, id2);
-        // But internal whitespace still matters (different action).
-        let id3 = action_id("ws1", "Do  thing");
-        assert_ne!(id1, id3);
     }
 
     // ----- user_notes (#77) ------------------------------------------------
@@ -2443,7 +1764,7 @@ mod tests {
     fn set_user_notes_round_trips() {
         let mut conn = open_test_db();
         let tx = conn.transaction().unwrap();
-        write_workstream(&tx, &make_ws(Some("ws_n"), "WS", &[], &[], &[], vec![]), 1_000)
+        write_workstream(&tx, &make_ws(Some("ws_n"), "WS", &[], &[], &[]), 1_000)
             .unwrap();
         tx.commit().unwrap();
 
@@ -2468,7 +1789,7 @@ mod tests {
     fn set_user_notes_with_none_clears_field() {
         let mut conn = open_test_db();
         let tx = conn.transaction().unwrap();
-        write_workstream(&tx, &make_ws(Some("ws_c"), "WS", &[], &[], &[], vec![]), 1_000)
+        write_workstream(&tx, &make_ws(Some("ws_c"), "WS", &[], &[], &[]), 1_000)
             .unwrap();
         tx.commit().unwrap();
         set_user_notes(&conn, "ws_c", Some("placeholder")).unwrap();
@@ -2481,7 +1802,7 @@ mod tests {
     fn write_workstream_does_not_overwrite_user_notes_on_resync() {
         let mut conn = open_test_db();
         let tx = conn.transaction().unwrap();
-        write_workstream(&tx, &make_ws(Some("ws_r"), "Hyundai", &[], &[], &[], vec![]), 1_000)
+        write_workstream(&tx, &make_ws(Some("ws_r"), "Hyundai", &[], &[], &[]), 1_000)
             .unwrap();
         tx.commit().unwrap();
         set_user_notes(&conn, "ws_r", Some("This is the new POC.")).unwrap();
@@ -2492,7 +1813,7 @@ mod tests {
         let tx = conn.transaction().unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_r"), "Hyundai (renamed)", &[], &[], &[], vec![]),
+            &make_ws(Some("ws_r"), "Hyundai (renamed)", &[], &[], &[]),
             2_000,
         )
         .unwrap();
@@ -2512,7 +1833,7 @@ mod tests {
 
     fn seed_workstream(conn: &mut Connection, id: &str) {
         let tx = conn.transaction().unwrap();
-        write_workstream(&tx, &make_ws(Some(id), "WS", &[], &[], &[], vec![]), 1_000)
+        write_workstream(&tx, &make_ws(Some(id), "WS", &[], &[], &[]), 1_000)
             .unwrap();
         tx.commit().unwrap();
     }
@@ -2698,7 +2019,7 @@ mod tests {
         let tx = conn.transaction().unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_oo"), "Renamed", &[], &[], &[], vec![]),
+            &make_ws(Some("ws_oo"), "Renamed", &[], &[], &[]),
             2_000,
         )
         .unwrap();
@@ -2743,7 +2064,6 @@ mod tests {
                 &["mg:test::m1"],
                 &["mg:test::e1"],
                 &[],
-                vec![],
             ),
             1_000,
         )
@@ -2813,7 +2133,7 @@ mod tests {
         let tx = conn.transaction().unwrap();
         write_workstream(
             &tx,
-            &make_ws(Some("ws_q"), "WS", &["mg:test::m1"], &[], &[], vec![]),
+            &make_ws(Some("ws_q"), "WS", &["mg:test::m1"], &[], &[]),
             1_000,
         )
         .unwrap();
@@ -3441,7 +2761,7 @@ mod tests {
             .unwrap();
 
         let tx = conn.transaction().unwrap();
-        let mut record = make_ws(Some("ws_new"), "Spawn", &[], &[], &[], vec![]);
+        let mut record = make_ws(Some("ws_new"), "Spawn", &[], &[], &[]);
         record.parent_id = Some("ws_a".to_string());
         write_workstream(&tx, &record, 9_000).unwrap();
         tx.commit().unwrap();
@@ -3465,7 +2785,7 @@ mod tests {
         // Resync the existing workstream; even with no parent_id in the
         // record, the user's parent assignment must survive.
         let tx = conn.transaction().unwrap();
-        let record = make_ws(Some("ws_c"), "Renamed child", &[], &[], &[], vec![]);
+        let record = make_ws(Some("ws_c"), "Renamed child", &[], &[], &[]);
         write_workstream(&tx, &record, 9_000).unwrap();
         tx.commit().unwrap();
 
@@ -3489,124 +2809,6 @@ mod tests {
         assert_eq!(child.parent_workstream_id.as_deref(), Some("ws_p"));
     }
 
-    // Seed a note-origin row in the unified actions table for the
-    // dedup tests below.
-    fn seed_note_action(conn: &Connection, id: &str, note_id: &str, text: &str) {
-        conn.execute(
-            "INSERT INTO actions \
-                (id, origin_kind, origin_note_id, origin_line, text, \
-                 done, created_ms) \
-             VALUES (?1, 'note', ?2, 1, ?3, 0, 100)",
-            params![id, note_id, text],
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn synth_dedup_attaches_workstream_to_existing_note_action() {
-        // When the synthesizer extracts an action whose source is a
-        // note that already carries the literal `- [ ]` line, skip
-        // emitting a parallel synth row and instead pin
-        // workstream_id on the existing note-origin row (#111).
-        let mut conn = open_test_db();
-        seed_note(&conn, "/n/a.md", 1_000);
-        seed_note_action(&conn, "n:1", "/n/a.md", "Send invoice");
-
-        let tx = conn.transaction().unwrap();
-        let ws = make_ws(
-            Some("ws_x"),
-            "X",
-            &[],
-            &[],
-            &["/n/a.md"],
-            vec![make_action("send invoice", "note", "/n/a.md")],
-        );
-        let counts = write_workstream(&tx, &ws, 2_000).unwrap();
-        tx.commit().unwrap();
-
-        // No new synth row should exist; the note row gets pinned.
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 1, "synth must NOT emit a parallel row");
-        let pinned: Option<String> = conn
-            .query_row(
-                "SELECT workstream_id FROM actions WHERE id = 'n:1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pinned.as_deref(), Some("ws_x"));
-        assert_eq!(counts.actions_added, 0);
-        assert_eq!(counts.actions_updated, 1);
-    }
-
-    #[test]
-    fn synth_does_not_dedup_across_notes() {
-        // The dedup is scoped to the same `source_id` note. A synth
-        // row paraphrasing the same text from a *different* note must
-        // produce its own row.
-        let mut conn = open_test_db();
-        seed_note(&conn, "/n/a.md", 1_000);
-        seed_note(&conn, "/n/b.md", 1_000);
-        seed_note_action(&conn, "n:a", "/n/a.md", "Send invoice");
-
-        let tx = conn.transaction().unwrap();
-        let ws = make_ws(
-            Some("ws_x"),
-            "X",
-            &[],
-            &[],
-            &["/n/b.md"],
-            vec![make_action("Send invoice", "note", "/n/b.md")],
-        );
-        write_workstream(&tx, &ws, 2_000).unwrap();
-        tx.commit().unwrap();
-
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 2);
-        // The original note row is untouched (still NULL workstream).
-        let na_ws: Option<String> = conn
-            .query_row(
-                "SELECT workstream_id FROM actions WHERE id = 'n:a'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(na_ws, None);
-    }
-
-    #[test]
-    fn synth_does_not_dedup_when_source_kind_is_email() {
-        // The dedup branch only fires for source_kind='note'.
-        // Email/event synth rows always go in as their own rows.
-        let mut conn = open_test_db();
-        seed_email(&conn, "mg:test::m1", 1_000);
-
-        let tx = conn.transaction().unwrap();
-        let ws = make_ws(
-            Some("ws_x"),
-            "X",
-            &["mg:test::m1"],
-            &[],
-            &[],
-            vec![make_action("Reply to Anna", "email", "mg:test::m1")],
-        );
-        let counts = write_workstream(&tx, &ws, 2_000).unwrap();
-        tx.commit().unwrap();
-
-        assert_eq!(counts.actions_added, 1);
-        let kind: String = conn
-            .query_row(
-                "SELECT origin_kind FROM actions LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(kind, "synth");
-    }
 
     // ---------- Manual attach / detach + unassigned feed (#108) ----------
 
@@ -3924,7 +3126,6 @@ mod tests {
             &["em:1"],
             &[],
             &[],
-            vec![],
         );
         write_workstream(&tx, &ws, 5_000).unwrap();
         tx.commit().unwrap();
@@ -3944,7 +3145,6 @@ mod tests {
             &["em:1"],
             &[],
             &[],
-            vec![],
         );
         write_workstream(&tx, &ws_again, 15_000).unwrap();
         tx.commit().unwrap();
@@ -3977,7 +3177,6 @@ mod tests {
             &["em:tombstoned", "em:old"],
             &[],
             &[],
-            vec![],
         );
         write_workstream(&tx, &ws, 5_000).unwrap();
         tx.commit().unwrap();
@@ -3987,7 +3186,7 @@ mod tests {
 
         // Next synth pass: cluster only em:fresh (Claude moved on).
         let tx = conn.transaction().unwrap();
-        let ws2 = make_ws(Some("ws_x"), "X", &["em:fresh"], &[], &[], vec![]);
+        let ws2 = make_ws(Some("ws_x"), "X", &["em:fresh"], &[], &[]);
         write_workstream(&tx, &ws2, 15_000).unwrap();
         tx.commit().unwrap();
 

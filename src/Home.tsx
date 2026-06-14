@@ -1,10 +1,8 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { AssigneeChip, stripLeadingOwnerPrefix } from "./AssigneeChip";
-import { dueBucket, friendlyDueLabel } from "./dueLabel";
 import {
-  type ActionListItem,
   type CalendarEvent,
   type ConnectorStatusEvent,
   deleteOpenQuestion,
@@ -22,7 +20,6 @@ import {
   type Workstream,
 } from "./file";
 import { ResolveQuestionPopover } from "./ResolveQuestionPopover";
-import { WorkstreamChip } from "./WorkstreamChip";
 import { ActivityPanel } from "./ActivityPanel";
 import { avatarColor } from "./initials";
 import { MoreMenu } from "./MoreMenu";
@@ -36,15 +33,10 @@ import {
   IconArchive,
   IconBell,
   IconBriefcase,
-  IconCalendar,
-  IconChat,
-  IconCheck,
-  IconChecklist,
   IconChevRight,
   IconFileText,
   IconHelp,
   IconHome,
-  IconMail,
   IconMic,
   IconMore,
   IconPlus,
@@ -80,35 +72,11 @@ type Props = {
   onFavoriteRow?: (path: string, nextFavorited: boolean) => void;
   /** Clone a row to a new bundle. */
   onDuplicateRow?: (path: string) => void;
-  /** Open action items across all non-archived owned notes. Drives the
-   *  Action items sidebar nav, the count badge, and the home teaser. */
-  actions: ActionListItem[];
   /** Currently-unresolved open questions count for the sidebar badge
-   *  (#113). Updated alongside `actions` on every save. */
+   *  (#113). */
   openQuestionCount: number;
-  /** Flip an action item's done state. Optimistic upstream. */
-  onToggleAction: (id: string, nextDone: boolean) => void;
-  /** Permanently remove an action item's checkbox line from its source
-   *  note (#100). Optimistic upstream. */
-  onDeleteAction: (id: string) => void;
-  /** Append a quick todo to the catch-all Inbox note. `dueToken` is the
-   *  optional payload after `@` (e.g. `2026-05-15` or `2026-05-15 09:00`);
-   *  Rust resolves any relative form during write_note. */
-  onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
-  /** Team members for the assignee-chip dropdown on action rows (#51). */
+  /** Team members for the assignee-chip dropdown on open-question rows. */
   members: TeamMember[];
-  /** Reassign an action to a different team member (or null to unassign).
-   *  Body-rewrites the source line; the upstream refetch picks up the
-   *  new assignee_id via the resolver. */
-  onReassignAction: (actionId: string, memberId: string | null) => Promise<void>;
-  /** Pin (or unpin with null) an action to a workstream (#111). */
-  onReattachActionWorkstream: (
-    actionId: string,
-    workstreamId: string | null,
-  ) => Promise<void>;
-  /** Reopen + lock a worker-auto-resolved action (#124). Optimistic
-   *  upstream — the upstream refetch sweeps `auto_resolved_ms = null`. */
-  onUndoAutoResolved: (id: string) => Promise<void>;
   /** In-app notification queue surfaced by the bell button (#37). */
   notifications: NotificationRecord[];
   /** Stamp `read_at` on every unread notification. Called when the
@@ -131,28 +99,12 @@ type Props = {
 type NavId =
   | "home"
   | "chat"
-  | "actions"
   | "openquestions"
   | "workstreams"
   | "favorites"
   | "archive"
   | "team";
 type FilterId = "all" | "notes" | "meetings";
-
-export function DueChip({ dueMs }: { dueMs: number | null }) {
-  if (dueMs == null) return null;
-  // Recompute on each render so label flips at midnight when the user
-  // returns to the page. Cheap; the home feed already re-renders often.
-  const now = Date.now();
-  return (
-    <span
-      className={`home-due ${dueBucket(dueMs, now)}`}
-      title={new Date(dueMs).toLocaleString()}
-    >
-      {friendlyDueLabel(dueMs, now)}
-    </span>
-  );
-}
 
 /// Connector-health hook (#141). Returns `true` when at least one
 /// connector has a non-null `last_error` — drives the alert dot on the
@@ -289,24 +241,6 @@ function formatHm(ms: number): string {
   }).format(new Date(ms));
 }
 
-/// Past-only relative time for action-row sublines (#123). The
-/// existing `formatRelative` is future-focused (due dates); this one
-/// clamps to >= 0 so old timestamps render as "2d ago" rather than
-/// "in -2 days".
-function timeAgo(ms: number, nowMs: number): string {
-  const dt = Math.max(0, nowMs - ms);
-  const m = Math.floor(dt / 60_000);
-  if (m < 1) return "just now";
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h ago`;
-  const d = Math.floor(h / 24);
-  if (d < 30) return `${d}d ago`;
-  const mo = Math.floor(d / 30);
-  if (mo < 12) return `${mo}mo ago`;
-  return `${Math.floor(mo / 12)}y ago`;
-}
-
 function formatRelative(startMs: number, nowMs: number): string {
   const delta = startMs - nowMs;
   if (delta < 60_000) return "now";
@@ -382,15 +316,8 @@ export function Home({
   onArchiveRow,
   onFavoriteRow,
   onDuplicateRow,
-  actions,
   openQuestionCount,
-  onToggleAction,
-  onDeleteAction,
-  onAddInboxTodo,
   members,
-  onReassignAction,
-  onReattachActionWorkstream,
-  onUndoAutoResolved,
   notifications,
   onMarkAllNotificationsRead,
   workstreams,
@@ -521,13 +448,11 @@ export function Home({
 
   // External "open this nav" requests (e.g. the AttendeePicker's
   // "+ Add team member" link) come in as `margin:nav` events so the
-  // sender doesn't have to lift state. Mirrors the dueDatePopover
-  // CustomEvent pattern.
+  // sender doesn't have to lift state.
   useEffect(() => {
     const VALID: NavId[] = [
       "home",
       "chat",
-      "actions",
       "workstreams",
       "favorites",
       "archive",
@@ -570,8 +495,6 @@ export function Home({
   }, [notes, filter, tagFilter]);
 
   const grouped = useMemo(() => groupByDay(filteredNotes), [filteredNotes]);
-
-  const openActionCount = actions.filter((a) => !a.done).length;
 
   const { upcoming, raw: rawEvents, nowMs: eventsNowMs } = useUpcomingEvents();
   const settingsAlert = useConnectorHealthAlert();
@@ -647,9 +570,7 @@ export function Home({
         <Sidebar
           active={nav}
           onSelect={setNav}
-          actionCount={openActionCount}
           openQuestionCount={openQuestionCount}
-          workstreamCount={workstreams.filter((w) => w.open_action_count > 0).length}
           tags={allTags}
           activeTag={tagFilter}
           onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
@@ -774,8 +695,6 @@ export function Home({
           <TeamView
             onOpenNote={onOpen}
             onOpenWorkstream={openWorkstream}
-            onToggleAction={onToggleAction}
-            onReassignAction={onReassignAction}
           />
         ) : nav === "workstreams" ? (
           <WorkstreamsView
@@ -786,22 +705,6 @@ export function Home({
             onOpenNote={onOpen}
             onChanged={onWorkstreamsChanged}
           />
-        ) : nav === "actions" ? (
-          <ActionsFeed
-            actions={actions}
-            onToggle={onToggleAction}
-            onDelete={onDeleteAction}
-            onOpenNote={onOpen}
-            onOpenWorkstream={openWorkstream}
-            onAddInboxTodo={onAddInboxTodo}
-            members={members}
-            workstreams={workstreams}
-            onReassign={onReassignAction}
-            onReattachWorkstream={onReattachActionWorkstream}
-            onUndoAutoResolved={(id) => {
-              void onUndoAutoResolved(id);
-            }}
-          />
         ) : nav === "openquestions" ? (
           <OpenQuestionsFeed
             onOpenNote={onOpen}
@@ -810,17 +713,6 @@ export function Home({
           />
         ) : (
           <>
-            {nav !== "favorites" && openActionCount > 0 && (
-              <ActionItemsTeaser
-                items={actions}
-                onToggle={onToggleAction}
-                onOpenNote={onOpen}
-                onOpenWorkstream={openWorkstream}
-                onViewAll={() => setNav("actions")}
-                members={members}
-                onReassign={onReassignAction}
-              />
-            )}
             <NotesFeed
               loading={notesLoading}
               grouped={grouped}
@@ -850,9 +742,7 @@ export function Home({
 function Sidebar({
   active,
   onSelect,
-  actionCount,
   openQuestionCount,
-  workstreamCount,
   tags,
   activeTag,
   onTagSelect,
@@ -864,9 +754,7 @@ function Sidebar({
 }: {
   active: NavId;
   onSelect: (id: NavId) => void;
-  actionCount: number;
   openQuestionCount: number;
-  workstreamCount: number;
   tags: string[];
   activeTag: string | null;
   onTagSelect: (tag: string) => void;
@@ -915,13 +803,6 @@ function Sidebar({
           onClick={() => onSelect("chat")}
         />
         <NavItem
-          icon={<IconChecklist size={14} sw={1.7} />}
-          label="Action items"
-          badge={actionCount > 0 ? String(actionCount) : null}
-          active={active === "actions"}
-          onClick={() => onSelect("actions")}
-        />
-        <NavItem
           icon={<IconHelp size={14} sw={1.7} />}
           label="Open questions"
           badge={openQuestionCount > 0 ? String(openQuestionCount) : null}
@@ -931,7 +812,6 @@ function Sidebar({
         <NavItem
           icon={<IconBriefcase size={14} sw={1.7} />}
           label="Workstreams"
-          badge={workstreamCount > 0 ? String(workstreamCount) : null}
           active={active === "workstreams"}
           onClick={() => onSelect("workstreams")}
         />
@@ -1111,9 +991,9 @@ function Greeting({
 
 /** Page-scoped actions for the right side of `PageHeader`. Composer
  *  toggles dispatch CustomEvents because the composer state lives
- *  inside the sub-page component (TeamSection / ActionsFeed); the
- *  page header just fires the open trigger. Refresh on Workstreams
- *  has its handler already at Home.tsx scope so it's a direct call. */
+ *  inside the sub-page component (TeamSection); the page header just
+ *  fires the open trigger. Refresh on Workstreams has its handler
+ *  already at Home.tsx scope so it's a direct call. */
 function renderScopedActions(
   nav: NavId,
   ctx: {
@@ -1134,19 +1014,6 @@ function renderScopedActions(
         >
           <IconPlus size={13} sw={1.8} />
           Add team member
-        </button>
-      );
-    case "actions":
-      return (
-        <button
-          type="button"
-          className="home-section-add"
-          onClick={() =>
-            window.dispatchEvent(new CustomEvent("margin:open-actions-composer"))
-          }
-        >
-          <IconPlus size={13} sw={1.8} />
-          New todo
         </button>
       );
     case "workstreams":
@@ -1196,8 +1063,6 @@ function renderScopedActions(
 
 function pageHeaderTitle(nav: NavId): string {
   switch (nav) {
-    case "actions":
-      return "Action items";
     case "openquestions":
       return "Open questions";
     case "workstreams":
@@ -1224,9 +1089,9 @@ function PageHeader({
 }: {
   title: string;
   /** Page-scoped actions rendered on the right of the header. e.g.
-   *  "Add team member" on Team, "New todo" on Actions, "Refresh" on
-   *  Workstreams. The global New-note / New-meeting CTAs live in the
-   *  sidebar footer for non-home pages instead of competing here. */
+   *  "Add team member" on Team, "Refresh" on Workstreams. The global
+   *  New-note / New-meeting CTAs live in the sidebar footer for
+   *  non-home pages instead of competing here. */
   actions?: React.ReactNode;
 }) {
   return (
@@ -1312,755 +1177,13 @@ function AttendeeStack({ attendees }: { attendees: string[] }) {
   );
 }
 
-// ---------- Action items teaser ------------------------------------------
-
-function ActionItemsTeaser({
-  items,
-  onToggle,
-  onOpenNote,
-  onOpenWorkstream,
-  onViewAll,
-  members,
-  onReassign,
-}: {
-  items: ActionListItem[];
-  onToggle: (id: string, nextDone: boolean) => void;
-  onOpenNote: (path: string) => void;
-  onOpenWorkstream: (id: string) => void;
-  onViewAll: () => void;
-  members: TeamMember[];
-  onReassign: (actionId: string, memberId: string | null) => void;
-}) {
-  // Show what's currently in state — items are fetched in `open` scope,
-  // so anything done here was just ticked off in this page session and
-  // we keep it visible (filled checkbox + strikethrough) until the next
-  // refresh drops it. The `View all` badge tracks remaining open count.
-  const top = items.slice(0, 3);
-  const openCount = items.filter((it) => !it.done).length;
-  if (top.length === 0) return null;
-
-  return (
-    <section className="home-section">
-      <div className="home-section-head">
-        <div>
-          <div className="home-section-eyebrow">Action items</div>
-          <h2 className="home-section-title">Things to do</h2>
-        </div>
-        <button
-          type="button"
-          className="home-section-action"
-          onClick={onViewAll}
-          title="See all action items"
-        >
-          View all ({openCount})
-          <IconChevRight size={12} sw={1.7} />
-        </button>
-      </div>
-      <div className="home-actions">
-        {top.map((it) => (
-          <ActionRow
-            key={it.id}
-            it={it}
-            onToggle={onToggle}
-            onOpenNote={onOpenNote}
-            onOpenWorkstream={onOpenWorkstream}
-            members={members}
-            onReassign={onReassign}
-          />
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function ActionsFilterBar({
-  filter,
-  onChange,
-  members,
-  workstreams,
-  selfId,
-  counts,
-}: {
-  filter: ActionsFilter;
-  onChange: (next: ActionsFilter) => void;
-  members: TeamMember[];
-  workstreams: Workstream[];
-  selfId: string | null;
-  counts: { all: number; mine: number; unassigned: number };
-}) {
-  // Members excluding self for the per-person picker. Sorted by display
-  // name to keep the dropdown predictable across renders.
-  const others = useMemo(
-    () =>
-      [...members]
-        .filter((m) => m.id !== selfId)
-        .sort((a, b) => a.display_name.localeCompare(b.display_name)),
-    [members, selfId],
-  );
-
-  // Active workstreams alphabetized for the per-workstream picker.
-  const sortedWorkstreams = useMemo(
-    () =>
-      [...workstreams].sort((a, b) =>
-        a.title.localeCompare(b.title, undefined, { sensitivity: "base" }),
-      ),
-    [workstreams],
-  );
-
-  const memberSelected =
-    filter.kind === "member"
-      ? others.find((m) => m.id === filter.memberId)
-      : undefined;
-  const workstreamSelected =
-    filter.kind === "workstream"
-      ? sortedWorkstreams.find((w) => w.id === filter.workstreamId)
-      : undefined;
-
-  return (
-    <div className="actions-filter-bar">
-      <button
-        type="button"
-        className={
-          "home-filter-chip" + (filter.kind === "all" ? " active" : "")
-        }
-        onClick={() => onChange({ kind: "all" })}
-      >
-        All <span className="actions-filter-count">{counts.all}</span>
-      </button>
-      {selfId && (
-        <button
-          type="button"
-          className={
-            "home-filter-chip" + (filter.kind === "mine" ? " active" : "")
-          }
-          onClick={() => onChange({ kind: "mine" })}
-        >
-          Assigned to me{" "}
-          <span className="actions-filter-count">{counts.mine}</span>
-        </button>
-      )}
-      <button
-        type="button"
-        className={
-          "home-filter-chip" +
-          (filter.kind === "unassigned" ? " active" : "")
-        }
-        onClick={() => onChange({ kind: "unassigned" })}
-      >
-        Unassigned{" "}
-        <span className="actions-filter-count">{counts.unassigned}</span>
-      </button>
-      {others.length > 0 && (
-        <select
-          className={
-            "home-filter-chip actions-filter-select" +
-            (filter.kind === "member" ? " active" : "")
-          }
-          value={memberSelected?.id ?? ""}
-          onChange={(e) => {
-            const id = e.target.value;
-            if (id) onChange({ kind: "member", memberId: id });
-            else onChange({ kind: "all" });
-          }}
-          title="Filter by teammate"
-        >
-          <option value="">Teammate…</option>
-          {others.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.display_name}
-            </option>
-          ))}
-        </select>
-      )}
-      {sortedWorkstreams.length > 0 && (
-        <select
-          className={
-            "home-filter-chip actions-filter-select" +
-            (filter.kind === "workstream" ? " active" : "")
-          }
-          value={workstreamSelected?.id ?? ""}
-          onChange={(e) => {
-            const id = e.target.value;
-            if (id) onChange({ kind: "workstream", workstreamId: id });
-            else onChange({ kind: "all" });
-          }}
-          title="Filter by workstream"
-        >
-          <option value="">Workstream…</option>
-          {sortedWorkstreams.map((w) => (
-            <option key={w.id} value={w.id}>
-              {w.title}
-            </option>
-          ))}
-        </select>
-      )}
-    </div>
-  );
-}
-
-// Order in which due-buckets render. The string keys match the values
-// returned by `dueBucket` from dueLabel.ts; the labels are human copy.
-export const BUCKET_ORDER = [
-  { key: "overdue", label: "Overdue" },
-  { key: "today", label: "Today" },
-  { key: "soon", label: "This week" },
-  { key: "later", label: "Later" },
-] as const;
-
-export function ActionRow({
-  it,
-  onToggle,
-  onDelete,
-  onOpenNote,
-  onOpenWorkstream,
-  members,
-  workstreams,
-  onReassign,
-  onReattachWorkstream,
-  onUndoAutoResolved,
-}: {
-  it: ActionListItem;
-  onToggle: (id: string, nextDone: boolean) => void;
-  /** When provided, a hover-revealed trash button is rendered (#100).
-   *  The actions page wires this through; per-note teasers and Team
-   *  reuse the row without delete. */
-  onDelete?: (id: string) => void;
-  onOpenNote: (path: string) => void;
-  /** Optional — routes synth-origin rows to the Workstreams detail
-   *  view. When omitted, synth rows still render but the click
-   *  handler short-circuits. */
-  onOpenWorkstream?: (id: string) => void;
-  members: TeamMember[];
-  /** Active workstreams for the attach chip (#111). When omitted the
-   *  workstream chip is hidden. */
-  workstreams?: Workstream[];
-  onReassign: (actionId: string, memberId: string | null) => void;
-  /** Pin/unpin the action to a workstream (#111). When omitted the
-   *  chip is read-only (no popover affordance). */
-  onReattachWorkstream?: (
-    actionId: string,
-    workstreamId: string | null,
-  ) => void;
-  /** Click target for the "Margin auto-resolved" pill (#124). When
-   *  omitted, the pill is still rendered but read-only — used by
-   *  surfaces that don't expose the Undo action. */
-  onUndoAutoResolved?: (id: string) => void;
-}) {
-  // When the action has a resolved assignee, hide the literal
-  // `Owner — ` prefix in the displayed text — the chip already
-  // communicates ownership. Unresolved/ambiguous prefixes stay visible
-  // so the user can see (and edit) the raw line content.
-  const displayText = it.assignee_id
-    ? stripLeadingOwnerPrefix(it.text)
-    : it.text;
-  const isSynth = it.origin_kind === "synth";
-  const isReconcile = it.origin_kind === "reconcile";
-  const isWaiting =
-    it.origin_synth_kind === "email_waiting"
-    || it.origin_synth_kind === "teams_waiting"
-    || it.origin_synth_kind === "meeting_waiting";
-  const counterparty = isWaiting && it.subject_member_id
-    ? members.find((m) => m.id === it.subject_member_id) ?? null
-    : null;
-  const openTarget = () => {
-    // Origin drives the primary navigation target: note-origin rows
-    // open their source note; synth-origin rows open the attached
-    // workstream when present.
-    if (isSynth) {
-      if (it.workstream_id && onOpenWorkstream) {
-        onOpenWorkstream(it.workstream_id);
-      }
-    } else if (it.origin_note_path) {
-      onOpenNote(it.origin_note_path);
-    }
-  };
-  const originTitle = isSynth ? it.workstream_title : it.note_title;
-  const titleAttr = originTitle ? `Open ${originTitle}` : undefined;
-  return (
-    <div
-      className="home-action-row"
-      role="button"
-      tabIndex={0}
-      onClick={openTarget}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openTarget();
-        }
-      }}
-      title={titleAttr}
-    >
-      <button
-        type="button"
-        className={"home-checkbox" + (it.done ? " done" : "")}
-        aria-label={it.done ? "Mark as open" : "Mark as done"}
-        onClick={(e) => {
-          // Don't navigate when the user is just toggling done.
-          e.stopPropagation();
-          onToggle(it.id, !it.done);
-        }}
-      >
-        {it.done && <IconCheck size={20} sw={3.6} />}
-      </button>
-      <div className="home-action-body">
-        <div className={"home-action-text" + (it.done ? " done" : "")}>{displayText}</div>
-        {originTitle && (
-          <div className="home-action-origin">
-            {isSynth ? (
-              <IconBriefcase size={10} sw={1.7} />
-            ) : isReconcile ? (
-              <IconCalendar size={10} sw={1.7} />
-            ) : (
-              <IconFileText size={10} sw={1.7} />
-            )}
-            <span className="home-action-origin-label">
-              {isSynth ? "Workstream" : isReconcile ? "Reconcile" : "Note"}
-            </span>
-            <span className="home-action-origin-sep">·</span>
-            <span className="home-action-origin-title">{originTitle}</span>
-            {/* Note-origin row pinned to a workstream: show both. */}
-            {!isSynth && it.workstream_title && (
-              <>
-                <span className="home-action-origin-sep">·</span>
-                <IconBriefcase size={10} sw={1.7} />
-                <span className="home-action-origin-title">
-                  {it.workstream_title}
-                </span>
-              </>
-            )}
-          </div>
-        )}
-        {isWaiting && (
-          <div className="home-action-waiting">
-            {it.origin_synth_kind === "email_waiting" && (
-              <IconMail size={10} sw={1.7} />
-            )}
-            {it.origin_synth_kind === "teams_waiting" && (
-              <IconChat size={10} sw={1.7} />
-            )}
-            {it.origin_synth_kind === "meeting_waiting" && (
-              <IconCalendar size={10} sw={1.7} />
-            )}
-            {counterparty ? (
-              <>
-                <span className="home-action-waiting-label">from</span>
-                <button
-                  type="button"
-                  className="home-action-waiting-name"
-                  title={`Open ${counterparty.display_name}'s profile`}
-                  onClick={(e) => {
-                    // Stop the row's outer click so we navigate to the
-                    // member instead of the row's origin target.
-                    e.stopPropagation();
-                    window.dispatchEvent(
-                      new CustomEvent("margin:open-team-member", {
-                        detail: { memberId: counterparty.id },
-                      }),
-                    );
-                  }}
-                >
-                  {counterparty.display_name}
-                </button>
-              </>
-            ) : (
-              <span className="home-action-waiting-label">
-                from this person
-              </span>
-            )}
-            <span className="home-action-origin-sep">·</span>
-            <span className="home-action-waiting-time">
-              {timeAgo(it.created_ms, Date.now())}
-            </span>
-          </div>
-        )}
-        {typeof it.auto_resolved_ms === "number" && onUndoAutoResolved && (
-          <button
-            type="button"
-            className="home-auto-resolved"
-            title="Auto-resolved because the model judged it complete. Click to reopen."
-            onClick={(e) => {
-              e.stopPropagation();
-              onUndoAutoResolved(it.id);
-            }}
-          >
-            Auto-resolved · undo
-          </button>
-        )}
-      </div>
-      <DueChip dueMs={it.due_ms} />
-      {workstreams && onReattachWorkstream && (
-        <WorkstreamChip
-          workstreamId={it.workstream_id}
-          workstreamTitle={it.workstream_title}
-          workstreams={workstreams}
-          onPick={(wsId) => onReattachWorkstream(it.id, wsId)}
-        />
-      )}
-      <AssigneeChip
-        assigneeId={it.assignee_id}
-        assigneeDisplayName={it.assignee_display_name}
-        members={members}
-        onPick={(memberId) => onReassign(it.id, memberId)}
-      />
-      {onDelete && (
-        <button
-          type="button"
-          className="home-action-delete"
-          aria-label="Delete action item"
-          title="Delete"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete(it.id);
-          }}
-        >
-          <IconTrash size={14} sw={1.7} />
-        </button>
-      )}
-    </div>
-  );
-}
-
-// ---- Inbox composer -----------------------------------------------------
-
-function InboxComposerForm({
-  onAdd,
-  onClose,
-}: {
-  onAdd: (text: string, dueToken: string | null) => Promise<void>;
-  onClose: () => void;
-}) {
-  const [text, setText] = useState("");
-  const [dateStr, setDateStr] = useState("");
-  const [includeTime, setIncludeTime] = useState(false);
-  const [timeStr, setTimeStr] = useState("09:00");
-  const [busy, setBusy] = useState(false);
-  const inputRef = useRef<HTMLInputElement | null>(null);
-
-  useEffect(() => {
-    inputRef.current?.focus();
-  }, []);
-
-  const reset = () => {
-    setText("");
-    setDateStr("");
-    setIncludeTime(false);
-    setTimeStr("09:00");
-  };
-
-  const submit = async () => {
-    const trimmed = text.trim();
-    if (!trimmed || busy) return;
-    const dueToken = dateStr
-      ? includeTime
-        ? `${dateStr} ${timeStr}`
-        : dateStr
-      : null;
-    setBusy(true);
-    try {
-      await onAdd(trimmed, dueToken);
-      reset();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <div className="inbox-composer">
-      <input
-        ref={inputRef}
-        type="text"
-        className="inbox-composer-text"
-        placeholder="What needs doing?"
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            void submit();
-          } else if (e.key === "Escape") {
-            reset();
-            onClose();
-          }
-        }}
-      />
-      <div className="inbox-composer-actions">
-        <input
-          type="date"
-          className="inbox-composer-date"
-          lang="de-DE"
-          value={dateStr}
-          onChange={(e) => setDateStr(e.target.value)}
-        />
-        <label className="inbox-composer-timetoggle">
-          <input
-            type="checkbox"
-            checked={includeTime}
-            onChange={(e) => setIncludeTime(e.target.checked)}
-          />
-          Time
-        </label>
-        {includeTime && (
-          <input
-            type="time"
-            className="inbox-composer-time"
-            lang="de-DE"
-            value={timeStr}
-            onChange={(e) => setTimeStr(e.target.value)}
-          />
-        )}
-        <div className="inbox-composer-spacer" />
-        <button
-          type="button"
-          className="inbox-composer-cancel"
-          onClick={() => {
-            reset();
-            onClose();
-          }}
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          className="inbox-composer-save"
-          disabled={!text.trim() || busy}
-          onClick={() => void submit()}
-        >
-          {busy ? "Adding…" : "Add"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-type ActionsFilter =
-  | { kind: "all" }
-  | { kind: "mine" }
-  | { kind: "unassigned" }
-  | { kind: "member"; memberId: string }
-  | { kind: "workstream"; workstreamId: string };
-
-function ActionsFeed({
-  actions,
-  onToggle,
-  onDelete,
-  onOpenNote,
-  onOpenWorkstream,
-  onAddInboxTodo,
-  members,
-  workstreams,
-  onReassign,
-  onReattachWorkstream,
-  onUndoAutoResolved,
-}: {
-  actions: ActionListItem[];
-  onToggle: (id: string, nextDone: boolean) => void;
-  onDelete: (id: string) => void;
-  onOpenNote: (path: string) => void;
-  onOpenWorkstream: (id: string) => void;
-  onAddInboxTodo: (text: string, dueToken: string | null) => Promise<void>;
-  members: TeamMember[];
-  workstreams: Workstream[];
-  onReassign: (actionId: string, memberId: string | null) => void;
-  onReattachWorkstream: (
-    actionId: string,
-    workstreamId: string | null,
-  ) => void;
-  /** Reopen + lock a worker auto-resolved row (#124). */
-  onUndoAutoResolved: (id: string) => void;
-}) {
-  const [composerOpen, setComposerOpen] = useState(false);
-  const [filter, setFilter] = useState<ActionsFilter>({ kind: "all" });
-  // The "New todo" trigger lives in PageHeader (when nav === "actions");
-  // we listen for its dispatched event and open the inline composer.
-  useEffect(() => {
-    const onOpen = () => setComposerOpen(true);
-    window.addEventListener("margin:open-actions-composer", onOpen);
-    return () =>
-      window.removeEventListener("margin:open-actions-composer", onOpen);
-  }, []);
-
-  const selfId = useMemo(
-    () => members.find((m) => m.is_self)?.id ?? null,
-    [members],
-  );
-
-  // Filter the action list client-side. The backend supports
-  // assignee_id and workstream_id filter params, but routing the
-  // predicate here keeps chip switches snappy and avoids extra IPC
-  // round-trips.
-  const filtered = useMemo(() => {
-    switch (filter.kind) {
-      case "all":
-        return actions;
-      case "mine":
-        return selfId
-          ? actions.filter((a) => a.assignee_id === selfId)
-          : [];
-      case "unassigned":
-        return actions.filter((a) => a.assignee_id == null);
-      case "member":
-        return actions.filter((a) => a.assignee_id === filter.memberId);
-      case "workstream":
-        return actions.filter((a) => a.workstream_id === filter.workstreamId);
-    }
-  }, [actions, filter, selfId]);
-
-  // Counts power the chip labels.
-  const counts = useMemo(() => {
-    let mine = 0;
-    let unassigned = 0;
-    for (const a of actions) {
-      if (a.assignee_id == null) unassigned++;
-      else if (a.assignee_id === selfId) mine++;
-    }
-    return { mine, unassigned, all: actions.length };
-  }, [actions, selfId]);
-
-  // Split dated vs. undated, then bucket the dated half by urgency.
-  // Backend already orders dated rows by `due_ms ASC`, so each bucket is
-  // chronological without further sorting. Undated rows fall into one
-  // flat catch-all bucket at the bottom.
-  const { byBucket, undated } = useMemo(() => {
-    const now = Date.now();
-    const buckets: Record<string, ActionListItem[]> = {
-      overdue: [],
-      today: [],
-      soon: [],
-      later: [],
-    };
-    const undatedRows: ActionListItem[] = [];
-    for (const a of filtered) {
-      if (a.due_ms != null) {
-        buckets[dueBucket(a.due_ms, now)].push(a);
-      } else {
-        undatedRows.push(a);
-      }
-    }
-    return { byBucket: buckets, undated: undatedRows };
-  }, [filtered]);
-
-  // Page-level "New todo" trigger lives in PageHeader (Home.tsx);
-  // ActionsFeed renders only the composer form when open.
-  const composer = composerOpen ? (
-    <InboxComposerForm
-      onAdd={onAddInboxTodo}
-      onClose={() => setComposerOpen(false)}
-    />
-  ) : null;
-
-  const filterBar = (
-    <ActionsFilterBar
-      filter={filter}
-      onChange={setFilter}
-      members={members}
-      workstreams={workstreams}
-      selfId={selfId}
-      counts={counts}
-    />
-  );
-
-  if (actions.length === 0) {
-    return (
-      <section className="home-section">
-        {composer}
-        <p className="home-empty">
-          No open action items. Add <code>- [ ] task</code> lines to any note,
-          trail with <code>@2026-01-15</code> / <code>@tomorrow</code> /{" "}
-          <code>@friday</code> to schedule, or hit <em>New todo</em> above.
-        </p>
-      </section>
-    );
-  }
-
-  if (filtered.length === 0) {
-    return (
-      <section className="home-section">
-        {composer}
-        {filterBar}
-        <p className="home-empty">
-          No action items match this filter.{" "}
-          <button
-            type="button"
-            className="home-empty-link"
-            onClick={() => setFilter({ kind: "all" })}
-          >
-            Clear filter
-          </button>
-        </p>
-      </section>
-    );
-  }
-
-  return (
-    <section className="home-section">
-      {composer}
-      {filterBar}
-
-      {BUCKET_ORDER.map(({ key, label }) => {
-        const items = byBucket[key];
-        if (items.length === 0) return null;
-        return (
-          <div key={key} className={`home-action-bucket bucket-${key}`}>
-            <div className="home-action-bucket-head">
-              <span className="home-action-bucket-label">{label}</span>
-              <span className="home-action-bucket-count">{items.length}</span>
-            </div>
-            <div className="home-actions">
-              {items.map((it) => (
-                <ActionRow
-                  key={it.id}
-                  it={it}
-                  onToggle={onToggle}
-                  onDelete={onDelete}
-                  onOpenNote={onOpenNote}
-                  onOpenWorkstream={onOpenWorkstream}
-                  members={members}
-                  workstreams={workstreams}
-                  onReassign={onReassign}
-                  onReattachWorkstream={onReattachWorkstream}
-                  onUndoAutoResolved={onUndoAutoResolved}
-                />
-              ))}
-            </div>
-          </div>
-        );
-      })}
-
-      {undated.length > 0 && (
-        <div className="home-action-bucket bucket-undated">
-          <div className="home-action-bucket-head">
-            <span className="home-action-bucket-label">No due date</span>
-            <span className="home-action-bucket-count">{undated.length}</span>
-          </div>
-          <div className="home-actions">
-            {undated.map((it) => (
-              <ActionRow
-                key={it.id}
-                it={it}
-                onToggle={onToggle}
-                onDelete={onDelete}
-                onOpenNote={onOpenNote}
-                onOpenWorkstream={onOpenWorkstream}
-                members={members}
-                onReassign={onReassign}
-                onUndoAutoResolved={onUndoAutoResolved}
-              />
-            ))}
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
 // ---------- Open questions feed (#113) ------------------------------------
 
-/// Dedicated Open Questions page — clones the data flow of
-/// `ActionsFeed` but reads from `note_open_questions` via the
-/// `listOpenQuestions` IPC. Top-of-page tab toggle picks open vs.
-/// resolved. Asked-of and workstream filters mirror the actions
-/// surface. No due-date bucketing — questions don't carry due dates
-/// in v1; rows are ordered by parent note's `modified_ms desc`.
+/// Dedicated Open Questions page — reads from `note_open_questions`
+/// via the `listOpenQuestions` IPC. Top-of-page tab toggle picks open
+/// vs. resolved. Asked-of and workstream filters scope the list. No
+/// due-date bucketing — questions don't carry due dates in v1; rows
+/// are ordered by parent note's `modified_ms desc`.
 function OpenQuestionsFeed({
   onOpenNote,
   members,
