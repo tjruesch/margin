@@ -15,11 +15,6 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   AliasKind,
   type CalendarEvent,
-  type OpenQuestionItem,
-  resolveOpenQuestion,
-  reopenOpenQuestion,
-  setOpenQuestionAskedOf,
-  deleteOpenQuestion,
   type EmailMessage,
   type ExternalParticipant,
   type TeamMember,
@@ -47,8 +42,6 @@ import {
   setWorkstreamStatus,
   setWorkstreamUserNotes,
 } from "./file";
-import { AssigneeChip } from "./AssigneeChip";
-import { ResolveQuestionPopover } from "./ResolveQuestionPopover";
 import { usePageDetailLifecycle } from "./pageDetail";
 import {
   IconArchive,
@@ -1268,13 +1261,6 @@ function WorkstreamDetailView({
         }
       />
 
-      <OpenQuestionsSection
-        questions={detail.open_questions}
-        members={teamMembers}
-        onOpenNote={onOpenNote}
-        onResolved={() => void reload()}
-      />
-
       <EmailsSection
         emails={detail.emails}
         onDetach={(itemId) => void handleDetach("email", itemId)}
@@ -2331,121 +2317,6 @@ function LinkComposer({
 }
 
 // ----- Sections ------------------------------------------------------------
-
-/// Open Questions section on the Workstream detail view (#113).
-/// Per-row click opens the source note; per-row
-/// resolve/reopen/reassign/delete fires the matching IPC. Calls
-/// `onResolved` after any mutation so the parent can `reload()` and
-/// pick up updated counts.
-function OpenQuestionsSection({
-  questions,
-  members,
-  onOpenNote,
-  onResolved,
-}: {
-  questions: OpenQuestionItem[];
-  members: TeamMember[];
-  onOpenNote: (path: string) => void;
-  onResolved: () => void;
-}) {
-  if (questions.length === 0) return null;
-  return (
-    <section className="workstream-section">
-      <h2 className="workstream-section-title">
-        Open questions ({questions.length})
-      </h2>
-      <div className="home-actions">
-        {questions.map((q) => (
-          <div
-            key={q.id}
-            className="home-action-row"
-            role="button"
-            tabIndex={0}
-            onClick={() =>
-              q.origin_note_path && onOpenNote(q.origin_note_path)
-            }
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                if (q.origin_note_path) onOpenNote(q.origin_note_path);
-              }
-            }}
-          >
-            <ResolveQuestionPopover
-              resolved={q.resolved}
-              initialAnswer={q.resolved_note}
-              onResolve={async (answer) => {
-                try {
-                  await resolveOpenQuestion(q.id, answer);
-                } catch (e) {
-                  console.error("[workstreams] resolve question failed", e);
-                }
-                onResolved();
-              }}
-              onReopen={async () => {
-                try {
-                  await reopenOpenQuestion(q.id);
-                } catch (e) {
-                  console.error("[workstreams] reopen question failed", e);
-                }
-                onResolved();
-              }}
-            />
-            <div className="home-action-body">
-              <div className={"home-action-text" + (q.resolved ? " done" : "")}>
-                {q.text}
-              </div>
-              {q.resolved && q.resolved_note && (
-                <div className="home-action-answer">
-                  <span className="home-action-answer-bullet">↳</span>
-                  <span className="home-action-answer-text">
-                    {q.resolved_note}
-                  </span>
-                </div>
-              )}
-            </div>
-            <AssigneeChip
-              assigneeId={q.asked_of_id}
-              assigneeDisplayName={q.asked_of_display_name}
-              members={members}
-              onPick={async (memberId) => {
-                try {
-                  await setOpenQuestionAskedOf(q.id, memberId);
-                } catch (e) {
-                  console.error(
-                    "[workstreams] set_open_question_asked_of failed",
-                    e,
-                  );
-                }
-                onResolved();
-              }}
-            />
-            <button
-              type="button"
-              className="home-action-delete"
-              aria-label="Delete question"
-              title="Delete"
-              onClick={async (e) => {
-                e.stopPropagation();
-                try {
-                  await deleteOpenQuestion(q.id);
-                } catch (err) {
-                  console.error(
-                    "[workstreams] delete_open_question failed",
-                    err,
-                  );
-                }
-                onResolved();
-              }}
-            >
-              <IconTrash size={14} sw={1.7} />
-            </button>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
 
 function EmailsSection({
   emails,

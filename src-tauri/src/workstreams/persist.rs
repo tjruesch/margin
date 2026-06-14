@@ -269,17 +269,6 @@ pub fn get_workstream_detail(
         }
     }
 
-    // Open questions on this workstream (#113) inherit from the
-    // attached notes via `workstream_signals(kind='note')`. The
-    // `list_open_questions` IPC already does that join; we just
-    // call it with this workstream's id.
-    let open_questions = crate::notes::list_open_questions_for(
-        conn,
-        crate::notes::QuestionScope::Open,
-        None,
-        Some(id),
-    )
-    .unwrap_or_default();
     let links = list_workstream_links(conn, id)?;
     let children = list_children_of(conn, id)?;
 
@@ -288,7 +277,6 @@ pub fn get_workstream_detail(
         emails,
         events,
         notes,
-        open_questions,
         links,
         teams_messages,
         children,

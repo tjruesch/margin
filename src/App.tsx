@@ -47,8 +47,6 @@ import {
   getMeetingAttendees,
   setNoteTags,
   shareNote,
-  listOpenQuestions,
-  listTeamMembers,
   listWorkstreams,
   synthesizeWorkstreams,
   type TeamMember,
@@ -305,11 +303,6 @@ export default function App() {
   // sidebar / autocomplete stay in sync without an extra disk walk.
   const [notes, setNotes] = useState<NoteListItem[]>([]);
   const [notesLoading, setNotesLoading] = useState<boolean>(true);
-  /** Currently-unresolved open questions (#113). Surfaces as the
-   *  badge count on the "Open questions" sidebar entry. Refreshed on
-   *  every save since `write_note` re-parses body_md and the count can
-   *  shift. */
-  const [openQuestionCount, setOpenQuestionCount] = useState<number>(0);
   // Synthesized workstreams (#71). Populated by listWorkstreams on
   // mount; refreshed when the synthesizer emits `workstream-status`.
   const [workstreams, setWorkstreams] = useState<Workstream[]>([]);
@@ -319,10 +312,6 @@ export default function App() {
   const [synthInFlight, setSynthInFlight] = useState<boolean>(false);
   // Toast slot below the Workstreams header. Auto-clears after 4s.
   const [synthMessage, setSynthMessage] = useState<string | null>(null);
-  // Team members. Loaded once at mount and refreshed on `margin:nav`
-  // events so adds / edits / deletes done on the Team page are reflected
-  // next time the user is back on Home.
-  const [members, setMembers] = useState<TeamMember[]>([]);
   // In-app notifications surfaced by the title-bar bell (#37). Persisted
   // via tauri-plugin-store; survives app restarts. Capped at 50.
   const [notifications, setNotifications] = useState<NotificationRecord[]>(
@@ -439,17 +428,6 @@ export default function App() {
       console.error("listNotes failed:", err);
     } finally {
       setNotesLoading(false);
-    }
-  }, []);
-
-  /** Re-scan the open-question count that drives the sidebar badge
-   *  (#113). Derives from `body_md`, so a `write_note` can shift it. */
-  const refreshOpenQuestionCount = useCallback(async () => {
-    try {
-      const qs = await listOpenQuestions("open");
-      setOpenQuestionCount(qs.length);
-    } catch (err) {
-      console.error("listOpenQuestions failed:", err);
     }
   }, []);
 
@@ -1359,16 +1337,13 @@ export default function App() {
       .then(setHasKey)
       .catch(() => setHasKey(false));
     void refreshNotes();
-    void refreshOpenQuestionCount();
   }, []);
 
   // Re-scan notes whenever the user enters home or flips between active
   // and archive scopes so the feed reflects any edits since last visit.
-  // Also refresh the open-question count so the sidebar badge stays current.
   useEffect(() => {
     if (mode === "home") {
       void refreshNotes();
-      void refreshOpenQuestionCount();
     }
     // refreshNotes is stable (defined below with empty deps)
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1546,38 +1521,6 @@ export default function App() {
     },
     [isOwnedPath, refreshNotes, loadFile],
   );
-
-  // Refresh the open-question count whenever the on-disk saved content
-  // changes for the current note. Catches autosave, manual save, and the
-  // reconcile write path so the sidebar badge stays in sync.
-  useEffect(() => {
-    if (!path) return;
-    void refreshOpenQuestionCount();
-  }, [path, savedContent, refreshOpenQuestionCount]);
-
-  // Refresh team-member list. Cheap; runs on mount and on every
-  // `margin:nav` event (fires when the user changes sidebar nav).
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = async () => {
-      try {
-        const fresh = await listTeamMembers();
-        if (!cancelled) setMembers(fresh);
-      } catch (err) {
-        console.error("listTeamMembers failed:", err);
-      }
-    };
-    void refresh();
-    const onNav = () => void refresh();
-    const onTeamChanged = () => void refresh();
-    window.addEventListener("margin:nav", onNav);
-    window.addEventListener("margin:team-changed", onTeamChanged);
-    return () => {
-      cancelled = true;
-      window.removeEventListener("margin:nav", onNav);
-      window.removeEventListener("margin:team-changed", onTeamChanged);
-    };
-  }, []);
 
   /** Open the macOS share sheet for the active note. The Rust side
    *  writes a renamed temp `<title>.md` (frontmatter stripped) and
@@ -1853,8 +1796,6 @@ export default function App() {
             onArchiveRow={(p, next) => void onArchiveNote(p, next)}
             onFavoriteRow={(p, next) => void onFavoriteNote(p, next)}
             onDuplicateRow={(p) => void onDuplicateNote(p)}
-            openQuestionCount={openQuestionCount}
-            members={members}
             notifications={notifications}
             onMarkAllNotificationsRead={markNotificationsRead}
             workstreams={workstreams}

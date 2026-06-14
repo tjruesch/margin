@@ -25,8 +25,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result, Transaction};
 use serde::Serialize;
 
 use crate::notes::{
-    extract_preview, open_question_id, parse_open_questions, NoteListItem, NoteScope,
-    ParsedQuestion, NOTE_FILENAME, TRANSCRIPT_FILENAME,
+    extract_preview, NoteListItem, NoteScope, NOTE_FILENAME, TRANSCRIPT_FILENAME,
 };
 use crate::paths;
 
@@ -72,7 +71,8 @@ const SCHEMA_V39: &str = include_str!("migrations/039_reconcile_origin.sql");
 const SCHEMA_V40: &str = include_str!("migrations/040_actions_migration_flag.sql");
 const SCHEMA_V41: &str = include_str!("migrations/041_action_deletions.sql");
 const SCHEMA_V42: &str = include_str!("migrations/042_drop_actions.sql");
-const SCHEMA_VERSION: i64 = 42;
+const SCHEMA_V43: &str = include_str!("migrations/043_drop_open_questions.sql");
+const SCHEMA_VERSION: i64 = 43;
 
 /// Register the sqlite-vec extension as an "auto extension" so every
 /// future `Connection::open*` in this process loads `vec0` (#104).
@@ -333,6 +333,10 @@ pub(crate) fn apply_migrations(conn: &Connection) -> Result<()> {
     if version == 41 {
         conn.execute_batch(SCHEMA_V42)?;
         version = 42;
+    }
+    if version == 42 {
+        conn.execute_batch(SCHEMA_V43)?;
+        version = 43;
     }
     if version != SCHEMA_VERSION {
         // Future: bump SCHEMA_VERSION and add another step above.
@@ -1125,21 +1129,18 @@ pub(crate) struct Indexable {
     pub(crate) duration_ms: Option<u64>,
     pub(crate) preview: String,
     pub(crate) body_size: i64,
-    pub(crate) open_questions: Vec<ParsedQuestion>,
     pub(crate) body: String,
 }
 
 /// Build an `Indexable` from an in-memory `body_md` string. Title is
-/// derived from the first `# Heading` line; open questions parsed from
-/// `- [?]` lines. Duration is best-effort hydrated from
-/// `<notes_dir>/<note_id>/transcript.json` when present — audio/
-/// transcripts still live on disk after #112.
+/// derived from the first `# Heading` line. Duration is best-effort
+/// hydrated from `<notes_dir>/<note_id>/transcript.json` when present —
+/// audio/transcripts still live on disk after #112.
 pub(crate) fn parse_indexable_from_body(
     bundle_id: &str,
     body_md: &str,
     modified_ms: i64,
 ) -> Indexable {
-    let open_questions = parse_open_questions(body_md);
     let title = body_md
         .lines()
         .find_map(|l| {
@@ -1171,7 +1172,6 @@ pub(crate) fn parse_indexable_from_body(
         duration_ms,
         preview,
         body_size,
-        open_questions,
         body: body_md.to_string(),
     }
 }
@@ -1264,64 +1264,7 @@ pub(crate) fn upsert_in_tx(
         params![note_id, p.title, p.body],
     )?;
 
-    // Resolve owner candidates on open-question lines to team-member
-    // ids for the `asked_of_id` column.
-    let team_members = crate::team::list_team_members_raw(tx).unwrap_or_else(|e| {
-        eprintln!("[index] list_team_members_raw failed: {e}");
-        Vec::new()
-    });
-    let resolver = crate::team::OwnerResolver::from_members(&team_members);
-
-    let now_ms = current_unix_ms();
-
-    // Open questions (#113): wholesale-replace scoped to unresolved
-    // rows. Resolved rows live forever (until the note is deleted via
-    // FK CASCADE) so the "Resolved" tab on the Open Questions page
-    // can show history. The ON CONFLICT branch reopens a resolved row
-    // when the user manually edits `[x]` back to `[?]` in markdown.
-    tx.execute(
-        "DELETE FROM note_open_questions \
-           WHERE origin_note_id = ?1 AND resolved = 0",
-        params![note_id],
-    )?;
-    {
-        let mut stmt = tx.prepare_cached(
-            "INSERT INTO note_open_questions \
-                (id, origin_note_id, origin_line, text, resolved, \
-                 created_ms, asked_of_id) \
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6) \
-             ON CONFLICT(id) DO UPDATE SET \
-                origin_line   = excluded.origin_line, \
-                resolved      = 0, \
-                resolved_ms   = NULL, \
-                resolved_note = NULL, \
-                asked_of_id   = excluded.asked_of_id",
-        )?;
-        for q in &p.open_questions {
-            let id = open_question_id(&p.bundle_id, &q.text);
-            let asked_of_id = q
-                .owner_candidate
-                .as_deref()
-                .and_then(|c| resolver.resolve(c));
-            stmt.execute(params![
-                id,
-                note_id,
-                q.line as i64,
-                q.text,
-                now_ms,
-                asked_of_id,
-            ])?;
-        }
-    }
     Ok(())
-}
-
-pub(crate) fn current_unix_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 pub(crate) fn remove_in_tx(tx: &Transaction<'_>, note_id: &str) -> Result<()> {
@@ -1530,7 +1473,6 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: 0,
-            open_questions: vec![],
             body: String::new(),
         };
         let tx = conn.transaction().unwrap();
@@ -1820,7 +1762,6 @@ mod tests {
             duration_ms: None,
             preview: String::new(),
             body_size: body.len() as i64,
-            open_questions: vec![],
             body: body.into(),
         }
     }
@@ -1857,146 +1798,5 @@ mod tests {
             )
             .unwrap();
         assert_eq!(modified, 1);
-    }
-
-    // ----- #113 open questions integration ----------------------------------
-
-    fn mk_indexable_with_questions(
-        bundle_id: &str,
-        body: &str,
-        questions: Vec<ParsedQuestion>,
-        modified_ms: i64,
-    ) -> Indexable {
-        Indexable {
-            bundle_id: bundle_id.into(),
-            title: bundle_id.into(),
-            modified_ms,
-            duration_ms: None,
-            preview: String::new(),
-            body_size: body.len() as i64,
-            open_questions: questions,
-            body: body.into(),
-        }
-    }
-
-    #[test]
-    fn upsert_replaces_open_questions_but_keeps_resolved() {
-        let mut conn = fresh_conn();
-        let p = mk_indexable_with_questions(
-            "a",
-            "- [?] alpha\n- [?] beta\n",
-            vec![
-                ParsedQuestion {
-                    line: 1,
-                    text: "alpha".into(),
-                    owner_candidate: None,
-                },
-                ParsedQuestion {
-                    line: 2,
-                    text: "beta".into(),
-                    owner_candidate: None,
-                },
-            ],
-            100,
-        );
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "a", &p).unwrap();
-        tx.commit().unwrap();
-
-        // Mark `alpha` resolved out-of-band (simulating the resolve IPC).
-        conn.execute(
-            "UPDATE note_open_questions SET resolved = 1, resolved_ms = 200 \
-               WHERE id = (SELECT id FROM note_open_questions \
-                            WHERE origin_note_id = 'a' AND text = 'alpha')",
-            [],
-        )
-        .unwrap();
-
-        // Re-upsert with a body that drops both [?] lines.
-        let p2 = mk_indexable_with_questions(
-            "a",
-            "- [x] alpha\n",
-            vec![],
-            200,
-        );
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "a", &p2).unwrap();
-        tx.commit().unwrap();
-
-        // Resolved row survives; open row (beta) is gone.
-        let resolved_n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM note_open_questions \
-                  WHERE origin_note_id = 'a' AND resolved = 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(resolved_n, 1);
-        let open_n: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM note_open_questions \
-                  WHERE origin_note_id = 'a' AND resolved = 0",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(open_n, 0);
-    }
-
-    #[test]
-    fn upsert_reopens_resolved_row_when_marker_flips_back() {
-        let mut conn = fresh_conn();
-        // Initial save with one question.
-        let p = mk_indexable_with_questions(
-            "a",
-            "- [?] foo\n",
-            vec![ParsedQuestion {
-                line: 1,
-                text: "foo".into(),
-                owner_candidate: None,
-            }],
-            100,
-        );
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "a", &p).unwrap();
-        tx.commit().unwrap();
-        // Mark it resolved.
-        conn.execute(
-            "UPDATE note_open_questions SET resolved = 1, \
-                                              resolved_ms = 150, \
-                                              resolved_note = 'yes' \
-              WHERE origin_note_id = 'a'",
-            [],
-        )
-        .unwrap();
-        // User manually edits `[x]` back to `[?]` in the body — the
-        // parser surfaces the question again. ON CONFLICT branch
-        // reopens the row.
-        let p2 = mk_indexable_with_questions(
-            "a",
-            "- [?] foo\n",
-            vec![ParsedQuestion {
-                line: 1,
-                text: "foo".into(),
-                owner_candidate: None,
-            }],
-            200,
-        );
-        let tx = conn.transaction().unwrap();
-        upsert_in_tx(&tx, "a", &p2).unwrap();
-        tx.commit().unwrap();
-
-        let (resolved, resolved_ms, resolved_note): (i64, Option<i64>, Option<String>) = conn
-            .query_row(
-                "SELECT resolved, resolved_ms, resolved_note \
-                   FROM note_open_questions WHERE origin_note_id = 'a'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(resolved, 0);
-        assert_eq!(resolved_ms, None);
-        assert_eq!(resolved_note, None);
     }
 }

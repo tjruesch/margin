@@ -40,18 +40,13 @@ the raw inputs:
 ## Key decisions
 - Bullet list. Decisive verbs. _None._ if nothing decided.
 
-## Open questions
-- [?] Question, when no specific person owes the answer.
-- [?] Sarah — Confirm the migration runs before the freeze.
-- _None._ if nothing.
-
 ---
 
 ## Notes
 {verbatim user hand-notes — preserve formatting, headings, lists}
 ```
 
-The three reconciled sections at the top are *your* synthesis. The `## Notes` \
+The two reconciled sections at the top are *your* synthesis. The `## Notes` \
 block below the divider is reference material — preserve it verbatim. The raw \
 transcript is stored separately by the app; **do not** include a `## Transcript` \
 section, the transcript text, or any verbatim quotes longer than a phrase.
@@ -66,13 +61,13 @@ exact decisions, deadlines, technical specifics.
 - **Preserve the user's notes verbatim** under `## Notes` — do not edit, \
 reformat, or 'improve' them. They go in as-is.
 - **Do NOT echo the transcript** into the document. The user has it stored \
-separately and can view it on demand. Distill it into the four reconciled \
+separately and can view it on demand. Distill it into the two reconciled \
 sections; never paste it.
-- **If the user's notes are empty**, produce the four sections from the \
+- **If the user's notes are empty**, produce the two sections from the \
 transcript alone. Skip the `## Notes` section content but keep the heading and \
 write `_(no hand-notes were taken)_`.
 - **If the transcript is empty or unintelligible**, lean entirely on the \
-user's notes. Note the absence under `## Open questions`.
+user's notes.
 - **First H1 line**: emit a `# {title}` line at the very top. Use the title \
 provided in the user message; if none, infer one from the content.
 
@@ -83,10 +78,6 @@ Capture the meeting's purpose and outcome. Skip filler.
 - **Key decisions**: a bullet list of decisions actually reached (something \
 committed to or rejected, not merely discussed). Decisive verbs (chose, will, \
 approved, rejected, deferred). One short sentence each.
-- **Open questions**: questions left unanswered, blockers, deferred topics. \
-Phrased as questions. Format as `- [?] {Asked-of} — {question}` or \
-`- [?] {question}` when no specific person owes the answer — the `[?]` \
-marker is what the app parses into the Open Questions surface.
 - **Names**: preserve as written in the user's notes; check the transcript \
 when the user wrote initials or partial names. If unclear, omit owner rather \
 than guess.
@@ -137,10 +128,6 @@ SDK work.
 - v2 API will use cursor-based pagination (not offset).
 - API contract must be locked by Friday.
 
-## Open questions
-
-_None._
-
 ---
 
 ## Notes
@@ -174,13 +161,6 @@ pending data validation and product-philosophy review.
 
 _None._
 
-## Open questions
-
-- [?] Does auto-creating a sample project violate the empty-canvas philosophy \
-enough to outweigh the activation lift?
-- [?] Lin — Do we have the data to prove the empty state is the cause of \
-the 40% drop?
-
 ---
 
 ## Notes
@@ -190,7 +170,7 @@ _(no hand-notes were taken)_
 
 ## Final reminder
 
-Produce the entire output: `# {title}` line, then three `##` reconciled \
+Produce the entire output: `# {title}` line, then two `##` reconciled \
 sections, then `---`, then `## Notes` with the user's notes verbatim (or the \
 empty-notes placeholder). Stop there. Never emit a `## Transcript` section \
 and never paste the transcript text into the document. No preamble, no code \

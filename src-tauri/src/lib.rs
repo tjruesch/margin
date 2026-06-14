@@ -418,11 +418,6 @@ pub fn run() {
             ) {
                 eprintln!("notes body backfill failed at boot: {e}");
             }
-            // #113: one-shot reparse so existing `- [?]` lines populate
-            // the new note_open_questions table.
-            if let Err(e) = notes::questions_backfill_if_pending(&mut conn) {
-                eprintln!("questions backfill failed at boot: {e}");
-            }
             if let Err(e) = team::bootstrap_self_if_missing(&mut conn) {
                 eprintln!("team bootstrap failed at boot: {e}");
             }
@@ -541,11 +536,6 @@ pub fn run() {
             notes::set_note_tags,
             notes::set_archived,
             notes::set_favorite,
-            notes::list_open_questions,
-            notes::resolve_open_question,
-            notes::reopen_open_question,
-            notes::set_open_question_asked_of,
-            notes::delete_open_question,
             sharing::share_note,
             team::list_team_members,
             team::get_team_member,

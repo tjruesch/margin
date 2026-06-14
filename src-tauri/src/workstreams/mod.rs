@@ -154,9 +154,6 @@ pub struct WorkstreamDetail {
     pub emails: Vec<crate::connectors::email::EmailMessage>,
     pub events: Vec<crate::connectors::calendar::CalendarEvent>,
     pub notes: Vec<NoteRef>,
-    /// Open questions inheriting from this workstream's attached
-    /// notes via `workstream_signals(kind='note')` (#113).
-    pub open_questions: Vec<crate::notes::OpenQuestionItem>,
     pub links: Vec<WorkstreamLink>,
     /// Teams chat messages attached to this workstream via the
     /// `workstream_signals` pivot (kind='teams_message'). Recency-desc
