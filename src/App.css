@@ -1612,12 +1612,6 @@ select.settings-input {
 
 /* ----- Action items ----- */
 
-.home-actions {
-  margin-top: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
 .inbox-composer-cancel,
 .inbox-composer-save {
   padding: 5px 12px;
@@ -1751,122 +1745,6 @@ select.settings-input {
   font-weight: 600;
   color: var(--fg);
 }
-.home-action-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 14px;
-  padding: 12px 14px;
-  border-radius: 10px;
-  background: var(--home-card);
-  border: 0.5px solid var(--home-line);
-  cursor: pointer;
-  transition: all 120ms ease;
-}
-.home-action-row:hover {
-  background: var(--home-card-hover);
-  box-shadow: 0 2px 8px color-mix(in srgb, var(--fg) 4%, transparent);
-}
-.home-action-delete {
-  flex-shrink: 0;
-  width: 26px;
-  height: 26px;
-  margin-top: -1px;
-  border-radius: 6px;
-  background: transparent;
-  border: 0;
-  color: var(--fg-muted);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  opacity: 0;
-  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
-}
-.home-action-row:hover .home-action-delete,
-.home-action-delete:focus-visible {
-  opacity: 1;
-}
-.home-action-delete:hover {
-  background: color-mix(in srgb, #e5484d 14%, transparent);
-  color: #e5484d;
-}
-.home-checkbox {
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
-  flex-shrink: 0;
-  background: transparent;
-  /* `--home-line-strong` (= --border, ~#d0d7de in light mode) is the
-     hairline used for card borders, which gives barely any contrast
-     against the white card background — the unchecked checkbox read
-     as a blank gap in the sidebar's narrow rows. Bump to the muted
-     foreground tone for a clearly perceptible "empty checkbox" glyph
-     while staying subtle next to the bolder filled (done) state. */
-  border: 1.5px solid color-mix(in srgb, var(--fg) 35%, transparent);
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  margin-top: 2px;
-  color: var(--bg);
-  transition: all 120ms ease;
-}
-.home-checkbox:hover {
-  border-color: color-mix(in srgb, var(--fg) 55%, transparent);
-}
-.home-checkbox.done {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.home-checkbox svg {
-  width: 11px;
-  height: 11px;
-  overflow: visible;
-}
-.home-action-body {
-  flex: 1;
-  min-width: 0;
-}
-.home-action-text {
-  font-size: 14px;
-  font-weight: 500;
-  color: var(--fg);
-  line-height: 1.4;
-}
-.home-action-text.done {
-  color: var(--fg-muted);
-  text-decoration: line-through;
-}
-.home-action-origin {
-  margin-top: 3px;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 11px;
-  color: var(--fg-muted);
-  line-height: 1.3;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.home-action-origin svg {
-  flex-shrink: 0;
-  opacity: 0.75;
-}
-.home-action-origin-label {
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-.home-action-origin-sep {
-  opacity: 0.5;
-}
-.home-action-origin-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
 /* ----- Notes feed ----- */
 
 .home-filter {
@@ -1896,13 +1774,6 @@ select.settings-input {
   font-weight: 600;
 }
 
-.actions-filter-bar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-bottom: 14px;
-}
 .actions-filter-count {
   display: inline-block;
   margin-left: 5px;
@@ -1917,19 +1788,6 @@ select.settings-input {
 .home-filter-chip.active .actions-filter-count {
   background: color-mix(in srgb, var(--fg) 14%, transparent);
   color: var(--fg);
-}
-.actions-filter-select {
-  appearance: none;
-  -webkit-appearance: none;
-  padding-right: 22px;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2'><polyline points='6 9 12 15 18 9'/></svg>");
-  background-repeat: no-repeat;
-  background-position: right 7px center;
-  background-size: 10px 10px;
-}
-.actions-filter-select:focus {
-  outline: 1px solid color-mix(in srgb, var(--fg) 30%, transparent);
-  outline-offset: -1px;
 }
 
 .home-empty-link {
@@ -4192,134 +4050,6 @@ input.nh-title {
 }
 .attendee-modal-submit:not(:disabled):hover {
   filter: brightness(1.05);
-}
-
-/* ----- Action-row assignee chip (#51) ----- */
-
-.assignee-popover-anchor {
-  position: relative;
-  display: inline-flex;
-  flex-shrink: 0;
-}
-
-.assignee-chip,
-.assignee-chip-empty {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font: inherit;
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  flex-shrink: 0;
-  transition: filter 100ms ease, background 100ms ease, border-color 100ms ease;
-  padding: 0;
-}
-.assignee-chip {
-  border: 1.5px solid var(--bg);
-  color: #fff;
-}
-.assignee-chip:hover {
-  filter: brightness(1.08);
-}
-.assignee-chip-empty {
-  border: 1px dashed color-mix(in srgb, var(--fg) 40%, transparent);
-  background: transparent;
-  color: var(--fg-muted);
-}
-.assignee-chip-empty:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-}
-
-.assignee-popover {
-  position: absolute;
-  top: 30px;
-  right: 0;
-  z-index: 20;
-  min-width: 220px;
-  max-height: 320px;
-  overflow-y: auto;
-  padding: 5px;
-  border-radius: 10px;
-  border: 0.5px solid var(--home-line);
-  background: var(--bg);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18),
-    0 4px 12px rgba(0, 0, 0, 0.08);
-  animation: nh-pop-in 140ms ease-out;
-}
-.assignee-popover-empty {
-  padding: 12px;
-  text-align: center;
-  color: var(--fg-muted);
-  font-size: 12.5px;
-}
-.assignee-popover-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 6px 8px;
-  border-radius: 6px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  font: inherit;
-  font-size: 13px;
-  text-align: left;
-  color: var(--fg);
-}
-.assignee-popover-row:hover {
-  background: var(--home-card-hover);
-}
-.assignee-popover-row.active {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
-}
-.assignee-popover-disc {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  color: #fff;
-  font-size: 9px;
-  font-weight: 700;
-  flex-shrink: 0;
-}
-.assignee-popover-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.assignee-popover-self {
-  font-size: 9px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  padding: 1.5px 6px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--accent);
-}
-.assignee-popover-sep {
-  height: 0.5px;
-  background: var(--home-line);
-  margin: 4px 0;
-}
-.assignee-popover-unassign {
-  color: #c44a1f;
-  font-weight: 500;
-}
-.assignee-popover-unassign:hover {
-  background: color-mix(in srgb, #c44a1f 10%, transparent);
 }
 
 /* ----- Notifications panel (#37) ----- */
@@ -6729,22 +6459,6 @@ button.workstream-external-chip:hover {
   color: var(--fg-muted);
 }
 
-/* Actions — reuse home-action-row layout for visual parity with the
-   Home action items page (#81 follow-up). The only workstream-specific
-   touch is the small "from <kind>" source chip on the right, slotted
-   in the same column the home page uses for its AssigneeChip. */
-.workstream-action-source-chip {
-  font-size: 10.5px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--fg-muted);
-  padding: 2px 8px;
-  border-radius: 10px;
-  background: var(--home-chip);
-  white-space: nowrap;
-}
-
 /* Emails */
 .workstream-emails,
 .workstream-meetings,
@@ -6862,104 +6576,6 @@ button.workstream-external-chip:hover {
   margin: 0;
   font-size: 13px;
   color: var(--fg-muted);
-}
-
-/* ----- Open questions (#113) ----- */
-
-.resolve-popover-anchor {
-  position: relative;
-  display: inline-flex;
-  flex-shrink: 0;
-}
-.home-question-checkbox {
-  /* Same footprint as the home-checkbox but with a circular outline
-     so the question vs. action distinction is visible at a glance. */
-  border-radius: 50%;
-}
-.home-question-checkbox:not(.resolved) svg {
-  color: var(--fg-muted);
-}
-.home-question-checkbox.resolved {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.resolve-popover {
-  position: absolute;
-  top: 30px;
-  left: 0;
-  z-index: 20;
-  min-width: 280px;
-  padding: 8px;
-  border-radius: 10px;
-  border: 0.5px solid var(--home-line);
-  background: var(--bg);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18),
-    0 4px 12px rgba(0, 0, 0, 0.08);
-  animation: nh-pop-in 140ms ease-out;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.resolve-popover-input {
-  width: 100%;
-  padding: 6px 8px;
-  border-radius: 6px;
-  border: 0.5px solid var(--home-line);
-  background: var(--bg);
-  color: var(--fg);
-  font: inherit;
-  font-size: 13px;
-  resize: vertical;
-}
-.resolve-popover-actions {
-  display: flex;
-  gap: 6px;
-  justify-content: flex-end;
-}
-.resolve-popover-btn {
-  font: inherit;
-  font-size: 12.5px;
-  padding: 5px 10px;
-  border-radius: 6px;
-  border: 0.5px solid var(--home-line);
-  background: transparent;
-  color: var(--fg);
-  cursor: pointer;
-}
-.resolve-popover-btn:hover {
-  background: var(--home-card-hover);
-}
-.resolve-popover-primary {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #fff;
-}
-.resolve-popover-primary:hover {
-  filter: brightness(1.05);
-  background: var(--accent);
-}
-.resolve-popover-primary:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.home-action-answer {
-  display: flex;
-  gap: 6px;
-  margin-top: 2px;
-  font-size: 12.5px;
-  color: var(--fg-muted);
-  font-style: italic;
-}
-.home-action-answer-bullet {
-  flex-shrink: 0;
-}
-.home-action-answer-text {
-  min-width: 0;
-  word-break: break-word;
-}
-.actions-filter-spacer {
-  flex: 1;
 }
 
 /* ----- Unassigned feed + workstream picker (#108) ----- */

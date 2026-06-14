@@ -198,12 +198,5 @@ function buildRows(s: DailyActivitySummary): string[] {
     rows.push(`${s.people_interacted} ${noun} interacted with today`);
   }
 
-  // Open questions (#113): all-time, not today-scoped. The other rows
-  // are activity windows; this one is the standing backlog.
-  if (s.open_questions_count > 0) {
-    const noun = s.open_questions_count === 1 ? "question" : "questions";
-    rows.push(`${s.open_questions_count} open ${noun}`);
-  }
-
   return rows;
 }
