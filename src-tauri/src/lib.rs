@@ -17,9 +17,11 @@ mod observations;
 mod paths;
 mod profiles;
 mod reconcile;
+mod reminders;
 mod sharing;
 mod sysaudio;
 mod team;
+mod todos;
 mod transcribe;
 mod voice;
 mod workstreams;
@@ -491,6 +493,11 @@ pub fn run() {
             // Anthropic API key is configured.
             profiles::start_worker(app.handle().clone());
 
+            // Todo due-date reminder ticker (#166). Ticks every 30s,
+            // fires an OS notification per newly-due todo. Idle until a
+            // todo with a due date exists.
+            reminders::start(app.handle().clone());
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -585,6 +592,11 @@ pub fn run() {
             workstreams::commands::set_workstream_parent,
             activity::get_daily_activity,
             activity::list_recent_activity,
+            todos::list_todos,
+            todos::create_todo,
+            todos::update_todo,
+            todos::set_todo_done,
+            todos::delete_todo,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

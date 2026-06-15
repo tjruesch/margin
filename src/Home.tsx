@@ -6,6 +6,7 @@ import {
   type ConnectorStatusEvent,
   listCalendarEvents,
   listConnectors,
+  listTodos,
   type NoteListItem,
   openOrCreateEventNote,
 } from "./file";
@@ -16,6 +17,7 @@ import { type NotificationRecord, unreadCount } from "./notifications";
 import { NotificationsPanel } from "./NotificationsPanel";
 import { ChatPage } from "./ChatPage";
 import { ChangelogView } from "./Changelog";
+import { TodosView } from "./Todos";
 import { SearchPalette } from "./SearchPalette";
 import { TeamView } from "./Team";
 import { WorkstreamsView } from "./Workstreams";
@@ -24,6 +26,7 @@ import {
   IconBell,
   IconBrand,
   IconBriefcase,
+  IconChecklist,
   IconChevRight,
   IconHome,
   IconMic,
@@ -84,6 +87,7 @@ type NavId =
   | "chat"
   | "workstreams"
   | "changelog"
+  | "todos"
   | "favorites"
   | "archive"
   | "team";
@@ -126,6 +130,43 @@ function useConnectorHealthAlert(): boolean {
     };
   }, []);
   return hasError;
+}
+
+/// Dot on the Todos nav item when any incomplete todo is overdue (#166).
+/// Refetches on every `todos-changed` event and re-checks once a minute
+/// so a todo crossing its due time lights up without a manual refresh.
+function useTodosOverdueAlert(): boolean {
+  const [overdue, setOverdue] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const list = await listTodos("active");
+        if (cancelled) return;
+        const now = Date.now();
+        setOverdue(list.some((t) => t.due_ms != null && t.due_ms <= now));
+      } catch (e) {
+        if (!cancelled) console.error("[home] listTodos failed:", e);
+      }
+    };
+    void refresh();
+    let unlisten: UnlistenFn | null = null;
+    (async () => {
+      const fn = await listen("todos-changed", () => void refresh());
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    })();
+    const tick = setInterval(() => void refresh(), 60_000);
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+      clearInterval(tick);
+    };
+  }, []);
+  return overdue;
 }
 
 /// Live calendar data hook (#62). Returns mapped `UpcomingEvent`s for
@@ -436,6 +477,7 @@ export function Home({
       "chat",
       "workstreams",
       "changelog",
+      "todos",
       "favorites",
       "archive",
       "team",
@@ -480,6 +522,7 @@ export function Home({
 
   const { upcoming, raw: rawEvents, nowMs: eventsNowMs } = useUpcomingEvents();
   const settingsAlert = useConnectorHealthAlert();
+  const todosAlert = useTodosOverdueAlert();
 
   // Today-bound count for the greeting subline. Counts events whose
   // start falls between today's midnight and tomorrow's, ignoring
@@ -557,6 +600,7 @@ export function Home({
           onTagSelect={(t) => setTagFilter(t === tagFilter ? null : t)}
           onOpenSettings={onOpenSettings}
           settingsAlert={settingsAlert}
+          todosAlert={todosAlert}
           onOpenPalette={() => setPaletteOpen(true)}
           onNewNote={onNewNote}
           onNewMeeting={onNewMeeting}
@@ -688,6 +732,8 @@ export function Home({
           />
         ) : nav === "changelog" ? (
           <ChangelogView onOpenSettings={onOpenSettings} />
+        ) : nav === "todos" ? (
+          <TodosView />
         ) : (
           <>
             <NotesFeed
@@ -724,6 +770,7 @@ function Sidebar({
   onTagSelect,
   onOpenSettings,
   settingsAlert,
+  todosAlert,
   onOpenPalette,
   onNewNote,
   onNewMeeting,
@@ -738,6 +785,8 @@ function Sidebar({
    *  is errored (#141). Lets the user notice broken sync from anywhere
    *  in the app, not just by visiting Settings → Connectors. */
   settingsAlert: boolean;
+  /** Dot on the Todos nav item when any incomplete todo is overdue. */
+  todosAlert: boolean;
   onOpenPalette: () => void;
   /** Global compose CTAs. The Greeting on Home renders these inline;
    *  on every other nav we surface them from the sidebar footer
@@ -788,6 +837,13 @@ function Sidebar({
           label="Changelog"
           active={active === "changelog"}
           onClick={() => onSelect("changelog")}
+        />
+        <NavItem
+          icon={<IconChecklist size={14} sw={1.7} />}
+          label="Todos"
+          active={active === "todos"}
+          alert={todosAlert}
+          onClick={() => onSelect("todos")}
         />
         <NavItem
           icon={<IconUser size={14} sw={1.7} />}
@@ -1028,6 +1084,7 @@ function renderScopedActions(
         </>
       );
     case "changelog":
+    case "todos":
     case "favorites":
     case "archive":
     case "home":
@@ -1042,6 +1099,8 @@ function pageHeaderTitle(nav: NavId): string {
       return "Workstreams";
     case "changelog":
       return "Changelog";
+    case "todos":
+      return "Todos";
     case "team":
       return "Team";
     case "favorites":

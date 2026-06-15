@@ -7729,3 +7729,312 @@ button.workstream-external-chip:hover {
   color: var(--fg);
 }
 
+/* ---------- Todos (#166) --------------------------------------------- */
+.todo-view {
+  padding: 22px 32px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 760px;
+}
+
+.todo-composer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--home-line);
+  border-radius: 10px;
+  background: var(--home-card);
+}
+.todo-composer-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font-size: 14px;
+  outline: none;
+}
+.todo-composer-due {
+  border: 0.5px solid var(--home-line);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 12px;
+  padding: 4px 6px;
+  font-family: inherit;
+}
+.todo-composer-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  border: 0.5px solid var(--home-accent-border);
+  background: var(--home-accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.todo-composer-add:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.todo-composer-add:not(:disabled):hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.todo-tabs {
+  display: flex;
+  gap: 6px;
+}
+.todo-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 0.5px solid var(--home-line);
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.todo-tab:hover {
+  background: var(--home-chip);
+  color: var(--fg);
+}
+.todo-tab.active {
+  background: var(--home-accent-soft);
+  border-color: var(--home-accent-border);
+  color: var(--accent);
+}
+.todo-tab-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.todo-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+.todo-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.todo-group-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  padding-left: 2px;
+}
+.todo-group-head.todo-group-overdue {
+  color: #c44a1f;
+}
+[data-theme="dark"] .todo-group-head.todo-group-overdue {
+  color: #e8825b;
+}
+.todo-group-count {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+.todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.todo-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 12px;
+  border-radius: 9px;
+  border: 0.5px solid transparent;
+  background: var(--home-card);
+}
+.todo-row:hover {
+  background: var(--home-card-hover);
+  border-color: var(--home-line);
+}
+.todo-row:hover .todo-delete {
+  opacity: 1;
+}
+.todo-row.done {
+  opacity: 0.62;
+}
+
+.todo-check {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border);
+  background: transparent;
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.todo-check:hover {
+  border-color: var(--accent);
+}
+.todo-check.checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.todo-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.todo-text {
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font-size: 14px;
+  text-align: left;
+  cursor: text;
+  padding: 0;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.todo-row.done .todo-text {
+  text-decoration: line-through;
+}
+.todo-edit-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  border-bottom: 1px solid var(--accent);
+  background: transparent;
+  color: var(--fg);
+  font-size: 14px;
+  outline: none;
+  padding: 0 0 1px;
+}
+
+.todo-due-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.todo-due {
+  border: 0.5px solid var(--home-line);
+  border-radius: 6px;
+  background: var(--home-chip);
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.todo-due:hover {
+  color: var(--fg);
+}
+.todo-due.overdue {
+  color: #c44a1f;
+  background: color-mix(in srgb, #c44a1f 12%, transparent);
+  border-color: color-mix(in srgb, #c44a1f 28%, transparent);
+  font-weight: 550;
+}
+[data-theme="dark"] .todo-due.overdue {
+  color: #e8825b;
+}
+.todo-due-clear {
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  opacity: 0.6;
+}
+.todo-due-clear:hover {
+  opacity: 1;
+  color: #c44a1f;
+}
+.todo-due-add {
+  border: 0.5px dashed var(--home-line);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 11.5px;
+  padding: 2px 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+  opacity: 0.8;
+}
+.todo-due-add:hover {
+  opacity: 1;
+  color: var(--accent);
+  border-color: var(--home-accent-border);
+}
+.todo-due-input {
+  border: 0.5px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 11.5px;
+  padding: 2px 6px;
+  font-family: inherit;
+  flex-shrink: 0;
+}
+
+.todo-delete {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 6px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.todo-delete:hover {
+  color: #c44a1f;
+  background: color-mix(in srgb, #c44a1f 10%, transparent);
+}
+
+/* command palette: the pinned "Create todo" row + added confirmation */
+.palette-result-todo .palette-result-icon {
+  color: var(--accent);
+}
+.palette-empty-inline {
+  padding: 8px 14px 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.palette-added {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--accent);
+}
+
