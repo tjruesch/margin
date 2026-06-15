@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import {
+  createTodo,
   searchNotes,
   SEARCH_HIGHLIGHT_CLOSE,
   SEARCH_HIGHLIGHT_OPEN,
@@ -11,6 +12,7 @@ import {
 import { LevelMeter } from "./LevelMeter";
 import {
   IconArrowRight,
+  IconChecklist,
   IconFileText,
   IconMic,
   IconSearch,
@@ -58,6 +60,14 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
   const [activeIdx, setActiveIdx] = useState(0);
   const [voiceState, setVoiceState] = useState<VoiceState>({ kind: "off" });
   const voiceModeActive = voiceState.kind !== "off";
+  // Brief "✓ Added …" confirmation after creating a todo from the palette.
+  const [justAdded, setJustAdded] = useState<string | null>(null);
+  // True for the one search pass right after a voice capture, so the
+  // "Create todo" row (not the first note hit) becomes the active row —
+  // dictating a todo then pressing Enter commits it.
+  const voiceCaptured = useRef(false);
+  // Where the current query text came from, stamped onto created todos.
+  const inputSource = useRef<"palette" | "voice">("palette");
 
   const { messages, isStreaming, sendMessage } = useChat();
 
@@ -101,7 +111,10 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
         const results = await searchNotes(trimmed, 20);
         if (queryGen.current !== gen) return;
         setHits(results);
-        setActiveIdx(0);
+        // After a voice capture, jump to the "Create todo" row (which
+        // sits just past the note hits) so Enter commits the dictation.
+        setActiveIdx(voiceCaptured.current ? results.length : 0);
+        voiceCaptured.current = false;
       } catch (err) {
         if (queryGen.current !== gen) return;
         console.error("[search] failed:", err);
@@ -207,6 +220,12 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
         setVoiceState({ kind: "didnt-catch", message: r.text });
         return;
       }
+      // A dictation in the palette is treated as a todo capture: the
+      // transcript lands in the box and the search pass promotes the
+      // "Create todo" row to active (see the debounce effect) so a
+      // single Enter commits it. The user can still arrow up to search.
+      voiceCaptured.current = true;
+      inputSource.current = "voice";
       setQuery((prev) => {
         const sep = prev.length > 0 && !prev.endsWith(" ") ? " " : "";
         return prev + sep + r.text;
@@ -246,6 +265,29 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
     await sendMessage(trimmed);
   };
 
+  // Create a todo from the current query (typed or dictated). Keeps the
+  // palette open and clears the box so several can be captured in a row
+  // — handy for voice. A brief confirmation replaces the empty prompt.
+  const createTodoFromPalette = async (text: string) => {
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return;
+    const source = inputSource.current;
+    try {
+      await createTodo(trimmed, null, source);
+      setJustAdded(trimmed);
+      setQuery("");
+      setHits([]);
+      setActiveIdx(0);
+      inputSource.current = "palette";
+      window.setTimeout(() => {
+        setJustAdded((cur) => (cur === trimmed ? null : cur));
+      }, 2600);
+      setTimeout(() => inputRef.current?.focus(), 0);
+    } catch (err) {
+      console.error("[palette] create todo failed:", err);
+    }
+  };
+
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Escape") {
       e.preventDefault();
@@ -265,15 +307,29 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
         if (query.trim().length > 0) submitChatTurn(query);
         return;
       }
-      if (hits.length === 0) return;
+      const hasQuery = query.trim().length > 0;
+      // The "Create todo" row sits just past the note hits.
+      const todoIdx = hits.length;
+      // Shift+Enter: create a todo from the current query, no matter
+      // which row is active.
+      if (e.key === "Enter" && e.shiftKey) {
+        e.preventDefault();
+        if (hasQuery) void createTodoFromPalette(query);
+        return;
+      }
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setActiveIdx((i) => Math.min(i + 1, hits.length - 1));
+        const max = hasQuery ? todoIdx : hits.length - 1;
+        setActiveIdx((i) => Math.min(i + 1, Math.max(max, 0)));
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         setActiveIdx((i) => Math.max(i - 1, 0));
       } else if (e.key === "Enter") {
         e.preventDefault();
+        if (hasQuery && activeIdx === todoIdx) {
+          void createTodoFromPalette(query);
+          return;
+        }
         const hit = hits[activeIdx];
         if (hit) {
           onOpenNote(hit.note_path);
@@ -329,7 +385,10 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
               className="palette-input"
               placeholder={placeholder}
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(e) => {
+                inputSource.current = "palette";
+                setQuery(e.target.value);
+              }}
               disabled={mode === "chat" && isStreaming}
               spellCheck={false}
               autoCorrect="off"
@@ -370,11 +429,13 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
             hits={hits}
             loading={loading}
             activeIdx={activeIdx}
+            justAdded={justAdded}
             onHover={setActiveIdx}
             onPick={(path) => {
               onOpenNote(path);
               onClose();
             }}
+            onCreateTodo={() => void createTodoFromPalette(query)}
           />
         ) : (
           <Conversation
@@ -398,7 +459,8 @@ export function SearchPalette({ open, onClose, onOpenNote, onOpenWorkstream }: P
             </span>
           ) : (
             <span>
-              <kbd>↵</kbd> open · <kbd>⌘↵</kbd> ask AI · <kbd>esc</kbd> close
+              <kbd>↵</kbd> open · <kbd>⌘↵</kbd> ask · <kbd>⇧↵</kbd> todo ·{" "}
+              <kbd>esc</kbd> close
             </span>
           )}
         </div>
@@ -444,28 +506,46 @@ function SearchResults({
   hits,
   loading,
   activeIdx,
+  justAdded,
   onHover,
   onPick,
+  onCreateTodo,
 }: {
   ref: React.RefObject<HTMLDivElement | null>;
   query: string;
   hits: SearchHit[];
   loading: boolean;
   activeIdx: number;
+  justAdded: string | null;
   onHover: (idx: number) => void;
   onPick: (path: string) => void;
+  onCreateTodo: () => void;
 }) {
+  const q = query.trim();
+  if (q.length === 0) {
+    return (
+      <div className="palette-results" ref={ref} role="listbox">
+        {justAdded ? (
+          <div className="palette-empty palette-added">
+            <IconChecklist size={13} sw={1.8} /> Added “{justAdded}” to todos
+          </div>
+        ) : (
+          <div className="palette-empty">
+            Type to search across all your notes — titles, bodies, and meeting
+            transcripts. <kbd>⌘↵</kbd> asks AI · <kbd>⇧↵</kbd> creates a todo ·
+            hold <kbd>space</kbd> to dictate.
+          </div>
+        )}
+      </div>
+    );
+  }
+  const todoIdx = hits.length;
   return (
     <div className="palette-results" ref={ref} role="listbox">
-      {query.trim().length === 0 ? (
-        <div className="palette-empty">
-          Type to search across all your notes — titles, bodies, and meeting
-          transcripts. Press <kbd>⌘↵</kbd> to ask AI instead.
-        </div>
-      ) : loading && hits.length === 0 ? (
-        <div className="palette-empty">Searching…</div>
+      {loading && hits.length === 0 ? (
+        <div className="palette-empty-inline">Searching…</div>
       ) : hits.length === 0 ? (
-        <div className="palette-empty">No matches.</div>
+        <div className="palette-empty-inline">No note matches.</div>
       ) : (
         hits.map((hit, idx) => (
           <ResultRow
@@ -478,6 +558,22 @@ function SearchResults({
           />
         ))
       )}
+      <button
+        type="button"
+        className={"palette-result palette-result-todo" + (activeIdx === todoIdx ? " is-active" : "")}
+        data-row-idx={todoIdx}
+        onMouseEnter={() => onHover(todoIdx)}
+        onClick={onCreateTodo}
+      >
+        <span className="palette-result-icon" aria-hidden="true">
+          <IconChecklist size={14} sw={1.7} />
+        </span>
+        <span className="palette-result-body">
+          <span className="palette-result-title">Create todo</span>
+          <span className="palette-result-snippet">“{q}”</span>
+        </span>
+        <span className="palette-result-source">⇧↵</span>
+      </button>
     </div>
   );
 }

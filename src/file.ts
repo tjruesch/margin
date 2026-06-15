@@ -760,6 +760,52 @@ export async function getContributionInsight(
   return invoke<ContributionInsight>("get_contribution_insight", { id, regenerate });
 }
 
+// --- Todos (#166) --------------------------------------------------------
+
+/** A standalone to-do item. `due_ms` is optional; a background ticker
+ *  fires an OS notification when an incomplete item comes due. */
+export type Todo = {
+  id: string;
+  text: string;
+  done: boolean;
+  due_ms: number | null;
+  created_ms: number;
+  modified_ms: number;
+  completed_ms: number | null;
+};
+
+export type TodoScope = "active" | "completed" | "all";
+
+export async function listTodos(scope: TodoScope = "active"): Promise<Todo[]> {
+  return invoke<Todo[]>("list_todos", { scope });
+}
+
+/** Create a todo. `source` records the entry point: "page" | "palette"
+ *  | "voice". */
+export async function createTodo(
+  text: string,
+  dueMs: number | null = null,
+  source = "page",
+): Promise<Todo> {
+  return invoke<Todo>("create_todo", { text, dueMs, source });
+}
+
+export async function updateTodo(
+  id: string,
+  text: string,
+  dueMs: number | null,
+): Promise<Todo | null> {
+  return invoke<Todo | null>("update_todo", { id, text, dueMs });
+}
+
+export async function setTodoDone(id: string, done: boolean): Promise<Todo | null> {
+  return invoke<Todo | null>("set_todo_done", { id, done });
+}
+
+export async function deleteTodo(id: string): Promise<void> {
+  return invoke<void>("delete_todo", { id });
+}
+
 // --- Calendar events (#63) -----------------------------------------------
 
 export type CalendarAttendee = {
