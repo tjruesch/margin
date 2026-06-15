@@ -688,6 +688,78 @@ export async function syncConnectorNow(connectorId: string): Promise<void> {
   return invoke<void>("sync_connector_now", { connectorId });
 }
 
+// --- GitHub connector + changelog (#165) ---------------------------------
+
+/** One GitHub contribution: a pull request (`kind: "pr"`) or a commit
+ *  (`kind: "commit"`). Merged PRs (`state: "merged"`) are delivered
+ *  features; everything else is work in progress. */
+export type GithubContribution = {
+  id: string;
+  connector_id: string;
+  external_id: string;
+  kind: "pr";
+  state: "merged" | "open" | "closed";
+  title: string;
+  body: string | null;
+  repo: string;
+  url: string;
+  author_login: string;
+  author_avatar_url: string | null;
+  created_at_ms: number;
+  merged_at_ms: number | null;
+  modified_ms: number;
+  ai_summary: string | null;
+  ai_highlight: string | null;
+  ai_generated_ms: number | null;
+};
+
+/** A blog/LinkedIn-worthy angle on a PR. Present only when the AI
+ *  cleared a deliberately high bar. */
+export type InsightHighlight = {
+  angle: string;
+  content: string;
+};
+
+/** AI changelog insight for one PR. `highlight` is null when nothing
+ *  rose to the "worth writing about" bar. */
+export type ContributionInsight = {
+  summary: string;
+  highlight: InsightHighlight | null;
+  generated_ms: number;
+  cached: boolean;
+};
+
+/** Validate a GitHub personal access token, store it, and create the
+ *  `github:<login>` connector. The runner backfills the last 30 days on
+ *  its next tick. Resolves to the new connector id; rejects with a
+ *  human-readable message if the token is invalid. */
+export async function connectGithub(token: string): Promise<string> {
+  return invoke<string>("connect_github", { token });
+}
+
+/** True when a GitHub connector is configured. */
+export async function hasGithubConnector(): Promise<boolean> {
+  return invoke<boolean>("has_github_connector");
+}
+
+/** Changelog feed — pull requests only, newest-first. */
+export async function listGithubContributions(
+  limit?: number,
+): Promise<GithubContribution[]> {
+  return invoke<GithubContribution[]>("list_github_contributions", { limit });
+}
+
+/** Fetch (and cache) the AI insight for one PR: a summary plus an
+ *  optional high-bar "worth writing about" highlight. Generated on
+ *  first call (needs the Anthropic key); pass `regenerate: true` to
+ *  force a fresh pass. */
+export async function getContributionInsight(
+  id: string,
+  regenerate = false,
+): Promise<ContributionInsight> {
+  return invoke<ContributionInsight>("get_contribution_insight", { id, regenerate });
+}
+
 // --- Calendar events (#63) -----------------------------------------------
 
 export type CalendarAttendee = {

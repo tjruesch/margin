@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   type ConnectorInfo,
   type ConnectorStatusEvent,
+  connectGithub,
   deleteAnthropicApiKey,
   deleteConnector,
   deleteFirecrawlApiKey,
@@ -27,6 +28,7 @@ import {
 import { PromptInspector } from "./PromptInspector";
 import type { ChatMessageView } from "./ChatMessage";
 import {
+  IconBrand,
   IconChevLeft,
   IconEdit,
   IconHome,
@@ -468,6 +470,10 @@ function ConnectorsSection() {
           ))}
         </div>
       )}
+      <GitHubConnectCard
+        connected={connectors.some((c) => c.kind === "github")}
+        onConnected={() => void refresh()}
+      />
       {pickerOpen && (
         <ConnectorPickerModal
           providers={providers}
@@ -475,6 +481,87 @@ function ConnectorsSection() {
         />
       )}
     </section>
+  );
+}
+
+/// GitHub connects via a personal access token rather than OAuth (no
+/// build-time client id needed), so it gets its own card below the OAuth
+/// connectors. Once connected it also shows up as a regular connector
+/// row above — this card stays for rotating the token.
+function GitHubConnectCard({
+  connected,
+  onConnected,
+}: {
+  connected: boolean;
+  onConnected: () => void;
+}) {
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const onConnect = async () => {
+    const value = token.trim();
+    if (!value) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await connectGithub(value);
+      setToken("");
+      onConnected();
+    } catch (e) {
+      setError(
+        typeof e === "string"
+          ? e
+          : e instanceof Error
+          ? e.message
+          : "Failed to connect GitHub",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="github-card">
+      <div className="github-card-head">
+        <IconBrand kind="github" size={16} />
+        <span className="github-card-title">GitHub</span>
+        {connected && <span className="github-card-badge">Connected</span>}
+      </div>
+      <p className="settings-section-intro">
+        {connected
+          ? "Connected. Paste a new token to rotate it — or manage / remove the connector above."
+          : "Build a changelog from your GitHub activity: merged pull requests as delivered features, commits as work in progress. Polled every 15 minutes; the last 30 days are backfilled on connect."}
+      </p>
+      <div className="settings-actions">
+        <input
+          type="password"
+          className="settings-input"
+          placeholder="ghp_… or github_pat_…"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void onConnect();
+          }}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button
+          className="ghost"
+          onClick={() => void onConnect()}
+          disabled={busy || !token.trim()}
+        >
+          {busy ? "Connecting…" : connected ? "Update token" : "Connect"}
+        </button>
+      </div>
+      {error && <div className="settings-error">{error}</div>}
+      <span className="settings-hint">
+        Create a token at GitHub → Settings → Developer settings → Personal
+        access tokens. Classic tokens need the <code>repo</code> scope (or{" "}
+        <code>public_repo</code> for public repos only). Stored only in your
+        macOS keychain.
+      </span>
+    </div>
   );
 }
 

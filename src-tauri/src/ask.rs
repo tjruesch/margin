@@ -108,6 +108,7 @@ const TOOL_NAMES: &[&str] = &[
     "read_email",
     "search_similar",
     "read_edges",
+    "search_changelog",
 ];
 /// Per-event-series cap on occurrences returned by `read_event_series`
 /// (#128). A weekly meeting that's been running 3 years has ~150 rows;
@@ -1196,7 +1197,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "search_similar",
-            "description": "Search the user's content semantically (via the Voyage embedding index, #104). Use this for questions like 'what was I working on around X', 'who said anything about Y last month', 'remind me what we decided about Z' — where keyword search would miss the answer because the user's wording differs from the original. Returns up to `limit` hits across notes, emails, calendar events, and workstreams, ranked by cosine similarity to the query.",
+            "description": "Search the user's content semantically (via the Voyage embedding index, #104). Use this for questions like 'what was I working on around X', 'who said anything about Y last month', 'remind me what we decided about Z' — where keyword search would miss the answer because the user's wording differs from the original. Returns up to `limit` hits across notes, emails, calendar events, workstreams, and GitHub contributions, ranked by cosine similarity to the query.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -1208,9 +1209,9 @@ fn tool_definitions() -> serde_json::Value {
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["note","email","event","workstream","teams_message"]
+                            "enum": ["note","email","event","workstream","teams_message","github"]
                         },
-                        "description": "Optional. Restrict results to a subset of entity kinds."
+                        "description": "Optional. Restrict results to a subset of entity kinds. Use \"github\" for the user's own pull requests and commits."
                     },
                     "limit": {
                         "type": "integer",
@@ -1239,6 +1240,30 @@ fn tool_definitions() -> serde_json::Value {
                     }
                 },
                 "required": ["node_kind", "node_id"]
+            }
+        },
+        {
+            "name": "search_changelog",
+            "description": "Search the user's own GitHub pull requests — the changelog built by the GitHub connector (#165). Merged PRs are delivered features; open/closed PRs are work in progress. Use for questions like 'what did I ship this week', 'what features have I delivered', 'what am I working on in repo X'. Returns matching PRs newest-first (by merge time for merged PRs, else creation time). Leave `query` empty to get the most recent activity.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional free-text filter matched against PR title, repository name, and body. Empty or omitted returns the most recent PRs."
+                    },
+                    "merged_only": {
+                        "type": "boolean",
+                        "description": "Optional. When true, return only merged PRs (delivered features). Default false."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Max PRs to return. Default 15."
+                    }
+                },
+                "required": []
             }
         }
     ])
@@ -1593,6 +1618,11 @@ fn dispatch_tool(
     // loop which is already on a Tokio runtime).
     if name == "search_similar" {
         return dispatch_search_similar(app, input);
+    }
+    // search_changelog — GitHub contributions (#165). Direct DB query,
+    // no `n` index and no embedding round-trip.
+    if name == "search_changelog" {
+        return dispatch_search_changelog(app, input);
     }
 
     let n = match input.get("n").and_then(|v| v.as_u64()) {
@@ -2008,6 +2038,99 @@ fn dispatch_search_similar(app: &AppHandle, input: &serde_json::Value) -> ToolRe
             is_error: true,
         },
     }
+}
+
+/// GitHub changelog search (#165). Direct query against
+/// `github_contributions` — no embedding round-trip, so it works even
+/// before the Voyage index catches up (and with no Voyage key at all).
+fn dispatch_search_changelog(app: &AppHandle, input: &serde_json::Value) -> ToolResult {
+    let query = input
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let merged_only = input
+        .get("merged_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let limit = input
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 50) as usize)
+        .unwrap_or(15);
+
+    let conn_state = app.state::<std::sync::Mutex<rusqlite::Connection>>();
+    let c = match conn_state.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            return ToolResult {
+                content: format!("search_changelog: db lock: {e}"),
+                is_error: true,
+            }
+        }
+    };
+    let hits = match crate::connectors::github_contributions::search_contributions(
+        &c,
+        &query,
+        merged_only,
+        limit,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            return ToolResult {
+                content: format!("search_changelog failed: {e}"),
+                is_error: true,
+            }
+        }
+    };
+
+    if hits.is_empty() {
+        let qpart = if query.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" matching \"{}\"", query.trim())
+        };
+        return ToolResult {
+            content: format!(
+                "No pull requests{qpart}. The GitHub connector may not be configured (Settings → Connectors) or hasn't synced yet."
+            ),
+            is_error: false,
+        };
+    }
+
+    let mut out = format!("# {} pull request(s)\n\n", hits.len());
+    for (i, h) in hits.iter().enumerate() {
+        let (label, when) = if h.state == "merged" {
+            ("delivered feature (merged PR)", h.merged_at_ms.unwrap_or(h.created_at_ms))
+        } else {
+            ("open/closed PR (in progress)", h.created_at_ms)
+        };
+        let state_note = if h.state != "merged" {
+            format!(" [{}]", h.state)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{idx}. **{title}** — {label}{state_note}\n   {repo} · {date} · {url}\n",
+            idx = i + 1,
+            title = h.title,
+            label = label,
+            state_note = state_note,
+            repo = h.repo,
+            date = fmt_changelog_day(when),
+            url = h.url,
+        ));
+    }
+    ToolResult {
+        content: out,
+        is_error: false,
+    }
+}
+
+fn fmt_changelog_day(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ms / 1000, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown date".to_string())
 }
 
 struct EdgeRow {

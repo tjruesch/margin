@@ -125,6 +125,20 @@ pub fn preview_for(conn: &Connection, ref_kind: &str, ref_id: &str) -> String {
                 _ => ref_id.to_string(),
             }
         }
+        "github" => {
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT repo, title FROM github_contributions WHERE id = ?1",
+                    params![ref_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .unwrap_or(None);
+            match row {
+                Some((repo, title)) => format!("{repo}: {title}"),
+                None => ref_id.to_string(),
+            }
+        }
         _ => ref_id.to_string(),
     };
     truncate_chars(&raw, 100)
@@ -289,6 +303,33 @@ pub fn collect_work(conn: &Connection, model: &str) -> rusqlite::Result<Vec<Work
         }
         items.push(WorkItem {
             ref_kind: "workstream".into(),
+            ref_id: id,
+            source_hash: sha256_hex(&text),
+            text,
+        });
+    }
+
+    // ---- github contributions (#165) ----
+    let gh_rows: Vec<(String, String, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT g.id, g.title, g.body, g.repo FROM github_contributions g \
+             LEFT JOIN embeddings e \
+               ON e.ref_kind = 'github' AND e.ref_id = g.id AND e.model = ?1 \
+             WHERE e.indexed_ms IS NULL OR g.modified_ms > e.indexed_ms",
+        )?;
+        let rows = stmt.query_map(params![model], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for (id, title, body, repo) in gh_rows {
+        let body = body.unwrap_or_default();
+        let text = truncate_chars(&format!("{repo}: {title}\n{body}"), SOURCE_CHAR_CAP);
+        if text.trim().is_empty() {
+            continue;
+        }
+        items.push(WorkItem {
+            ref_kind: "github".into(),
             ref_id: id,
             source_hash: sha256_hex(&text),
             text,

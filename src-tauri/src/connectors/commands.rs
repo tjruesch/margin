@@ -436,6 +436,208 @@ pub async fn get_email_body(
     Ok(body)
 }
 
+// ----- GitHub connector (#165) -------------------------------------------
+
+/// Far-future expiry for the stored PAT. GitHub personal access tokens
+/// don't carry an expiry in the token response (classic tokens may never
+/// expire; fine-grained ones expire server-side and simply start
+/// returning 401, which surfaces as `reauth_needed`). We park the
+/// keychain `expires_at_ms` in the year ~3000 so no refresh is attempted.
+const GITHUB_TOKEN_EXPIRY_MS: i64 = 32_503_680_000_000;
+
+/// Connect a GitHub account from a pasted personal access token. Unlike
+/// `start_oauth_connector` there's no browser flow: we validate the
+/// token via `GET /user`, store it in the keychain, write the connector
+/// row, and mark it due so the runner backfills the last 30 days on its
+/// next tick. Re-running with a token for the same account rotates it.
+#[tauri::command]
+pub async fn connect_github(
+    app: AppHandle,
+    token: String,
+    conn: tauri::State<'_, Mutex<Connection>>,
+    registry: tauri::State<'_, Arc<ConnectorRegistry>>,
+) -> Result<String, String> {
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        return Err("Paste a GitHub personal access token first.".to_string());
+    }
+
+    let identity = super::github::validate_token(&token)
+        .await
+        .map_err(|e| match e {
+            super::ConnectorError::ReauthNeeded(_) => {
+                "That token didn't work. Check it has `repo` (or read) scope and hasn't expired."
+                    .to_string()
+            }
+            other => other.to_string(),
+        })?;
+
+    let connector_id = format!("github:{}", identity.login);
+    let display_name = match identity.name.as_deref().map(str::trim) {
+        Some(n) if !n.is_empty() => format!("GitHub ({} · {n})", identity.login),
+        _ => format!("GitHub ({})", identity.login),
+    };
+
+    // Persist the PAT in the keychain — same slot the OAuth connectors
+    // use, so `delete_connector` cleans it up for free.
+    let tokens = crate::keychain::ConnectorTokens {
+        access_token: token,
+        refresh_token: None,
+        expires_at_ms: GITHUB_TOKEN_EXPIRY_MS,
+        scope: String::new(),
+    };
+    crate::keychain::write_connector_tokens(&connector_id, &tokens).map_err(|e| e.to_string())?;
+
+    let now_ms = current_unix_ms();
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        c.execute(
+            "INSERT INTO connectors(id, kind, display_name, enabled, config_json, created_ms, updated_ms) \
+             VALUES (?1, 'github', ?2, 1, '{}', ?3, ?3) \
+             ON CONFLICT(id) DO UPDATE SET \
+                display_name = excluded.display_name, \
+                enabled = 1, \
+                updated_ms = excluded.updated_ms",
+            rusqlite::params![&connector_id, &display_name, now_ms],
+        )
+        .map_err(|e| e.to_string())?;
+        c.execute(
+            "INSERT INTO sync_status(connector_id, next_due_ms) \
+             VALUES (?1, 0) \
+             ON CONFLICT(connector_id) DO UPDATE SET next_due_ms = 0, last_error = NULL",
+            rusqlite::params![&connector_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = registry.rebuild_instances(&app, &c) {
+            eprintln!("[connectors] rebuild after connect_github failed: {e}");
+        }
+    }
+
+    let _ = app.emit(
+        "connector-status",
+        serde_json::json!({
+            "connector_id": connector_id,
+            "state": "added",
+            "message": null,
+        }),
+    );
+
+    Ok(connector_id)
+}
+
+/// True when a GitHub connector is configured. Drives the Settings card
+/// (connect form vs connected state) and the changelog empty state.
+#[tauri::command]
+pub fn has_github_connector(
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<bool, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM connectors WHERE kind = 'github'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// Changelog feed query — pull requests only, newest-first.
+#[tauri::command]
+pub fn list_github_contributions(
+    limit: Option<u32>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<Vec<super::github_contributions::Contribution>, String> {
+    let c = conn.lock().map_err(|e| e.to_string())?;
+    let lim = limit.unwrap_or(300) as usize;
+    super::github_contributions::list_contributions(&c, lim).map_err(|e| e.to_string())
+}
+
+/// AI changelog insight for one PR. Cached after first generation;
+/// `regenerate: true` forces a fresh pass. Generation needs the
+/// Anthropic key (keychain) and calls out to GitHub + Claude, so it's
+/// `async` and lazy (only when the user opens the detail view).
+#[derive(Serialize)]
+pub struct ContributionInsight {
+    pub summary: String,
+    pub highlight: Option<super::github::InsightHighlight>,
+    pub generated_ms: i64,
+    pub cached: bool,
+}
+
+#[tauri::command]
+pub async fn get_contribution_insight(
+    id: String,
+    regenerate: Option<bool>,
+    conn: tauri::State<'_, Mutex<Connection>>,
+) -> Result<ContributionInsight, String> {
+    let contribution = {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        super::github_contributions::get_contribution(&c, &id).map_err(|e| e.to_string())?
+    }
+    .ok_or_else(|| "contribution not found".to_string())?;
+
+    // Cached path — return the stored insight unless a regen is forced.
+    if !regenerate.unwrap_or(false) {
+        if let Some(gen_ms) = contribution.ai_generated_ms {
+            let highlight = contribution
+                .ai_highlight
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<super::github::InsightHighlight>(j).ok());
+            return Ok(ContributionInsight {
+                summary: contribution.ai_summary.clone().unwrap_or_default(),
+                highlight,
+                generated_ms: gen_ms,
+                cached: true,
+            });
+        }
+    }
+
+    let number = contribution
+        .external_id
+        .rsplit('#')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| format!("can't parse PR number from {}", contribution.external_id))?;
+
+    let generated = super::github::generate_pr_insight(
+        &contribution.connector_id,
+        &contribution.repo,
+        number,
+        &contribution.title,
+        contribution.body.as_deref(),
+    )
+    .await?;
+
+    let now_ms = current_unix_ms();
+    let highlight_json = generated
+        .highlight
+        .as_ref()
+        .and_then(|h| serde_json::to_string(h).ok());
+    {
+        let c = conn.lock().map_err(|e| e.to_string())?;
+        super::github_contributions::set_ai_insight(
+            &c,
+            &id,
+            &generated.summary,
+            highlight_json.as_deref(),
+            now_ms,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    Ok(ContributionInsight {
+        summary: generated.summary,
+        highlight: generated.highlight,
+        generated_ms: now_ms,
+        cached: false,
+    })
+}
+
 /// Minimal YAML string escape — sufficient for IDs / locations the
 /// connector hands us. If the value contains any special chars
 /// (colon, quotes, newline, leading/trailing whitespace) we wrap it

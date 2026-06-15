@@ -28,6 +28,8 @@ use serde::Serialize;
 pub mod calendar;
 pub mod commands;
 pub mod email;
+pub mod github;
+pub mod github_contributions;
 pub mod google;
 pub mod microsoft_graph;
 pub mod oauth;

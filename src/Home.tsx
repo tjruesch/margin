@@ -15,12 +15,14 @@ import { MoreMenu } from "./MoreMenu";
 import { type NotificationRecord, unreadCount } from "./notifications";
 import { NotificationsPanel } from "./NotificationsPanel";
 import { ChatPage } from "./ChatPage";
+import { ChangelogView } from "./Changelog";
 import { SearchPalette } from "./SearchPalette";
 import { TeamView } from "./Team";
 import { WorkstreamsView } from "./Workstreams";
 import {
   IconArchive,
   IconBell,
+  IconBrand,
   IconBriefcase,
   IconChevRight,
   IconHome,
@@ -81,6 +83,7 @@ type NavId =
   | "home"
   | "chat"
   | "workstreams"
+  | "changelog"
   | "favorites"
   | "archive"
   | "team";
@@ -432,6 +435,7 @@ export function Home({
       "home",
       "chat",
       "workstreams",
+      "changelog",
       "favorites",
       "archive",
       "team",
@@ -682,6 +686,8 @@ export function Home({
             onOpenNote={onOpen}
             onChanged={onWorkstreamsChanged}
           />
+        ) : nav === "changelog" ? (
+          <ChangelogView onOpenSettings={onOpenSettings} />
         ) : (
           <>
             <NotesFeed
@@ -776,6 +782,12 @@ function Sidebar({
           label="Workstreams"
           active={active === "workstreams"}
           onClick={() => onSelect("workstreams")}
+        />
+        <NavItem
+          icon={<IconBrand kind="github" size={14} />}
+          label="Changelog"
+          active={active === "changelog"}
+          onClick={() => onSelect("changelog")}
         />
         <NavItem
           icon={<IconUser size={14} sw={1.7} />}
@@ -1015,6 +1027,7 @@ function renderScopedActions(
           </button>
         </>
       );
+    case "changelog":
     case "favorites":
     case "archive":
     case "home":
@@ -1027,6 +1040,8 @@ function pageHeaderTitle(nav: NavId): string {
   switch (nav) {
     case "workstreams":
       return "Workstreams";
+    case "changelog":
+      return "Changelog";
     case "team":
       return "Team";
     case "favorites":

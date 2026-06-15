@@ -438,6 +438,7 @@ pub fn run() {
             let registry = std::sync::Arc::new(connectors::ConnectorRegistry::new());
             connectors::microsoft_graph::register(&registry);
             connectors::google::register(&registry);
+            connectors::github::register(&registry);
             if let Err(e) = registry.rebuild_instances(app.handle(), &conn) {
                 eprintln!("connector registry rebuild failed at boot: {e}");
             }
@@ -554,6 +555,10 @@ pub fn run() {
             connectors::commands::open_or_create_event_note,
             connectors::commands::list_email_messages,
             connectors::commands::get_email_body,
+            connectors::commands::connect_github,
+            connectors::commands::has_github_connector,
+            connectors::commands::list_github_contributions,
+            connectors::commands::get_contribution_insight,
             workstreams::commands::synthesize_workstreams,
             workstreams::commands::attach_signal_to_workstream,
             workstreams::commands::detach_signal_from_workstream,
