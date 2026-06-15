@@ -7309,3 +7309,423 @@ button.workstream-external-chip:hover {
   font-weight: 600;
 }
 
+/* ---------- GitHub changelog (#165) ---------------------------------- */
+.changelog-view {
+  padding: 22px 32px 40px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.changelog-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.changelog-filters {
+  display: flex;
+  gap: 6px;
+}
+
+.changelog-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 0.5px solid var(--home-line);
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.changelog-filter:hover {
+  background: var(--home-chip);
+  color: var(--fg);
+}
+.changelog-filter.active {
+  background: var(--home-accent-soft);
+  border-color: var(--home-accent-border);
+  color: var(--accent);
+}
+.changelog-filter-count {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.changelog-sync {
+  padding: 5px 12px;
+  border-radius: 7px;
+  border: 0.5px solid var(--home-line);
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.changelog-sync:hover:not(:disabled) {
+  background: var(--home-card-hover);
+}
+.changelog-sync:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.changelog-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.changelog-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.changelog-day {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  padding-left: 2px;
+}
+.changelog-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.changelog-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 0.5px solid var(--home-line);
+  background: var(--home-card);
+  cursor: pointer;
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+.changelog-row:hover,
+.changelog-row:focus-visible {
+  background: var(--home-card-hover);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--fg) 4%, transparent);
+  outline: none;
+}
+
+.changelog-icon {
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--home-chip);
+  color: var(--fg);
+}
+.changelog-icon-pr {
+  color: var(--accent);
+}
+
+.changelog-row-body {
+  flex: 1;
+  min-width: 0;
+}
+.changelog-row-title {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.changelog-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--fg-muted);
+}
+.changelog-repo {
+  font-family: var(--font-mono, ui-monospace, "JetBrains Mono Variable", monospace);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 340px;
+}
+.changelog-sep {
+  opacity: 0.5;
+}
+
+.changelog-badge {
+  flex-shrink: 0;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  border: 0.5px solid transparent;
+}
+.changelog-badge-delivered {
+  color: #1a7f37;
+  background: color-mix(in srgb, #1a7f37 12%, transparent);
+  border-color: color-mix(in srgb, #1a7f37 30%, transparent);
+}
+[data-theme="dark"] .changelog-badge-delivered {
+  color: #4ac26b;
+}
+.changelog-badge-wip {
+  color: var(--fg-muted);
+  background: var(--home-chip);
+}
+.changelog-badge-open {
+  color: var(--accent);
+  background: var(--home-accent-soft);
+  border-color: var(--home-accent-border);
+}
+.changelog-badge-closed {
+  color: #c44a1f;
+  background: color-mix(in srgb, #c44a1f 12%, transparent);
+}
+
+.changelog-connect-cta {
+  margin-top: 12px;
+  align-self: flex-start;
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: 0.5px solid var(--home-accent-border);
+  background: var(--home-accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.changelog-connect-cta:hover {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+/* GitHub connect card in Settings → Connectors */
+.github-card {
+  margin-top: 14px;
+  padding: 14px;
+  border: 0.5px solid var(--home-line);
+  border-radius: 10px;
+  background: var(--bg);
+}
+.github-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.github-card-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.github-card-badge {
+  margin-left: auto;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: #1a7f37;
+  background: color-mix(in srgb, #1a7f37 12%, transparent);
+}
+[data-theme="dark"] .github-card-badge {
+  color: #4ac26b;
+}
+.github-card .settings-actions {
+  margin-top: 8px;
+}
+.github-card code {
+  font-family: var(--font-mono, ui-monospace, "JetBrains Mono Variable", monospace);
+  font-size: 11.5px;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--home-chip);
+}
+
+/* changelog: small "insight ready" marker on a list row */
+.changelog-insight-dot {
+  color: var(--accent);
+  font-size: 10px;
+  margin-left: 2px;
+}
+
+/* ---------- Changelog PR detail view --------------------------------- */
+.changelog-detail {
+  padding: 18px 32px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  max-width: 760px;
+}
+
+.changelog-detail-back {
+  align-self: flex-start;
+  padding: 4px 8px 4px 4px;
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 12.5px;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.changelog-detail-back:hover {
+  color: var(--fg);
+  background: var(--home-chip);
+}
+
+.changelog-detail-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.changelog-detail-badges {
+  display: flex;
+  gap: 6px;
+}
+.changelog-detail-title {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--fg);
+  margin: 0;
+}
+.changelog-detail-meta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--fg-muted);
+}
+.changelog-detail-link {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12.5px;
+  cursor: pointer;
+  padding: 0;
+}
+.changelog-detail-link:hover {
+  text-decoration: underline;
+}
+
+/* AI insight block */
+.changelog-insight {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
+  border: 0.5px solid var(--home-line);
+  border-radius: 12px;
+  background: var(--home-card);
+}
+.changelog-insight-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.changelog-insight-h {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-muted);
+  margin: 0;
+}
+.changelog-insight-summary {
+  font-size: 14.5px;
+  line-height: 1.55;
+  color: var(--fg);
+  margin: 0;
+}
+.changelog-insight-loading {
+  font-size: 13.5px;
+  color: var(--fg-muted);
+  margin: 0;
+}
+.changelog-insight-none {
+  font-size: 13px;
+  color: var(--fg-muted);
+  font-style: italic;
+  margin: 4px 0 0;
+}
+.changelog-insight-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  color: #c44a1f;
+}
+.changelog-regen {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 0.5px solid var(--home-line);
+  background: var(--bg);
+  color: var(--fg-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.changelog-regen:hover {
+  background: var(--home-card-hover);
+  color: var(--fg);
+}
+
+/* the high-bar "worth writing about" highlight */
+.changelog-highlight {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px 14px;
+  margin-top: 4px;
+  border-radius: 10px;
+  border: 0.5px solid var(--home-accent-border);
+  background: var(--home-accent-soft);
+}
+.changelog-highlight-tag {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.changelog-highlight-angle {
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.3;
+  color: var(--fg);
+}
+.changelog-highlight-content {
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--fg);
+  margin: 0;
+}
+
+/* PR description markdown — constrain the shared markdown-body */
+.changelog-body-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.changelog-body.markdown-body {
+  font-size: 13.5px;
+  background: transparent;
+  color: var(--fg);
+}
+
