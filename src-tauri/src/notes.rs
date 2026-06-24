@@ -201,6 +201,28 @@ pub fn transcript_path_for(note_id: String) -> Option<String> {
     }
 }
 
+/// Read an arbitrary UTF-8 text file from disk and return its contents.
+///
+/// After #112 the frontend no longer touches the filesystem directly —
+/// `@tauri-apps/plugin-fs` is unregistered and blocked by the webview
+/// ACL. The remaining first-party callers (the transcript viewer reading
+/// `<notes_dir>/<id>/transcript.json`, and the external-file import /
+/// reload paths) route their disk reads through this command so all IO
+/// stays on the Rust side of the IPC boundary like every other command.
+#[tauri::command]
+pub fn read_text_file(path: String) -> Result<String, String> {
+    fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))
+}
+
+/// Write `contents` to `path`, creating the file or truncating an
+/// existing one. Backs the transcript "Export as .txt" affordance and
+/// the external-note save path. The destination is always a path the
+/// user picked through the save dialog, so no extra scoping is needed.
+#[tauri::command]
+pub fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    fs::write(&path, contents).map_err(|e| format!("{path}: {e}"))
+}
+
 /// Search across all non-archived owned notes (titles + bodies via the
 /// FTS5 index, plus per-bundle transcript.json segments). Returns a
 /// ranked list of `SearchHit`s. `limit` defaults to 20 and is clamped

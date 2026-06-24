@@ -540,6 +540,8 @@ pub fn run() {
             notes::delete_note,
             notes::read_note,
             notes::transcript_path_for,
+            notes::read_text_file,
+            notes::write_text_file,
             notes::write_note,
             notes::set_note_tags,
             notes::set_archived,

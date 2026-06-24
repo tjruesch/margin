@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { readFile, type Segment, type Transcript } from "./file";
+import {
+  pickTxtFileToSave,
+  readFile,
+  writeFile,
+  type Segment,
+  type Transcript,
+} from "./file";
 
 type Props = {
   /** Path to the bundle's transcript.json. */
@@ -9,6 +15,8 @@ type Props = {
 export function TranscriptView({ path }: Props) {
   const [data, setData] = useState<Transcript | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -50,9 +58,33 @@ export function TranscriptView({ path }: Props) {
   const langLabel = data.language && data.language !== "und" ? data.language.toUpperCase() : null;
   const durationLabel = formatDuration(data.duration_ms);
 
+  const onExport = async () => {
+    setExportError(null);
+    setExporting(true);
+    try {
+      const dest = await pickTxtFileToSave();
+      if (dest) await writeFile(dest, transcriptToPlainText(data));
+    } catch (e) {
+      setExportError(typeof e === "string" ? e : "Export failed");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="transcript-view">
-      <div className="transcript-eyebrow">Transcript</div>
+      <div className="transcript-header">
+        <div className="transcript-eyebrow">Transcript</div>
+        <button
+          type="button"
+          className="transcript-export-button"
+          onClick={() => void onExport()}
+          disabled={exporting}
+        >
+          {exporting ? "Exporting…" : "Export as .txt"}
+        </button>
+      </div>
+      {exportError && <div className="transcript-export-error">{exportError}</div>}
       <div className="transcript-meta">
         {langLabel && <span>Detected language: {langLabel}</span>}
         <span>{durationLabel}</span>
@@ -113,4 +145,27 @@ function formatDuration(ms: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+/** Render the transcript as plain text for the "Export as .txt" button:
+ *  a short metadata header followed by speaker-labelled paragraphs, using
+ *  the same grouping as the on-screen view. */
+function transcriptToPlainText(data: Transcript): string {
+  const langLabel =
+    data.language && data.language !== "und" ? data.language.toUpperCase() : null;
+  const meta = [
+    langLabel ? `Language: ${langLabel}` : null,
+    `Duration: ${formatDuration(data.duration_ms)}`,
+    data.num_speakers != null && data.num_speakers > 0
+      ? `Speakers: ${data.num_speakers}`
+      : null,
+  ].filter((x): x is string => x !== null);
+
+  const lines: string[] = [];
+  if (meta.length) lines.push(meta.join("  ·  "), "");
+  for (const g of groupBySpeaker(data.segments)) {
+    if (g.speaker !== null) lines.push(`Speaker ${g.speaker}:`);
+    lines.push(g.text, "");
+  }
+  return lines.join("\n").trimEnd() + "\n";
 }
