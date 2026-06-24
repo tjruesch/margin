@@ -16,26 +16,31 @@ export async function pickFileToSave(suggestedName = "Untitled.md"): Promise<str
   return result ?? null;
 }
 
+const TXT_FILTER = [{ name: "Text", extensions: ["txt"] }];
+
+export async function pickTxtFileToSave(suggestedName = "transcript.txt"): Promise<string | null> {
+  const result = await saveDialog({ defaultPath: suggestedName, filters: TXT_FILTER });
+  return result ?? null;
+}
+
 // Filesystem-level IPCs (`readFile` / `writeFile` / `watchFile` /
-// `unwatchFile` / `fileExists`) were removed in #112. The stubs
-// below preserve the legacy call shape used by the editor's transcript
-// loader and a couple of vestigial code paths so the migration diff
-// stays focused on the architectural move. They are pure shims that
-// proxy disk reads via Tauri's plugin-fs where it still makes sense
-// (audio/transcript siblings).
+// `unwatchFile` / `fileExists`) were removed in #112. The stubs below
+// preserve the legacy call shape used by the editor's transcript loader
+// and a couple of vestigial code paths so the migration diff stays
+// focused on the architectural move. They proxy disk IO through the
+// `read_text_file` / `write_text_file` Rust commands — `@tauri-apps/
+// plugin-fs` is unregistered and blocked by the webview ACL, so all file
+// access stays on the Rust side like the rest of the IPC surface.
 
 export async function readFile(path: string): Promise<FileContents> {
-  // After #112 this is only used to read transcript.json sidecars from
-  // disk. The shim keeps existing call sites working without a wider
-  // refactor.
-  const { readTextFile } = await import("@tauri-apps/plugin-fs");
-  const content = await readTextFile(path);
+  // After #112 this reads transcript.json sidecars and the occasional
+  // external markdown file picked via the open dialog.
+  const content = await invoke<string>("read_text_file", { path });
   return { path, content };
 }
 
 export async function writeFile(path: string, content: string): Promise<void> {
-  const { writeTextFile } = await import("@tauri-apps/plugin-fs");
-  await writeTextFile(path, content);
+  await invoke<void>("write_text_file", { path, contents: content });
 }
 
 export async function getInitialFile(): Promise<string | null> {
@@ -316,8 +321,7 @@ export async function notesDir(): Promise<string> {
  *  Read the file, create a new note row with the body. The original
  *  on-disk file is left untouched. */
 export async function convertExternal(sourcePath: string): Promise<NoteRef> {
-  const { readTextFile } = await import("@tauri-apps/plugin-fs");
-  const body = await readTextFile(sourcePath);
+  const { content: body } = await readFile(sourcePath);
   const ref = await createNote();
   await writeNote(ref.id, body, [], false, false, {});
   return ref;

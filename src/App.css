@@ -2316,13 +2316,46 @@ select.settings-input {
   padding-left: 32px;
   padding-right: 32px;
 }
+.transcript-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
 .transcript-eyebrow {
   font-size: 11px;
   font-weight: 700;
   color: var(--fg-muted);
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  margin-bottom: 8px;
+}
+.transcript-header .transcript-eyebrow {
+  margin-bottom: 0;
+}
+.transcript-export-button {
+  flex: none;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  border: 0.5px solid var(--border-muted);
+  border-radius: 6px;
+  padding: 5px 11px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.transcript-export-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fg) 9%, transparent);
+}
+.transcript-export-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.transcript-export-error {
+  font-size: 12.5px;
+  color: #b23a1a;
+  margin-bottom: 12px;
 }
 .transcript-meta {
   display: flex;
